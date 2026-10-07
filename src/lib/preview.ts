@@ -1,0 +1,292 @@
+import { hasBackendRuntime, invoke } from "./backend";
+
+/**
+ * Mirror of Rust `preview::PreviewTarget`: one workspace of a conversation, by the number the
+ * model addresses it with — workspace 1, the project's further workspaces, then the ones the
+ * conversation attached. The terminal addresses a shell the same way, so a preview page and a
+ * terminal opened for "workspace 2" are in the same directory, on the same machine.
+ */
+export interface PreviewTarget {
+  /** The conversation; for the draft, the id it will materialize as. */
+  conversationId: string;
+  /** Only for the draft: the project it is aimed at, which the host has no conversation for yet. */
+  draftWorkspaceId?: string | null;
+  /** 1-based. Absent is workspace 1. */
+  workspace?: number;
+}
+
+export function previewTargetKey(target: PreviewTarget): string {
+  return `${target.conversationId}\n${target.draftWorkspaceId ?? ""}\n${target.workspace ?? 1}`;
+}
+
+/** Mirror of Rust `preview_servers::PreviewServerStatus`. */
+export type PreviewServerStatus = "starting" | "running" | "stopped" | "failed";
+
+/** Mirror of Rust `preview::PreviewConfiguredServer` — one usable `.mewrk/launch.json` entry. */
+export interface PreviewConfiguredServer {
+  name: string;
+  command: string | null;
+  args: string[];
+  cwd: string;
+  /**
+   * Still the parser's `u32`. A port read out of a command line is not range-checked, so a value
+   * above 65535 reaches the renderer intact and `preview_start_server` is the one that refuses it.
+   */
+  port: number;
+  autoPort?: boolean | null;
+  url?: string | null;
+}
+
+/** Mirror of Rust `preview::PreviewMalformedEntry`. */
+export interface PreviewMalformedEntry {
+  name: string;
+  reason: string;
+}
+
+/** Mirror of Rust `preview::PreviewConfigurationList`. */
+export interface PreviewConfigurationList {
+  launchJsonPath: string;
+  servers: PreviewConfiguredServer[];
+  malformed: PreviewMalformedEntry[];
+  /** The full explanation of an unusable file, absent when the file is usable. */
+  problem?: string | null;
+  problemReason?: string | null;
+}
+
+/** Mirror of Rust `preview_servers::PreviewServerSnapshot`. */
+export interface PreviewServerSnapshot {
+  /** The host registry's key for this one process: what the pane stops it and reads it by. */
+  handle: string;
+  /**
+   * What the model addresses it by: its `.mewrk/launch.json` name, numbered (`dev-2`) when the
+   * file repeats the name. Unique only within one workspace, so it is never a key here.
+   */
+  serverId: string;
+  name: string;
+  port: number;
+  status: PreviewServerStatus;
+  startedAt: string;
+  /** The worktree the server is registered under, not the process's own directory. */
+  cwd: string;
+  sessionId?: string | null;
+  /**
+   * The machine the server runs on, by name, when that is not this computer. Its port is that
+   * machine's; `url` is where this computer reaches it.
+   */
+  machine?: string | null;
+  /**
+   * Where the preview reaches the server from this computer, when that is not
+   * `http://localhost:<port>`: a server on another machine is forwarded to a local port.
+   */
+  url?: string | null;
+  /**
+   * Which of the conversation's workspaces the server belongs to. Only a conversation-wide list
+   * says so; a list for one workspace is all that workspace's.
+   */
+  workspace?: number | null;
+}
+
+/** Mirror of Rust `preview::PreviewAttachment` — a `url` entry with no command to run. */
+export interface PreviewAttachment {
+  /** The entry's name, as for a process — but no process answers to it, so `preview_stop` and `preview_logs` refuse it. */
+  serverId: string;
+  name: string;
+  /** `0` whenever the entry states no port, which a non-localhost url never does. */
+  port: number;
+  /**
+   * Where the preview opens it. For a workspace on another machine a localhost url is that
+   * machine's, so this is the local address it was forwarded to.
+   */
+  url: string;
+}
+
+/**
+ * Mirror of Rust `preview::PreviewStartOutcome`.
+ *
+ * Untagged, like the host's own enum: an attach started no process, so it has no snapshot to
+ * report and is told apart by the member that is only there for it.
+ */
+export type PreviewStartOutcome =
+  | { server: PreviewServerSnapshot; reused: boolean }
+  | { attached: PreviewAttachment };
+
+/** Whether a start attached to somebody else's server instead of running one. */
+export function isPreviewAttachment(
+  outcome: PreviewStartOutcome
+): outcome is { attached: PreviewAttachment } {
+  return "attached" in outcome;
+}
+
+/** Mirror of Rust `preview_servers::PreviewLogQuery`. */
+export interface PreviewLogQuery {
+  errorsOnly?: boolean;
+  search?: string;
+  /**
+   * Clamped host-side to 1..={@link PREVIEW_MAX_LOG_LINES}; omitted means
+   * {@link PREVIEW_DEFAULT_LOG_LINES}.
+   */
+  lines?: number;
+}
+
+/**
+ * The host's own line ceiling (`preview_servers::MAX_LOG_LINES`), so it is also the largest
+ * request that changes anything. `preview.test.ts` reads the Rust sources to prove this number
+ * still matches both places that spell it out there.
+ */
+export const PREVIEW_MAX_LOG_LINES = 200;
+
+/** What the host uses when `lines` is omitted (`preview_servers::DEFAULT_LOG_LINES`). */
+export const PREVIEW_DEFAULT_LOG_LINES = 50;
+
+function requireDesktopRuntime(): void {
+  if (!hasBackendRuntime()) throw new Error("开发服务器仅可在桌面应用中使用");
+}
+
+/**
+ * Everything `.mewrk/launch.json` says, including what is wrong with it. A workspace on another
+ * machine is read there. Never throws for the file's own problems; an unreachable machine does.
+ */
+export async function listPreviewConfigurations(
+  target: PreviewTarget
+): Promise<PreviewConfigurationList> {
+  requireDesktopRuntime();
+  return invoke<PreviewConfigurationList>("preview_list_configurations", { target });
+}
+
+/**
+ * The dev servers running for this workspace, whichever conversation started them. With no
+ * `workspace` in the target, every workspace of the conversation's, each carrying its number.
+ */
+export async function listPreviewServers(target: PreviewTarget): Promise<PreviewServerSnapshot[]> {
+  requireDesktopRuntime();
+  return invoke<PreviewServerSnapshot[]>("preview_list_servers", { target });
+}
+
+/**
+ * Starts the configured server `name` addresses, or hands back the one already answering it.
+ *
+ * Blocks until the host has a running process or has given up, so a failure arrives as a rejected
+ * promise carrying the spawn diagnosis — which is the text the failure card shows. A workspace on
+ * another machine starts the server there, and the outcome's address is the local port it was
+ * forwarded to.
+ *
+ * The server belongs to `target.conversationId` — for the draft, the conversation it will become.
+ */
+export async function startPreviewServer(
+  target: PreviewTarget,
+  name?: string
+): Promise<PreviewStartOutcome> {
+  requireDesktopRuntime();
+  return invoke<PreviewStartOutcome>("preview_start_server", {
+    target,
+    name: name ?? null
+  });
+}
+
+/** Stops one dev server and forgets it, buffered output included. False means it was already gone. */
+export async function stopPreviewServer(handle: string): Promise<boolean> {
+  requireDesktopRuntime();
+  return invoke<boolean>("preview_stop_server", { handle });
+}
+
+/** One dev server's buffered output, filtered the way the `preview_logs` tool filters it. */
+export async function readPreviewServerLogs(
+  handle: string,
+  query: PreviewLogQuery = {}
+): Promise<string> {
+  requireDesktopRuntime();
+  return invoke<string>("preview_server_logs", {
+    handle,
+    errorsOnly: query.errorsOnly ?? null,
+    search: query.search ?? null,
+    lines: query.lines ?? null
+  });
+}
+
+/** Where a configured or running server answers. */
+export function previewServerAddress(server: {
+  port: number;
+  url?: string | null;
+}): string {
+  const explicit = server.url?.trim();
+  if (explicit) return explicit;
+  return `http://localhost:${server.port}`;
+}
+
+/**
+ * Whether a page at `url` is being served by a server answering at `address`.
+ *
+ * Origin equality, not string equality: the page navigates within the server —
+ * a route, a query, a trailing slash — and every one of those is still that
+ * server's page. `about:blank` is nobody's, and a URL neither side can parse
+ * matches nothing rather than matching everything.
+ */
+export function previewUrlIsServedAt(url: string | null | undefined, address: string): boolean {
+  const page = url?.trim();
+  if (!page || page === "about:blank") return false;
+  try {
+    return new URL(page).origin === new URL(address).origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The whole-buffer replies the host sends instead of output. They are sentences, not log lines, so
+ * the drawer shows its own empty state rather than printing them as if a server had said them.
+ *
+ * Each one is a Rust literal — three from `preview_servers::render_preview_logs`, the last from
+ * `preview::NO_SERVER_FOR_LOGS`. `preview.test.ts` reads both sources and fails when the wording
+ * on either side moves, because a reply this list no longer recognises reaches the drawer as a
+ * line and gets printed as though a dev server had emitted it.
+ */
+export const PREVIEW_EMPTY_LOG_REPLIES = [
+  "No logs yet.",
+  "No server errors found.",
+  "No dev server is running. preview_logs takes a process serverId from preview_list."
+];
+
+/**
+ * The fourth reply, which quotes the search term back, so no set of exact strings can hold it.
+ * Nothing reaches the drawer with it today — the drawer has no search box — and the host answers
+ * with it the moment one exists.
+ */
+const PREVIEW_EMPTY_LOG_SEARCH_REPLY = /^No logs matching "[\s\S]*"\.$/u;
+
+/** Splits one `preview_server_logs` reply into drawer lines. Empty for every "nothing yet" reply. */
+export function previewLogLines(rendered: string): string[] {
+  const text = rendered.replace(/\r\n/g, "\n");
+  const reply = text.trim();
+  if (
+    !reply
+    || PREVIEW_EMPTY_LOG_REPLIES.includes(reply)
+    || PREVIEW_EMPTY_LOG_SEARCH_REPLY.test(reply)
+  ) {
+    return [];
+  }
+  const lines = text.split("\n");
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+export type PreviewLogSeverity = "error" | "warn";
+
+/** Claude Code's own classifier: the first 200 characters, uppercased, decide the colour. */
+export function previewLogSeverity(line: string): PreviewLogSeverity | null {
+  const head = line.slice(0, 200).toUpperCase();
+  if (
+    head.includes("ERROR")
+    || head.includes("ERR!")
+    || head.includes("FATAL")
+    || head.includes("FAIL")
+  ) {
+    return "error";
+  }
+  return head.includes("WARN") ? "warn" : null;
+}
+
+/** The source's log cadence. */
+export const PREVIEW_LOG_POLL_INTERVAL_MS = 1000;
+
+/** How often the pane re-reads the configuration file and the running-server list. */
+export const PREVIEW_SERVER_POLL_INTERVAL_MS = 1500;

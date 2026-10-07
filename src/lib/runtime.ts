@@ -1,0 +1,4168 @@
+import { Channel, hasBackendRuntime, invoke } from "./backend";
+import { createId } from "./id";
+import {
+  createTemporaryWorkspace,
+  runEnvKey,
+  TEMPORARY_WORKSPACE_ID,
+  workspaceEnvKey
+} from "./workspaces";
+import { createSeedDocument } from "../seed";
+import { normalizeBackground } from "./background";
+import { isRegistered, isShellBackend } from "./machineShells";
+import {
+  emptyConversationPresetSettings
+} from "./conversationPresets";
+import { isHostDerivedToolName, isWebToolName } from "./taskTools";
+import { hostMessageContainerOf } from "./hostMessages";
+import type { HostMessageContainer, JsonValue, SandboxSettings, SandboxSupport, ShellBackend } from "../types";
+import type {
+  AutoCompactSettings,
+  AgentModelSelection,
+  AgentRole,
+  AgentRoleResource,
+  AppLanguage,
+  AttachedWorkspace,
+  AppReleaseAsset,
+  AppUpdateCheck,
+  AppUpdateDownload,
+  AppUpdateDownloadEvent,
+  AppUpdateInstallOutcome,
+  AppComponentsStatus,
+  AppVersionInfo,
+  LocalModelDefaultPrompts,
+  LocalModelPromptReport,
+  LocalModelTask,
+  LocalModelStatus,
+  LocalModelVariantId,
+  ProviderFamily,
+  ApiKeyStatus,
+  AppearancePreferences,
+  CodexOauthStatus,
+  ConversationTemplateSummary,
+  ClaudeAgentComponentStatus,
+  ClaudeAgentLoginStatus,
+  ApiProvider,
+  AppDocument,
+  CapabilityCatalog,
+  CapabilityResourceKind,
+  ContextItem,
+  Conversation,
+  ConversationPlan,
+  ConversationPreset,
+  ConversationPresetSettings,
+  ConversationSettings,
+  ConversationToolLock,
+  ConversationWorktree,
+  ConversationWebSearchSettings,
+  DraftConversationSnapshot,
+  EnvironmentToolDefinition,
+  EnvironmentToolSnapshot,
+  ExecutionEnvironmentAssets,
+  ForkDecisionRecord,
+  GlobalSettings,
+  FileAttachment,
+  FileAttachmentFormat,
+  ImageAttachment,
+  KeyToken,
+  McpProbeReport,
+  ModelProfile,
+  ModelRunRequest,
+  ResolvedAppLanguage,
+  RunTarget,
+  ModelRunResponse,
+  ModelStreamEvent,
+  PendingForkRequest,
+  PendingToolPrompt,
+  QueuedMessage,
+  ReasoningEffort,
+  SecurityLevel,
+  ShortcutCommandId,
+  SubagentRunRecord,
+  SshMachineConfig,
+  ThemePreference,
+  ToolDescriptor,
+  AttestEditedToolContextRequest,
+  AttestInsertedToolContextRequest,
+  AttestEditedToolContextResponse,
+  ToolExecutionRequest,
+  WslDistro,
+  Workspace,
+  ToolExecutionResponse,
+  ToolApprovalGrant,
+  ToolPromptDecision,
+  QuestionResponse,
+  WebSearchAssets,
+  FamilySetting,
+} from "../types";
+import {
+  DEFAULT_SEARCH_COMPRESSION_CUTOFF,
+  DEFAULT_SEARCH_MAX_RESULTS,
+  SEARCH_COMPRESSION_CUTOFF_CEILING,
+  SEARCH_MAX_RESULTS_CEILING,
+  SEARCH_PROVIDERS,
+  isKnownSearchProvider,
+  searchProviderSupports
+} from "./searchProviders";
+import {
+  knownProtocolCapabilities,
+  knownFamilySettings,
+  normalizeCapabilities,
+  normalizePromptCache,
+  normalizeReasoningContent,
+} from "./modelCapabilities";
+import {
+  clampMessageFontSize,
+  clampZoom,
+  normalizeHexColor
+} from "./appearance";
+import { PRIMARY_MODIFIER, SHORTCUT_COMMANDS, concreteBinding, isValidBinding, orderBinding } from "./shortcuts";
+import { NATIVE_FETCH_TOOLS, NATIVE_SEARCH_TOOLS } from "../types";
+import { CLAUDE_AGENT_REGISTRY, ensureClaudeAgentProvider } from "./claudeAgentProvider";
+import { ensureCodexProvider } from "./codexProvider";
+import { estimateTokens } from "./contextTokens";
+import { normalizeAutoCompactSettings } from "./autoCompact";
+import { normalizeReasoningEffort, parseReasoningEffort } from "./reasoningEffort";
+import {
+  MAX_FILE_ATTACHMENT_PDF_BYTES,
+  MAX_FILE_ATTACHMENT_TEXT_BYTES,
+  MAX_FILE_ATTACHMENT_TOKENS,
+  MAX_PDF_PAGES
+} from "./fileBudget";
+
+const STORAGE_KEY = "mewrk.document.v1";
+const API_KEY_LENGTH_PREFIX = "mewrk.api-key-length.v1.";
+const IMAGE_ATTACHMENT_STORAGE_PREFIX = "mewrk.image-attachment.v1.";
+const IMAGE_ATTACHMENT_INDEX_KEY = "mewrk.image-attachment-index.v1";
+const IMAGE_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
+const IMAGE_ATTACHMENT_MAX_NAME_BYTES = 256;
+const IMAGE_ATTACHMENT_MAX_DIMENSION = 8_000;
+const IMAGE_ATTACHMENT_MAX_PIXELS = 16 * 1024 * 1024;
+const PREVIEW_IMAGE_MAX_BYTES = 3 * 1024 * 1024;
+const PREVIEW_IMAGE_STORAGE_CHARACTERS = Math.floor(4.5 * 1024 * 1024);
+const PREVIEW_IMAGE_STORAGE_COUNT = 32;
+const PREVIEW_IMAGE_ORPHAN_GRACE_MS = 60 * 60 * 1000;
+const API_FORMATS = new Set<ProviderFamily>([
+  "openai_responses",
+  "openai_codex",
+  "openai_chat",
+  "anthropic",
+  "claude_agent",
+  "google",
+  "xai",
+  "azure",
+  "bedrock",
+  "vertex",
+  "openai_compatible",
+]);
+type PreviewRunControl = {
+  cancelled: boolean;
+  steers: QueuedMessage[];
+};
+const previewRunCancellations = new Map<string, PreviewRunControl>();
+const SECURITY_LEVELS = new Set<SecurityLevel>(["request_approval", "allow_edits", "full_access"]);
+const APP_LANGUAGES = new Set<AppLanguage>(["auto", "zh-CN", "en-US"]);
+const RESOLVED_APP_LANGUAGES = new Set<ResolvedAppLanguage>(["zh-CN", "en-US"]);
+const THEME_PREFERENCES = new Set<ThemePreference>(["day", "night", "system"]);
+function uniqueStringIds(value: unknown): string[] {
+  return [...new Set(Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+    : [])];
+}
+
+
+function optionalPresetId(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+/** Tool descriptions are discovered JSON files; the document stores only the selected asset ID. */
+function normalizeToolDescriptionFileId(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function normalizeConversationPresetSettings(
+  value: unknown,
+  fallback: ConversationPresetSettings,
+  knownToolNames: ReadonlySet<string>
+): ConversationPresetSettings {
+  const input = record(value) ?? {};
+  const rawEnabledTools = Array.isArray(input.enabledTools)
+    ? uniqueStringIds(input.enabledTools)
+    : [];
+  const enabledTools = Array.isArray(input.enabledTools)
+    ? rawEnabledTools.filter((name) => knownToolNames.has(name) && !isHostDerivedToolName(name))
+    : [...fallback.enabledTools];
+  return {
+    enabledTools,
+    toolDescriptionFileId: normalizeToolDescriptionFileId(input.toolDescriptionFileId)
+      ?? fallback.toolDescriptionFileId,
+    // Selected by catalog id, like the skills below. A preset written when roles
+    // were records of their own carried them in `agentDefinitions`; the host
+    // exports those to files on load and puts their ids here, so that key is
+    // never read.
+    agentIds: Array.isArray(input.agentIds) ? uniqueStringIds(input.agentIds) : [...fallback.agentIds],
+    // Absence means false: a role is required, so a silent preset must not route
+    // subagents back to the primary conversation model.
+    allowRolelessSubagents: input.allowRolelessSubagents === true,
+    hookIds: Array.isArray(input.hookIds) ? uniqueStringIds(input.hookIds) : [...fallback.hookIds],
+    skillIds: Array.isArray(input.skillIds) ? uniqueStringIds(input.skillIds) : [...fallback.skillIds],
+    mcpIds: Array.isArray(input.mcpIds) ? uniqueStringIds(input.mcpIds) : [...fallback.mcpIds],
+    webSearch: normalizeConversationWebSearch(input.webSearch, fallback.webSearch),
+    // Same migration as conversations: a preset written when web access was two
+    // checkboxes said so by naming a web tool, and that name is stripped below.
+    webSearchEnabled: input.webSearchEnabled === true || rawEnabledTools.some(isWebToolName),
+    // A preset written when plan mode was part of one keeps the key on disk;
+    // it is not read. Plan mode is a composer switch a conversation starts off.
+    securityLevel: normalizeSecurityLevel(input.securityLevel, fallback.securityLevel),
+    // Absent means off for both tiers. Memory reads and writes files on disk,
+    // so an unstated preset opts in to nothing.
+    globalMemoryEnabled: input.globalMemoryEnabled === true,
+    projectMemoryEnabled: input.projectMemoryEnabled === true,
+    skillToolEnabled: input.skillToolEnabled === true,
+    mcpToolDiscoveryEnabled: input.mcpToolDiscoveryEnabled === true,
+    // Absent on a preset written before the choice existed: Claude Code's form.
+    hostMessageContainer: hostMessageContainerOf(input as { hostMessageContainer?: HostMessageContainer })
+  };
+}
+
+function normalizeConversationPreset(
+  value: unknown,
+  fallbackSettings: ConversationPresetSettings,
+  knownToolNames: ReadonlySet<string>
+): ConversationPreset | null {
+  const input = record(value);
+  const id = optionalPresetId(input?.id);
+  if (!input || !id) return null;
+  return {
+    id,
+    name: typeof input.name === "string" ? input.name : "",
+    description: typeof input.description === "string" ? input.description : "",
+    // A trace, so it is taken as written and never checked against the template
+    // store: a preset whose template is gone simply opens with nothing.
+    templateId: typeof input.templateId === "string" ? input.templateId : "",
+    settings: normalizeConversationPresetSettings(
+      input.settings, fallbackSettings, knownToolNames
+    )
+  };
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function optionalFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalPositiveInteger(value: unknown): number | undefined {
+  const number = optionalFiniteNumber(value);
+  return number === undefined ? undefined : Math.max(1, Math.floor(number));
+}
+
+function optionalNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+
+function normalizeImageAttachments(value: unknown): ImageAttachment[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const images = value.flatMap((entry) => {
+    const image = record(entry);
+    const width = optionalNonNegativeInteger(image?.width);
+    const height = optionalNonNegativeInteger(image?.height);
+    const bytes = optionalNonNegativeInteger(image?.bytes);
+    const shortId = optionalNonNegativeInteger(image?.shortId);
+    const name = typeof image?.name === "string" ? image.name.trim() : "";
+    const pixels = width === undefined || height === undefined ? 0 : width * height;
+    if (
+      !image
+      || typeof image.id !== "string"
+      || !/^[0-9a-f]{64}$/.test(image.id)
+      || !isValidImageAttachmentName(name)
+      || typeof image.mime !== "string"
+      || !["image/png", "image/jpeg", "image/gif", "image/webp"].includes(image.mime)
+      || width === undefined
+      || width === 0
+      || width > IMAGE_ATTACHMENT_MAX_DIMENSION
+      || height === undefined
+      || height === 0
+      || height > IMAGE_ATTACHMENT_MAX_DIMENSION
+      || !Number.isSafeInteger(pixels)
+      || pixels > IMAGE_ATTACHMENT_MAX_PIXELS
+      || bytes === undefined
+      || bytes === 0
+      || bytes > IMAGE_ATTACHMENT_MAX_BYTES
+    ) return [];
+    return [{
+      id: image.id,
+      name,
+      mime: image.mime,
+      width,
+      height,
+      bytes,
+      // Zero is not a valid conversation number; drop it rather than surface a broken placeholder.
+      ...(shortId !== undefined && shortId >= 1 ? { shortId } : {})
+    }];
+  }).filter((image, index, all) => all.findIndex((candidate) => candidate.id === image.id) === index);
+  return images.length ? images : undefined;
+}
+
+/**
+ * Mirrors Rust `file_attachments::validate_file_metadata`: a reference the
+ * host would refuse on save never reaches the renderer's document either.
+ */
+function normalizeFileAttachments(value: unknown): FileAttachment[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const files = value.flatMap((entry) => {
+    const file = record(entry);
+    const bytes = optionalNonNegativeInteger(file?.bytes);
+    const tokens = optionalNonNegativeInteger(file?.tokens);
+    const pages = optionalNonNegativeInteger(file?.pages);
+    const name = typeof file?.name === "string" ? file.name.trim() : "";
+    const format = file?.format;
+    if (
+      !file
+      || typeof file.id !== "string"
+      || !/^[0-9a-f]{64}$/.test(file.id)
+      || !isValidImageAttachmentName(name)
+      || (format !== "text" && format !== "pdf")
+      || bytes === undefined
+      || bytes === 0
+      || bytes > (format === "pdf" ? MAX_FILE_ATTACHMENT_PDF_BYTES : MAX_FILE_ATTACHMENT_TEXT_BYTES)
+      || tokens === undefined
+      || tokens > MAX_FILE_ATTACHMENT_TOKENS
+      || (format === "pdf" ? pages === undefined || pages === 0 || pages > MAX_PDF_PAGES : file.pages !== undefined)
+    ) return [];
+    return [{
+      id: file.id,
+      name,
+      format,
+      bytes,
+      tokens,
+      ...(format === "pdf" ? { pages } : {})
+    } as FileAttachment];
+  }).filter((file, index, all) => all.findIndex((candidate) => candidate.id === file.id) === index);
+  return files.length ? files : undefined;
+}
+
+function normalizeSecurityLevel(value: unknown, fallback: SecurityLevel = "request_approval"): SecurityLevel {
+  return typeof value === "string" && SECURITY_LEVELS.has(value as SecurityLevel)
+    ? value as SecurityLevel
+    : fallback;
+}
+
+/** Which model a conversation's last request used, when all three parts are readable. */
+function normalizeToolLockRequest(value: unknown): ConversationToolLock["lastRequest"] {
+  const input = record(value);
+  if (!input) return null;
+  const { providerId, modelId, at } = input;
+  return typeof providerId === "string" && providerId
+    && typeof modelId === "string" && modelId
+    && typeof at === "string" && at
+    ? { providerId, modelId, at }
+    : null;
+}
+
+/** Each model's latest request, unreadable entries dropped and one kept per model — the last written. */
+function normalizeToolLockModelRequests(value: unknown): ConversationToolLock["modelRequests"] {
+  if (!Array.isArray(value)) return [];
+  const byModel = new Map<string, NonNullable<ConversationToolLock["lastRequest"]>>();
+  for (const item of value) {
+    const request = normalizeToolLockRequest(item);
+    if (!request) continue;
+    const key = JSON.stringify([request.providerId, request.modelId]);
+    byModel.delete(key);
+    byModel.set(key, request);
+  }
+  return [...byModel.values()];
+}
+
+/**
+ * Plan mode used to be the security level `plan`; settings written then keep
+ * their intent as the plan-mode switch (the host's `migrate_legacy_plan_level`
+ * does the same on its side).
+ */
+function normalizePlanMode(input: { planModeEnabled?: unknown; securityLevel?: unknown }): boolean {
+  return input.planModeEnabled === true || input.securityLevel === "plan";
+}
+
+/**
+ * Normalize a conversation worktree only when path, branch, and baseline are valid.
+ * Falling back to the workspace root is safe when a worktree cannot be released or
+ * checked for additional commits.
+ */
+function normalizeConversationWorktree(value: unknown): ConversationWorktree | null {
+  const worktree = record(value);
+  if (!worktree) return null;
+  const { path, branch, baseOid, baseBranch } = worktree;
+  if (
+    typeof path !== "string" || !path.trim() || path.length > 4096
+    || typeof branch !== "string" || !branch.trim() || branch.length > 512
+    || typeof baseOid !== "string" || !/^[0-9a-f]{7,64}$/.test(baseOid)
+  ) return null;
+  const workspace = normalizeAttachedWorkspaces([worktree.workspace], undefined)[0] ?? null;
+  return {
+    path,
+    branch,
+    baseOid,
+    ...(typeof baseBranch === "string" && baseBranch.trim() && baseBranch.length <= 512
+      ? { baseBranch }
+      : {}),
+    ...(workspace ? { workspace } : {})
+  };
+}
+
+/**
+ * A conversation's worktrees from either shape they were written in: the list, or — from
+ * before every workspace could have one — a single `worktree` record, which is workspace 1's.
+ * An invalid record is dropped, so its workspace runs at its registered directory.
+ */
+function normalizeConversationWorktrees(list: unknown, legacy: unknown): ConversationWorktree[] {
+  const values = Array.isArray(list) ? list : legacy ? [legacy] : [];
+  return values.flatMap((value) => {
+    const worktree = normalizeConversationWorktree(value);
+    return worktree ? [worktree] : [];
+  });
+}
+
+/**
+ * Normalize only the run-target shape. The host rejects missing SSH machines at
+ * dispatch time so dangling bindings can remain persisted.
+ *
+ * Distro validation must match `validate_wsl_distro_name`; accepting a broader form
+ * would produce a document that loads but cannot be saved by Rust.
+ */
+const WSL_DISTRO_PATTERN = /^[\p{L}\p{N}](?:[\p{L}\p{N}._ -]{0,62}[\p{L}\p{N}._-])?$/u;
+
+/** Mirrors host startup-environment names that would run a script before each command. */
+const RESERVED_ENV_VAR_NAMES = new Set([
+  "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH", "GLOBIGNORE", "GIT_EXTERNAL_DIFF"
+]);
+
+function normalizeRunTarget(value: unknown): RunTarget | null {
+  const target = record(value);
+  if (!target) return null;
+  if (target.kind === "wsl") {
+    const distro = target.distro;
+    if (typeof distro !== "string" || !WSL_DISTRO_PATTERN.test(distro)) return null;
+    return { kind: "wsl", distro };
+  }
+  if (target.kind === "ssh") {
+    const machineId = target.machineId;
+    if (typeof machineId !== "string" || !machineId.trim() || machineId.length > 128) return null;
+    return { kind: "ssh", machineId };
+  }
+  return null;
+}
+
+/**
+ * Keep only entries that could have come from a host directory picker: a
+ * non-empty path with a machine the host can name, deduplicated, and capped.
+ *
+ * `legacy` is the pre-multi-machine `additionalDirectories` array, folded in as
+ * host-machine entries when the new list is absent. Reading it is not optional:
+ * until the conversation is next saved it is the only record those grants have,
+ * and a reader that ignored it would silently narrow what the conversation can
+ * reach.
+ *
+ * Dropping a malformed entry is the safe direction — a workspace widens the
+ * conversation's boundary, and the host re-checks every entry against its own
+ * authorization record on save, so a guess here would only produce a document
+ * that loads and then refuses to save.
+ */
+function normalizeAttachedWorkspaces(value: unknown, legacy: unknown): AttachedWorkspace[] {
+  const entries: AttachedWorkspace[] = [];
+  const seen = new Set<string>();
+  const push = (machine: RunTarget | null, rawPath: unknown) => {
+    if (entries.length >= 32) return;
+    if (typeof rawPath !== "string") return;
+    const path = rawPath.trim();
+    if (!path || path.length > 4096) return;
+    // One machine's `/srv/app` is not another's, so identity is the pair.
+    const key = `${machine ? runEnvKey(machine) : "local"}\u0000${path}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    entries.push(machine ? { machine, path } : { path });
+  };
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const workspace = record(entry);
+      if (!workspace) continue;
+      push(normalizeRunTarget(workspace.machine), workspace.path);
+    }
+  }
+  if (entries.length === 0 && Array.isArray(legacy)) {
+    for (const entry of legacy) push(null, entry);
+  }
+  return entries;
+}
+
+/**
+ * The most workspaces one project may have, the first included. Mirrors the
+ * host's per-project limit; the host rejects a document over it.
+ */
+export const MAX_PROJECT_WORKSPACES = 16;
+
+/**
+ * A project's workspaces after the first, on the same terms as a conversation's
+ * attached ones: an entry that could not have come from a host picker is
+ * dropped, and so is one that repeats the project's first workspace — the host
+ * refuses a project that names the same directory twice.
+ */
+function normalizeProjectMembers(value: unknown, primary: AttachedWorkspace): AttachedWorkspace[] {
+  const primaryKey = `${runEnvKey(primary.machine)} ${primary.path.trim()}`;
+  return normalizeAttachedWorkspaces(value, undefined)
+    .filter((entry) => `${runEnvKey(entry.machine)} ${entry.path}` !== primaryKey)
+    .slice(0, MAX_PROJECT_WORKSPACES - 1);
+}
+
+/** Mirrors the host's bound on environment-variable tables. */
+const MAX_ENV_TABLES = 1024;
+
+/** Whether `key` is a machine's `runEnvKey`: `local`, `wsl:<distro>`, or `ssh:<id>`. */
+function isMachineEnvKey(key: string): boolean {
+  return key === "local"
+    || (key.startsWith("wsl:") && WSL_DISTRO_PATTERN.test(key.slice(4)))
+    || (key.startsWith("ssh:") && key.slice(4).trim().length > 0 && key.slice(4).length <= 128);
+}
+
+/**
+ * Moves tables keyed by a bare machine — written when variables belonged to the
+ * machine — onto every workspace on that machine that has no table of its own,
+ * so commands keep the variables they ran with. The machine keys are dropped:
+ * the host never reads them.
+ */
+function spreadMachineEnvVars(
+  envVars: Record<string, Record<string, string>>,
+  workspaces: readonly Workspace[]
+): Record<string, Record<string, string>> {
+  const machineKeys = Object.keys(envVars).filter((key) => !key.includes("|"));
+  if (!machineKeys.length) return envVars;
+  const spread: Record<string, Record<string, string>> = {};
+  for (const [key, table] of Object.entries(envVars)) {
+    if (key.includes("|")) spread[key] = table;
+  }
+  const directories: AttachedWorkspace[] = workspaces.flatMap((project) => [
+    ...(project.kind === "directory" && project.path ? [{ machine: project.machine, path: project.path }] : []),
+    ...(project.additionalWorkspaces ?? []),
+    ...project.conversations.flatMap((conversation) => conversation.attachedWorkspaces)
+  ]);
+  for (const directory of directories) {
+    const table = envVars[runEnvKey(directory.machine)];
+    const key = workspaceEnvKey(directory.machine, directory.path);
+    if (!table || !Object.keys(table).length || key in spread) continue;
+    if (Object.keys(spread).length >= MAX_ENV_TABLES) break;
+    spread[key] = { ...table };
+  }
+  return spread;
+}
+
+/** Host validation of execution environments is authoritative; discard malformed entries here. */
+function normalizeExecutionEnvironments(
+  value: unknown,
+  fallback: ExecutionEnvironmentAssets
+): ExecutionEnvironmentAssets {
+  const input = record(value);
+  if (!input) {
+    return {
+      sshMachines: fallback.sshMachines.map((machine) => ({ ...machine })),
+      envVars: Object.fromEntries(
+        Object.entries(fallback.envVars).map(([key, table]) => [key, { ...table }])
+      ),
+      ...(fallback.sandboxes
+        ? {
+          sandboxes: Object.fromEntries(Object.entries(fallback.sandboxes).map(([key, sandbox]) => [
+            key,
+            normalizeSandboxSettings(sandbox) ?? defaultSandboxSettings()
+          ]))
+        }
+        : {}),
+      ...(fallback.wslAgentShells ? { wslAgentShells: { ...fallback.wslAgentShells } } : {})
+    };
+  }
+  const now = new Date().toISOString();
+  const seen = new Set<string>();
+  // Match host validation so every loaded document remains saveable.
+  const controlChars = /[\u0000-\u001f\u007f]/;
+  const sshMachines: SshMachineConfig[] = (Array.isArray(input.sshMachines) ? input.sshMachines : [])
+    .flatMap((entry) => {
+      const machine = record(entry);
+      if (
+        !machine
+        || typeof machine.id !== "string" || !machine.id.trim() || machine.id.length > 128
+        || typeof machine.name !== "string" || !machine.name.trim()
+        || typeof machine.host !== "string" || !machine.host.trim()
+      ) return [];
+      if (seen.has(machine.id)) return [];
+      const host = machine.host.trim();
+      // The host is one SSH argv element; whitespace and control characters are
+      // invalid, and a leading `-` would be parsed as an option.
+      if (host.length > 512 || /\s/.test(host) || controlChars.test(host) || host.startsWith("-")) {
+        return [];
+      }
+      const identityFile = typeof machine.identityFile === "string" ? machine.identityFile : "";
+      if (identityFile.length > 4096 || controlChars.test(identityFile)) return [];
+      seen.add(machine.id);
+      const port = typeof machine.port === "number" && Number.isInteger(machine.port)
+        && machine.port >= 0 && machine.port <= 65535 ? machine.port : 0;
+      return [{
+        id: machine.id,
+        name: machine.name.trim().slice(0, 64),
+        host,
+        port,
+        identityFile,
+        ...(isShellBackend(machine.agentShell) ? { agentShell: machine.agentShell as ShellBackend } : {}),
+        createdAt: typeof machine.createdAt === "string" && machine.createdAt ? machine.createdAt : now,
+        updatedAt: typeof machine.updatedAt === "string" && machine.updatedAt ? machine.updatedAt : now
+      }];
+    })
+    .slice(0, 64);
+  const envVars: Record<string, Record<string, string>> = {};
+  const tables = record(input.envVars) ?? {};
+  for (const [key, tableValue] of Object.entries(tables).slice(0, MAX_ENV_TABLES)) {
+    // Keys name a workspace — `<machine key>|<path>` — or, from before variables
+    // moved onto workspaces, a bare machine; `normalizeDocument` spreads those
+    // over the machine's workspaces. A dangling `ssh:<id>` remains valid so a
+    // deleted machine does not prevent document persistence.
+    const separator = key.indexOf("|");
+    const machineKey = separator < 0 ? key : key.slice(0, separator);
+    const path = separator < 0 ? null : key.slice(separator + 1);
+    const validKey = isMachineEnvKey(machineKey)
+      && (path === null || (path.trim().length > 0 && path.length <= 4096 && !controlChars.test(path)));
+    if (!validKey) continue;
+    const table = record(tableValue);
+    if (!table) continue;
+    const normalized: Record<string, string> = {};
+    for (const [name, value] of Object.entries(table)) {
+      if (typeof value !== "string") continue;
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || name.length > 128) continue;
+      if (RESERVED_ENV_VAR_NAMES.has(name)) continue;
+      const upper = name.toUpperCase();
+      const harnessPrivate = (upper.startsWith("MEWRK_") || upper.startsWith("VITE_"))
+        && (upper.includes("BROWSER_DEV") || upper.includes("E2E"));
+      if (harnessPrivate) continue;
+      if (value.length > 8192 || controlChars.test(value)) continue;
+      if (Object.keys(normalized).length >= 128) break;
+      normalized[name] = value;
+    }
+    envVars[key] = normalized;
+  }
+  // A sandbox belongs to a workspace, so only a workspace key names one.
+  const sandboxes: Record<string, SandboxSettings> = {};
+  for (const [key, value] of Object.entries(record(input.sandboxes) ?? {}).slice(0, MAX_ENV_TABLES)) {
+    const separator = key.indexOf("|");
+    const path = separator < 0 ? "" : key.slice(separator + 1);
+    if (
+      separator < 0 || !isMachineEnvKey(key.slice(0, separator))
+      || !path.trim() || path.length > 4096 || controlChars.test(path)
+    ) continue;
+    const sandbox = normalizeSandboxSettings(value);
+    if (sandbox) sandboxes[key] = sandbox;
+  }
+  // Mirrors host validation: a WSL agent shell is one of WSL's registered backends.
+  const wslAgentShells: Record<string, ShellBackend> = {};
+  for (const [distro, backend] of Object.entries(record(input.wslAgentShells) ?? {}).slice(0, 256)) {
+    if (!WSL_DISTRO_NAME.test(distro) || !isShellBackend(backend) || !isRegistered("wsl", backend)) continue;
+    wslAgentShells[distro] = backend;
+  }
+  return {
+    sshMachines,
+    envVars,
+    ...(Object.keys(sandboxes).length ? { sandboxes } : {}),
+    ...(Object.keys(wslAgentShells).length ? { wslAgentShells } : {})
+  };
+}
+
+/**
+ * Mirrors the host's `DEFAULT_SANDBOX_ALLOWLIST`: where packages and source
+ * come from, so installing dependencies works out of the box.
+ */
+export const DEFAULT_SANDBOX_ALLOWLIST: readonly string[] = [
+  "github.com",
+  "*.github.com",
+  "*.githubusercontent.com",
+  "gitlab.com",
+  "*.gitlab.com",
+  "bitbucket.org",
+  "registry.npmjs.org",
+  "*.npmjs.org",
+  "registry.yarnpkg.com",
+  "*.yarnpkg.com",
+  "nodejs.org",
+  "pypi.org",
+  "*.pypi.org",
+  "files.pythonhosted.org",
+  "crates.io",
+  "*.crates.io",
+  "static.rust-lang.org",
+  "proxy.golang.org",
+  "sum.golang.org",
+  "repo.maven.apache.org",
+  "repo1.maven.org",
+  "plugins.gradle.org",
+  "services.gradle.org",
+  "rubygems.org",
+  "*.rubygems.org",
+  "api.nuget.org",
+  "*.nuget.org",
+  "pub.dev",
+  "*.pub.dev",
+  "repo.packagist.org",
+  "cdn.jsdelivr.net"
+];
+
+/** The settings a sandbox starts with when it is first switched on. */
+export function defaultSandboxSettings(): SandboxSettings {
+  return {
+    enabled: false,
+    network: { mode: "allowlist", allow: [...DEFAULT_SANDBOX_ALLOWLIST], deny: [] },
+    writable: [],
+    denyRead: []
+  };
+}
+
+/** Mirrors host validation of the sandbox's lists: bounded, no blanks or control characters. */
+function normalizeSandboxSettings(value: unknown): SandboxSettings | null {
+  const input = record(value);
+  if (!input) return null;
+  const controlChars = /[\u0000-\u001f\u007f]/;
+  const entries = (list: unknown, accept: (entry: string) => boolean): string[] => (
+    Array.isArray(list) ? list : []
+  )
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0 && entry.length <= 4096 && !controlChars.test(entry) && accept(entry))
+    .slice(0, 256);
+  const hostPattern = (entry: string) => !/[\s/]/.test(entry);
+  const absolutePath = (entry: string) => entry.startsWith("/") || entry.startsWith("~") || /^[A-Za-z]:/.test(entry);
+  const network = record(input.network);
+  const mode = network?.mode;
+  return {
+    enabled: input.enabled === true,
+    network: {
+      mode: mode === "off" || mode === "open" || mode === "allowlist" ? mode : "allowlist",
+      allow: network && Array.isArray(network.allow)
+        ? entries(network.allow, hostPattern)
+        : [...DEFAULT_SANDBOX_ALLOWLIST],
+      deny: entries(network?.deny, hostPattern)
+    },
+    writable: entries(input.writable, absolutePath),
+    denyRead: entries(input.denyRead, absolutePath)
+  };
+}
+
+/** Mirrors the host's `validate_wsl_distro_name`. */
+const WSL_DISTRO_NAME = /^[\p{L}\p{N}](?:[\p{L}\p{N}._ -]{0,62}[\p{L}\p{N}._-])?$/u;
+
+function normalizeAppLanguage(value: unknown, fallback: AppLanguage): AppLanguage {
+  return typeof value === "string" && APP_LANGUAGES.has(value as AppLanguage)
+    ? value as AppLanguage
+    : fallback;
+}
+
+function normalizeResolvedAppLanguage(
+  value: unknown,
+  fallback: ResolvedAppLanguage
+): ResolvedAppLanguage {
+  return typeof value === "string" && RESOLVED_APP_LANGUAGES.has(value as ResolvedAppLanguage)
+    ? value as ResolvedAppLanguage
+    : fallback;
+}
+
+function normalizeThemePreference(value: unknown, fallback: ThemePreference): ThemePreference {
+  return typeof value === "string" && THEME_PREFERENCES.has(value as ThemePreference)
+    ? value as ThemePreference
+    : fallback;
+}
+
+function normalizeModel(value: unknown, family: ProviderFamily): ModelProfile | null {
+  const input = record(value);
+  if (!input || typeof input.id !== "string" || !input.id.trim()) return null;
+  return {
+    id: input.id.trim(),
+    name: typeof input.name === "string" ? input.name.trim() : "",
+    group: typeof input.group === "string" ? input.group.trim() : "",
+    contextWindow: optionalPositiveInteger(input.contextWindow),
+    maxOutputTokens: optionalPositiveInteger(input.maxOutputTokens),
+    capabilities: normalizeCapabilities(Array.isArray(input.capabilities) ? input.capabilities : []),
+    reasoningContent: normalizeReasoningContent(input.reasoningContent, family),
+    promptCache: normalizePromptCache(input.promptCache),
+    ...(optionalPositiveInteger(input.cacheTtlMinutes) === undefined
+      ? {}
+      : { cacheTtlMinutes: optionalPositiveInteger(input.cacheTtlMinutes) })
+  };
+}
+
+/**
+ * Family-specific identity fields. Retain only keys known to the selected family;
+ * empty values are absent and required settings are checked by the host at runtime.
+ */
+function normalizeFamilySettings(
+  value: unknown,
+  family: ProviderFamily
+): Partial<Record<FamilySetting, string>> {
+  const input = record(value);
+  const result: Partial<Record<FamilySetting, string>> = {};
+  if (!input) return result;
+  for (const setting of knownFamilySettings(family)) {
+    const raw = input[setting];
+    if (typeof raw === "string" && raw.trim()) result[setting] = raw.trim();
+  }
+  return result;
+}
+
+function normalizeProvider(value: unknown): ApiProvider | null {
+  const input = record(value);
+  if (!input || typeof input.id !== "string" || !input.id.trim()) return null;
+  const family = typeof input.family === "string" && API_FORMATS.has(input.family as ProviderFamily)
+    ? input.family as ProviderFamily
+    : "openai_responses";
+  const seenModelIds = new Set<string>();
+  // The family resolves each model's reasoning form, so it must be settled first.
+  const models = (Array.isArray(input.models)
+    ? input.models
+        .map((model) => normalizeModel(model, family))
+        .filter((model): model is ModelProfile => Boolean(model))
+    : []).filter((model) => {
+      if (seenModelIds.has(model.id)) return false;
+      seenModelIds.add(model.id);
+      return true;
+    });
+  const requestedModelId = typeof input.activeModelId === "string" ? input.activeModelId.trim() : null;
+  const activeModel = models.find((model) => model.id === requestedModelId);
+  return {
+    id: input.id.trim(),
+    name: typeof input.name === "string" && input.name.trim() ? input.name.trim() : "未命名提供商",
+    enabled: input.enabled !== false,
+    family,
+    baseUrl: typeof input.baseUrl === "string" ? input.baseUrl.trim() : "",
+    familySettings: normalizeFamilySettings(input.familySettings, family),
+    /* A provider has one address, `baseUrl`. Older documents may still carry
+       `endpointBaseUrls` (image, speech and transcription overrides nothing ever
+       read); it is left behind here rather than rejected. */
+    notes: typeof input.notes === "string" ? input.notes : "",
+    models,
+    activeModelId: activeModel ? activeModel.id : null
+  };
+}
+
+/** Global provider rows are catalog-only, deduplicated, and canonicalized in catalog order. */
+function normalizeWebSearchAssets(value: unknown, fallback: WebSearchAssets): WebSearchAssets {
+  // A missing block uses seeded defaults. A present empty block is an explicit
+  // choice to disable every provider and must remain empty.
+  if (value === undefined || value === null) {
+    return structuredClone(fallback);
+  }
+  const input = record(value);
+  const requested = Array.isArray(input?.providers) ? input.providers : [];
+  const byKind = new Map<string, Record<string, unknown>>();
+  for (const candidate of requested) {
+    const provider = record(candidate);
+    if (!provider || typeof provider.kind !== "string" || !isKnownSearchProvider(provider.kind)) continue;
+    if (!byKind.has(provider.kind)) byKind.set(provider.kind, provider);
+  }
+  const text = (source: Record<string, unknown> | undefined, key: string) =>
+    typeof source?.[key] === "string" ? (source[key] as string).trim() : "";
+  return {
+    providers: SEARCH_PROVIDERS.map((catalogProvider) => {
+      const provider = byKind.get(catalogProvider.kind);
+      return {
+        kind: catalogProvider.kind,
+        enabled: Boolean(provider?.enabled),
+        searchApiHost: text(provider, "searchApiHost"),
+        fetchApiHost: text(provider, "fetchApiHost"),
+        engines: Array.isArray(provider?.engines)
+          ? provider.engines
+            .filter((engine): engine is string => typeof engine === "string")
+            .map((engine) => engine.trim())
+            .filter(Boolean)
+          : [],
+        basicAuthUsername: text(provider, "basicAuthUsername")
+      };
+    })
+  };
+}
+
+const DEFAULT_CONVERSATION_WEB_SEARCH: ConversationWebSearchSettings = {
+  maxSearchesPerCall: 0,
+  provider: { kind: "native" },
+  fetchProvider: { kind: "native" },
+  nativeSearchTool: NATIVE_SEARCH_TOOLS[0],
+  nativeFetchTool: NATIVE_FETCH_TOOLS[0],
+  maxResults: DEFAULT_SEARCH_MAX_RESULTS,
+  compressionCutoff: DEFAULT_SEARCH_COMPRESSION_CUTOFF,
+  fetchCompressionCutoff: DEFAULT_SEARCH_COMPRESSION_CUTOFF,
+  domainFilter: "off",
+  includeDomains: [],
+  excludeDomains: []
+};
+
+/** New-conversation web-search defaults mirror Rust ConversationWebSearchSettings::default. */
+export function defaultConversationWebSearchSettings(): ConversationWebSearchSettings {
+  return structuredClone(DEFAULT_CONVERSATION_WEB_SEARCH);
+}
+
+/** An absent selection is the default (native), matching Rust's
+ * `#[serde(default)] SearchProviderSelection::Native` — normalizing a missing
+ * field to "unavailable" would silently disable search on any document that
+ * predates or partially wrote this block. Only a selection that names something
+ * this build cannot resolve becomes unavailable, and it keeps none of the old
+ * ID, so enabling that provider later cannot silently restore a binding the
+ * user was already told was lost. `disabled` is a deliberate answer and is kept
+ * as itself: it is the user saying this conversation does not search, which is
+ * not the same as a binding that broke. */
+function normalizeSearchProviderSelection(value: unknown): ConversationWebSearchSettings["provider"] {
+  if (value === undefined || value === null) return { kind: "native" };
+  const input = record(value);
+  if (input?.kind === "native") return { kind: "native" };
+  if (input?.kind === "disabled") return { kind: "disabled" };
+  if (input?.kind === "explicit" && typeof input.providerKind === "string"
+    && isKnownSearchProvider(input.providerKind)) {
+    return { kind: "explicit", providerKind: input.providerKind };
+  }
+  return { kind: "unavailable" };
+}
+
+
+/** An absent fetch selection is `native`, matching Rust's
+ * `#[serde(default)] FetchProviderSelection::Native`. `native` survives a model
+ * change by changing shape rather than backend: it grants a second web tool on
+ * a family that splits retrieval out and none on a family that keeps retrieval
+ * inside its search tool. A named provider this build cannot resolve, or one
+ * that cannot fetch, becomes `unavailable` — the same answer the search leg
+ * gives — rather than `disabled`, which would pass a lost binding off as the
+ * user's own "off" and hide the Repair it needs.
+ *
+ * A document written before the selector became exhaustive carries `auto`,
+ * which named no backend of its own: it took fetching from the search backend
+ * when that backend could fetch. It is resolved here the way it would have
+ * resolved then — against this conversation's own search selection — so the
+ * conversation keeps the backend it was already fetching with rather than being
+ * moved onto whatever the new default happens to be. Its last resort, a global
+ * default provider, no longer exists; `native` stands in for it, which is what
+ * `auto` picked whenever the search leg was native. */
+function normalizeFetchProviderSelection(
+  value: unknown,
+  searchProvider: ConversationWebSearchSettings["provider"]
+): ConversationWebSearchSettings["fetchProvider"] {
+  if (value === undefined || value === null) return { kind: "native" };
+  const input = record(value);
+  if (input?.kind === "auto") {
+    return searchProvider.kind === "explicit"
+      && searchProviderSupports(searchProvider.providerKind, "fetchUrls")
+      ? { kind: "explicit", providerKind: searchProvider.providerKind }
+      : { kind: "native" };
+  }
+  if (input?.kind === "native") return { kind: "native" };
+  if (input?.kind === "disabled") return { kind: "disabled" };
+  if (input?.kind === "explicit" && typeof input.providerKind === "string"
+    && isKnownSearchProvider(input.providerKind)
+    && searchProviderSupports(input.providerKind, "fetchUrls")) {
+    return { kind: "explicit", providerKind: input.providerKind };
+  }
+  return { kind: "unavailable" };
+}
+
+/**
+ * An unknown version reads as the default rather than emptying the field.
+ *
+ * A document written by a build that knew another version has to keep opening
+ * here, and losing a preference is a smaller cost than losing the conversation.
+ * Mirrors Rust's hand-written `Deserialize` for `NativeSearchTool`.
+ */
+function normalizeNativeToolVersion<T extends string>(
+  value: unknown,
+  offered: readonly T[]
+): T {
+  return typeof value === "string" && (offered as readonly string[]).includes(value)
+    ? value as T
+    : offered[0];
+}
+
+/**
+ * A result-shaping number, clamped rather than rejected.
+ *
+ * 0 is inside the range, not below it: it is the answer "no limit" and must
+ * survive a round trip. Anything that is not a whole number at all — a string,
+ * a fraction, a missing key — falls back, because there is no cap to read out
+ * of it; anything that is one is clamped to the range this build can honour.
+ */
+function normalizeSearchBudget(value: unknown, fallbackValue: number, ceiling: number): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return fallbackValue;
+  return Math.min(value, ceiling);
+}
+
+function normalizeSearchMaxResults(value: unknown, fallbackValue: number): number {
+  return normalizeSearchBudget(value, fallbackValue, SEARCH_MAX_RESULTS_CEILING);
+}
+
+function normalizeSearchCompressionCutoff(value: unknown, fallbackValue: number): number {
+  return normalizeSearchBudget(value, fallbackValue, SEARCH_COMPRESSION_CUTOFF_CEILING);
+}
+
+/** Domain rules as written: trimmed, blanks dropped, order kept. A malformed
+ * rule is the pipeline's business to ignore — dropping it here would delete
+ * what the user typed instead of telling them it does nothing. */
+function normalizeDomainRules(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((rule): rule is string => typeof rule === "string")
+    .map((rule) => rule.trim())
+    .filter(Boolean)
+    .slice(0, 512);
+}
+
+function normalizeConversationWebSearch(
+  value: unknown,
+  fallback: ConversationWebSearchSettings
+): ConversationWebSearchSettings {
+  const input = record(value) ?? {};
+  const requestedCallLimit = typeof input.maxSearchesPerCall === "number"
+    && Number.isInteger(input.maxSearchesPerCall)
+    && input.maxSearchesPerCall >= 0
+    ? input.maxSearchesPerCall
+    : fallback.maxSearchesPerCall;
+  const provider = normalizeSearchProviderSelection(input.provider);
+  const compressionCutoff = normalizeSearchCompressionCutoff(
+    input.compressionCutoff,
+    fallback.compressionCutoff
+  );
+  return {
+    maxSearchesPerCall: Math.min(99_999, requestedCallLimit),
+    provider,
+    fetchProvider: normalizeFetchProviderSelection(input.fetchProvider, provider),
+    nativeSearchTool: normalizeNativeToolVersion(input.nativeSearchTool, NATIVE_SEARCH_TOOLS),
+    nativeFetchTool: normalizeNativeToolVersion(input.nativeFetchTool, NATIVE_FETCH_TOOLS),
+    maxResults: normalizeSearchMaxResults(input.maxResults, fallback.maxResults),
+    compressionCutoff,
+    // A document written before the fetch leg had its own cap carries one knob
+    // that covered both legs, so an absent key takes that knob's value rather
+    // than the default: a user who set 0 (no cap) keeps "no cap" on fetch.
+    // Mirrors Rust's hand-written `Deserialize` for `ConversationWebSearchSettings`.
+    fetchCompressionCutoff: normalizeSearchCompressionCutoff(
+      input.fetchCompressionCutoff,
+      compressionCutoff
+    ),
+    domainFilter: input.domainFilter === "exclude" || input.domainFilter === "include"
+      ? input.domainFilter
+      : "off",
+    includeDomains: normalizeDomainRules(input.includeDomains),
+    excludeDomains: normalizeDomainRules(input.excludeDomains)
+  };
+}
+
+/**
+ * A role's model binding, read the way the host writes it. Only the SHAPE is
+ * checked: a pair that does not currently resolve is kept verbatim, because at
+ * rest there is no telling "the provider is signed out and has not fetched its
+ * catalog" from "this model is gone", and availability is asked at render and
+ * at call time instead. A malformed pair carries no usable identifier, so it
+ * reads as `unavailable` rather than as a working default.
+ */
+function normalizeAgentModelSelection(value: unknown): AgentModelSelection {
+  const input = record(value);
+  if (!input || input.kind === "inherit") return { kind: "inherit" };
+  if (input.kind === "explicit") {
+    const providerId = typeof input.providerId === "string" ? input.providerId : "";
+    const modelId = typeof input.modelId === "string" ? input.modelId : "";
+    return (
+      !providerId
+      || providerId.trim() !== providerId
+      || !modelId
+      || modelId.trim() !== modelId
+    ) ? { kind: "unavailable" } : { kind: "explicit", providerId, modelId };
+  }
+  return { kind: "unavailable" };
+}
+
+/**
+ * One role file's body, as the catalog carries it.
+ *
+ * The host validated the file and materialised every default before it got
+ * here (`agent_roles::AgentRoleFile`), so this only makes the shape total: a
+ * key a newer or older host leaves out reads as the file format's own default
+ * — every list empty, the web configuration a conversation's default — rather
+ * than as `undefined` somewhere deep in the editor.
+ */
+export function normalizeAgentRole(value: unknown): AgentRole | null {
+  const input = record(value);
+  if (!input) return null;
+  return {
+    name: typeof input.name === "string" ? input.name : "",
+    description: typeof input.description === "string" ? input.description : "",
+    modelSelection: normalizeAgentModelSelection(input.modelSelection),
+    effort: input.effort === undefined || input.effort === null
+      ? null
+      : parseReasoningEffort(input.effort),
+    tools: uniqueStringIds(input.tools),
+    disallowedTools: uniqueStringIds(input.disallowedTools),
+    skillIds: uniqueStringIds(input.skillIds),
+    mcpIds: uniqueStringIds(input.mcpIds),
+    hookIds: uniqueStringIds(input.hookIds),
+    webSearch: normalizeConversationWebSearch(input.webSearch, DEFAULT_CONVERSATION_WEB_SEARCH),
+    templateId: typeof input.templateId === "string" && input.templateId
+      ? input.templateId
+      : null
+  };
+}
+
+/**
+ * The catalog's role entries. A missing section is an empty one — a host from
+ * before roles were files sends none — and an entry without an id cannot be
+ * selected or named, so it is left out. An unavailable entry keeps its row with
+ * `role: null`, as an unreadable skill keeps its row: the reason rides its
+ * description.
+ */
+export function normalizeAgentRoleResources(value: unknown): AgentRoleResource[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  return value.flatMap((candidate): AgentRoleResource[] => {
+    const input = record(candidate);
+    const id = typeof input?.id === "string" ? input.id : "";
+    if (!input || !id || seen.has(id)) return [];
+    seen.add(id);
+    const source = input.source === "builtin" || input.source === "workspace" ? input.source : "user";
+    const role = input.available === false ? null : normalizeAgentRole(input.role);
+    return [{
+      id,
+      name: typeof input.name === "string" ? input.name : role?.name ?? id,
+      description: typeof input.description === "string" ? input.description : "",
+      location: typeof input.location === "string" ? input.location : "",
+      source,
+      available: role !== null,
+      ...(typeof input.workspaceKey === "string" && input.workspaceKey
+        ? { workspaceKey: input.workspaceKey }
+        : {}),
+      role
+    }];
+  });
+}
+
+const SHORTCUT_COMMAND_IDS = new Set<string>(SHORTCUT_COMMANDS.map((command) => command.id));
+
+function trimmedString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value.trim() : fallback;
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => (typeof entry === "string" ? [entry] : []));
+}
+
+/*
+ * There are no MCP-server or skill normalizers any more. Both are configuration
+ * files the user owns (`<level>/mcp.json`, `<level>/skills/<dir>/SKILL.md`), so
+ * the host parses them during `discover_capabilities` and the renderer only ever
+ * sees the resulting `ResourceDescriptor`s. Nothing about them is persisted in
+ * the application document, so nothing about them is normalized on load.
+ */
+
+/** Normalize a key chord: tokens must be strings and form a valid ordered binding. */
+function normalizeKeyBinding(value: unknown): KeyToken[] {
+  const tokens = stringList(value).map((token) => token.trim()).filter(Boolean);
+  if (!tokens.length) return [];
+  const ordered = orderBinding([...new Set(tokens)]);
+  return isValidBinding(ordered) ? ordered : [];
+}
+
+function normalizeShortcuts(value: unknown): GlobalSettings["shortcuts"] {
+  const input = record(value);
+  if (!input) return {};
+  const result: GlobalSettings["shortcuts"] = {};
+  for (const [id, entry] of Object.entries(input)) {
+    // Commands not in the code-owned command table cannot retain orphaned bindings.
+    if (!SHORTCUT_COMMAND_IDS.has(id)) continue;
+    const preference = record(entry);
+    if (!preference) continue;
+    const binding = normalizeKeyBinding(preference.binding);
+    result[id as ShortcutCommandId] = {
+      binding,
+      // A command without a binding cannot be enabled.
+      enabled: binding.length > 0 && preference.enabled === true
+    };
+  }
+  return result;
+}
+
+/** Normalize the composer send/newline chord without checking command-table conflicts. */
+function normalizeComposerShortcut(value: unknown, fallback: KeyToken[]): KeyToken[] {
+  const tokens = stringList(value).map((token) => token.trim()).filter(Boolean);
+  if (!tokens.length) return [...fallback];
+  const ordered = orderBinding([...new Set(tokens)]);
+  // Both roles choose modifiers for the required terminating `Enter` key.
+  return ordered[ordered.length - 1] === "Enter" ? ordered : [...fallback];
+}
+
+function normalizeAppearance(
+  value: unknown,
+  fallback: AppearancePreferences
+): AppearancePreferences {
+  const input = record(value);
+  if (!input) return { ...fallback };
+  const sendShortcut = normalizeComposerShortcut(input.sendShortcut, fallback.sendShortcut);
+  let newlineShortcut = normalizeComposerShortcut(input.newlineShortcut, fallback.newlineShortcut);
+  // Send and newline cannot share a chord. Restore the newline default, or a
+  // guaranteed different fallback, on collision.
+  if (newlineShortcut.join("+") === sendShortcut.join("+")) {
+    newlineShortcut = fallback.newlineShortcut.join("+") === sendShortcut.join("+")
+      ? concreteBinding([PRIMARY_MODIFIER, "Enter"])
+      : [...fallback.newlineShortcut];
+  }
+  const themeColor = normalizeHexColor(
+    typeof input.themeColor === "string" ? input.themeColor : ""
+  );
+  // Before the background library, `customBackground` turned the picture and the glass on
+  // together (the host carries this forward too; see `model::deserialize_appearance`).
+  const legacyPicture = input.background === undefined
+    && input.customBackground === true
+    && typeof input.backgroundImage === "string"
+    && input.backgroundImage !== ""
+    ? input.backgroundImage
+    : null;
+  return {
+    themeColor: themeColor ?? "",
+    zoom: clampZoom(optionalFiniteNumber(input.zoom) ?? fallback.zoom),
+    uiFontFamily: trimmedString(input.uiFontFamily),
+    monoFontFamily: trimmedString(input.monoFontFamily),
+    messageFontSize: clampMessageFontSize(
+      optionalFiniteNumber(input.messageFontSize) ?? fallback.messageFontSize
+    ),
+    serifMessages: input.serifMessages === true,
+    wideMessages: input.wideMessages === true,
+    sendShortcut,
+    newlineShortcut,
+    spellCheck: input.spellCheck === true,
+    renderUserMarkdown: input.renderUserMarkdown === true,
+    confirmMessageDelete: input.confirmMessageDelete !== false,
+    collapseReasoning: input.collapseReasoning !== false,
+    codeBlockCollapsible: input.codeBlockCollapsible === true,
+    codeBlockWrappable: input.codeBlockWrappable === true,
+    singleDollarMath: input.singleDollarMath !== false,
+    customCss: typeof input.customCss === "string" ? input.customCss : "",
+    liquidGlass: input.liquidGlass === true || legacyPicture !== null,
+    background: normalizeBackground(legacyPicture ?? input.background),
+    localModel: normalizeLocalModelPreferences(input.localModel)
+  };
+}
+
+function normalizeLocalModelPreferences(value: unknown): AppearancePreferences["localModel"] {
+  const input = record(value) ?? {};
+  return {
+    titles: input.titles === true,
+    shellExplanations: input.shellExplanations === true,
+    errorExplanations: input.errorExplanations === true,
+    subagents: input.subagents === true,
+    titlePrompt: typeof input.titlePrompt === "string" ? input.titlePrompt : "",
+    shellPrompt: typeof input.shellPrompt === "string" ? input.shellPrompt : "",
+    errorPrompt: typeof input.errorPrompt === "string" ? input.errorPrompt : ""
+  };
+}
+
+const TOOL_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
+
+function normalizeEnvironmentTools(
+  value: unknown,
+  fallback: EnvironmentToolDefinition[]
+): EnvironmentToolDefinition[] {
+  if (!Array.isArray(value)) return fallback.map((tool) => ({ ...tool }));
+  const seen = new Set<string>();
+  return value.flatMap((entry) => {
+    const input = record(entry);
+    if (!input) return [];
+    const name = trimmedString(input.name);
+    const executable = trimmedString(input.executable) || name;
+    if (!TOOL_NAME_PATTERN.test(name) || !executable) return [];
+    const key = name.toLowerCase();
+    if (seen.has(key)) return [];
+    seen.add(key);
+    const versionArgs = stringList(input.versionArgs).map((argument) => argument.trim()).filter(Boolean);
+    return [{ name, executable, versionArgs: versionArgs.length ? versionArgs : ["--version"] }];
+  });
+}
+
+function normalizeGlobalSettings(
+  value: unknown,
+  fallback: GlobalSettings,
+  knownToolNames: ReadonlySet<string>
+): GlobalSettings {
+  const input = record(value) ?? {};
+  const seenProviderIds = new Set<string>();
+  // Providers are user-created except the built-in Codex and Claude Agent rows,
+  // which `ensureCodexProvider` and `ensureClaudeAgentProvider` keep present.
+  const providers = ensureClaudeAgentProvider(ensureCodexProvider((Array.isArray(input.apiProviders)
+    ? input.apiProviders.map(normalizeProvider).filter((provider): provider is ApiProvider => Boolean(provider))
+    : fallback.apiProviders).filter((provider) => {
+      if (seenProviderIds.has(provider.id)) return false;
+      seenProviderIds.add(provider.id);
+      return true;
+    })));
+  const fallbackPreset = fallback.conversationPresets.find(
+    (preset) => preset.id === fallback.defaultConversationPresetId
+  ) ?? fallback.conversationPresets[0];
+  const fallbackPresetSettings: ConversationPresetSettings = fallbackPreset?.settings
+    ?? emptyConversationPresetSettings();
+  // Search assets depend only on the fixed provider catalog and can be assembled here.
+  const webSearchAssets = normalizeWebSearchAssets(input.webSearch, fallback.webSearch);
+  const seenPresetIds = new Set<string>();
+  const conversationPresets = (Array.isArray(input.conversationPresets)
+    ? input.conversationPresets
+        .map((preset) => normalizeConversationPreset(
+          preset, fallbackPresetSettings, knownToolNames
+        ))
+        .filter((preset): preset is ConversationPreset => Boolean(preset))
+    : fallback.conversationPresets.map((preset) => ({
+        ...preset,
+        settings: normalizeConversationPresetSettings(
+          preset.settings, fallbackPresetSettings, knownToolNames
+        )
+      })))
+    .filter((preset) => {
+      if (seenPresetIds.has(preset.id)) return false;
+      seenPresetIds.add(preset.id);
+      return true;
+    });
+  const requestedDefaultPresetId = optionalPresetId(input.defaultConversationPresetId);
+  const defaultConversationPresetId = conversationPresets.some(
+    (preset) => preset.id === requestedDefaultPresetId
+  ) ? requestedDefaultPresetId! : conversationPresets[0]?.id ?? "";
+  const requestedProviderId = typeof input.activeProviderId === "string" ? input.activeProviderId.trim() : null;
+  const requestedProvider = providers.find((provider) => (
+    provider.id === requestedProviderId && provider.enabled
+  )) ?? null;
+  const activeProvider = requestedProvider
+    ?? providers.find((provider) => provider.enabled)
+    ?? null;
+  return {
+    appLanguage: normalizeAppLanguage(input.appLanguage, fallback.appLanguage),
+    // The App effect overwrites this with the actually resolved value on load,
+    // so it only has to be sane until then.
+    resolvedAppLanguage: normalizeResolvedAppLanguage(input.resolvedAppLanguage, fallback.resolvedAppLanguage),
+    theme: normalizeThemePreference(input.theme, fallback.theme),
+    conversationPresets,
+    defaultConversationPresetId,
+    lastReasoningEffort: normalizeReasoningEffort(input.lastReasoningEffort, fallback.lastReasoningEffort),
+    apiProviders: providers,
+    activeProviderId: activeProvider?.id ?? null,
+    webSearch: webSearchAssets,
+    appearance: normalizeAppearance(input.appearance, fallback.appearance),
+    shortcuts: normalizeShortcuts(input.shortcuts),
+    environmentTools: normalizeEnvironmentTools(input.environmentTools, fallback.environmentTools),
+    executionEnvironments: normalizeExecutionEnvironments(
+      input.executionEnvironments, fallback.executionEnvironments
+    ),
+    autoCompact: normalizeAutoCompactSettings(input.autoCompact, fallback.autoCompact)
+  };
+}
+
+function normalizeContextItems(values: unknown): ContextItem[] {
+  if (!Array.isArray(values)) return [];
+  return values.flatMap((value) => {
+    const normalized = normalizeContextItem(value);
+    return normalized ? [normalized] : [];
+  });
+}
+
+function normalizeContextItem(value: unknown): ContextItem | null {
+  const input = record(value);
+  if (!input || typeof input.id !== "string" || typeof input.kind !== "string") return null;
+  if (input.kind === "tool") {
+    const result = record(input.result);
+    if (!result) return null;
+    const subagent = record(input.subagent);
+    const context = {
+      ...(input as unknown as Extract<ContextItem, { kind: "tool" }>),
+      kind: "tool",
+      result: {
+        ...(result as unknown as Extract<ContextItem, { kind: "tool" }>["result"]),
+        images: normalizeImageAttachments(result.images)
+      },
+      subagent: subagent ? {
+        ...(subagent as unknown as NonNullable<Extract<ContextItem, { kind: "tool" }>["subagent"]>),
+        contexts: Array.isArray(subagent.contexts)
+          ? normalizeContextItems(subagent.contexts)
+          : []
+      } : undefined
+    } satisfies Extract<ContextItem, { kind: "tool" }>;
+    return context;
+  }
+  if (input.kind === "system" || input.kind === "user" || input.kind === "assistant" || input.kind === "reasoning") {
+    if (input.kind === "user") {
+      return {
+        ...(input as unknown as Extract<ContextItem, { kind: "user" }>),
+        images: normalizeImageAttachments(input.images),
+        files: normalizeFileAttachments(input.files)
+      };
+    }
+    return input as unknown as ContextItem;
+  }
+  return null;
+}
+
+/** Defensively normalize the current schema: fill absent optional fields, discard
+ * malformed entries, and reject version mismatches. */
+export function normalizeDocument(value: unknown): AppDocument {
+  const fallback = createSeedDocument();
+  const input = record(value);
+  if (!input) throw new Error("文档根节点必须是对象");
+  const schemaVersion = optionalFiniteNumber(input.schemaVersion) ?? 0;
+  if (schemaVersion > fallback.schemaVersion) {
+    throw new Error(`数据由更新版本写入（schema ${schemaVersion}），当前版本只支持 schema ${fallback.schemaVersion}`);
+  }
+  if (schemaVersion < fallback.schemaVersion) {
+    throw new Error(`数据由旧版 schema ${schemaVersion} 写入，历史迁移已在未发布阶段删除，当前版本只支持 schema ${fallback.schemaVersion}`);
+  }
+  // Use the seeded built-in catalog but retain dynamically discovered MCP descriptors
+  // that are absent from it, including their enabled-tool selections.
+  const dynamicTools = (Array.isArray(input.tools) ? input.tools : [])
+    .flatMap((entry) => {
+      const descriptor = record(entry);
+      const name = typeof descriptor?.name === "string" ? descriptor.name.trim() : "";
+      if (!descriptor || !name || descriptor.category !== "mcp") return [];
+      return fallback.tools.some((tool) => tool.name === name)
+        ? []
+        : [descriptor as unknown as ToolDescriptor];
+    })
+    .filter((tool, index, list) => list.findIndex((entry) => entry.name === tool.name) === index);
+  const tools = [...fallback.tools, ...dynamicTools];
+  const knownToolNames = new Set(tools.map((tool) => tool.name));
+  // Persisted assets and presets live in top-level containers; merge them into the
+  // flat `GlobalSettings` input before normalization.
+  const globalInput = record(input.globalSettings);
+  const mergedGlobalInput: Record<string, unknown> = {
+    ...(globalInput ?? {}),
+    ...(record(input.assets) ?? {}),
+    ...(record(input.presets) ?? {})
+  };
+  const globalSettings = normalizeGlobalSettings(
+    globalInput || record(input.assets) || record(input.presets) ? mergedGlobalInput : undefined,
+    fallback.globalSettings,
+    knownToolNames
+  );
+  const sourceWorkspaces = Array.isArray(input.workspaces)
+    ? [...input.workspaces as AppDocument["workspaces"]]
+    : fallback.workspaces;
+  /** Normalize conversation settings and workspace snapshots through the same path
+   * because they share a structure and must accept the same values. */
+  const normalizeToolLockValue = (value: unknown): ConversationToolLock | undefined => {
+    const lockInput = record(value);
+    if (!lockInput) return undefined;
+    return {
+      // Retired names leave the lock for the same reason they leave
+      // `enabledTools`: a tool the catalog no longer has cannot reach a request,
+      // so holding it locked would tone a row that is never drawn.
+      tools: uniqueStringIds(lockInput.tools)
+        .filter((name) => knownToolNames.has(name) && !isHostDerivedToolName(name)),
+      mcpIds: uniqueStringIds(lockInput.mcpIds),
+      globalMemory: lockInput.globalMemory === true,
+      projectMemory: lockInput.projectMemory === true,
+      skillTool: lockInput.skillTool === true,
+      mcpToolDiscovery: lockInput.mcpToolDiscovery === true,
+      webSearch: lockInput.webSearch === true,
+      planMode: lockInput.planMode === true,
+      // A skill id is never dropped even when discovery no longer finds it: the
+      // body it stood for is in the transcript regardless of what is on disk
+      // now, and forgetting the id would offer the user a removal that cannot
+      // actually take the text back.
+      skillIds: uniqueStringIds(lockInput.skillIds),
+      // Absent means "no run has opened this conversation's prompt yet", which
+      // is not the same as "the prompt was opened with no skills": the first
+      // reads every selected skill as part of the prompt, the second reads all
+      // of them as later additions.
+      promptSkillIds: Array.isArray(lockInput.promptSkillIds)
+        ? uniqueStringIds(lockInput.promptSkillIds)
+        : null,
+      searchBackend: lockInput.searchBackend === undefined || lockInput.searchBackend === null
+        ? null
+        : normalizeSearchProviderSelection(lockInput.searchBackend),
+      fetchBackend: lockInput.fetchBackend === undefined || lockInput.fetchBackend === null
+        ? null
+        : normalizeFetchProviderSelection(
+          lockInput.fetchBackend,
+          normalizeSearchProviderSelection(lockInput.searchBackend)
+        ),
+      webFetch: lockInput.webFetch === true,
+      searchProvider: lockInput.searchProvider === undefined
+        || lockInput.searchProvider === null
+        ? null
+        : normalizeSearchProviderSelection(lockInput.searchProvider),
+      // A lock written before the fetch selector became exhaustive may pin
+      // `auto`, which is resolved against the backend the same lock pinned for
+      // searching — the same reading the run itself would have given it. With
+      // nothing pinned there, native is what `auto` resolved to.
+      fetchProvider: lockInput.fetchProvider === undefined
+        || lockInput.fetchProvider === null
+        ? null
+        : normalizeFetchProviderSelection(
+          lockInput.fetchProvider,
+          normalizeSearchProviderSelection(lockInput.searchProvider)
+        ),
+      lastRequest: normalizeToolLockRequest(lockInput.lastRequest),
+      modelRequests: normalizeToolLockModelRequests(lockInput.modelRequests),
+      // Absent on a lock from before they were recorded: nothing is known of
+      // what that request carried, so nothing about them is toned.
+      hookIds: Array.isArray(lockInput.hookIds) ? uniqueStringIds(lockInput.hookIds) : null,
+      promptProfile: typeof lockInput.promptProfile === "string" ? lockInput.promptProfile : null,
+      hostMessageContainer: lockInput.hostMessageContainer === "box" || lockInput.hostMessageContainer === "user"
+        ? lockInput.hostMessageContainer
+        : null
+    };
+  };
+  const normalizeConversationSettingsValue = (value: unknown): ConversationSettings => {
+    const settingsInput = record(value) ?? {};
+    const rawEnabledTools = uniqueStringIds(settingsInput.enabledTools);
+    const enabledTools = rawEnabledTools
+      .filter((name) => knownToolNames.has(name) && !isHostDerivedToolName(name));
+    /* Roles used to be records carried here. The host exports a legacy
+       `agentDefinitions` list to files on load and owns whatever is left of it,
+       so it is dropped rather than spread back into a save. */
+    const { agentDefinitions: _legacyAgentDefinitions, ...currentSettings } = settingsInput;
+    return {
+      ...(currentSettings as unknown as ConversationSettings),
+      enabledTools,
+      hookIds: uniqueStringIds(settingsInput.hookIds),
+      skillIds: uniqueStringIds(settingsInput.skillIds),
+      mcpIds: uniqueStringIds(settingsInput.mcpIds),
+      toolDescriptionFileId: normalizeToolDescriptionFileId(settingsInput.toolDescriptionFileId),
+      agentIds: uniqueStringIds(settingsInput.agentIds),
+      // As for presets, absence means false and requires a role.
+      allowRolelessSubagents: settingsInput.allowRolelessSubagents === true,
+      webSearch: normalizeConversationWebSearch(
+        settingsInput.webSearch,
+        DEFAULT_CONVERSATION_WEB_SEARCH
+      ),
+      // Web access became one switch after it had already been two checkboxes,
+      // so a conversation saved under the old shape still says what it wanted:
+      // it named a web tool in `enabledTools`. Read that BEFORE the filter above
+      // drops those names as host-derived, otherwise every existing conversation
+      // would come back from disk offline.
+      webSearchEnabled: settingsInput.webSearchEnabled === true
+        || rawEnabledTools.some(isWebToolName),
+      reasoningEffort: normalizeReasoningEffort(
+        settingsInput.reasoningEffort,
+        globalSettings.lastReasoningEffort
+      ),
+      // No global default is inherited; absent values use the most cautious level.
+      securityLevel: normalizeSecurityLevel(settingsInput.securityLevel, "request_approval"),
+      planModeEnabled: normalizePlanMode(settingsInput),
+      // The two tiers are independent switches, and both default OFF: memory
+      // reads and writes files the user may not expect a conversation to
+      // touch, so turning a tier on is an explicit choice. The built-in
+      // engineering defaults preset — not this normalizer — is where a
+      // fresh conversation's answer comes from.
+      globalMemoryEnabled: settingsInput.globalMemoryEnabled === true,
+      projectMemoryEnabled: settingsInput.projectMemoryEnabled === true,
+      // Absence means false, preserving inline skill content for older conversations.
+      skillToolEnabled: settingsInput.skillToolEnabled === true,
+      mcpToolDiscoveryEnabled: settingsInput.mcpToolDiscoveryEnabled === true,
+      // Absent means user messages, the host's own default.
+      hostMessageContainer: hostMessageContainerOf(settingsInput as { hostMessageContainer?: HostMessageContainer }),
+      // Absent on a conversation from before the choice (it hands off) and on
+      // the draft, which settles it by the model when it becomes a conversation.
+      ...(settingsInput.compactionMethod === "handoff" || settingsInput.compactionMethod === "native"
+        ? { compactionMethod: settingsInput.compactionMethod }
+        : {}),
+      // Absent until this conversation's first run has exposed something.
+      toolLock: normalizeToolLockValue(settingsInput.toolLock)
+    };
+  };
+  const normalizeConversations = (workspace: AppDocument["workspaces"][number]) =>
+    workspace.conversations.map((conversation) => {
+        const conversationInput = record(conversation);
+        const baseSettings = normalizeConversationSettingsValue(conversationInput?.settings);
+      return {
+          ...conversation,
+          queuePaused: conversationInput?.queuePaused === true || undefined,
+          contexts: Array.isArray(conversation.contexts)
+            ? normalizeContextItems(conversation.contexts)
+            : [],
+          queuedMessages: Array.isArray(conversationInput?.queuedMessages)
+            ? conversationInput.queuedMessages.flatMap((value) => {
+                const message = record(value);
+                const images = normalizeImageAttachments(message?.images);
+                const files = normalizeFileAttachments(message?.files);
+                if (
+                  !message
+                  || typeof message.id !== "string"
+                  || !message.id.trim()
+                  || message.id.length > 128
+                  || typeof message.content !== "string"
+                  || (!message.content.trim() && !images?.length && !files?.length)
+                  || Array.from(message.content).length > 100_000
+                  || typeof message.createdAt !== "string"
+                  || !Number.isFinite(Date.parse(message.createdAt))
+                ) return [];
+                return [{
+                  id: message.id,
+                  content: message.content,
+                  images,
+                  files,
+                  createdAt: message.createdAt
+                }];
+              }).filter((message, index, messages) => messages.findIndex(
+                (candidate) => candidate.id === message.id
+              ) === index).slice(0, 100)
+            : [],
+          userAbortedTasks: Array.isArray(conversationInput?.userAbortedTasks)
+            ? conversationInput.userAbortedTasks.flatMap((value) => {
+                const task = record(value);
+                const metrics = record(task?.metrics);
+                const kinds = new Set(["subagent", "workflow", "terminal", "shell", "browser"]);
+                const metric = (name: string): number | null | undefined => {
+                  const value = metrics?.[name];
+                  return value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0)
+                    ? value
+                    : undefined;
+                };
+                const childCount = metric("childCount");
+                const tokens = metric("tokens");
+                const toolCount = metric("toolCount");
+                const elapsedMs = metric("elapsedMs");
+                if (
+                  !task
+                  || typeof task.id !== "string" || !task.id.trim() || task.id.length > 128
+                  || typeof task.sourceKind !== "string" || !kinds.has(task.sourceKind)
+                  || typeof task.sourceIdentity !== "string" || !task.sourceIdentity.trim() || task.sourceIdentity.length > 256
+                  || typeof task.label !== "string" || Array.from(task.label).length > 512
+                  || typeof task.detail !== "string" || Array.from(task.detail).length > 4096
+                  || !metrics
+                  || childCount === undefined || tokens === undefined || toolCount === undefined || elapsedMs === undefined
+                  || typeof task.startedAt !== "string" || (task.startedAt !== "" && !Number.isFinite(Date.parse(task.startedAt)))
+                  || typeof task.endedAt !== "string" || !Number.isFinite(Date.parse(task.endedAt))
+                  || task.reason !== "userAborted"
+                ) return [];
+                return [{
+                  id: task.id,
+                  sourceKind: task.sourceKind as import("../types").UserAbortedTaskKind,
+                  sourceIdentity: task.sourceIdentity,
+                  label: task.label,
+                  detail: task.detail,
+                  metrics: { childCount, tokens, toolCount, elapsedMs },
+                  startedAt: task.startedAt,
+                  endedAt: task.endedAt,
+                  reason: "userAborted" as const
+                }];
+              }).filter((task, index, tasks) => tasks.findIndex(
+                (candidate) => candidate.id === task.id
+              ) === index).slice(-256)
+            : [],
+          branches: Array.isArray(conversationInput?.branches)
+            ? conversationInput.branches.flatMap((value) => {
+                const branch = record(value);
+                if (
+                  !branch
+                  || typeof branch.id !== "string"
+                  || typeof branch.forkContextId !== "string"
+                  || typeof branch.active !== "boolean"
+                ) return [];
+                return [{
+                  id: branch.id,
+                  forkContextId: branch.forkContextId,
+                  active: branch.active,
+                  contexts: Array.isArray(branch.contexts)
+                    ? normalizeContextItems(branch.contexts)
+                    : [],
+                  createdAt: typeof branch.createdAt === "string" ? branch.createdAt : conversation.createdAt,
+                  updatedAt: typeof branch.updatedAt === "string" ? branch.updatedAt : conversation.updatedAt
+                }];
+              })
+            : [],
+          settings: baseSettings,
+          worktrees: normalizeConversationWorktrees(
+            conversationInput?.worktrees,
+            (conversationInput as { worktree?: unknown } | undefined)?.worktree
+          ),
+          runTarget: normalizeRunTarget(conversationInput?.runTarget),
+          attachedWorkspaces: normalizeAttachedWorkspaces(
+            conversationInput?.attachedWorkspaces,
+            conversationInput?.additionalDirectories
+          ),
+          // A parent that turns out not to exist is resolved at render time,
+          // not here: the tree builder treats a dangling id as a root.
+          parentConversationId: typeof conversationInput?.parentConversationId === "string"
+            && conversationInput.parentConversationId.trim()
+            && conversationInput.parentConversationId !== conversation.id
+            ? conversationInput.parentConversationId
+            : null,
+          // A dangling preset ID is kept as-is, like the workspace default below;
+          // unresolvable simply displays as an unnamed draft.
+          presetId: typeof conversationInput?.presetId === "string"
+            && conversationInput.presetId.trim()
+            && conversationInput.presetId.length <= 128
+            ? conversationInput.presetId
+            : ""
+      };
+    });
+  const regularWorkspaces: AppDocument["workspaces"] = [];
+  let temporaryWorkspace: AppDocument["workspaces"][number] | null = null;
+  /** A workspace may retain a dangling default preset ID; unresolved means unset,
+   * consistent with capability resource IDs. */
+  const workspacePresetId = (workspace: unknown): string => {
+    const value = record(workspace)?.defaultConversationPresetId;
+    return typeof value === "string" && value.trim() && value.length <= 128 ? value : "";
+  };
+  const workspaceLastSettings = (workspace: unknown): ConversationSettings | null => {
+    const value = record(workspace)?.lastConversationSettings;
+    return record(value) ? normalizeConversationSettingsValue(value) : null;
+  };
+  // A project's draft is a conversation that has not been sent yet, so its
+  // settings take the same path a conversation's do.
+  const workspaceDraft = (workspace: unknown): { draftConversation?: DraftConversationSnapshot } => {
+    const draftInput = record(record(workspace)?.draftConversation);
+    if (!draftInput || !record(draftInput.settings)) return {};
+    return {
+      draftConversation: {
+        settings: normalizeConversationSettingsValue(draftInput.settings),
+        presetId: typeof draftInput.presetId === "string"
+          && draftInput.presetId.trim()
+          && draftInput.presetId.length <= 128
+          ? draftInput.presetId
+          : ""
+      }
+    };
+  };
+  for (const workspace of sourceWorkspaces) {
+    const conversations = normalizeConversations(workspace);
+    if (workspace.id === TEMPORARY_WORKSPACE_ID) {
+      if (temporaryWorkspace) {
+        temporaryWorkspace.conversations.push(...conversations);
+      } else {
+        temporaryWorkspace = {
+          id: TEMPORARY_WORKSPACE_ID,
+          name: "临时工作区",
+          kind: "temporary",
+          path: "",
+          createdAt: workspace.createdAt,
+          defaultConversationPresetId: workspacePresetId(workspace),
+          lastConversationSettings: workspaceLastSettings(workspace),
+          ...workspaceDraft(workspace),
+          conversations
+        };
+      }
+      continue;
+    }
+    const kind = (workspace as unknown as { kind?: unknown }).kind;
+    if (kind !== "directory" || workspace.id.startsWith("__")) {
+      if (temporaryWorkspace) {
+        temporaryWorkspace.conversations.push(...conversations);
+      } else {
+        temporaryWorkspace = createTemporaryWorkspace(conversations);
+      }
+      continue;
+    }
+    const workspaceMachine = normalizeRunTarget(
+      (workspace as unknown as { machine?: unknown }).machine
+    );
+    const additionalWorkspaces = normalizeProjectMembers(
+      (workspace as unknown as { additionalWorkspaces?: unknown }).additionalWorkspaces,
+      { machine: workspaceMachine, path: workspace.path }
+    );
+    regularWorkspaces.push({
+      id: workspace.id,
+      name: workspace.name,
+      kind: "directory",
+      path: workspace.path,
+      ...(workspaceMachine ? { machine: workspaceMachine } : {}),
+      ...(additionalWorkspaces.length ? { additionalWorkspaces } : {}),
+      createdAt: workspace.createdAt,
+      defaultConversationPresetId: workspacePresetId(workspace),
+      lastConversationSettings: workspaceLastSettings(workspace),
+      ...workspaceDraft(workspace),
+      conversations
+    });
+  }
+  const workspaces = [
+    ...regularWorkspaces,
+    temporaryWorkspace ?? createTemporaryWorkspace()
+  ];
+  const executionEnvironments = globalSettings.executionEnvironments;
+  return {
+    schemaVersion: fallback.schemaVersion,
+    globalSettings: {
+      ...globalSettings,
+      executionEnvironments: {
+        ...executionEnvironments,
+        envVars: spreadMachineEnvVars(executionEnvironments.envVars, workspaces)
+      }
+    },
+    workspaces,
+    tools,
+    capabilities: record(input.capabilities)
+      ? {
+          hooks: Array.isArray(record(input.capabilities)?.hooks)
+            ? record(input.capabilities)?.hooks as CapabilityCatalog["hooks"]
+            : [],
+          skills: Array.isArray(record(input.capabilities)?.skills)
+            ? record(input.capabilities)?.skills as CapabilityCatalog["skills"]
+            : fallback.capabilities.skills,
+          mcps: Array.isArray(record(input.capabilities)?.mcps)
+            ? record(input.capabilities)?.mcps as CapabilityCatalog["mcps"]
+            : fallback.capabilities.mcps,
+          toolDescriptionFiles: Array.isArray(record(input.capabilities)?.toolDescriptionFiles)
+            ? record(input.capabilities)?.toolDescriptionFiles as CapabilityCatalog["toolDescriptionFiles"]
+            : fallback.capabilities.toolDescriptionFiles,
+          agents: Array.isArray(record(input.capabilities)?.agents)
+            ? normalizeAgentRoleResources(record(input.capabilities)?.agents)
+            : fallback.capabilities.agents,
+          ...(Array.isArray(record(input.capabilities)?.unreadableLevels)
+            ? { unreadableLevels: record(input.capabilities)?.unreadableLevels as CapabilityCatalog["unreadableLevels"] }
+            : {})
+        }
+      : fallback.capabilities
+  };
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  if (!globalThis.crypto?.subtle) throw new Error("当前环境不支持安全的 API Key 端点指纹");
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Browser-preview marker for whether a provider has been configured with a key.
+ * It mirrors desktop credential identity: one key per provider ID. */
+async function credentialFingerprint(providerId: string): Promise<string> {
+  return sha256Hex(`v6\0${providerId}`);
+}
+
+export async function getStoredApiKeyLength(providerId: string): Promise<number | undefined> {
+  const fingerprint = await credentialFingerprint(providerId);
+  const value = Number(window.localStorage.getItem(`${API_KEY_LENGTH_PREFIX}${fingerprint}`));
+  return Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+async function rememberApiKeyLength(providerId: string, keyLength?: number): Promise<void> {
+  const fingerprint = await credentialFingerprint(providerId);
+  const storageKey = `${API_KEY_LENGTH_PREFIX}${fingerprint}`;
+  if (Number.isInteger(keyLength) && (keyLength ?? 0) > 0) {
+    window.localStorage.setItem(storageKey, String(keyLength));
+  } else {
+    window.localStorage.removeItem(storageKey);
+  }
+}
+
+export async function forgetStoredApiKeyLength(providerId: string): Promise<void> {
+  await rememberApiKeyLength(providerId);
+}
+
+async function browserLoad(): Promise<AppDocument> {
+  const stored = window.localStorage.getItem(STORAGE_KEY);
+  let document: AppDocument;
+  if (!stored) {
+    document = createSeedDocument();
+  } else {
+    try {
+      document = normalizeDocument(JSON.parse(stored));
+    } catch (error) {
+      throw new Error(`本地数据无法读取，原始数据已保留：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  try {
+    // A browser reload discards unsent composer state, so every indexed image
+    // not referenced by the recovered document can safely enter the delayed
+    // orphan lifecycle. Only Mewrk's attachment namespace is touched.
+    reconcilePreviewImageStore(
+      new Set(),
+      referencedPreviewImageIdsIn(document),
+      true
+    );
+  } catch {
+    // Index maintenance is best-effort and must not make a valid document
+    // unloadable when localStorage is at quota.
+  }
+  return document;
+}
+
+/**
+ * Copies a conversation's history through `throughContextId` into a branch.
+ *
+ * The host reads the source from its own committed document and re-issues an
+ * execution receipt for every copied tool result, so the branch is an
+ * independent conversation that can be edited and saved on its own. Ids are
+ * regenerated by the host; the renderer must not reuse the source's.
+ *
+ * The browser preview has no receipt book, so it copies locally with fresh ids.
+ */
+export async function forkConversationContexts(request: {
+  workspaceId: string;
+  sourceConversationId: string;
+  targetConversationId: string;
+  throughContextId: string;
+  sourceContexts: ContextItem[];
+}): Promise<ContextItem[]> {
+  if (hasBackendRuntime()) {
+    return invoke<ContextItem[]>("fork_conversation_contexts", {
+      workspaceId: request.workspaceId,
+      sourceConversationId: request.sourceConversationId,
+      targetConversationId: request.targetConversationId,
+      throughContextId: request.throughContextId
+    });
+  }
+  const cut = request.sourceContexts.findIndex(
+    (context) => context.id === request.throughContextId
+  );
+  if (cut < 0) throw new Error(`分支起点 ${request.throughContextId} 不在源对话中`);
+  const turnIds = new Map<string, string>();
+  const remap = (turn?: string): string | undefined => {
+    if (turn === undefined) return undefined;
+    const existing = turnIds.get(turn);
+    if (existing) return existing;
+    const next = createId("turn");
+    turnIds.set(turn, next);
+    return next;
+  };
+  return request.sourceContexts.slice(0, cut + 1).map((context) => {
+    const id = createId("ctx");
+    return context.kind === "system" || context.kind === "user"
+      ? { ...context, id }
+      : { ...context, id, modelTurnId: remap(context.modelTurnId) };
+  });
+}
+
+/**
+ * Conversation templates: the stored message queue a preset or a role opens with.
+ *
+ * Bodies cross this boundary in one direction only, through
+ * `updateConversationTemplate`. The host owns them because a template carries
+ * tool cards, and applying one re-issues the execution receipts that make those
+ * cards persistable in their new conversation — the same reason
+ * `forkConversationContexts` is a host command. Everything else here names a
+ * template; nothing else sends one.
+ *
+ * Without a backend there is no receipt book and no template store, so the list
+ * is empty and every mutation refuses. That path is vitest and the localStorage
+ * preview, where the read model is already the only truth.
+ */
+const NO_TEMPLATE_STORE = "当前运行环境没有对话模板存储";
+
+export async function listConversationTemplates(): Promise<ConversationTemplateSummary[]> {
+  if (!hasBackendRuntime()) return [];
+  return invoke<ConversationTemplateSummary[]>("list_conversation_templates");
+}
+
+/**
+ * Instantiates a template for a conversation. The returned contexts carry fresh
+ * ids and host receipts bound to `targetConversationId`; the caller persists
+ * them through an ordinary conversation update, which consumes those receipts.
+ */
+export async function applyConversationTemplate(request: {
+  workspaceId: string;
+  templateId: string;
+  targetConversationId: string;
+}): Promise<ContextItem[]> {
+  if (!hasBackendRuntime()) throw new Error(NO_TEMPLATE_STORE);
+  return invoke<ContextItem[]>("apply_conversation_template", {
+    workspaceId: request.workspaceId,
+    templateId: request.templateId,
+    targetConversationId: request.targetConversationId
+  });
+}
+
+/**
+ * Reads a template's stored body for display and for editing.
+ *
+ * The ids and receipts that come back belong to whatever conversation the body
+ * was last written from, so this body is unsaveable as a conversation by
+ * construction — which is what makes it safe to read without a target. Use
+ * `applyConversationTemplate` to actually instantiate one. An id nothing has
+ * been written under yet reads as an empty body rather than an error: that is
+ * the state of every preset and every role before its first save.
+ */
+export async function previewConversationTemplate(
+  templateId: string
+): Promise<ContextItem[]> {
+  if (!hasBackendRuntime()) return [];
+  return invoke<ContextItem[]>("preview_conversation_template", { templateId });
+}
+
+/**
+ * Writes a body onto a template, creating it when its owner has none yet.
+ *
+ * The prose is the renderer's to rewrite freely. A tool card may be kept,
+ * dropped, rewritten or placed, but the host normalizes what it takes: an
+ * authored card keeps only its arguments and its result text, and the host
+ * supplies every field it alone can vouch for. Applying a template re-attests
+ * its cards for the target conversation, so a card that got in here becomes one
+ * this application vouches for — normalizing is what keeps that claim no
+ * stronger than the one a hand-written card on a timeline already carries. The
+ * returned summary describes the stored template, which may therefore differ
+ * from the submitted body.
+ */
+export async function updateConversationTemplate(
+  templateId: string,
+  contexts: ContextItem[]
+): Promise<ConversationTemplateSummary> {
+  if (!hasBackendRuntime()) throw new Error(NO_TEMPLATE_STORE);
+  return invoke<ConversationTemplateSummary>("update_conversation_template", {
+    templateId,
+    contexts
+  });
+}
+
+/**
+ * Saves a conversation's history as a new template under `templateId`.
+ *
+ * Like `forkConversationContexts`, this names what to copy and sends no body:
+ * the host reads the conversation from its own store, so every tool card keeps
+ * the result this application really produced. The id must be one nothing has
+ * been written under yet.
+ */
+export async function captureConversationTemplate(request: {
+  workspaceId: string;
+  conversationId: string;
+  templateId: string;
+}): Promise<ConversationTemplateSummary> {
+  if (!hasBackendRuntime()) throw new Error(NO_TEMPLATE_STORE);
+  return invoke<ConversationTemplateSummary>("capture_conversation_template", {
+    workspaceId: request.workspaceId,
+    conversationId: request.conversationId,
+    templateId: request.templateId
+  });
+}
+
+export async function deleteConversationTemplate(templateId: string): Promise<void> {
+  if (!hasBackendRuntime()) throw new Error(NO_TEMPLATE_STORE);
+  await invoke("delete_conversation_template", { templateId });
+}
+
+/** Whether the host's last `load_document` said this process started on a brand-new install. */
+let freshInstall = false;
+
+export async function loadDocument(): Promise<AppDocument> {
+  if (hasBackendRuntime()) {
+    const loaded = await invoke<unknown>("load_document");
+    freshInstall = record(loaded)?.freshInstall === true;
+    return withUnloadedBodies(normalizeDocument(loaded), record(loaded)?.unloadedConversationIds);
+  }
+  return browserLoad();
+}
+
+/**
+ * Whether the app started on a brand-new install, as the document load reported
+ * it: the host seeded the document this process. The browser preview never does.
+ */
+export function startedOnFreshInstall(): boolean {
+  return freshInstall;
+}
+
+/**
+ * Marks the conversations the host sent without their bodies. The host loads a
+ * document with no contexts at all and names the conversations that have
+ * some; each is fetched when it is opened (`lib/conversationBodies.ts`).
+ */
+function withUnloadedBodies(document: AppDocument, ids: unknown): AppDocument {
+  const unloaded = new Set(Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : []);
+  if (unloaded.size === 0) return document;
+  return {
+    ...document,
+    workspaces: document.workspaces.map((workspace) => ({
+      ...workspace,
+      conversations: workspace.conversations.map((conversation) => (
+        unloaded.has(conversation.id) ? { ...conversation, bodyUnloaded: true } : conversation
+      ))
+    }))
+  };
+}
+
+/** A conversation as the host takes it: the renderer's own bookkeeping stays behind. */
+function conversationForHost(conversation: Conversation): Conversation {
+  if (conversation.bodyUnloaded === undefined) return conversation;
+  const { bodyUnloaded: _unloaded, ...rest } = conversation;
+  return rest;
+}
+
+/**
+ * Whether the host owns conversation data. With a backend, conversation bodies live
+ * in host SQLite and renderer changes go through commands. Browser preview and tests
+ * instead use the localStorage document as their authoritative model.
+ */
+export function hasConversationCommands(): boolean {
+  return hasBackendRuntime();
+}
+
+export async function createConversationRemote(
+  workspaceId: string,
+  conversation: Conversation
+): Promise<Conversation | null> {
+  if (!hasBackendRuntime()) return null;
+  return invoke<Conversation>("create_conversation", {
+    workspaceId,
+    conversation: conversationForHost(conversation)
+  });
+}
+
+export async function deleteConversationRemote(
+  workspaceId: string,
+  conversationId: string
+): Promise<void> {
+  if (!hasBackendRuntime()) return;
+  await invoke("delete_conversation", { workspaceId, conversationId });
+}
+
+export async function updateConversationRemote(
+  workspaceId: string,
+  conversation: Conversation,
+  expectedContextIds: string[]
+): Promise<Conversation | null> {
+  if (!hasBackendRuntime()) return null;
+  return invoke<Conversation>("update_conversation", {
+    workspaceId,
+    conversation: conversationForHost(conversation),
+    expectedContextIds
+  });
+}
+
+export async function reorderConversationsRemote(
+  workspaceId: string,
+  conversationIds: string[]
+): Promise<void> {
+  if (!hasBackendRuntime()) return;
+  await invoke("reorder_conversations", { workspaceId, conversationIds });
+}
+
+export async function loadConversationRemote(
+  conversationId: string
+): Promise<Conversation | null> {
+  if (!hasBackendRuntime()) return null;
+  return invoke<Conversation | null>("load_conversation", { conversationId });
+}
+
+/** What a recorded request was: a conversation round, or a host-minted one-shot. */
+export type HistoryRequestKind = "model" | "search" | "fetch";
+
+/** The four things a request carries, in the order it carries them. */
+export type HistoryPartKind = "system" | "systemDynamic" | "tools" | "message";
+
+/**
+ * What the conversation's history holds, one kind per entry: a payload put on the
+ * wire, the response to it, a hook's decision, a call as it actually ran and what
+ * it returned, and a change to the timeline — the user's or a run's.
+ */
+export type HistoryEntryKind = "request" | "response" | "hook" | "tool" | "result" | "edit" | "run";
+
+/**
+ * Provider-reported usage. Every field is optional because providers disclose
+ * different subsets, and an absent counter has to read as absent rather than as
+ * zero.
+ */
+export interface HistoryUsage {
+  inputTokens?: number;
+  /** Cached reads included in `inputTokens`, on the same discipline as `ModelUsage`. */
+  cachedInputTokens?: number;
+  outputTokens?: number;
+}
+
+/**
+ * One entry of the history the host keeps, without its body. Every kind shares one
+ * `seq` per conversation, so the list reads in the order things happened.
+ */
+export interface HistoryEntry {
+  seq: number;
+  createdAt: string;
+  kind: HistoryEntryKind;
+  /**
+   * The child agent this entry belongs to, absent on the conversation's own. A
+   * child runs under the parent's conversation id, and nothing else keeps the two
+   * apart.
+   */
+  owner?: string;
+  /** The run it belongs to; absent on an edit. */
+  requestId?: string;
+  round?: number;
+  /** The call a tool entry, a result or a tool hook is about. */
+  callId?: string;
+  /** For a response: the request it answers. */
+  answers?: number;
+  /** Kind-specific metadata, as recorded; see `historyRecord.ts` for each kind's. */
+  detail: Record<string, unknown>;
+  /**
+   * A response's own usage; on a request, the usage of the response that answered
+   * it. Absent where nothing came back or nothing was disclosed.
+   */
+  usage?: HistoryUsage;
+}
+
+export interface HistoryPart {
+  ordinal: number;
+  kind: HistoryPartKind;
+  hash: string;
+  /** Prompt text for the system parts; JSON text for the others. */
+  body: string;
+  /** UTF-8 length of `body`, counted by the host so the parts sum to `bytes`. */
+  bytes: number;
+  truncated: boolean;
+}
+
+/** One step of a timeline change, with the row as it read before and after. */
+export interface HistoryOp {
+  ordinal: number;
+  op: "insert" | "remove" | "replace";
+  contextId: string;
+  position?: number;
+  /** The row after the change, as JSON text; absent on a removal. */
+  body?: string;
+  /** The row as the history last had it before the change. */
+  before?: string;
+}
+
+/** One entry in full, as a row reads it when it opens. */
+export interface HistoryEntryDetail {
+  entry: HistoryEntry;
+  /**
+   * JSON text of the entry's body: a request's envelope (minus its parts and every
+   * credential-bearing field), a response's message, a hook's decision, a call's
+   * input, a result's output.
+   */
+  body?: string;
+  truncated: boolean;
+  /** A request's parts, in wire order. */
+  parts?: HistoryPart[];
+  /** A timeline change's steps. */
+  ops?: HistoryOp[];
+}
+
+/**
+ * One owner's history. `owners` picks whose: omitted is the conversation's own
+ * trunk, and the addresses of child agents are theirs — a spawned agent's name,
+ * or the run-scoped address the host stamps on a workflow step (`<run>/ws<n>`),
+ * read off `SubagentView.ledgerOwner`. An agent whose address is not known has an
+ * empty list, which asks for nothing rather than for the trunk.
+ */
+export async function listHistoryEntries(
+  conversationId: string,
+  owners?: readonly string[]
+): Promise<HistoryEntry[]> {
+  if (!hasBackendRuntime()) return [];
+  return invoke<HistoryEntry[]>("list_history_entries", {
+    conversationId,
+    owners: owners ? [...owners] : null
+  });
+}
+
+export async function loadHistoryEntry(
+  conversationId: string,
+  seq: number
+): Promise<HistoryEntryDetail | null> {
+  if (!hasBackendRuntime()) return null;
+  return invoke<HistoryEntryDetail | null>("load_history_entry", { conversationId, seq });
+}
+
+let documentSaveTail: Promise<void> = Promise.resolve();
+
+function copyDocument(document: AppDocument): AppDocument {
+  return typeof structuredClone === "function"
+    ? structuredClone(document)
+    : JSON.parse(JSON.stringify(document)) as AppDocument;
+}
+
+function imageAttachmentForPersistence(image: ImageAttachment): ImageAttachment {
+  return {
+    id: image.id,
+    name: image.name,
+    mime: image.mime,
+    width: image.width,
+    height: image.height,
+    bytes: image.bytes,
+    ...(image.shortId !== undefined ? { shortId: image.shortId } : {})
+  };
+}
+
+function fileAttachmentForPersistence(file: FileAttachment): FileAttachment {
+  return {
+    id: file.id,
+    name: file.name,
+    format: file.format,
+    bytes: file.bytes,
+    tokens: file.tokens,
+    ...(file.pages !== undefined ? { pages: file.pages } : {})
+  };
+}
+
+/**
+ * Projects a renderer context into the only shape allowed in local persistence.
+ * Streaming state and provider protocol envelopes intentionally have no branch
+ * here, so browser preview storage enforces the same boundary as Rust serde.
+ */
+function contextForPersistence(context: ContextItem): ContextItem {
+  switch (context.kind) {
+    case "system":
+      return {
+        id: context.id,
+        kind: "system",
+        content: context.content,
+        ...(context.localOnly ? { localOnly: true } : {}),
+        ...(context.hookExecution ? {
+          hookExecution: {
+            executionId: context.hookExecution.executionId,
+            hookId: context.hookExecution.hookId,
+            hookName: context.hookExecution.hookName,
+            event: context.hookExecution.event,
+            status: context.hookExecution.status,
+            contextInjected: context.hookExecution.contextInjected
+          }
+        } : {}),
+        ...(context.toolsAdded?.length ? { toolsAdded: [...context.toolsAdded] } : {}),
+        ...(context.nativeCompaction ? {
+          nativeCompaction: {
+            providerId: context.nativeCompaction.providerId,
+            model: context.nativeCompaction.model,
+            ...(context.nativeCompaction.modelName ? { modelName: context.nativeCompaction.modelName } : {}),
+            parts: JSON.parse(JSON.stringify(context.nativeCompaction.parts)) as JsonValue[],
+            ...(context.nativeCompaction.retained?.length
+              ? {
+                retained: context.nativeCompaction.retained.map((message) => ({
+                  role: message.role,
+                  sourceId: message.sourceId,
+                  content: message.content,
+                  ...(message.truncated ? { truncated: true } : {})
+                }))
+              }
+              : {}),
+            tokensBefore: context.nativeCompaction.tokensBefore,
+            tokensAfter: context.nativeCompaction.tokensAfter,
+            ...(context.nativeCompaction.appendedTools?.length
+              ? { appendedTools: [...context.nativeCompaction.appendedTools] }
+              : {}),
+            ...(context.nativeCompaction.planTools ? { planTools: true } : {}),
+            ...(context.nativeCompaction.cacheKey ? { cacheKey: context.nativeCompaction.cacheKey } : {})
+          }
+        } : {}),
+        createdAt: context.createdAt
+      };
+    case "user":
+      return {
+        id: context.id,
+        kind: "user",
+        content: context.content,
+        ...(context.images?.length
+          ? { images: context.images.map(imageAttachmentForPersistence) }
+          : {}),
+        ...(context.files?.length
+          ? { files: context.files.map(fileAttachmentForPersistence) }
+          : {}),
+        createdAt: context.createdAt
+      };
+    case "assistant":
+      return {
+        id: context.id,
+        kind: "assistant",
+        content: context.content,
+        ...(context.round === undefined ? {} : { round: context.round }),
+        ...(context.modelTurnId === undefined ? {} : { modelTurnId: context.modelTurnId }),
+        ...(context.interrupted ? { interrupted: true } : {}),
+        createdAt: context.createdAt
+      };
+    case "reasoning":
+      return {
+        id: context.id,
+        kind: "reasoning",
+        ...(context.content === undefined ? {} : { content: context.content }),
+        ...(context.form === undefined ? {} : { form: context.form }),
+        ...(context.round === undefined ? {} : { round: context.round }),
+        ...(context.modelTurnId === undefined ? {} : { modelTurnId: context.modelTurnId }),
+        ...(context.interrupted ? { interrupted: true } : {}),
+        createdAt: context.createdAt
+      };
+    case "tool": {
+      const input = context.input;
+      const requestedInput = context.requestedInput;
+      const result = context.result;
+      return {
+        id: context.id,
+        kind: "tool",
+        toolName: context.toolName,
+        ...(context.round === undefined ? {} : { round: context.round }),
+        ...(context.modelTurnId === undefined ? {} : { modelTurnId: context.modelTurnId }),
+        ...(requestedInput === undefined ? {} : { requestedInput }),
+        input,
+        result: {
+          success: result.success,
+          output: result.output,
+          ...(result.images?.length
+            ? { images: result.images.map(imageAttachmentForPersistence) }
+            : {}),
+          ...(result.diff === undefined ? {} : { diff: result.diff }),
+          executedAt: result.executedAt,
+          durationMs: result.durationMs
+        },
+        ...(context.subagent ? {
+          subagent: {
+            ...(context.subagent.kind === undefined ? {} : { kind: context.subagent.kind }),
+            ...(context.subagent.name === undefined ? {} : { name: context.subagent.name }),
+            ...(context.subagent.label === undefined ? {} : { label: context.subagent.label }),
+            ...(context.subagent.inheritsModelMemory ? { inheritsModelMemory: true } : {}),
+            ...(context.subagent.forkModelBinding ? {
+              forkModelBinding: {
+                providerId: context.subagent.forkModelBinding.providerId,
+                modelId: context.subagent.forkModelBinding.modelId,
+                memoryLanguage: context.subagent.forkModelBinding.memoryLanguage,
+                memoryToolNames: [...context.subagent.forkModelBinding.memoryToolNames],
+                systemPromptSnapshot: context.subagent.forkModelBinding.systemPromptSnapshot,
+                systemPromptReceipt: context.subagent.forkModelBinding.systemPromptReceipt,
+                ...(context.subagent.forkModelBinding.memorySnapshotReceipt === undefined
+                  ? {}
+                  : {
+                      memorySnapshotReceipt:
+                        context.subagent.forkModelBinding.memorySnapshotReceipt
+                    }),
+                bindingReceipt: context.subagent.forkModelBinding.bindingReceipt,
+                // Absence is the v1 marker on the Rust side, so an absent key
+                // must stay absent: writing an explicit 1 would make a genuine
+                // pre-versioning record indistinguishable from a stamped one.
+                ...(context.subagent.forkModelBinding.receiptVersion === undefined
+                  ? {}
+                  : { receiptVersion: context.subagent.forkModelBinding.receiptVersion })
+              }
+            } : {}),
+            ...(context.subagent.agentDefinition ? {
+              agentDefinition: {
+                source: context.subagent.agentDefinition.source,
+                sourceKey: context.subagent.agentDefinition.sourceKey,
+                name: context.subagent.agentDefinition.name,
+                revision: context.subagent.agentDefinition.revision,
+                memoryEpoch: context.subagent.agentDefinition.memoryEpoch,
+                providerId: context.subagent.agentDefinition.providerId,
+                modelId: context.subagent.agentDefinition.modelId,
+                memory: context.subagent.agentDefinition.memory,
+                scopeKey: context.subagent.agentDefinition.scopeKey,
+                configurationReceipt:
+                  context.subagent.agentDefinition.configurationReceipt,
+                // Same rule as the fork binding: never synthesize a version.
+                ...(context.subagent.agentDefinition.receiptVersion === undefined
+                  ? {}
+                  : { receiptVersion: context.subagent.agentDefinition.receiptVersion })
+              }
+            } : {}),
+            ...(context.subagent.executionModeReceipt
+              ? { executionModeReceipt: context.subagent.executionModeReceipt }
+              : {}),
+            task: context.subagent.task,
+            status: context.subagent.status,
+            contexts: context.subagent.contexts.map(contextForPersistence),
+            updates: context.subagent.updates.map((update) => ({
+              content: update.content,
+              createdAt: update.createdAt
+            })),
+            // This builder is an explicit allowlist, so a new SubagentRunRecord
+            // field is dropped on every save until it is named here — with no
+            // type error, because the object is built rather than spread.
+            ...(context.subagent.structuredOutput === undefined
+              ? {}
+              : { structuredOutput: context.subagent.structuredOutput }),
+            ...(context.subagent.outputSchema === undefined
+              ? {}
+              : { outputSchema: context.subagent.outputSchema }),
+            // The host fingerprints the serialized record for its tool receipt, so
+            // retaining run-only fields without persisting them would reject saves.
+            ...(context.subagent.usage === undefined
+              ? {}
+              : { usage: context.subagent.usage })
+          }
+        } : {}),
+        // The host's proof that this card's result came from its own execution.
+        // Dropping it here would not lose a cosmetic field — it would strip the
+        // card's only durable credential and get the card quarantined on the
+        // very next save.
+        ...(context.attestation ? { attestation: context.attestation } : {}),
+        // The provider's own call id for this exchange. Dropped here, replay
+        // would silently fall back to a minted digest and every tool call in
+        // the turn would change id on the next turn — no error, just a forfeited
+        // prompt cache. Same allowlist hazard as the subagent record above.
+        ...(context.providerCallId ? { providerCallId: context.providerCallId } : {}),
+        createdAt: context.createdAt
+      };
+    }
+  }
+}
+
+/** Persisted layout stores assets and presets in top-level containers while the
+ * in-memory `GlobalSettings` remains flat. */
+interface PersistedAppDocument {
+  schemaVersion: number;
+  globalSettings: {
+    appLanguage: AppDocument["globalSettings"]["appLanguage"];
+    resolvedAppLanguage: AppDocument["globalSettings"]["resolvedAppLanguage"];
+    theme: AppDocument["globalSettings"]["theme"];
+    lastReasoningEffort: ReasoningEffort;
+    activeProviderId: string | null;
+    appearance: AppearancePreferences;
+    shortcuts: GlobalSettings["shortcuts"];
+    environmentTools: EnvironmentToolDefinition[];
+    autoCompact: AutoCompactSettings;
+  };
+  assets: {
+    apiProviders: AppDocument["globalSettings"]["apiProviders"];
+    webSearch: AppDocument["globalSettings"]["webSearch"];
+    executionEnvironments: ExecutionEnvironmentAssets;
+  };
+  presets: {
+    conversationPresets: AppDocument["globalSettings"]["conversationPresets"];
+    defaultConversationPresetId: string;
+  };
+  workspaces: AppDocument["workspaces"];
+  tools: AppDocument["tools"];
+  capabilities: AppDocument["capabilities"];
+}
+
+function documentForPersistence(document: AppDocument): PersistedAppDocument {
+  const {
+    conversationPresets,
+    defaultConversationPresetId,
+    apiProviders,
+    webSearch,
+    executionEnvironments,
+    ...coreGlobalSettings
+  } = document.globalSettings;
+  return {
+    schemaVersion: document.schemaVersion,
+    globalSettings: coreGlobalSettings,
+    assets: {
+      apiProviders,
+      webSearch,
+      executionEnvironments
+    },
+    presets: {
+      conversationPresets,
+      defaultConversationPresetId
+    },
+    tools: document.tools,
+    capabilities: document.capabilities,
+    workspaces: document.workspaces.map((workspace) => ({
+      ...workspace,
+      conversations: workspace.conversations.map((conversation) => ({
+        ...conversation,
+        contexts: conversation.contexts.map(contextForPersistence),
+        queuedMessages: conversation.queuedMessages.map((message) => ({
+          id: message.id,
+          content: message.content,
+          ...(message.images?.length
+            ? { images: message.images.map(imageAttachmentForPersistence) }
+            : {}),
+          ...(message.files?.length
+            ? { files: message.files.map(fileAttachmentForPersistence) }
+            : {}),
+          createdAt: message.createdAt
+        })),
+        branches: conversation.branches.map((branch) => ({
+          ...branch,
+          contexts: branch.contexts.map(contextForPersistence)
+        }))
+      }))
+    }))
+  };
+}
+
+/**
+ * Collect provider IDs from the previously persisted document so removed providers
+ * can still have their preview credential markers deleted.
+ */
+function providerIdsFromStoredDocument(value: string | null): Set<string> {
+  const result = new Set<string>();
+  if (!value) return result;
+  try {
+    const root = record(JSON.parse(value));
+    const assets = record(root?.assets);
+    const providers = Array.isArray(assets?.apiProviders) ? assets.apiProviders : [];
+    for (const entry of providers) {
+      const provider = record(entry);
+      const id = typeof provider?.id === "string" ? provider.id.trim() : "";
+      if (id) result.add(id);
+    }
+    return result;
+  } catch {
+    return result;
+  }
+}
+
+async function saveDocumentNow(document: AppDocument, durable: boolean): Promise<void> {
+  const persisted = documentForPersistence(document);
+  if (hasBackendRuntime()) {
+    // The host persists conversation bodies; return an empty read-model list to
+    // avoid overwriting them with the renderer snapshot.
+    await invoke("save_document", {
+      document: {
+        ...persisted,
+        workspaces: persisted.workspaces.map((workspace) => ({
+          ...workspace,
+          conversations: []
+        }))
+      },
+      durable
+    });
+    return;
+  }
+  const previousProviderIds = providerIdsFromStoredDocument(
+    window.localStorage.getItem(STORAGE_KEY)
+  );
+  const previousReferencedImages = referencedPreviewImageIdsFromStorage();
+  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(persisted));
+  try {
+    // A removed conversation/edit/branch starts a grace period. Images that
+    // were never in the document (for example a live composer draft) are not
+    // classified as orphans by an unrelated save.
+    reconcilePreviewImageStore(
+      previousReferencedImages,
+      referencedPreviewImageIdsIn(persisted),
+      false
+    );
+  } catch {
+    // The canonical document save already succeeded; delayed cleanup can
+    // retry on the next save or reload.
+  }
+  const nextProviderIds = new Set(persisted.assets.apiProviders.map((provider) => provider.id));
+  await Promise.all([...previousProviderIds]
+    .filter((providerId) => !nextProviderIds.has(providerId))
+    .map((providerId) => queueSecretMutation(() => browserDeleteApiKey(providerId))));
+}
+
+export async function saveDocument(
+  document: AppDocument,
+  options: { immutableSnapshot?: boolean; durable?: boolean } = {}
+): Promise<void> {
+  // React state snapshots are immutable already. Callers that can uphold that
+  // contract avoid a second full-document clone before IPC serialization.
+  const snapshot = options.immutableSnapshot ? document : copyDocument(document);
+  const operation = documentSaveTail
+    .catch(() => undefined)
+    .then(() => saveDocumentNow(snapshot, options.durable === true));
+  documentSaveTail = operation;
+  return operation;
+}
+
+export async function flushDocumentSaves(): Promise<void> {
+  await documentSaveTail;
+  if (hasBackendRuntime()) {
+    await invoke("flush_document_saves");
+  }
+}
+
+export async function requestToolApproval(request: ToolExecutionRequest): Promise<ToolApprovalGrant> {
+  if (hasBackendRuntime()) return invoke<ToolApprovalGrant>("request_tool_approval", { request });
+  return { nonce: createId("preview-approval"), expiresInMs: 90_000 };
+}
+
+/**
+ * Answers one approval card. For a call the renderer started itself, the
+ * returned grant carries the nonce — the backend mints it here, from the
+ * arguments it classified when the card was raised, so the call that runs is
+ * the one the user saw. For a card raised inside a model run, the blocked
+ * worker is what resumes and the grant is empty.
+ */
+export async function resolveToolPrompt(
+  promptId: string,
+  decision: ToolPromptDecision,
+  /** Only a denied plan-exit card carries one: what the model should change. */
+  feedback?: string,
+  /** Only a question card carries one: what the user did with its questions. */
+  question?: QuestionResponse
+): Promise<ToolApprovalGrant> {
+  if (hasBackendRuntime()) {
+    return invoke<ToolApprovalGrant>("resolve_tool_prompt", { promptId, decision, feedback, question });
+  }
+  if (question) return { nonce: createId("preview-approval"), expiresInMs: 90_000 };
+  if (decision === "deny") throw new Error("用户拒绝了这次工具执行");
+  return { nonce: createId("preview-approval"), expiresInMs: 90_000 };
+}
+
+export async function attestEditedToolContext(
+  request: AttestEditedToolContextRequest
+): Promise<AttestEditedToolContextResponse> {
+  if (hasBackendRuntime()) {
+    return invoke<AttestEditedToolContextResponse>("attest_edited_tool_context", { request });
+  }
+  // A browser-only preview has no authoritative record or host signing key.
+  throw new Error("浏览器预览无法签发工具记录凭证，请连接应用后端");
+}
+
+export async function attestInsertedToolContext(
+  request: AttestInsertedToolContextRequest
+): Promise<AttestEditedToolContextResponse> {
+  if (hasBackendRuntime()) {
+    return invoke<AttestEditedToolContextResponse>("attest_inserted_tool_context", { request });
+  }
+  throw new Error("浏览器预览无法签发工具记录凭证，请连接应用后端");
+}
+
+export async function executeTool(request: ToolExecutionRequest, approvalNonce?: string): Promise<ToolExecutionResponse> {
+  if (hasBackendRuntime()) return invoke<ToolExecutionResponse>("execute_tool", { request, approvalNonce });
+  const started = performance.now();
+  await new Promise((resolve) => window.setTimeout(resolve, 280));
+  return {
+    success: true,
+    output: `[浏览器预览] ${request.toolName} 已接收参数\n${JSON.stringify(request.input, null, 2)}`,
+    executedAt: new Date().toISOString(),
+    durationMs: Math.round(performance.now() - started)
+  };
+}
+
+function detectImageMime(bytes: Uint8Array): ImageAttachment["mime"] {
+  if (
+    bytes.length >= 8
+    && bytes[0] === 0x89
+    && bytes[1] === 0x50
+    && bytes[2] === 0x4e
+    && bytes[3] === 0x47
+    && bytes[4] === 0x0d
+    && bytes[5] === 0x0a
+    && bytes[6] === 0x1a
+    && bytes[7] === 0x0a
+  ) return "image/png";
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    bytes.length >= 6
+    && bytes[0] === 0x47
+    && bytes[1] === 0x49
+    && bytes[2] === 0x46
+    && bytes[3] === 0x38
+    && (bytes[4] === 0x37 || bytes[4] === 0x39)
+    && bytes[5] === 0x61
+  ) return "image/gif";
+  if (
+    bytes.length >= 12
+    && bytes[0] === 0x52
+    && bytes[1] === 0x49
+    && bytes[2] === 0x46
+    && bytes[3] === 0x46
+    && bytes[8] === 0x57
+    && bytes[9] === 0x45
+    && bytes[10] === 0x42
+    && bytes[11] === 0x50
+  ) return "image/webp";
+  throw new Error("仅支持 PNG、JPEG、WebP 或静态 GIF 图片");
+}
+
+function isValidImageAttachmentName(name: string): boolean {
+  return name.length > 0
+    && new TextEncoder().encode(name).byteLength <= IMAGE_ATTACHMENT_MAX_NAME_BYTES
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(name);
+}
+
+function validatePreviewImageName(name: string): string {
+  const normalized = name.trim();
+  if (!isValidImageAttachmentName(normalized)) {
+    throw new Error(
+      `图片名称不能为空、不能含控制字符且不能超过 ${IMAGE_ATTACHMENT_MAX_NAME_BYTES} 字节`
+    );
+  }
+  return normalized;
+}
+
+function skipGifSubBlocks(bytes: Uint8Array, start: number): number {
+  let cursor = start;
+  while (true) {
+    const length = bytes[cursor];
+    if (length === undefined) throw new Error("GIF 子块长度被截断");
+    cursor += 1;
+    if (length === 0) return cursor;
+    cursor += length;
+    if (cursor > bytes.length) throw new Error("GIF 子块数据被截断");
+  }
+}
+
+function validatePreviewAnimationPolicy(bytes: Uint8Array, mime: ImageAttachment["mime"]): void {
+  if (mime !== "image/gif") return;
+  if (bytes.length < 13) throw new Error("GIF 文件头无效");
+  let cursor = 13;
+  const packed = bytes[10];
+  if ((packed & 0x80) !== 0) {
+    cursor += 3 * (1 << ((packed & 0x07) + 1));
+    if (cursor > bytes.length) throw new Error("GIF 全局调色板被截断");
+  }
+  let frames = 0;
+  while (true) {
+    const marker = bytes[cursor];
+    if (marker === undefined) throw new Error("GIF 数据缺少结束标记");
+    if (marker === 0x3b) {
+      if (frames !== 1) throw new Error("GIF 必须包含且仅包含一帧图片");
+      return;
+    }
+    if (marker === 0x21) {
+      cursor += 2;
+      if (cursor > bytes.length) throw new Error("GIF 扩展块位置被截断");
+      cursor = skipGifSubBlocks(bytes, cursor);
+      continue;
+    }
+    if (marker === 0x2c) {
+      frames += 1;
+      if (frames > 1) {
+        throw new Error("仅支持单帧 GIF；动画 GIF 无法作为跨 API 图片输入");
+      }
+      cursor += 10;
+      if (cursor > bytes.length) throw new Error("GIF 图像描述块被截断");
+      const localPacked = bytes[cursor - 1];
+      if ((localPacked & 0x80) !== 0) {
+        cursor += 3 * (1 << ((localPacked & 0x07) + 1));
+        if (cursor > bytes.length) throw new Error("GIF 局部调色板被截断");
+      }
+      cursor += 1;
+      if (cursor > bytes.length) throw new Error("GIF LZW 参数被截断");
+      cursor = skipGifSubBlocks(bytes, cursor);
+      continue;
+    }
+    throw new Error(`GIF 包含未知数据块 0x${marker.toString(16).padStart(2, "0")}`);
+  }
+}
+
+function detectImageDimensions(bytes: Uint8Array, mime: string): { width: number; height: number } {
+  if (mime === "image/png" && bytes.length >= 24) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return { width: view.getUint32(16), height: view.getUint32(20) };
+  }
+  if (mime === "image/gif" && bytes.length >= 10) {
+    return {
+      width: bytes[6] | (bytes[7] << 8),
+      height: bytes[8] | (bytes[9] << 8)
+    };
+  }
+  if (mime === "image/jpeg") {
+    let offset = 2;
+    const dimensionMarkers = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+    while (offset + 8 < bytes.length) {
+      if (bytes[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      const marker = bytes[offset + 1];
+      if (dimensionMarkers.has(marker)) {
+        return {
+          height: (bytes[offset + 5] << 8) | bytes[offset + 6],
+          width: (bytes[offset + 7] << 8) | bytes[offset + 8]
+        };
+      }
+      const length = (bytes[offset + 2] << 8) | bytes[offset + 3];
+      if (length < 2) break;
+      offset += 2 + length;
+    }
+  }
+  if (mime === "image/webp" && bytes.length >= 30) {
+    const chunk = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
+    if (chunk === "VP8X") {
+      return {
+        width: 1 + bytes[24] + (bytes[25] << 8) + (bytes[26] << 16),
+        height: 1 + bytes[27] + (bytes[28] << 8) + (bytes[29] << 16)
+      };
+    }
+    if (chunk === "VP8 " && bytes.length >= 30) {
+      return {
+        width: (bytes[26] | (bytes[27] << 8)) & 0x3fff,
+        height: (bytes[28] | (bytes[29] << 8)) & 0x3fff
+      };
+    }
+    if (chunk === "VP8L" && bytes.length >= 25) {
+      return {
+        width: 1 + (((bytes[22] & 0x3f) << 8) | bytes[21]),
+        height: 1 + (((bytes[24] & 0x0f) << 10) | (bytes[23] << 2) | ((bytes[22] & 0xc0) >> 6))
+      };
+    }
+  }
+  return { width: 0, height: 0 };
+}
+
+function validatePreviewImageDimensions(dimensions: { width: number; height: number }): void {
+  const pixels = dimensions.width * dimensions.height;
+  if (
+    dimensions.width <= 0
+    || dimensions.height <= 0
+    || dimensions.width > IMAGE_ATTACHMENT_MAX_DIMENSION
+    || dimensions.height > IMAGE_ATTACHMENT_MAX_DIMENSION
+    || !Number.isSafeInteger(pixels)
+    || pixels > IMAGE_ATTACHMENT_MAX_PIXELS
+  ) {
+    throw new Error(
+      `浏览器预览中的图片宽高必须为 1–${IMAGE_ATTACHMENT_MAX_DIMENSION} 像素，且总像素不能超过 16 MP`
+    );
+  }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.length, offset + 0x8000)));
+  }
+  return window.btoa(binary);
+}
+
+function strictBase64ToBytes(encoded: string): Uint8Array {
+  const maxEncodedLength = 4 * Math.ceil(PREVIEW_IMAGE_MAX_BYTES / 3);
+  if (
+    encoded.length === 0
+    || encoded.length > maxEncodedLength
+    || encoded.length % 4 !== 0
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(encoded)
+  ) {
+    throw new Error("图片 base64 数据无效");
+  }
+  const binary = window.atob(encoded);
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  if (bytes.byteLength === 0 || bytes.byteLength > PREVIEW_IMAGE_MAX_BYTES) {
+    throw new Error("浏览器预览图片字节数无效");
+  }
+  return bytes;
+}
+
+async function browserImageAttachmentId(bytes: Uint8Array): Promise<string> {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("浏览器预览缺少安全哈希能力，无法保存图片");
+  }
+  const digestInput = new Uint8Array(bytes.byteLength);
+  digestInput.set(bytes);
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", digestInput.buffer);
+  return Array.from(new Uint8Array(digest)).map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+interface PreviewImageIndexEntry {
+  id: string;
+  characters: number;
+  touchedAt: number;
+  orphanedAt?: number;
+}
+
+function previewImageIndex(): PreviewImageIndexEntry[] {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(IMAGE_ATTACHMENT_INDEX_KEY) ?? "[]") as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((entry) => {
+      const value = record(entry);
+      const orphanedAt = optionalNonNegativeInteger(value?.orphanedAt);
+      return value
+        && typeof value.id === "string"
+        && optionalNonNegativeInteger(value.characters) !== undefined
+        && optionalNonNegativeInteger(value.touchedAt) !== undefined
+        ? [{
+            id: value.id,
+            characters: value.characters as number,
+            touchedAt: value.touchedAt as number,
+            ...(orphanedAt === undefined ? {} : { orphanedAt })
+          }]
+        : [];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function referencedPreviewImageIdsIn(value: unknown): Set<string> {
+  const ids = new Set<string>();
+  const addImages = (candidate: unknown) => {
+    if (!Array.isArray(candidate)) return;
+    candidate.forEach((image) => {
+      const attachment = record(image);
+      if (typeof attachment?.id === "string" && /^[0-9a-f]{64}$/u.test(attachment.id)) {
+        ids.add(attachment.id);
+      }
+    });
+  };
+  const visitContexts = (candidate: unknown) => {
+    if (!Array.isArray(candidate)) return;
+    candidate.forEach((entry) => {
+      const context = record(entry);
+      if (!context) return;
+      if (context.kind === "user") addImages(context.images);
+      if (context.kind === "tool") {
+        addImages(record(context.result)?.images);
+        visitContexts(record(context.subagent)?.contexts);
+      }
+    });
+  };
+  const document = record(value);
+  if (!document || !Array.isArray(document.workspaces)) return ids;
+  document.workspaces.forEach((workspaceValue) => {
+    const workspace = record(workspaceValue);
+    if (!Array.isArray(workspace?.conversations)) return;
+    workspace.conversations.forEach((conversationValue) => {
+      const conversation = record(conversationValue);
+      if (!conversation) return;
+      visitContexts(conversation.contexts);
+      if (Array.isArray(conversation.queuedMessages)) {
+        conversation.queuedMessages.forEach((message) => addImages(record(message)?.images));
+      }
+      if (Array.isArray(conversation.branches)) {
+        conversation.branches.forEach((branch) => visitContexts(record(branch)?.contexts));
+      }
+    });
+  });
+  return ids;
+}
+
+function referencedPreviewImageIdsFromStorage(): Set<string> {
+  try {
+    return referencedPreviewImageIdsIn(JSON.parse(
+      window.localStorage.getItem(STORAGE_KEY) ?? "null"
+    ));
+  } catch {
+    // A corrupt preview document is handled by browserLoad; do not delete attachments optimistically.
+    return new Set();
+  }
+}
+
+function writePreviewImageIndex(index: PreviewImageIndexEntry[]): void {
+  window.localStorage.setItem(IMAGE_ATTACHMENT_INDEX_KEY, JSON.stringify(index));
+}
+
+function reconcilePreviewImageStore(
+  previousReferenced: Set<string>,
+  nextReferenced: Set<string>,
+  markAllUnreferenced: boolean
+): void {
+  const now = Date.now();
+  const next: PreviewImageIndexEntry[] = [];
+  for (const entry of previewImageIndex()) {
+    const storageKey = `${IMAGE_ATTACHMENT_STORAGE_PREFIX}${entry.id}`;
+    if (window.localStorage.getItem(storageKey) === null) continue;
+    if (nextReferenced.has(entry.id)) {
+      next.push({
+        id: entry.id,
+        characters: entry.characters,
+        touchedAt: entry.touchedAt
+      });
+      continue;
+    }
+    const orphanedAt = entry.orphanedAt
+      ?? ((markAllUnreferenced || previousReferenced.has(entry.id)) ? now : undefined);
+    if (orphanedAt !== undefined && now - orphanedAt >= PREVIEW_IMAGE_ORPHAN_GRACE_MS) {
+      window.localStorage.removeItem(storageKey);
+      continue;
+    }
+    next.push({
+      ...entry,
+      ...(orphanedAt === undefined ? {} : { orphanedAt })
+    });
+  }
+  writePreviewImageIndex(next);
+}
+
+function clearPreviewImageStore(): void {
+  const keys: string[] = [];
+  for (let index = 0; index < window.localStorage.length; index += 1) {
+    const key = window.localStorage.key(index);
+    if (key?.startsWith(IMAGE_ATTACHMENT_STORAGE_PREFIX)) keys.push(key);
+  }
+  keys.forEach((key) => window.localStorage.removeItem(key));
+  window.localStorage.removeItem(IMAGE_ATTACHMENT_INDEX_KEY);
+}
+
+function makePreviewImageStorageRoom(incomingId: string, incomingCharacters: number): PreviewImageIndexEntry[] {
+  const referenced = referencedPreviewImageIdsFromStorage();
+  const now = Date.now();
+  const index = previewImageIndex()
+    .filter((entry) => entry.id !== incomingId)
+    .filter((entry) => window.localStorage.getItem(`${IMAGE_ATTACHMENT_STORAGE_PREFIX}${entry.id}`) !== null)
+    .sort((left, right) => left.touchedAt - right.touchedAt);
+  let characters = index.reduce((total, entry) => total + entry.characters, 0) + incomingCharacters;
+  while (
+    index.length + 1 > PREVIEW_IMAGE_STORAGE_COUNT
+    || characters > PREVIEW_IMAGE_STORAGE_CHARACTERS
+  ) {
+    const removableIndex = index.findIndex((entry) => (
+      !referenced.has(entry.id)
+      && entry.orphanedAt !== undefined
+      && now - entry.orphanedAt >= PREVIEW_IMAGE_ORPHAN_GRACE_MS
+    ));
+    if (removableIndex < 0) break;
+    const [removed] = index.splice(removableIndex, 1);
+    characters -= removed.characters;
+    window.localStorage.removeItem(`${IMAGE_ATTACHMENT_STORAGE_PREFIX}${removed.id}`);
+  }
+  if (
+    index.length + 1 > PREVIEW_IMAGE_STORAGE_COUNT
+    || characters > PREVIEW_IMAGE_STORAGE_CHARACTERS
+  ) {
+    throw new Error("浏览器预览图片存储已满；请删除不再需要的旧对话图片后重试");
+  }
+  return index;
+}
+
+/** Stores image bytes outside the main document and returns its lightweight reference. */
+export async function prepareImageAttachment(name: string, bytes: Uint8Array): Promise<ImageAttachment> {
+  if (hasBackendRuntime()) {
+    return invoke<ImageAttachment>("image_attachment_upload", { name, data: bytesToBase64(bytes) });
+  }
+  const normalizedName = validatePreviewImageName(name);
+  if (bytes.byteLength > PREVIEW_IMAGE_MAX_BYTES) {
+    throw new Error("浏览器预览中的单张图片不能超过 3 MiB");
+  }
+  const mime = detectImageMime(bytes);
+  validatePreviewAnimationPolicy(bytes, mime);
+  const dimensions = detectImageDimensions(bytes, mime);
+  validatePreviewImageDimensions(dimensions);
+  const attachment: ImageAttachment = {
+    id: await browserImageAttachmentId(bytes),
+    name: normalizedName,
+    mime,
+    ...dimensions,
+    bytes: bytes.byteLength
+  };
+  const dataUrl = `data:${mime};base64,${bytesToBase64(bytes)}`;
+  const storageKey = `${IMAGE_ATTACHMENT_STORAGE_PREFIX}${attachment.id}`;
+  const previous = window.localStorage.getItem(storageKey);
+  try {
+    const index = makePreviewImageStorageRoom(attachment.id, dataUrl.length);
+    window.localStorage.setItem(
+      storageKey,
+      JSON.stringify({ attachment, dataUrl })
+    );
+    writePreviewImageIndex([
+      ...index,
+      { id: attachment.id, characters: dataUrl.length, touchedAt: Date.now() }
+    ]);
+  } catch (error) {
+    try {
+      if (previous === null) window.localStorage.removeItem(storageKey);
+      else window.localStorage.setItem(storageKey, previous);
+    } catch {
+      // Preserve the original quota/storage error below.
+    }
+    throw error instanceof Error && error.message.startsWith("浏览器预览")
+      ? error
+      : new Error("浏览器预览无法保存图片；本地存储空间可能不足");
+  }
+  return attachment;
+}
+
+/**
+ * Site icon for one web-search source, as a `data:` URL, or `null`.
+ *
+ * The host fetches it: the CSP is `img-src 'self' data:` with no outbound
+ * `connect-src`, so the renderer cannot reach the site — and should not, since
+ * doing it through a third-party icon service would hand that service every
+ * domain the user's searches touched. In the browser preview there is no host,
+ * so every site falls back to its lettered placeholder.
+ */
+export async function webSourceIcon(url: string): Promise<string | null> {
+  if (!hasBackendRuntime()) return null;
+  try {
+    return await invoke<string | null>("web_source_icon", { url }) ?? null;
+  } catch {
+    // A missing icon is ordinary. Reporting it would turn every site without
+    // one into an error the user has to read.
+    return null;
+  }
+}
+
+/** Resolves one attachment to a displayable data URL without putting bytes in the document. */
+/**
+ * The small picture an image's timeline chip shows: the host's thumbnail, made
+ * on first request. Without a host there is no thumbnail and the chip shows the
+ * image itself.
+ */
+export async function imageAttachmentThumbnail(imageId: string): Promise<string> {
+  if (hasBackendRuntime()) return invoke<string>("image_attachment_thumbnail", { imageId });
+  return imageAttachmentData(imageId);
+}
+
+export async function imageAttachmentData(imageId: string): Promise<string> {
+  if (hasBackendRuntime()) return invoke<string>("image_attachment_data", { imageId });
+  const stored = window.localStorage.getItem(`${IMAGE_ATTACHMENT_STORAGE_PREFIX}${imageId}`);
+  if (!stored) throw new Error(`图片 ${imageId} 不存在`);
+  try {
+    const input = record(JSON.parse(stored));
+    const attachment = record(input?.attachment);
+    const mime = attachment?.mime;
+    const normalizedAttachment = normalizeImageAttachments([attachment])?.[0];
+    if (
+      normalizedAttachment?.id !== imageId
+      || typeof input?.dataUrl !== "string"
+      || !input.dataUrl.startsWith(`data:${mime};base64,`)
+    ) throw new Error();
+    const bytes = strictBase64ToBytes(input.dataUrl.slice(`data:${mime};base64,`.length));
+    if (bytes.byteLength !== normalizedAttachment.bytes) throw new Error();
+    const detectedMime = detectImageMime(bytes);
+    if (detectedMime !== normalizedAttachment.mime) throw new Error();
+    validatePreviewAnimationPolicy(bytes, detectedMime);
+    const dimensions = detectImageDimensions(bytes, detectedMime);
+    validatePreviewImageDimensions(dimensions);
+    if (
+      dimensions.width !== normalizedAttachment.width
+      || dimensions.height !== normalizedAttachment.height
+      || await browserImageAttachmentId(bytes) !== imageId
+    ) throw new Error();
+    try {
+      const current = previewImageIndex().find((entry) => entry.id === imageId);
+      const index = previewImageIndex().filter((entry) => entry.id !== imageId);
+      writePreviewImageIndex([
+        ...index,
+        {
+          id: imageId,
+          characters: input.dataUrl.length,
+          touchedAt: Date.now(),
+          ...(current?.orphanedAt === undefined ? {} : { orphanedAt: current.orphanedAt })
+        }
+      ]);
+    } catch {
+      // Reading an existing attachment should still work if index maintenance hits quota.
+    }
+    return input.dataUrl;
+  } catch {
+    throw new Error(`图片 ${imageId} 已损坏`);
+  }
+}
+
+/**
+ * Browser-preview stand-in for the host's file attachment store. The frontend
+ * alone has nowhere durable to keep a file, so it lives for the page's lifetime:
+ * enough to attach, preview and send while developing the UI, and a reload
+ * leaves the reference behind with nothing to open — which the preview says.
+ */
+const previewFileAttachments = new Map<string, { format: FileAttachmentFormat; bytes: Uint8Array; text: string }>();
+const PREVIEW_FILE_ATTACHMENT_LIMIT = 32;
+
+function previewFileText(bytes: Uint8Array): string {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error("文本文件必须是 UTF-8 编码");
+  }
+  if (text.includes("\u0000")) throw new Error("文本文件不能包含空字符");
+  return text.startsWith("\uFEFF") ? text.slice(1) : text;
+}
+
+/**
+ * Stores a non-image file with the host and returns its reference.
+ *
+ * `extracted` is the text a PDF's pages carry, read out by the renderer (pdf.js
+ * lives here, not in the host); a text file is its own text and sends none.
+ */
+export async function prepareFileAttachment(
+  name: string,
+  bytes: Uint8Array,
+  format: FileAttachmentFormat,
+  extracted?: { text: string; pages: number }
+): Promise<FileAttachment> {
+  if (hasBackendRuntime()) {
+    return invoke<FileAttachment>("file_attachment_upload", {
+      name,
+      data: bytesToBase64(bytes),
+      format,
+      text: extracted?.text ?? null,
+      pages: extracted?.pages ?? null
+    });
+  }
+  const normalizedName = name.trim();
+  if (!isValidImageAttachmentName(normalizedName)) {
+    throw new Error(`文件名称不能为空、不能含控制字符且不能超过 ${IMAGE_ATTACHMENT_MAX_NAME_BYTES} 字节`);
+  }
+  if (!bytes.byteLength) throw new Error("文件是空的");
+  let text: string;
+  if (format === "text") {
+    if (bytes.byteLength > MAX_FILE_ATTACHMENT_TEXT_BYTES) throw new Error("文本文件过大");
+    text = previewFileText(bytes);
+  } else {
+    if (bytes.byteLength > MAX_FILE_ATTACHMENT_PDF_BYTES) throw new Error("PDF 过大");
+    if (!extracted?.text.trim() || extracted.pages < 1) throw new Error("PDF 没有可读取的文字");
+    text = extracted.text;
+  }
+  const id = await browserImageAttachmentId(bytes);
+  previewFileAttachments.delete(id);
+  previewFileAttachments.set(id, { format, bytes, text });
+  while (previewFileAttachments.size > PREVIEW_FILE_ATTACHMENT_LIMIT) {
+    const oldest = previewFileAttachments.keys().next().value as string | undefined;
+    if (!oldest) break;
+    previewFileAttachments.delete(oldest);
+  }
+  return {
+    id,
+    name: normalizedName,
+    format,
+    bytes: bytes.byteLength,
+    tokens: estimateTokens(text),
+    ...(format === "pdf" ? { pages: extracted?.pages ?? 1 } : {})
+  };
+}
+
+/** Resolves one file attachment to a `data:` URL of its original bytes. */
+export async function fileAttachmentData(fileId: string): Promise<string> {
+  if (hasBackendRuntime()) return invoke<string>("file_attachment_data", { fileId });
+  const stored = previewFileAttachments.get(fileId);
+  if (!stored) throw new Error(`文件 ${fileId} 不存在`);
+  const mime = stored.format === "pdf" ? "application/pdf" : "text/plain;charset=utf-8";
+  return `data:${mime};base64,${bytesToBase64(stored.bytes)}`;
+}
+
+/** What the host could tell about one path in a native drag, before anything is dropped. */
+export interface DroppedPathProbe {
+  path: string;
+  name: string;
+  kind: "file" | "directory" | "other" | "missing";
+  size: number;
+  /** Read from the file's first bytes; `none` for anything that is not a file. */
+  sniff: "image" | "pdf" | "text" | "binary" | "empty" | "unreadable" | "none";
+}
+
+/**
+ * Classifies the paths of the drag in progress.
+ *
+ * The host answers only for paths its own window saw enter or drop, so this is
+ * not a way to stat arbitrary files.
+ */
+export async function probeDroppedPaths(paths: string[]): Promise<DroppedPathProbe[]> {
+  if (!hasBackendRuntime()) return [];
+  return invoke<DroppedPathProbe[]>("dropped_paths_probe", { paths });
+}
+
+/** Reads one file of the last native drop, as a `File` the upload pipeline can take. */
+export async function readDroppedFile(path: string): Promise<File> {
+  const dropped = await invoke<{ name: string; data: string }>("dropped_file_read", { path });
+  const binary = window.atob(dropped.data);
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return new File([bytes], dropped.name);
+}
+
+export async function refreshCapabilities(): Promise<CapabilityCatalog> {
+  if (!hasBackendRuntime()) return (await browserLoad()).capabilities;
+  const catalog = await invoke<CapabilityCatalog>("discover_capabilities");
+  // The role entries carry a whole file body each, so they are made total here
+  // as the document's own copy is; a host from before roles were files sends no
+  // section at all, which is an empty one rather than an incomplete scan.
+  return catalog && typeof catalog === "object"
+    ? { ...catalog, agents: normalizeAgentRoleResources(catalog.agents) }
+    : catalog;
+}
+
+/**
+ * A summary of the configuration files discovery reads, which changes when any
+ * of them does. The settings pane polls it and rescans only when it moves. The
+ * browser preview has no files to watch, so its answer never changes.
+ */
+export async function capabilityFingerprint(): Promise<string> {
+  if (hasBackendRuntime()) return invoke<string>("capability_fingerprint");
+  return "";
+}
+
+/**
+ * Host commands for settings pages have no browser-preview fallback: dialling MCP
+ * servers, deleting folders on disk, and opening the OS file manager cannot be
+ * represented faithfully in a browser. Callers use `hasBackendRuntime()` to gate UI.
+ */
+
+/**
+ * Dials one discovered MCP server by its catalog id.
+ *
+ * The renderer names a server; it never describes one. The host re-reads the
+ * owning `mcp.json` and builds the connection from what is on disk, so nothing
+ * executable crosses IPC.
+ */
+export async function probeMcpServer(serverId: string): Promise<McpProbeReport> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法探测 MCP 服务器");
+  return invoke<McpProbeReport>("mcp_probe_server", { serverId });
+}
+
+/**
+ * Deletes one hook from the `hooks.json` it lives in.
+ *
+ * A hook is not a record in the application document — it is a line in a file the
+ * user maintains, so removing it is a write to that file. The catalog is stale
+ * afterwards: hook ids are derived from position, so the caller rescans rather
+ * than patching its copy.
+ */
+export async function deleteHook(hookId: string): Promise<void> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法删除钩子");
+  await invoke<void>("delete_hook", { hookId });
+}
+
+/**
+ * Deletes a discovered skill's folder, wherever the scan found it — under
+ * `~/.mewrk/skills` or a workspace's `.mewrk/skills`. The host re-discovers
+ * before deleting, so the renderer passes only the catalog id. The caller
+ * rescans.
+ */
+export async function deleteSkill(skillId: string): Promise<void> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法删除技能");
+  await invoke<void>("delete_skill", { skillId });
+}
+
+/**
+ * Removes a discovered server's key from the `mcp.json` it was read from,
+ * leaving the file's other keys untouched. The caller rescans.
+ */
+export async function deleteMcpServer(serverId: string): Promise<void> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法删除 MCP 服务器");
+  await invoke<void>("delete_mcp_server", { serverId });
+}
+
+/**
+ * Where `saveAgentRole` writes. `id` names an existing role file, which is
+ * overwritten in place — the host finds it again by a fresh scan, never by a
+ * path from here — and keeps its file name, so renaming a role keeps its id.
+ * Without `id` a new file is created at the level `workspaceKey` names
+ * (`capabilityWorkspaceKey`; `null` or absent is the global `~/.mewrk`).
+ * Mirrors Rust `SaveAgentRoleTarget`.
+ */
+export interface SaveAgentRoleTarget {
+  id?: string;
+  workspaceKey?: string | null;
+}
+
+/**
+ * Writes one subagent role file and resolves with the catalog id of the file
+ * written. A role is a JSON file the user owns — `<level>/.mewrk/agents/` —
+ * like a skill folder or an `mcp.json`, so only the host can write one; it
+ * validates the body the way discovery does and refuses rather than write a
+ * file discovery would mark unavailable. A built-in role cannot be saved; the
+ * editor saves a global copy instead. The caller rescans.
+ */
+export async function saveAgentRole(target: SaveAgentRoleTarget, role: AgentRole): Promise<string> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法保存角色");
+  return invoke<string>("save_agent_role", {
+    target: {
+      ...(target.id ? { id: target.id } : {}),
+      workspaceKey: target.workspaceKey ?? null
+    },
+    role
+  });
+}
+
+/**
+ * Deletes a discovered role's file, wherever the scan found it. The host
+ * re-discovers before deleting and refuses a built-in, so the renderer passes
+ * only the catalog id. Conversations that selected it keep a dangling id. The
+ * caller rescans.
+ */
+export async function deleteAgentRole(roleId: string): Promise<void> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法删除角色");
+  await invoke<void>("delete_agent_role", { roleId });
+}
+
+/**
+ * Opens the directory one kind of capability is configured in, creating it when
+ * it does not exist yet. `workspaceId` omitted is the global `~/.mewrk`; a
+ * workspace id opens that workspace's `.mewrk`.
+ */
+/**
+ * Opens a capability level's folder. On this computer the host opens it in the
+ * system file manager and answers `null`; a workspace on WSL or an SSH machine
+ * has its folder created there, and the answer names it for the Files pane.
+ */
+export async function revealCapabilityLocation(
+  kind: CapabilityResourceKind | "toolDescriptions",
+  workspaceKey?: string
+): Promise<{ machine: RunTarget; path: string } | null> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法打开目录");
+  return await invoke<{ machine: RunTarget; path: string } | null>("reveal_capability_location", {
+    kind,
+    workspaceKey: workspaceKey ?? null
+  });
+}
+
+export async function environmentToolSnapshots(): Promise<EnvironmentToolSnapshot[]> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法探测环境依赖");
+  return invoke<EnvironmentToolSnapshot[]>("environment_tool_snapshots");
+}
+
+/** Enumerate installed WSL distros. Browser preview returns an empty list, which is a
+ * normal absence of available distros rather than an error. */
+export async function listWslDistros(): Promise<WslDistro[]> {
+  if (!hasBackendRuntime()) return [];
+  return invoke<WslDistro[]>("list_wsl_distros");
+}
+
+/**
+ * Whether a machine (`null` is this one) can sandbox a workspace's commands, from the agent
+ * Mewrk runs there: the machine a workspace is on, not the one showing its settings.
+ */
+export async function machineSandboxSupport(machine: RunTarget | null): Promise<SandboxSupport | null> {
+  if (!hasBackendRuntime()) return null;
+  return invoke<SandboxSupport>("machine_sandbox_support", { machine });
+}
+
+/**
+ * Whether a workspace's directory is on a file system that ignores case, where the Linux sandbox
+ * (bubblewrap) protects files such as `.envrc` incompletely. Only worth asking where the
+ * machine's sandbox is bubblewrap; `null` in the browser preview.
+ */
+export async function workspaceSandboxIgnoresCase(machine: RunTarget | null, path: string): Promise<boolean | null> {
+  if (!hasBackendRuntime()) return null;
+  return invoke<boolean>("workspace_sandbox_ignores_case", { machine, path });
+}
+
+/** Sets this computer up for the sandbox (Windows: one administrator prompt); what it can do afterwards. */
+export async function setupLocalSandbox(): Promise<SandboxSupport> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法设置沙箱");
+  return invoke<SandboxSupport>("setup_local_sandbox");
+}
+
+export async function revealEnvironmentTool(executable: string): Promise<void> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法打开目录");
+  await invoke<void>("reveal_environment_tool", { executable });
+}
+
+/** Running version and install flavor; no network. */
+export async function appVersionInfo(): Promise<AppVersionInfo> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法读取版本信息");
+  return invoke<AppVersionInfo>("app_version_info");
+}
+
+/** Ask GitHub Releases for the latest version. The host owns the request; the WebView's CSP
+ * has no route to github.com. */
+// ---------------------------------------------------------------- local helper model
+
+/** Install and runtime status of the local helper model. */
+export async function localModelStatus(): Promise<LocalModelStatus> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<LocalModelStatus>("local_model_status");
+}
+
+/** Starts downloading one build of the model; progress arrives as `localModelChanged` events. */
+/** `chinaMirror` downloads from the mirror in mainland China (hf-mirror.com). */
+export async function localModelInstall(variant: LocalModelVariantId, chinaMirror: boolean): Promise<LocalModelStatus> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<LocalModelStatus>("local_model_install", { variant, chinaMirror });
+}
+
+/** Switches to another installed build, which then loads in the background. */
+export async function localModelActivate(variant: LocalModelVariantId): Promise<LocalModelStatus> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<LocalModelStatus>("local_model_activate", { variant });
+}
+
+export async function localModelCancelInstall(): Promise<void> {
+  if (!hasBackendRuntime()) return;
+  await invoke<void>("local_model_cancel_install");
+}
+
+/** Deletes one build: its files and its prompt caches. */
+export async function localModelRemove(variant: LocalModelVariantId): Promise<LocalModelStatus> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<LocalModelStatus>("local_model_remove", { variant });
+}
+
+/**
+ * Reports the token count and prefix state (KV cache) size of `prompt`, or of the prompt in
+ * effect for `task`. A state already cached is read from disk without the model; otherwise
+ * only `build` caches one, which may load the model (minutes on a Mac when the system has
+ * no compiled copy of it).
+ */
+export async function localModelPromptInfo(
+  task: LocalModelTask,
+  prompt?: string,
+  build = false
+): Promise<LocalModelPromptReport> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<LocalModelPromptReport>("local_model_prompt_info", { task, prompt: prompt ?? null, build });
+}
+
+/** The built-in prompts in the app language. */
+export async function localModelDefaultPrompts(): Promise<LocalModelDefaultPrompts> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  return invoke<LocalModelDefaultPrompts>("local_model_default_prompts");
+}
+
+/** The user named the conversation: the local helper model must not rename it. */
+export async function settleConversationTitle(conversationId: string): Promise<void> {
+  if (!hasBackendRuntime()) return;
+  await invoke<void>("settle_conversation_title", { conversationId });
+}
+
+/** What the local helper model wrote about a conversation's tool cards, by card id. */
+export interface ToolExplanations {
+  /** Shell command descriptions and subagent titles. */
+  explanations: Record<string, string>;
+  /** Why each failed call failed. */
+  errors: Record<string, string>;
+}
+
+export async function getToolExplanations(conversationId: string): Promise<ToolExplanations> {
+  if (!hasBackendRuntime()) return { explanations: {}, errors: {} };
+  return invoke<ToolExplanations>("get_tool_explanations", { conversationId });
+}
+
+export async function checkAppUpdate(): Promise<AppUpdateCheck> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法检查更新");
+  return invoke<AppUpdateCheck>("check_app_update");
+}
+
+/**
+ * Download the asset a check selected. `onProgress` receives byte counts while the transfer
+ * runs and a `verifying` marker while the host compares the digest with `SHA256SUMS`. Rejects
+ * with the host's cancellation message (`DOWNLOAD_CANCELLED_MESSAGES`) after `cancelAppUpdateDownload`.
+ */
+export async function downloadAppUpdate(
+  asset: AppReleaseAsset,
+  checksumsAsset: AppReleaseAsset | null,
+  onProgress: (event: AppUpdateDownloadEvent) => void
+): Promise<AppUpdateDownload> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法下载更新");
+  const channel = new Channel<AppUpdateDownloadEvent>();
+  channel.onmessage = onProgress;
+  return invoke<AppUpdateDownload>("download_app_update", {
+    asset,
+    checksumsAsset,
+    onProgress: channel
+  });
+}
+
+export async function cancelAppUpdateDownload(): Promise<void> {
+  if (!hasBackendRuntime()) return;
+  await invoke<void>("cancel_app_update_download");
+}
+
+/**
+ * Hand the downloaded file over. For the installer flavor the host starts the installer and
+ * exits the app, so the returned promise may never settle; callers must not wait on it to
+ * update their UI. For the portable flavor the archive is shown in the file manager.
+ */
+export async function installAppUpdate(path: string): Promise<AppUpdateInstallOutcome> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法安装更新");
+  return invoke<AppUpdateInstallOutcome>("install_app_update", { path });
+}
+
+let secretMutationTail: Promise<void> = Promise.resolve();
+
+function queueSecretMutation<T>(operation: () => Promise<T>): Promise<T> {
+  const result = secretMutationTail.catch(() => undefined).then(operation);
+  secretMutationTail = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+async function saveApiKeyNow(provider: ApiProvider, apiKey: string): Promise<ApiKeyStatus> {
+  const secret = apiKey.trim();
+  if (!secret) throw new Error("API Key 不能为空");
+  const keyLength = Array.from(secret).length;
+  if (hasBackendRuntime()) {
+    const result = await invoke<ApiKeyStatus | boolean | null>("save_api_key", { provider, apiKey: secret });
+    const status = typeof result === "object" && result && typeof result.configured === "boolean"
+      ? result
+      : { configured: result !== false };
+    await rememberApiKeyLength(provider.id, keyLength);
+    return { ...status, keyLength };
+  }
+  // Browser preview never performs a real network call, so retaining the supplied secret has no
+  // benefit. Keep only the non-secret length metadata that draws the mask.
+  await rememberApiKeyLength(provider.id, keyLength);
+  return { configured: true, keyLength };
+}
+
+export async function saveApiKey(provider: ApiProvider, apiKey: string): Promise<ApiKeyStatus> {
+  return queueSecretMutation(() => saveApiKeyNow(provider, apiKey));
+}
+
+export async function revealApiKey(provider: ApiProvider): Promise<string> {
+  await secretMutationTail;
+  if (!hasBackendRuntime()) throw new Error("浏览器预览不会保留 API Key 明文");
+  const secret = await invoke<string>("reveal_api_key", { provider });
+  await rememberApiKeyLength(provider.id, Array.from(secret).length);
+  return secret;
+}
+
+export async function deleteApiKey(provider: ApiProvider): Promise<ApiKeyStatus> {
+  return queueSecretMutation(async () => {
+    const status = hasBackendRuntime()
+      ? await invoke<ApiKeyStatus>("delete_api_key", { provider })
+      : await browserDeleteApiKey(provider.id);
+    await forgetStoredApiKeyLength(provider.id);
+    return status;
+  });
+}
+
+export async function codexOauthSignIn(provider: ApiProvider): Promise<CodexOauthStatus> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法登录 ChatGPT");
+  return invoke<CodexOauthStatus>("codex_oauth_sign_in", { provider });
+}
+
+export async function codexOauthCancelSignIn(provider: ApiProvider): Promise<void> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法登录 ChatGPT");
+  await invoke("codex_oauth_cancel_sign_in", { provider });
+}
+
+export async function codexOauthStatus(provider: ApiProvider): Promise<CodexOauthStatus> {
+  if (!hasBackendRuntime()) return { signedIn: false, signingIn: false, account: null };
+  return invoke<CodexOauthStatus>("codex_oauth_status", { provider });
+}
+
+export async function codexOauthSignOut(provider: ApiProvider): Promise<CodexOauthStatus> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法登录 ChatGPT");
+  return invoke<CodexOauthStatus>("codex_oauth_sign_out", { provider });
+}
+
+/**
+ * Read the local Claude Code login. There is no preview fallback: a fabricated
+ * "signed out" would invite the user to run a login the preview cannot start.
+ */
+export async function claudeAgentLoginStatus(provider: ApiProvider): Promise<ClaudeAgentLoginStatus> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法读取 Claude Code 登录状态");
+  return invoke<ClaudeAgentLoginStatus>("claude_agent_login_status", { provider });
+}
+
+export async function claudeAgentOpenLogin(provider: ApiProvider): Promise<void> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法读取 Claude Code 登录状态");
+  await invoke("claude_agent_open_login", { provider });
+}
+
+/**
+ * The Claude Agent SDK + Claude Code CLI components. `checkLatest` asks npm for the
+ * newest compatible version too (a network call); without it the host answers from
+ * what is on disk and the running task, which is what the progress poll uses.
+ */
+export async function claudeAgentComponentStatus(checkLatest: boolean): Promise<ClaudeAgentComponentStatus> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法管理 Claude Agent 组件");
+  return invoke<ClaudeAgentComponentStatus>("claude_agent_component_status", { checkLatest });
+}
+
+/** Start installing (or updating to) `version`; `null` takes the newest compatible one. Returns at once. */
+export async function installClaudeAgentComponent(version: string | null): Promise<void> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法管理 Claude Agent 组件");
+  await invoke("claude_agent_component_install", { version });
+}
+
+export async function cancelClaudeAgentComponentInstall(): Promise<void> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法管理 Claude Agent 组件");
+  await invoke("claude_agent_component_cancel");
+}
+
+/** The components Mewrk keeps current itself (the AI SDK sidecar); no network. */
+export async function appComponentsStatus(): Promise<AppComponentsStatus> {
+  if (!hasBackendRuntime()) throw new Error("浏览器预览无法读取组件状态");
+  return invoke<AppComponentsStatus>("app_components_status");
+}
+
+async function browserDeleteApiKey(providerId: string): Promise<ApiKeyStatus> {
+  await rememberApiKeyLength(providerId);
+  return { configured: false };
+}
+
+/**
+ * Fetch a provider's model catalog as a configuration-time action. It requires only
+ * a base URL and usually a key; enabled status is required only for conversation
+ * requests, which are checked by `runModel` and `validate_run_request`.
+ */
+export async function fetchModels(provider: ApiProvider): Promise<ModelProfile[]> {
+  if (hasBackendRuntime()) {
+    // Normalize discovered models because the host omits empty `name` and `group`
+    // fields while `ModelProfile` requires strings and the renderer calls `.trim()`.
+    const discovered = await invoke<unknown[]>("fetch_models", { provider });
+    return discovered
+      .map((model) => normalizeModel(model, provider.family))
+      .filter((model): model is ModelProfile => Boolean(model));
+  }
+  // Browser preview lacks host discovery policy and catalog. Its fixture must match
+  // the live shape, including `group`, so preview grouping matches desktop behavior,
+  // and the append capabilities Mewrk knows, which the host's projection declares.
+  return previewModels(provider).map((model) => ({
+    ...model,
+    capabilities: normalizeCapabilities([...model.capabilities, ...knownProtocolCapabilities(provider, model.id)])
+  }));
+}
+
+function previewModels(provider: ApiProvider): ModelProfile[] {
+  const common = {
+    reasoningContent: normalizeReasoningContent(undefined, provider.family),
+    promptCache: true
+  };
+  if (provider.family === "anthropic") {
+    return [
+      {
+        id: "claude-sonnet-preview",
+        name: "Claude Sonnet (preview)",
+        group: "claude",
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
+        capabilities: ["image_recognition"],
+        ...common
+      },
+      {
+        id: "claude-opus-preview",
+        name: "Claude Opus (preview)",
+        group: "claude",
+        contextWindow: 200000,
+        maxOutputTokens: 64000,
+        capabilities: ["image_recognition"],
+        ...common
+      }
+    ];
+  }
+  if (provider.family === "claude_agent") {
+    // The host asks the bundled CLI, which the preview does not have, so the
+    // preview serves the seed rows instead.
+    return CLAUDE_AGENT_REGISTRY.map(({ id, name, contextWindow, maxOutputTokens }) => ({
+      id,
+      name,
+      group: "claude",
+      contextWindow,
+      maxOutputTokens,
+      capabilities: ["image_recognition"],
+      ...common
+    }));
+  }
+  return [
+    {
+      id: "gpt-preview",
+      name: "GPT (preview)",
+      group: "gpt",
+      contextWindow: 128000,
+      maxOutputTokens: 32768,
+      capabilities: ["image_recognition"],
+      ...common
+    },
+    {
+      id: "gpt-mini-preview",
+      name: "GPT Mini (preview)",
+      group: "gpt",
+      contextWindow: 128000,
+      maxOutputTokens: 16384,
+      capabilities: ["image_recognition"],
+      ...common
+    },
+    {
+      id: "text-embedding-preview",
+      name: "Text Embedding (preview)",
+      group: "text",
+      contextWindow: 8192,
+      capabilities: [],
+      ...common
+    }
+  ];
+}
+
+/** The host reads the level as `thinkingEffort` (an alias of its `reasoning_effort`). */
+function modelRequestWithThinkingSelection<T extends { reasoningEffort: ReasoningEffort }>(
+  request: T
+): Omit<T, "reasoningEffort"> & { thinkingEffort: ReasoningEffort } {
+  const { reasoningEffort, ...rest } = request;
+  return { ...rest, thinkingEffort: reasoningEffort };
+}
+
+export async function runModel(
+  request: ModelRunRequest,
+  onEvent: (event: ModelStreamEvent) => void,
+  requestId: string
+): Promise<ModelRunResponse> {
+  if (!request.provider.enabled) {
+    throw new Error(`API 提供商 ${request.provider.name} 未启用，不能执行聊天请求`);
+  }
+  if (hasBackendRuntime()) {
+    type ModelChannelEvent = ModelStreamEvent
+      | { type: "debug_request_body"; round: number; body: unknown };
+    const channel = new Channel<ModelChannelEvent>();
+    channel.onmessage = (event) => {
+      if (event.type === "debug_request_body") {
+        console.log(`[dev] 模型 API 请求体（第 ${event.round} 轮）：`, event.body);
+        return;
+      }
+      onEvent(event);
+    };
+    return invoke<ModelRunResponse>("run_model", {
+      request: modelRequestWithThinkingSelection(request),
+      forkPromptContextId: request.forkPromptContextId,
+      compactNow: request.compactNow,
+      requestId,
+      onEvent: channel
+    });
+  }
+  const cancellation: PreviewRunControl = { cancelled: false, steers: [] };
+  previewRunCancellations.set(requestId, cancellation);
+  try {
+    const started = performance.now();
+    const latestUser = [...request.contexts].reverse().find((context) => context.kind === "user");
+    const text = latestUser && "content" in latestUser ? latestUser.content ?? "" : "";
+    const reasoning = `【浏览器预览】正在以 ${request.reasoningEffort} 程度检查当前对话与工作区上下文。`;
+    const output = `【浏览器预览】${request.provider.name} / ${request.model.id} 已接收请求。${text ? `\n\n用户输入：${text}` : ""}`;
+    const ensureRunning = () => {
+      if (cancellation.cancelled) throw new Error("模型运行已停止");
+    };
+    for (const delta of reasoning.match(/[\s\S]{1,8}/g) ?? []) {
+      await new Promise((resolve) => window.setTimeout(resolve, 4));
+      ensureRunning();
+      onEvent({ type: "reasoning_delta", round: 1, delta });
+    }
+    if (reasoning) onEvent({ type: "reasoning_done", round: 1 });
+    for (const delta of output.match(/[\s\S]{1,8}/g) ?? []) {
+      await new Promise((resolve) => window.setTimeout(resolve, 4));
+      ensureRunning();
+      onEvent({ type: "text_delta", round: 1, delta });
+    }
+    const inputTokens = Math.max(1, Math.ceil(text.length / 3));
+    const outputTokens = Math.ceil((reasoning.length + output.length) / 3);
+    const modelTurnId = `model-turn-${requestId}-1`;
+    const contexts: ContextItem[] = [
+        ...(reasoning ? [{
+          id: createId("ctx"),
+          kind: "reasoning" as const,
+          content: reasoning,
+          // The preview fixture generates its own plaintext reasoning content locally.
+          form: "plaintext" as const,
+          round: 1,
+          modelTurnId,
+          createdAt: new Date().toISOString()
+        }] : []),
+        { id: createId("ctx"), kind: "assistant", content: output, round: 1, modelTurnId, createdAt: new Date().toISOString() }
+    ];
+    let round = 2;
+    while (cancellation.steers.length) {
+      ensureRunning();
+      const steers = cancellation.steers.splice(0);
+      for (const steer of steers) {
+        onEvent({
+          type: "user_input_received",
+          round,
+          id: steer.id,
+          content: steer.content,
+          images: steer.images,
+          files: steer.files,
+          createdAt: steer.createdAt
+        });
+        contexts.push({
+          id: steer.id,
+          kind: "user",
+          content: steer.content,
+          images: steer.images,
+          files: steer.files,
+          createdAt: steer.createdAt
+        });
+      }
+      const steeredOutput = `【浏览器预览】已在当前回合接收引导：${steers.map((steer) =>
+        steer.content || `（${steer.images?.length ?? 0} 张图片）`
+      ).join("\n")}`;
+      for (const delta of steeredOutput.match(/[\s\S]{1,8}/g) ?? []) {
+        await new Promise((resolve) => window.setTimeout(resolve, 4));
+        ensureRunning();
+        onEvent({ type: "text_delta", round, delta });
+      }
+      contexts.push({
+        id: createId("ctx"),
+        kind: "assistant",
+        content: steeredOutput,
+        round,
+        modelTurnId: `model-turn-${requestId}-${round}`,
+        createdAt: new Date().toISOString()
+      });
+      round += 1;
+    }
+    return {
+      contexts,
+      usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      model: request.model.id,
+      providerName: request.provider.name,
+      durationMs: Math.round(performance.now() - started),
+      stopReason: "browser_preview",
+      contextTokens: inputTokens + outputTokens
+    };
+  } finally {
+    if (previewRunCancellations.get(requestId) === cancellation) {
+      previewRunCancellations.delete(requestId);
+    }
+  }
+}
+
+export async function cancelModelRun(requestId: string): Promise<boolean> {
+  if (hasBackendRuntime()) return invoke<boolean>("cancel_model_run", { requestId });
+  const cancellation = previewRunCancellations.get(requestId);
+  if (!cancellation) return false;
+  cancellation.cancelled = true;
+  return true;
+}
+
+/** Cancel the current run by conversation when a reload has lost the renderer's
+ * request ID. Browser preview tracks runs only by request ID, so it returns false. */
+export async function cancelConversationRun(conversationId: string): Promise<boolean> {
+  if (hasBackendRuntime()) {
+    return invoke<boolean>("cancel_conversation_run", { conversationId });
+  }
+  return false;
+}
+
+export interface ResumableRun {
+  conversationId: string;
+  requestId: string;
+  running: boolean;
+}
+
+export interface RunSettlementPayload {
+  response?: ModelRunResponse;
+  error?: string;
+}
+
+export type AttachRunResult =
+  | { status: "running"; requestId: string; request: ModelRunRequest; droppedEvents: number }
+  | { status: "finished"; requestId: string; request: ModelRunRequest; settlement: RunSettlementPayload }
+  | { status: "none" };
+
+/** List host runs that are live or have unclaimed settlement. Browser preview has none. */
+export async function listResumableRuns(): Promise<ResumableRun[]> {
+  if (hasBackendRuntime()) return invoke<ResumableRun[]>("list_resumable_runs");
+  return [];
+}
+
+/** Rescan conversations with deliverable results and no active run after adoption.
+ * `taskSettled` is an edge notification that can be evicted from bounded host backlog
+ * or lost when renderer state reloads. Browser preview has no pending wakeups. */
+export async function listWakePendingConversations(): Promise<string[]> {
+  if (hasBackendRuntime()) return invoke<string[]>("list_wake_pending_conversations");
+  return [];
+}
+
+/** List approval cards awaiting answers. Attach replay restores run-owned cards, but
+ * background-task cards can outlive every open stream and need restoration after
+ * startup or reconnection. Browser preview has none. */
+export async function listPendingToolPrompts(): Promise<
+  (PendingToolPrompt & { conversationId: string })[]
+> {
+  if (hasBackendRuntime()) {
+    return invoke<(PendingToolPrompt & { conversationId: string })[]>(
+      "list_pending_tool_prompts"
+    );
+  }
+  return [];
+}
+
+/** Load the conversation's plan document, or null when it has none. The plan is
+ * host state, not part of the document snapshot, so browser preview has none. */
+export async function loadConversationPlan(conversationId: string): Promise<ConversationPlan | null> {
+  if (hasBackendRuntime()) {
+    return invoke<ConversationPlan | null>("load_conversation_plan", { conversationId });
+  }
+  return null;
+}
+
+/** List the model's fork requests still waiting for the user, oldest first. The card
+ * belongs to no run, so nothing but this re-lists it after a reload. */
+export async function listPendingForkRequests(): Promise<PendingForkRequest[]> {
+  if (hasBackendRuntime()) {
+    return invoke<PendingForkRequest[]>("list_pending_fork_requests");
+  }
+  return [];
+}
+
+export interface PendingForkStart {
+  workspaceId: string;
+  conversationId: string;
+  promptContextId: string;
+}
+
+export async function listPendingForkStarts(): Promise<PendingForkStart[]> {
+  return hasBackendRuntime() ? invoke<PendingForkStart[]>("list_pending_fork_starts") : [];
+}
+
+/** Every answered fork request a conversation raised, oldest first. Task-bar rows
+ * only: the model is never shown them. */
+export async function listForkDecisions(conversationId: string): Promise<ForkDecisionRecord[]> {
+  return hasBackendRuntime()
+    ? invoke<ForkDecisionRecord[]>("list_fork_decisions", { conversationId })
+    : [];
+}
+
+/** Answer one fork card. Approval creates the child and returns it; the `forkResolved`
+ * push event — not this result — is what starts the child's run and carries the
+ * decision record the task bar shows. */
+export async function resolveForkRequest(
+  forkId: string,
+  approved: boolean
+): Promise<Conversation | null> {
+  if (!hasBackendRuntime()) return null;
+  return invoke<Conversation | null>("resolve_fork_request", { forkId, approved });
+}
+
+/** Attach a conversation's host event stream, replaying buffered events into `onEvent`. */
+export async function attachModelRun(
+  conversationId: string,
+  onEvent: (event: ModelStreamEvent) => void
+): Promise<AttachRunResult> {
+  if (!hasBackendRuntime()) return { status: "none" };
+  type ModelChannelEvent = ModelStreamEvent
+    | { type: "debug_request_body"; round: number; body: unknown };
+  const channel = new Channel<ModelChannelEvent>();
+  channel.onmessage = (event) => {
+    if (event.type === "debug_request_body") return;
+    onEvent(event);
+  };
+  return invoke<AttachRunResult>("attach_model_run", { conversationId, onEvent: channel });
+}
+
+/** Claim a `run_concluded` settlement, returning `null` when none is available. */
+export async function takeRunSettlement(
+  conversationId: string
+): Promise<RunSettlementPayload | null> {
+  if (!hasBackendRuntime()) return null;
+  return invoke<RunSettlementPayload | null>("take_run_settlement", { conversationId });
+}
+
+export async function steerModelRun(
+  requestId: string,
+  message: QueuedMessage
+): Promise<void> {
+  if (hasBackendRuntime()) {
+    await invoke("steer_model_run", {
+      requestId,
+      messageId: message.id,
+      content: message.content,
+      images: message.images,
+      files: message.files,
+      createdAt: message.createdAt
+    });
+    return;
+  }
+  const control = previewRunCancellations.get(requestId);
+  if (!control) throw new Error("模型回合已经结束；消息仍保留在队列中");
+  control.steers.push(message);
+}
+
+/** What the run panel can ask of one running step. */
+export type WorkflowStepAction = "skip" | "retry";
+
+/**
+ * Asks a live workflow run to skip or retry one running step.
+ *
+ * The run is addressed by its conversation, not by the round that started it:
+ * a run outlives that round, and its controls work for as long as it runs.
+ * Skip ends the step and hands the script `null`; Retry stops it and runs it
+ * again from scratch, and the script gets the new attempt's result. The host
+ * refuses a run that has already ended.
+ */
+export async function controlWorkflowStep(
+  conversationId: string,
+  runId: string,
+  stepIndex: number,
+  action: WorkflowStepAction
+): Promise<void> {
+  if (!hasBackendRuntime()) throw new Error("当前页面没有连接 Rust 后端");
+  await invoke("workflow_step_control", {
+    conversationId,
+    runId,
+    stepIndex,
+    action
+  });
+}
+
+/**
+ * Loads one workflow step's externalized full record from the run directory.
+ *
+ * The timeline context only carries a preview and the retrieval coordinates
+ * (`runId` + `stepIndex`); the drawer calls this when it needs the transcript.
+ * `null` is a legal answer, not an error: run directories are deleted with
+ * their conversation, so a dangling coordinate renders as "body no longer
+ * available" rather than throwing.
+ */
+export async function workflowStepRecord(
+  conversationId: string,
+  runId: string,
+  stepIndex: number
+): Promise<SubagentRunRecord | null> {
+  if (!hasBackendRuntime()) return null;
+  return (
+    (await invoke<SubagentRunRecord | null>("workflow_step_record", {
+      conversationId,
+      runId,
+      stepIndex
+    })) ?? null
+  );
+}
+
+/** Clear browser-preview markers that record a configured provider key. Provider IDs
+ * may survive a reset, so their ID-keyed markers must be removed with the document. */
+function clearPreviewApiKeyMarkers(): void {
+  const localKeys: string[] = [];
+  for (let index = 0; index < window.localStorage.length; index += 1) {
+    const key = window.localStorage.key(index);
+    if (key?.startsWith(API_KEY_LENGTH_PREFIX)) localKeys.push(key);
+  }
+  localKeys.forEach((key) => window.localStorage.removeItem(key));
+}
+
+export async function resetDocument(): Promise<AppDocument> {  await documentSaveTail.catch(() => undefined);
+  if (hasBackendRuntime()) return normalizeDocument(await invoke<unknown>("reset_document"));
+  const next = createSeedDocument();
+  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  clearPreviewImageStore();
+  clearPreviewApiKeyMarkers();
+  return next;
+}

@@ -1,0 +1,285 @@
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { configureI18n } from "../i18n";
+import { PopoverMenu } from "./PopoverMenu";
+import type { PopoverMenuProps } from "./PopoverMenu";
+
+function renderMenu() {
+  render(
+    <PopoverMenu
+      trigger={<span>模型</span>}
+      triggerLabel="模型"
+      menuLabel="模型"
+      sections={[{
+        id: "models",
+        items: [
+          { id: "a", label: "模型 A" },
+          { id: "b", label: "模型 B" }
+        ]
+      }]}
+    />
+  );
+}
+
+describe("PopoverMenu", () => {
+  beforeEach(() => configureI18n("zh-CN"));
+
+  it("puts a row's and a heading's action beside them, not inside them, and closes on it", async () => {
+    const user = userEvent.setup();
+    const onRow = vi.fn();
+    const onRowAction = vi.fn();
+    const onSectionAction = vi.fn();
+    render(
+      <PopoverMenu
+        trigger={<span>机器</span>}
+        triggerLabel="机器"
+        menuLabel="机器"
+        sections={[{
+          id: "machines",
+          label: "本机",
+          action: { label: "本机 的设置", icon: <span>⚙</span>, onSelect: onSectionAction },
+          items: [{ id: "app", label: "app", onSelect: onRow, action: { label: "app 的环境变量", icon: <span>⚙</span>, onSelect: onRowAction } }]
+        }]}
+      />
+    );
+
+    await user.click(screen.getByRole("button", { name: "机器" }));
+    const menu = screen.getByRole("menu", { name: "机器" });
+    const rowAction = within(menu).getByRole("button", { name: "app 的环境变量" });
+    // Nested buttons are invalid, so the action is the row button's sibling.
+    expect(rowAction.closest(".popover-menu__item")).toBeNull();
+    expect(rowAction).toHaveAttribute("title", "app 的环境变量");
+    expect(within(menu).getByRole("button", { name: "本机 的设置" }).closest(".popover-menu__label"))
+      .toHaveTextContent("本机");
+
+    await user.click(rowAction);
+    expect(onRowAction).toHaveBeenCalledTimes(1);
+    expect(onRow).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu", { name: "机器" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "机器" }));
+    await user.click(screen.getByRole("button", { name: "本机 的设置" }));
+    expect(onSectionAction).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("menu", { name: "机器" })).toBeNull();
+  });
+
+  it("stays open while its own list scrolls", async () => {
+    const user = userEvent.setup();
+    renderMenu();
+    await user.click(screen.getByRole("button", { name: "模型" }));
+
+    const list = screen.getByRole("menu", { name: "模型" }).querySelector(".popover-menu__list");
+    expect(list).not.toBeNull();
+    // A real scroll event does not bubble; it reaches the window listener through capture, which is
+    // exactly how `fireEvent.scroll` propagates it here.
+    fireEvent.scroll(list as Element);
+
+    expect(screen.getByRole("menu", { name: "模型" })).toBeInTheDocument();
+  });
+
+  it("paints above a modal its trigger sits in, and keeps the stylesheet's layer elsewhere", async () => {
+    const user = userEvent.setup();
+    const { unmount } = render(
+      <div style={{ position: "fixed", zIndex: 1200 }}>
+        <PopoverMenu
+          trigger={<span>搜索提供商</span>}
+          triggerLabel="搜索提供商"
+          menuLabel="搜索提供商"
+          sections={[{ id: "backends", items: [{ id: "native", label: "原生" }] }]}
+        />
+      </div>
+    );
+    await user.click(screen.getByRole("button", { name: "搜索提供商" }));
+    // Portaled to the body, the panel stacks against the backdrop rather than inside it.
+    expect(screen.getByRole("menu", { name: "搜索提供商" }).style.zIndex).toBe("1201");
+    unmount();
+
+    renderMenu();
+    await user.click(screen.getByRole("button", { name: "模型" }));
+    expect(screen.getByRole("menu", { name: "模型" }).style.zIndex).toBe("");
+  });
+
+  it("closes when the page behind it scrolls, because the measured position goes stale", async () => {
+    const user = userEvent.setup();
+    renderMenu();
+    await user.click(screen.getByRole("button", { name: "模型" }));
+    expect(screen.getByRole("menu", { name: "模型" })).toBeInTheDocument();
+
+    fireEvent.scroll(document);
+
+    expect(screen.queryByRole("menu", { name: "模型" })).toBeNull();
+  });
+  /* Two nesting shapes, because they answer different questions. Inline is a
+     list that happens to have groups in it; a flyout is a second step that
+     refines the row it came from, so the row stays visible beside its choices.
+     Only the second one needs the panel to stop clipping what it contains. */
+  it("opens a nested list beside its row in flyout mode, not inside the scrolling list", async () => {
+    const user = userEvent.setup();
+    render(
+      <PopoverMenu
+        trigger={<span>后端</span>}
+        triggerLabel="后端"
+        menuLabel="后端"
+        submenu="flyout"
+        sections={[{
+          id: "backends",
+          items: [
+            {
+              id: "native",
+              label: "原生",
+              checked: true,
+              children: [{ id: "v1", label: "web_search_20250305", checked: true }]
+            },
+            { id: "provider", label: "提供商", checked: false }
+          ]
+        }]}
+      />
+    );
+    await user.click(screen.getByRole("button", { name: "后端" }));
+
+    const panel = screen.getByRole("menu", { name: "后端" });
+    expect(panel).toHaveClass("popover-menu__panel--flyout");
+    const native = screen.getByRole("menuitemradio", { name: "原生" });
+    expect(native).toHaveAttribute("aria-expanded", "false");
+    await user.click(native);
+
+    expect(native).toHaveAttribute("aria-expanded", "true");
+    const nested = screen.getByRole("menu", { name: "原生" });
+    // A panel of its own beside the menu, not a box inside it.
+    expect(nested).toHaveClass("popover-menu__panel", "popover-menu__flyout");
+    expect(panel).not.toContainElement(nested);
+    expect(nested.parentElement).toBe(panel.parentElement);
+    await user.click(within(nested).getByRole("menuitemradio", { name: "web_search_20250305" }));
+    // A press in the submenu is a press in the menu: the row was chosen, and the menu closed after.
+    expect(screen.queryByRole("menu", { name: "后端" })).not.toBeInTheDocument();
+  });
+
+  it("walks into a submenu with the right arrow and back out with the left", async () => {
+    const user = userEvent.setup();
+    render(
+      <PopoverMenu
+        trigger={<span>后端</span>}
+        triggerLabel="后端"
+        menuLabel="后端"
+        submenu="flyout"
+        sections={[{
+          id: "backends",
+          items: [
+            { id: "native", label: "原生", children: [{ id: "v1", label: "第一版" }, { id: "v2", label: "第二版" }] },
+            { id: "provider", label: "提供商" }
+          ]
+        }]}
+      />
+    );
+    await user.click(screen.getByRole("button", { name: "后端" }));
+    const native = screen.getByRole("menuitem", { name: "原生" });
+    native.focus();
+
+    await user.keyboard("{ArrowRight}");
+    expect(native).toHaveAttribute("aria-expanded", "true");
+    expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: "第一版" }));
+    await user.keyboard("{ArrowDown}");
+    expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: "第二版" }));
+
+    await user.keyboard("{ArrowLeft}");
+    expect(screen.queryByRole("menu", { name: "原生" })).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(native);
+  });
+
+  it("nests inline by default, so an ordinary menu keeps one scrolling list", async () => {
+    const user = userEvent.setup();
+    render(
+      <PopoverMenu
+        trigger={<span>分组</span>}
+        triggerLabel="分组"
+        menuLabel="分组"
+        sections={[{
+          id: "groups",
+          items: [{ id: "g", label: "一组", children: [{ id: "x", label: "成员" }] }]
+        }]}
+      />
+    );
+    await user.click(screen.getByRole("button", { name: "分组" }));
+    await user.click(screen.getByRole("menuitem", { name: "一组" }));
+
+    const nested = screen.getByRole("menu", { name: "一组" });
+    expect(nested).toHaveClass("popover-menu__submenu");
+    expect(nested).not.toHaveClass("popover-menu__submenu--flyout");
+    expect(screen.getByRole("menu", { name: "分组" }))
+      .not.toHaveClass("popover-menu__panel--flyout");
+  });
+
+  describe("placement", () => {
+    const PANEL_HEIGHT = 120;
+
+    /** jsdom lays nothing out, so hand the anchor and the panel the boxes a real window would. */
+    function layout(triggerTop: number) {
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+        this: HTMLElement
+      ) {
+        const box = this.classList.contains("popover-menu__panel")
+          ? { left: 0, top: 0, width: 200, height: PANEL_HEIGHT }
+          : this.tagName === "BUTTON" && this.getAttribute("aria-haspopup") === "menu"
+            ? { left: 40, top: triggerTop, width: 90, height: 25 }
+            : { left: 0, top: 0, width: 0, height: 0 };
+        return {
+          ...box,
+          x: box.left,
+          y: box.top,
+          right: box.left + box.width,
+          bottom: box.top + box.height,
+          toJSON: () => box
+        } as DOMRect;
+      });
+    }
+
+    function renderPlaced(props: Partial<PopoverMenuProps> = {}) {
+      render(
+        <PopoverMenu
+          trigger={<span>机器</span>}
+          triggerLabel="机器"
+          menuLabel="机器"
+          sections={[{ id: "machines", items: [{ id: "local", label: "本机" }] }]}
+          {...props}
+        />
+      );
+    }
+
+    afterEach(() => vi.restoreAllMocks());
+
+    it("opens below by default even when there is room above", async () => {
+      layout(500);
+      const user = userEvent.setup();
+      renderPlaced();
+      await user.click(screen.getByRole("button", { name: "机器" }));
+
+      const panel = screen.getByRole("menu", { name: "机器" });
+      expect(panel).not.toHaveClass("popover-menu__panel--flipped");
+      expect(panel.style.top).toBe(`${500 + 25 + 6}px`);
+    });
+
+    it("opens above the trigger when asked to and the panel fits there", async () => {
+      layout(500);
+      const user = userEvent.setup();
+      renderPlaced({ placement: "above", panelClassName: "extra-layer" });
+      await user.click(screen.getByRole("button", { name: "机器" }));
+
+      const panel = screen.getByRole("menu", { name: "机器" });
+      expect(panel).toHaveClass("popover-menu__panel--flipped");
+      expect(panel).toHaveClass("extra-layer");
+      expect(panel.style.top).toBe(`${500 - 6 - PANEL_HEIGHT}px`);
+    });
+
+    it("falls back below when there is no room above", async () => {
+      layout(40);
+      const user = userEvent.setup();
+      renderPlaced({ placement: "above" });
+      await user.click(screen.getByRole("button", { name: "机器" }));
+
+      const panel = screen.getByRole("menu", { name: "机器" });
+      expect(panel).not.toHaveClass("popover-menu__panel--flipped");
+      expect(panel.style.top).toBe(`${40 + 25 + 6}px`);
+    });
+  });
+});

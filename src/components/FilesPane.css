@@ -1,0 +1,278 @@
+/* The file manager: each tab is a page, a 240px tree column beside one open file. The column is an
+   address bar, the tree, and a footer with the filter and the workspaces. Both columns fill the pane
+   body and scroll inside themselves, so a long path or a long line can never widen the pane. */
+.files-pane {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: row; overflow: hidden;
+  color: var(--text);
+}
+
+/* ---- title bar ---- */
+
+.files-pane__header {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 4px;
+}
+/* The title keeps its own width and the drawer handle sits right against it, so the handle is in
+   the same place whether or not a strip of tabs follows. */
+.files-pane__pane-title {
+  flex: 0 0 auto; min-width: 0; padding-left: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; -webkit-user-select: none; user-select: none;
+  color: var(--muted); font-size: 12.5px; font-weight: 500;
+}
+/* Two classes so the compact control outranks `.icon-button` in the barrel, which loads last. */
+.files-pane__header .files-pane__tree-toggle {
+  width: 24px; height: 24px; flex: 0 0 24px; margin-left: -2px; border-radius: 5px; color: var(--muted);
+}
+.files-pane__header .files-pane__tree-toggle:hover:not(:disabled) { color: var(--text); }
+
+/* The pages are the shared page strip (PageTabs.css). A preview page is the one the transcript
+   reuses for the next path it opens; italics say it is on loan. */
+.files-pane__tab--preview .page-tab__text { font-style: italic; }
+.files-pane__header .page-tabs { flex: 1; min-width: 0; }
+.files-pane__header .files-pane__add-page { width: 24px; height: 24px; flex: 0 0 24px; border-radius: 5px; }
+
+/* ---- tree column ---- */
+
+.files-pane__tree-column {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.files-pane__tree-column[hidden] { display: none; }
+/* Beside an open file the tree is a fixed column with a rule between the two. */
+.files-pane__tree-column--aside {
+  flex: 0 0 auto; border-right: 1px solid var(--border);
+}
+
+/* ---- address bar ---- */
+
+/* Where the page is, machine included. It reads as text until clicked, and then it is the field
+   that takes a typed one; the arrow before it goes up a level, and from a machine's top to the
+   list of machines. */
+.files-pane__address {
+  height: 32px; flex: 0 0 32px; padding: 0 6px 0 4px;
+  display: flex; align-items: center; gap: 2px;
+  border-bottom: 1px solid var(--border);
+}
+.files-pane__address .files-pane__address-up {
+  width: 22px; height: 22px; flex: 0 0 22px; border-radius: 5px; color: var(--muted);
+}
+.files-pane__address .files-pane__address-up:hover:not(:disabled) { color: var(--text); }
+/* A long path gives way in the middle (`PathText`): the directory being looked at is its end,
+   and that stays whole. */
+.files-pane__address-display {
+  flex: 1; min-width: 0; height: 24px; padding: 0 6px;
+  border: 0; border-radius: 5px; background: none; cursor: text;
+  text-align: left; overflow: hidden; white-space: nowrap;
+  color: var(--muted); font-size: 11.5px; line-height: 24px;
+}
+.files-pane__address-display:hover { background: var(--hover); color: var(--text); }
+.files-pane__address-display:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.files-pane__address-text { unicode-bidi: isolate; }
+.files-pane__address-placeholder { display: block; overflow: hidden; text-overflow: ellipsis; color: var(--faint); }
+.files-pane__address-input {
+  flex: 1; min-width: 0; height: 24px; padding: 0 6px;
+  border: 1px solid var(--border-strong); border-radius: 5px; background: var(--app);
+  color: var(--text); font-size: 11.5px;
+}
+.files-pane__address-input:focus { outline: none; border-color: var(--focus); }
+.files-pane__address-input--invalid,
+.files-pane__address-input--invalid:focus { border-color: var(--danger); }
+.files-pane__address-busy { flex: 0 0 13px; color: var(--faint); }
+.files-pane__address-error {
+  flex: 0 0 auto; margin: 0; padding: 4px 10px;
+  color: var(--danger); font-size: 10.5px; line-height: 1.4;
+}
+
+/* The tree and its empty space, which is the directory's own context menu. */
+.files-pane__tree-scroll {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+/* ---- footer ---- */
+
+.files-pane__footer {
+  height: 32px; flex: 0 0 32px; padding: 0 4px 0 0;
+  display: flex; align-items: center; gap: 2px;
+  border-top: 1px solid var(--border);
+}
+.files-pane__footer .files-pane__workspaces {
+  width: 24px; height: 24px; flex: 0 0 24px; border-radius: 5px; color: var(--muted);
+}
+.files-pane__footer .files-pane__workspaces:hover { color: var(--text); }
+.files-pane__filter {
+  flex: 1; min-width: 0; height: 100%; padding: 0 4px 0 8px;
+  display: flex; align-items: center; gap: 6px;
+}
+.files-pane__filter-icon {
+  flex: 0 0 16px; width: 16px; height: 16px;
+  display: grid; place-items: center; color: var(--faint);
+}
+.files-pane__filter-input {
+  flex: 1; min-width: 0;
+  border: 0; background: none; color: var(--text); font-size: 11.5px;
+  text-overflow: ellipsis;
+}
+.files-pane__filter-input:focus { outline: none; }
+.files-pane__filter-input::placeholder { color: var(--faint); }
+.files-pane__filter .files-pane__filter-clear {
+  width: 18px; height: 18px; flex: 0 0 18px; border-radius: 4px;
+}
+
+.files-pane__tree {
+  flex: 1; min-width: 0; min-height: 0; margin: 0; padding: 5px 4px;
+  list-style: none; overflow-y: scroll; overflow-x: hidden;
+}
+.files-pane__row {
+  position: relative; min-height: 24px; padding-right: 8px;
+  display: flex; align-items: center; gap: 4px;
+  border-radius: 5px; color: var(--text); font-size: 12px; line-height: 24px;
+  -webkit-user-select: none; user-select: none; cursor: pointer;
+}
+.files-pane__row:hover { background: var(--hover); }
+.files-pane__row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.files-pane__row--current { background: var(--active); }
+.files-pane__row--current:hover { background: var(--active); }
+/* A revealed row is lit long enough to be found, then released. The transition is on
+   the release so the jump lands instantly and the glow is what fades. */
+.files-pane__row--revealed { background: var(--accent-soft); }
+.files-pane__row { transition: background-color .3s; }
+.files-pane__row--message { color: var(--faint); cursor: default; }
+.files-pane__row--message:hover { background: transparent; }
+.files-pane__row--failed { color: var(--danger); }
+
+.files-pane__chevron {
+  width: 14px; height: 14px; flex: 0 0 14px;
+  color: var(--faint); transition: transform .12s;
+}
+.files-pane__chevron--open { transform: rotate(90deg); }
+.files-pane__icon { flex: 0 0 14px; color: var(--muted); }
+.files-pane__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The directory a match lives in, after the name it matched. */
+.files-pane__detail {
+  min-width: 0; flex: 0 1 auto;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--faint); font-size: 10.5px;
+}
+.files-pane__match { color: var(--text); font-weight: 600; }
+
+/* A link is marked after its name; what it opens is what it leads to. */
+.files-pane__link { flex: 0 0 11px; color: var(--faint); }
+/* A name that leads nowhere — a broken link, a socket — is listed but has nothing to open. */
+.files-pane__row--other { color: var(--muted); cursor: default; }
+/* A row being named: a rename, or a new folder at the top of the tree. */
+.files-pane__row--editing { cursor: default; }
+.files-pane__row--editing:hover { background: transparent; }
+.files-pane__rename {
+  flex: 1; min-width: 0; height: 20px; margin-right: 4px; padding: 0 5px;
+  border: 1px solid var(--focus); border-radius: 4px; background: var(--app);
+  color: var(--text); font-size: 12px;
+}
+.files-pane__rename:focus { outline: none; }
+
+.files-pane__row-menu { flex: 0 0 auto; margin-left: auto; display: flex; align-items: center; opacity: 0; }
+.files-pane__row:hover .files-pane__row-menu,
+.files-pane__row:focus-within .files-pane__row-menu { opacity: 1; }
+.files-pane__tree .files-pane__row-menu-trigger {
+  width: 18px; height: 18px; flex: 0 0 18px; border-radius: 4px;
+}
+
+/* ---- what the last action said ---- */
+
+.files-pane__action-error {
+  flex: 0 0 auto; margin: 0; padding: 6px 4px 6px 10px;
+  display: flex; align-items: flex-start; gap: 6px;
+  border-top: 1px solid var(--border);
+  color: var(--danger); font-size: 11px; line-height: 1.45;
+}
+.files-pane__action-error > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.files-pane__action-error .icon-button { width: 18px; height: 18px; flex: 0 0 18px; border-radius: 4px; }
+
+/* A delete asks first, above the footer, in the column it came from. */
+.files-pane__confirm {
+  flex: 0 0 auto; padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 8px;
+  border-top: 1px solid var(--border); background: var(--subtle);
+}
+.files-pane__confirm p { margin: 0; color: var(--text); font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere; }
+.files-pane__confirm-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.files-pane__confirm-actions button {
+  height: 24px; padding: 0 10px; border-radius: 5px; font-size: 11.5px;
+  border: 1px solid var(--border-strong); background: var(--panel); color: var(--text);
+}
+.files-pane__confirm-actions button:hover:not(:disabled) { background: var(--hover); }
+.files-pane__confirm-actions .files-pane__confirm-delete { border-color: var(--danger); color: var(--danger); }
+.files-pane__confirm-actions button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+/* ---- viewer ---- */
+
+.files-pane__viewer {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+/* The open file's own row: what it is, and the actions that belong to it. */
+.files-pane__viewer-bar {
+  height: 32px; flex: 0 0 32px; padding: 0 4px 0 8px;
+  display: flex; align-items: center; gap: 2px;
+  border-bottom: 1px solid var(--border);
+}
+.files-pane__viewer-path {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11px;
+}
+.files-pane__viewer-directory { color: var(--faint); }
+.files-pane__viewer-name { color: var(--text); font-weight: 500; }
+.files-pane__viewer-bar .files-pane__viewer-button {
+  width: 22px; height: 22px; flex: 0 0 22px; border-radius: 5px;
+}
+.files-pane__viewer-bar .files-pane__viewer-button[aria-pressed="true"] {
+  background: var(--active); color: var(--text);
+}
+.files-pane__notice {
+  flex: 0 0 auto; margin: 0; padding: 6px 10px;
+  color: var(--muted); font-size: 11px;
+}
+.files-pane__error {
+  flex: 0 0 auto; margin: 0; padding: 6px 10px;
+  color: var(--danger); font-size: 11px;
+}
+/* The numbered view's own look lives with it in `CodeBlock.css`; in the pane it only has to fill
+   the viewer. */
+.files-pane__code { flex: 1; }
+
+/* ---- rendered document ---- */
+
+.files-pane__document {
+  flex: 1; min-width: 0; min-height: 0;
+  padding: 10px 14px 28px; overflow-y: scroll; overflow-x: hidden;
+  font-size: 12.5px; line-height: 1.6; -webkit-user-select: text; user-select: text;
+}
+.files-pane__document img { max-width: 100%; height: auto; border-radius: 6px; }
+/* A README's badges and inline pictures sit in their line, the way the forge shows them; the
+   transcript's block-level images are for pictures a reply puts on their own. */
+.files-pane__document .markdown-content img { display: inline-block; margin: 0; vertical-align: middle; }
+.files-pane__document .markdown-content p > img:only-child { display: block; margin: .7em 0; }
+.files-pane__document .markdown-content [align="center"] img:only-child { display: inline-block; }
+/* A document's metadata block, above the document, set apart as data. */
+.files-pane__front-matter > .markdown-code > pre { margin-top: 0; font-size: 11.5px; }
+
+/* ---- empty state ---- */
+
+.files-pane__placeholder {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px; padding: 24px; color: var(--muted); text-align: center;
+}
+.files-pane__placeholder-icon {
+  width: 40px; height: 40px; display: grid; place-items: center;
+  border: 1px solid var(--border); border-radius: 11px; color: var(--faint);
+}
+.files-pane__placeholder h3 { margin: 8px 0 0; color: var(--text); font-size: 12.5px; font-weight: 500; }
+.files-pane__placeholder p { max-width: 260px; margin: 0; font-size: 11px; line-height: 1.5; }
+/* What an action said, or a delete asking first, under the empty state while the tree is put away. */
+.files-pane__placeholder-notices {
+  align-self: stretch; margin-top: 12px;
+  display: flex; flex-direction: column; text-align: left;
+}

@@ -1,0 +1,263 @@
+import type {
+  ContextItem,
+  ImageAttachment,
+  JsonObject,
+  JsonValue,
+  ModelCapability,
+  NativeCompaction,
+  ProviderFamily
+} from "../types";
+import type { ModelRunState } from "./modelStream";
+import { takesNativeCompaction } from "./modelCapabilities";
+
+/** Stable structural JSON form used for open-set supersession comparisons. */
+export function canonicalJson(value: JsonValue | JsonObject): string {
+  const canonicalize = (item: JsonValue): JsonValue => {
+    if (Array.isArray(item)) return item.map(canonicalize);
+    if (item !== null && typeof item === "object") {
+      return Object.fromEntries(
+        Object.keys(item).sort().map((key) => [key, canonicalize(item[key])])
+      ) as JsonValue;
+    }
+    return item;
+  };
+  return JSON.stringify(canonicalize(value as JsonValue));
+}
+
+/** Approximation shared with Rust: ASCII / 4 plus non-ASCII / 1.6, rounded up. */
+export function estimateTokens(text: string): number {
+  let ascii = 0;
+  let nonAscii = 0;
+  for (const character of text) {
+    if (character.codePointAt(0)! <= 0x7f) ascii += 1;
+    else nonAscii += 1;
+  }
+  return Math.ceil(ascii / 4 + nonAscii / 1.6);
+}
+
+function projectedContextText(item: ContextItem): string {
+  if (item.kind === "tool") {
+    return `${item.toolName}\n${canonicalJson(item.input)}\n${item.result.output}`;
+  }
+  if (item.kind === "reasoning") {
+    return `[Reasoning]\n${item.content ?? ""}`;
+  }
+  // A native compaction's card sends the messages it kept, wherever it stands;
+  // its own text is empty and never sent.
+  if (item.kind === "system" && item.nativeCompaction) {
+    return (item.nativeCompaction.retained ?? []).map((message) => message.content).join("\n");
+  }
+  return item.kind === "system" && item.localOnly ? "" : item.content;
+}
+
+function estimateImagesTokens(images: ImageAttachment[] | undefined): number {
+  return images?.reduce((total, image) => {
+    if (!image.width || !image.height) return total + 1024;
+    const tiled = 85 + Math.ceil(image.width / 512) * Math.ceil(image.height / 512) * 170;
+    return total + Math.max(1024, tiled);
+  }, 0) ?? 0;
+}
+
+function estimateContextImageTokens(item: ContextItem): number {
+  return estimateImagesTokens(
+    item.kind === "user"
+      ? item.images
+      : item.kind === "tool"
+        ? item.result.images
+        : undefined
+  );
+}
+
+/**
+ * Attached files are read by the model as their text, inlined at request time;
+ * the host estimated that text's tokens when the file was stored.
+ */
+function estimateContextFileTokens(item: ContextItem): number {
+  if (item.kind !== "user") return 0;
+  return item.files?.reduce((total, file) => total + file.tokens, 0) ?? 0;
+}
+
+export function estimateContextTokens(item: ContextItem): number {
+  return estimateTokens(projectedContextText(item))
+    + estimateContextImageTokens(item)
+    + estimateContextFileTokens(item);
+}
+
+/**
+ * Whether a card is part of what the model is sent. A host-local record is not,
+ * and neither is a reply or reasoning an error or Stop cut off: the fragment
+ * stays on the timeline, marked, until an edit makes it an ordinary card.
+ */
+export function isSentToModel(item: ContextItem): boolean {
+  if (item.kind === "system") return !item.localOnly || Boolean(item.nativeCompaction);
+  if (item.kind === "assistant" || item.kind === "reasoning") return item.interrupted !== true;
+  return true;
+}
+
+export function estimateContextsTokens(contexts: ContextItem[]): number {
+  return contexts.reduce((total, item) => total + (isSentToModel(item) ? estimateContextTokens(item) : 0), 0);
+}
+
+/**
+ * What of a timeline a request on this model carries: from the native
+ * compaction the conversation opens on, when it applies — made through this
+ * provider, for a model that compacts natively — or the whole timeline, where
+ * the card sends only the messages it kept. Mirrors Rust
+ * `native_compaction::wire_start`.
+ */
+export interface WireView {
+  contexts: ContextItem[];
+  /** The compaction the view opens with: its kept messages and item stand for the compacted conversation. */
+  compaction: NativeCompaction | null;
+}
+
+export function wireView(
+  contexts: ContextItem[],
+  target: {
+    provider: { id: string; family: ProviderFamily };
+    model: { capabilities?: readonly ModelCapability[] };
+  } | null
+): WireView {
+  if (target && takesNativeCompaction(target.provider, target.model)) {
+    for (let index = contexts.length - 1; index >= 0; index -= 1) {
+      const item = contexts[index];
+      if (item.kind === "system" && item.nativeCompaction?.providerId === target.provider.id) {
+        return { contexts: contexts.slice(index), compaction: item.nativeCompaction };
+      }
+    }
+  }
+  return { contexts, compaction: null };
+}
+
+/** A view's estimate: the compaction it opens with, as the host weighed it, plus what follows. */
+export function estimateWireTokens(view: WireView): number {
+  const following = view.compaction ? view.contexts.slice(1) : view.contexts;
+  return estimateContextsTokens(following) + (view.compaction?.tokensAfter ?? 0);
+}
+
+/** Rounds a run has streamed anything for, whether or not usage arrived. */
+function streamedRounds(run: ModelRunState): number[] {
+  const rounds = new Set<number>();
+  [run.streamedTextByRound, run.streamedReasoningByRound, run.streamedToolsByRound].forEach(
+    (byRound) => {
+      Object.keys(byRound).forEach((round) => rounds.add(Number(round)));
+    }
+  );
+  return [...rounds];
+}
+
+/** What one round has put on screen since the last provider snapshot. */
+function streamedRoundTokens(run: ModelRunState, round: number): number {
+  const text = run.streamedTextByRound[round] ?? "";
+  // Include the `[Reasoning]` prefix for each segment to match settled cards;
+  // combining segments once would make the estimate jump at settlement.
+  const reasoning = (run.streamedReasoningByRound[round] ?? [])
+    .filter((item) => item.length > 0)
+    .map((item) => `[Reasoning]\n${item}`)
+    .join("\n");
+  const tools = run.streamedToolsByRound[round] ?? [];
+  return (
+    estimateTokens(text)
+    + estimateTokens(reasoning)
+    // Same projection the settled tool context uses, so a round's estimate does
+    // not change shape the moment it stops being live.
+    + tools.reduce(
+      (total, tool) => total
+        + estimateTokens(`${tool.toolName}\n${canonicalJson(tool.input)}\n${tool.result.output}`)
+        + estimateImagesTokens(tool.result.images),
+      0
+    )
+  );
+}
+
+/**
+ * What a reported round's calls have returned. The calls are in the round's
+ * output, but their results reach the provider only with the next request, so
+ * no snapshot has counted them yet.
+ */
+function roundResultTokens(run: ModelRunState, round: number): number {
+  return (run.streamedToolsByRound[round] ?? []).reduce(
+    (total, tool) => total
+      + estimateTokens(tool.result.output)
+      + estimateImagesTokens(tool.result.images),
+    0
+  );
+}
+
+/** Messages the user steered, and the host delivered, into rounds after
+ * `round`, which its snapshot predates. */
+function steeredInputTokens(run: ModelRunState, round: number): number {
+  const steered = Object.entries(run.steeredInputsByRound)
+    .filter(([steeredRound]) => Number(steeredRound) > round)
+    .reduce((total, [, inputs]) => total + estimateContextsTokens(inputs), 0);
+  return Object.entries(run.hostContextsByRound ?? {})
+    .filter(([hostRound]) => Number(hostRound) > round)
+    .reduce(
+      (total, [, entries]) => total + estimateContextsTokens(entries.map((entry) => entry.context)),
+      steered
+    );
+}
+
+/**
+ * How large the conversation's context is *right now*, mid-turn.
+ *
+ * Providers only report usage at round boundaries — Anthropic at
+ * `message_start` and `message_delta`, Chat Completions in its final chunk,
+ * Responses at `response.completed` — so a gauge that waits for the turn's
+ * final response sits frozen for the entire turn and then jumps. This anchors
+ * on the newest snapshot the provider has actually given and adds an estimate
+ * of everything that has joined since — what the round's calls returned, what
+ * later rounds streamed, what the user steered in — which is the only part
+ * that can move between snapshots. The host measures the auto-compact
+ * threshold the same way (`api.rs::ContextMeasure`).
+ *
+ * `fallbackTokens` is the caller's estimate of the conversation as persisted,
+ * used before this run's first snapshot arrives. Nothing is added on top of it:
+ * the host writes streamed prose back as throttled `streaming` rows, so that
+ * estimate already covers what has streamed and already climbs on its own —
+ * adding the run's buffers as well would bill the same tokens twice.
+ *
+ * `estimated` is true whenever any part of the answer is estimated rather than
+ * provider-reported, and drives the `~` the gauge prints.
+ */
+export function liveContextTokens(
+  run: ModelRunState,
+  fallbackTokens: number
+): { tokens: number; estimated: boolean } {
+  const usageRounds = Object.keys(run.usageByRound).map(Number);
+  const anchorRound = usageRounds.length ? Math.max(...usageRounds) : null;
+  const anchorUsage = anchorRound === null ? undefined : run.usageByRound[anchorRound];
+  const anchorInput = anchorUsage?.inputTokens;
+  // `inputTokens` is the context the provider actually read, so it is the only
+  // figure worth anchoring on. Cached input is deliberately not added: it is
+  // already inside `inputTokens`. A snapshot reporting only output says nothing
+  // about how large the context is, and anchoring on it would claim the
+  // conversation had shrunk to the size of one response.
+  if (anchorRound === null || anchorInput === undefined) {
+    return { tokens: Math.max(0, fallbackTokens), estimated: true };
+  }
+  // A round that has reported its output tokens is accounted for in full; one
+  // that has only reported its input is still producing, so its own stream is
+  // the growth.
+  const settled = anchorUsage?.outputTokens;
+  const growthFrom = settled === undefined ? anchorRound : anchorRound + 1;
+  const growth = streamedRounds(run)
+    .filter((round) => round >= growthFrom)
+    .reduce((total, round) => total + streamedRoundTokens(run, round), 0)
+    + (settled === undefined ? 0 : roundResultTokens(run, anchorRound))
+    + steeredInputTokens(run, anchorRound);
+  return {
+    tokens: Math.max(0, anchorInput + (settled ?? 0) + growth),
+    estimated: growth > 0
+  };
+}
+
+export function formatCompactTokenCount(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    return `${(tokens / 1_000_000).toFixed(tokens >= 10_000_000 ? 0 : 1).replace(/\.0$/, "")}m`;
+  }
+  if (tokens >= 1_000) {
+    return `${(tokens / 1_000).toFixed(tokens >= 100_000 ? 0 : 1).replace(/\.0$/, "")}k`;
+  }
+  return String(Math.max(0, Math.round(tokens)));
+}

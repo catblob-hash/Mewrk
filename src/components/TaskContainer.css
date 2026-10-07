@@ -1,0 +1,74 @@
+/* Task container: one row per subagent, workflow and terminal process. */
+/* The list is mounted as a side pane's body, so it brings no chrome of its own:
+   the pane draws the frame, the title and the resize handles. */
+.tasks-pane { flex: 1; min-height: 0; overflow-y: scroll; padding: 8px 8px 16px; }
+.task-container__empty { margin: 24px 12px; font-size: 11.5px; color: var(--faint); text-align: center; }
+.task-container__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+
+.task-container__finished { margin-top: 10px; }
+.task-container__finished-toggle {
+  width: 100%; display: flex; align-items: center; gap: 6px;
+  padding: 5px 8px; background: transparent; border-radius: 6px;
+  font-size: 11px; font-weight: 600; color: var(--faint); text-align: left;
+}
+.task-container__finished-toggle:hover { background: var(--hover); color: var(--muted); }
+.task-container__finished-chevron { transition: transform .14s; flex: 0 0 auto; }
+.task-container__finished-chevron--open { transform: rotate(90deg); }
+.task-container__finished-count { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/*
+ * One task row. Nothing is inset: depth is expressed by the vertical rule on the
+ * left rather than by indentation, and a row with nothing to expand draws no
+ * disclosure placeholder, so every row — however deep, expandable or not —
+ * starts at the panel's left edge.
+ */
+.task-row { list-style: none; position: relative; }
+.task-row__main {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 6px 6px 6px; border-radius: 7px;
+  transition: background .14s;
+}
+.task-row__main[role="button"]:hover { background: var(--hover); }
+.task-row--selected > .task-row__main { background: var(--active); }
+
+.task-row__icon { flex: 0 0 auto; display: inline-flex; color: var(--faint); }
+.task-row__icon--running { color: var(--color-725c3c); }
+.task-row__icon--failed { color: var(--danger); }
+
+.task-row__copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.task-row__label {
+  font-size: 11.5px; font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.task-row__detail {
+  font-size: 10px; color: var(--faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* Finished rows go light, running rows stay dark, failures read red — the
+   subtitle too, since no row spells out its status in words. */
+.task-row--finished .task-row__label { color: var(--muted); font-weight: 560; }
+.task-row--failed .task-row__label,
+.task-row--failed .task-row__detail { color: var(--danger); }
+/* Colour for the running label's sweep; the utility itself is theme-agnostic. */
+.task-row--running { --pulse-color: var(--text); }
+
+.task-row__stop { width: 22px; height: 22px; flex: 0 0 22px; border-radius: 5px; }
+.task-row__stop:hover:not(:disabled) { color: var(--danger); background: var(--danger-soft); }
+.task-row__stop-spinner { animation: spin 1s linear infinite; }
+
+/* Child count / tokens / tool calls / elapsed, in that fixed order. */
+.task-metrics {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px;
+  font: 9.5px var(--mono, ui-monospace, monospace); font-variant-numeric: tabular-nums;
+  color: var(--faint);
+}
+.task-metrics__cell { min-width: 0; white-space: nowrap; }
+.task-row--running .task-metrics { color: var(--muted); }
+.task-row--failed .task-metrics { color: var(--danger); }
+
+@media (prefers-reduced-motion: reduce) {
+  .task-row__stop-spinner { animation-duration: .01ms; animation-iteration-count: 1; }
+}
+
+/* A workflow occupies a list slot but is not a row: it draws its own panel. */
+.task-container__workflow { list-style: none; }

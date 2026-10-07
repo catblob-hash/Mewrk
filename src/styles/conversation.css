@@ -1,0 +1,612 @@
+/* Main conversation */
+.main-pane { grid-column: auto; min-width: 0; height: 100%; display: flex; flex-direction: column; background: var(--app); }
+.topbar { height: var(--topbar-height); flex: 0 0 var(--topbar-height); padding: 0 12px 0 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--color-f7f7f5-ap92); }
+/* With the sidebar closed, `ShellNav` floats over the bar's left end; the title starts after it. */
+.app-shell--sidebar-closed .topbar { padding-left: calc(var(--shell-nav-inset) + var(--shell-nav-closed-width) + 14px); }
+/* The Windows caption buttons float over the bar's right end; the actions stop short of them. */
+:root[data-window-chrome="windows"] .topbar { padding-right: calc(var(--window-caption-width) + 6px); }
+.topbar__leading, .topbar__actions { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.topbar__leading { flex: 1 1 auto; }
+.topbar__actions { flex: 0 0 auto; }
+/* One line: the title, which renames in place, then its project in the quiet colour. */
+/* The title's hover box reaches 6px past the text on either side, so the row starts 6px early. */
+.conversation-title { min-width: 0; margin-left: -6px; display: flex; align-items: center; gap: 3px; }
+.conversation-title__heading { flex: 0 1 auto; min-width: 0; margin: 0; font-size: 13.5px; line-height: 20px; font-weight: 650; }
+.conversation-title__name { max-width: 100%; height: 26px; padding: 0 6px; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 6px; background: transparent; font: inherit; line-height: 26px; text-align: left; }
+button.conversation-title__name:hover:not(:disabled) { background: var(--hover); cursor: text; }
+button.conversation-title__name:disabled { opacity: 1; cursor: default; }
+/* While renaming, the field is as wide as its text, so a title turns into the field where it stands and
+   widens as it grows, up to a cap. A hidden copy of the text in the same grid cell sets that width: its
+   6px sides match the button's padding and the field's 5px plus border, and 2px more hold the caret (WebKit scrolls with less). */
+.conversation-title__field { max-width: 420px; display: grid; grid-template-columns: minmax(0, 1fr); }
+.conversation-title__field::after { content: attr(data-value); grid-area: 1 / 1; min-width: 3em; height: 0; padding: 0 8px 0 6px; overflow: hidden; visibility: hidden; white-space: pre; }
+.conversation-title__input { grid-area: 1 / 1; width: 100%; min-width: 0; height: 26px; padding: 0 5px; border: 1px solid var(--color-aeb9d2); border-radius: 6px; outline: 0; background: var(--panel); color: var(--text); font: inherit; box-shadow: 0 0 0 2px var(--color-5f5f5a-ap10); }
+.conversation-title__project { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--faint); }
+.topbar__empty { min-width: 0; display: flex; align-items: baseline; gap: 7px; }
+.topbar__empty-title { font-size: 15px; margin: 0; }
+.topbar__empty-tagline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--faint); }
+.save-status { height: 26px; display: inline-flex; align-items: center; gap: 4px; padding: 0 5px; color: var(--faint); font-size: 10px; }
+.save-status--error { color: var(--danger); }
+/* Truncate the host rejection reason in the top bar; the title retains the full text. */
+.save-status__reason { max-width: 30ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.85; }
+.conversation-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative; }
+/* The subagent transcript fills its side pane's body rather than stacking inside it. */
+.main-pane__subagent { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.main-pane__subagent > * { flex: 1; min-height: 0; }
+.conversation-view { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+/* The body of the conversation on screen is still being fetched (`lib/conversationBodies.ts`). */
+.conversation-view__body-loading { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 24px; color: var(--muted); font-size: 13px; text-align: center; }
+
+/* The left padding matches the scrollbar's track on the right, so the column stays centred over
+   the composer below, which spans the whole pane; the column widens by both to keep its width. */
+.context-scroll { flex: 1; min-height: 0; padding-left: var(--scrollbar-size); overflow-y: scroll; overflow-x: hidden; position: relative; }
+.context-stream { --timeline-actions-inset: 4px; width: min(820px, calc(100% - 48px + 2 * var(--scrollbar-size))); min-height: 100%; margin: 0 auto; padding: 24px 0 28px; display: flex; flex-direction: column; translate: 0 0; transition: translate .32s cubic-bezier(.2, .75, .25, 1); }
+/* Scrolled to the end, the last card stops well clear of the composer: the timeline's foot lies
+   under the composer's chips row and its 46px fade, so at the stream's own 28px the card ended
+   against them, with no gap left to right-click in. An empty timeline keeps its centred welcome. */
+.context-stream:not(:has(> .empty-state)) { padding-bottom: 72px; }
+/* Appearance settings are applied as data attributes; this is their sole CSS consumer. */
+:root[data-wide-messages="true"] .context-stream { width: min(1180px, calc(100% - 48px + 2 * var(--scrollbar-size))); }
+.context-slot { width: 100%; position: relative; content-visibility: auto; contain-intrinsic-size: auto 140px; }
+.context-slot + .context-slot { margin-top: 16px; }
+.context-card {
+  width: 100%; position: relative; border-radius: 10px; font-size: 13px; line-height: 1.58; color: var(--text);
+  scroll-margin: 120px; transition: background .12s, border-color .12s, box-shadow .12s;
+}
+.context-card:focus-visible { outline-offset: 3px; }
+/* The timeline takes focus on its own background, because its undo keys answer only while focus
+   is somewhere in it; that focus is not a place to draw a ring around the whole pane. */
+.context-scroll:focus { outline: none; }
+/* A drag with Ctrl held (⌘ on a Mac) draws a box over the timeline, fixed to the window while the
+   drag lasts; every row and card it touches is picked out for the right-click menu. */
+.context-scroll[data-selecting] { cursor: crosshair; }
+.timeline-marquee { position: fixed; z-index: 900; pointer-events: none; border: 1px solid var(--color-315eae-ap35); border-radius: 3px; background: color-mix(in srgb, var(--color-cfdcff) 30%, transparent); }
+.context-stream [data-timeline-selected] { background-color: color-mix(in srgb, var(--color-cfdcff) 55%, transparent); box-shadow: 0 0 0 1px var(--color-315eae-ap35); }
+.context-stream .context-card--user[data-timeline-selected] { border-color: var(--color-315eae-ap35); background-color: var(--color-cfdcff); }
+.context-stream :is(.timeline-row, .question-history)[data-timeline-selected] { border-radius: 6px; }
+/*
+ * One column for every control on the timeline. A row, a message and an editor
+ * all lay their buttons over their own top right corner, 24px square with 1px
+ * between them, ending `--timeline-actions-inset` short of the column's right
+ * edge. Delete is always last and edit beside it, so whatever the pointer is on,
+ * delete stands where the last one did; an editor's Save takes that same spot.
+ *
+ * `--context-actions-width` is how far a group reaches in from its right end,
+ * for the words under it to fade out over: 25px a button, less the last gap.
+ */
+.context-actions, .timeline-row__actions, .question-history__actions,
+.inline-text-editor__actions, .inline-tool-editor__actions { display: flex; align-items: center; gap: 1px; }
+:is(.context-actions, .timeline-row__actions, .question-history__actions,
+  .inline-text-editor__actions, .inline-tool-editor__actions) .icon-button { width: 24px; height: 24px; flex-basis: 24px; border-radius: 6px; }
+.context-card, .timeline-row__header { --context-actions-width: 49px; }
+.context-card:has(> .context-card__actions > .context-actions > :only-child),
+.timeline-row__header:has(> .timeline-row__main > .timeline-row__actions > :only-child) { --context-actions-width: 24px; }
+.context-card:has(> .context-card__actions > .context-actions > :nth-child(3)),
+.timeline-row__header:has(> .timeline-row__main > .timeline-row__actions > :nth-child(3)) { --context-actions-width: 74px; }
+.context-card:has(> .context-card__actions > .context-actions > :nth-child(4)) { --context-actions-width: 99px; }
+.context-card__content { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* What can be selected in the timeline: a message's words, a reasoning or prompt body, a hook's
+   output, the detail of a failed turn, a file's lines. Each is a selection region of its own
+   (`base.css`), and the row headers, labels and controls around them are not text to select. */
+.context-card__content, .markdown-content, .timeline-row__output, .turn-error small, .diff-output__body {
+  -webkit-user-select: text; user-select: text;
+}
+.context-card__images { margin-bottom: 8px; }
+/* Citation chips from server-side retrieval or grounding under assistant content. */
+.context-card__sources { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+.context-card__source { display: inline-flex; align-items: center; max-width: 260px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; font-size: 11px; color: var(--muted); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+a.context-card__source:hover { background: var(--hover); color: var(--text); }
+.context-editor__images { margin-bottom: 10px; }
+/* The system prompt is a timeline disclosure row, identical to the reasoning
+   row: no card shell, and the full stream width. */
+.context-card--user { width: auto; max-width: 78%; margin-left: auto; padding: 9px 12px 11px; border: 1px solid var(--color-dce3f3); background: var(--color-eef2f9); border-bottom-right-radius: 3px; }
+/* Only the branch a message is on is read under the bubble, so only then does it keep the room. */
+.context-card--user.context-card--branched { margin-bottom: 26px; }
+/* No narrower than its controls, so they cover a short message's words rather than overhang it. */
+.context-card--user { min-width: min(100%, calc(var(--context-actions-width) + 32px)); }
+/*
+ * A message names itself by which side it sits on, so neither kind carries a
+ * title. Its controls fade in over its top right corner while the pointer or
+ * focus is on it, on the timeline's one column, and take no room from the
+ * words: those they cover fade out beneath them while they show, the way a
+ * row's line does under its own.
+ */
+.context-card__actions { position: absolute; z-index: 1; top: 0; right: var(--timeline-actions-inset); opacity: 0; transition: opacity .12s ease; }
+.context-card:hover > .context-card__actions,
+.context-card:focus-within > .context-card__actions { opacity: 1; }
+/* Inside the bubble's 1px border, and level with the message's first line. */
+.context-card--user > .context-card__actions { top: 4px; right: calc(var(--timeline-actions-inset) - 1px); }
+/* The corner the controls cover, measured from the text's right edge, 12px in from the border. */
+.context-card--user:is(:hover, :focus-within) > .context-card__body {
+  --covered: calc(var(--context-actions-width) + var(--timeline-actions-inset) - 13px);
+  -webkit-mask-image: linear-gradient(to left, transparent calc(var(--covered) + 2px), var(--color-000000) calc(var(--covered) + 16px)), linear-gradient(var(--color-000000), var(--color-000000));
+  mask-image: linear-gradient(to left, transparent calc(var(--covered) + 2px), var(--color-000000) calc(var(--covered) + 16px)), linear-gradient(var(--color-000000), var(--color-000000));
+  -webkit-mask-size: 100% 22px, 100% 100%;
+  mask-size: 100% 22px, 100% 100%;
+  -webkit-mask-position: 0 0, 0 22px;
+  mask-position: 0 0, 0 22px;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+}
+.user-message-branches { position: absolute; top: calc(100% + 3px); right: calc(var(--timeline-actions-inset) - 1px); height: 24px; display: flex; align-items: center; gap: 1px; color: var(--faint); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.user-message-branches .icon-button { width: 24px; height: 24px; flex-basis: 24px; }
+.user-message-branches > span { min-width: 29px; text-align: center; }
+/*
+ * A reply spans the column so its controls can stand at the column's end, in
+ * the margin its words leave there, and narrows its words only where the
+ * window is too narrow for that margin to hold them.
+ */
+.context-card--assistant { padding: 2px 0 0; }
+.context-card--assistant > :not(.context-card__actions) { max-width: min(86%, calc(100% - var(--context-actions-width) - var(--timeline-actions-inset) - 10px)); }
+.context-card--assistant .context-card__content { font-size: var(--message-font-size); font-family: var(--message-font-family); }
+.context-card--user .context-card__content { font-size: var(--message-font-size); font-family: var(--message-font-family); }
+/*
+ * A long message folds to its first ten lines (`FOLDED_USER_MESSAGE_LINES` in
+ * ContextStream.tsx) of the card's 1.58 line height, fading out at the cut.
+ */
+.context-card__content--folded {
+  max-height: 15.8em; overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, var(--color-000000) calc(100% - 3.2em), transparent);
+  mask-image: linear-gradient(to bottom, var(--color-000000) calc(100% - 3.2em), transparent);
+}
+.context-card__fold { margin: 5px 0 0 -4px; padding: 1px 6px 1px 3px; display: inline-flex; align-items: center; gap: 3px; border-radius: 5px; background: transparent; color: var(--muted); font-size: 12px; line-height: 18px; }
+.context-card__fold:hover { background: var(--hover); color: var(--text); }
+.markdown-content { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+
+/*
+ * Streaming reveal: the text each 100 ms commit adds sweeps in from left to
+ * right, so it appears to be written rather than to blink into place a run at a
+ * time. `lib/streamReveal.ts` wraps only the new text in `.stream-fresh`, and
+ * spreads one commit's worth of spans across one sweep in reading order.
+ *
+ * A mask, not opacity, so the edge is a gradient moving across the words. On a
+ * span that wraps, the mask runs along the line fragments laid end to end, so
+ * the sweep follows the text onto the next line. `--stream-fresh-edge` has to
+ * be registered with @property — an unregistered custom property is a plain
+ * token and jumps rather than interpolating — and its resting value leaves the
+ * text fully shown.
+ *
+ * The two tick classes carry identical keyframes. React keeps the same span
+ * from one commit to the next, and alternating the name is what replays the
+ * sweep: re-setting a running animation's name does not.
+ */
+@property --stream-fresh-edge {
+  syntax: "<length-percentage>";
+  inherits: false;
+  initial-value: 200%;
+}
+
+@keyframes stream-fresh-0 {
+  from { --stream-fresh-edge: 0%; }
+  to { --stream-fresh-edge: calc(100% + 2em); }
+}
+@keyframes stream-fresh-1 {
+  from { --stream-fresh-edge: 0%; }
+  to { --stream-fresh-edge: calc(100% + 2em); }
+}
+
+.stream-fresh {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    var(--color-000000) calc(var(--stream-fresh-edge) - 2em),
+    transparent var(--stream-fresh-edge)
+  );
+  mask-image: linear-gradient(
+    to right,
+    var(--color-000000) calc(var(--stream-fresh-edge) - 2em),
+    transparent var(--stream-fresh-edge)
+  );
+  animation-duration: 100ms;
+  animation-timing-function: linear;
+  /* Hidden through its delay, shown for good once its turn is over. */
+  animation-fill-mode: both;
+}
+.stream-fresh--0 { animation-name: stream-fresh-0; }
+.stream-fresh--1 { animation-name: stream-fresh-1; }
+
+@media (prefers-reduced-motion: reduce) {
+  /* The reveal is decoration; text must still land fully opaque without it. */
+  .stream-fresh { -webkit-mask-image: none; mask-image: none; animation: none; }
+}
+.markdown-content > :first-child { margin-top: 0; }
+.markdown-content > :last-child { margin-bottom: 0; }
+.markdown-content p { margin: .48em 0; }
+.markdown-content h1, .markdown-content h2, .markdown-content h3,
+.markdown-content h4, .markdown-content h5, .markdown-content h6 { margin: 1.05em 0 .42em; color: var(--text); line-height: 1.3; }
+.markdown-content h1 { font-size: 1.42em; }
+.markdown-content h2 { font-size: 1.25em; }
+.markdown-content h3 { font-size: 1.12em; }
+.markdown-content h4, .markdown-content h5, .markdown-content h6 { font-size: 1em; }
+.markdown-content ul, .markdown-content ol { margin: .5em 0; padding-left: 1.65em; }
+.markdown-content li { margin: .18em 0; }
+.markdown-content li > p { margin: .18em 0; }
+.markdown-content ul.contains-task-list { padding-left: .25em; list-style: none; }
+.markdown-content .task-list-item { display: flex; align-items: flex-start; gap: .45em; }
+.markdown-content .task-list-item > input { margin-top: .38em; accent-color: var(--accent); }
+.markdown-content blockquote { margin: .65em 0; padding: .05em 0 .05em .85em; border-left: 2px solid var(--border-strong); color: var(--muted); }
+.markdown-content blockquote > :first-child { margin-top: 0; }
+.markdown-content blockquote > :last-child { margin-bottom: 0; }
+.markdown-content a { color: var(--color-315eae); text-decoration: underline; text-decoration-color: var(--color-315eae-ap35); text-underline-offset: 2px; }
+.markdown-content a:hover { text-decoration-color: currentColor; }
+/* Paths detected in model output. A button rather than an anchor keeps it
+   invisible to the external-link interceptor and gives keyboard activation a
+   real click; the reset makes it sit in the text flow like a link. */
+.markdown-content .md-path-link { display: inline; margin: 0; padding: 0; border: 0; background: none; appearance: none; font: inherit; line-height: inherit; vertical-align: baseline; text-align: left; color: var(--color-315eae); text-decoration: underline; text-decoration-color: var(--color-315eae-ap35); text-underline-offset: 2px; cursor: pointer; }
+.markdown-content .md-path-link:hover { text-decoration-color: currentColor; }
+/* Keep the inline-code chrome, but let the link color win over it. */
+.markdown-content .md-path-link--code > code { color: inherit; }
+.markdown-content code { border-radius: 4px; font: .9em/1.55 var(--mono); }
+.markdown-content :not(pre) > code { padding: .08em .32em; background: var(--color-edede9); color: var(--color-343431); }
+.markdown-content pre { max-width: 100%; margin: .65em 0; padding: 10px 12px; overflow: auto; border: 1px solid var(--color-e0e0db); border-radius: 8px; background: var(--color-f1f1ee); color: var(--color-343431); line-height: 1.55; }
+.markdown-content pre code { white-space: pre; overflow-wrap: normal; }
+:root[data-code-wrap="true"] .markdown-content pre code { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Collapse code blocks above this height; expand them on focus or hover. CSS avoids per-block state during streaming rerenders. */
+:root[data-code-collapse="true"] .markdown-content pre { max-height: 22em; }
+:root[data-code-collapse="true"] .markdown-content pre:hover,
+:root[data-code-collapse="true"] .markdown-content pre:focus-within { max-height: none; }
+.markdown-content hr { height: 1px; margin: .9em 0; border: 0; background: var(--border); }
+.markdown-content__table-scroll { max-width: 100%; margin: .7em 0; overflow-x: auto; }
+.markdown-content table { width: max-content; min-width: min(100%, 360px); border-collapse: collapse; font-size: .94em; }
+.markdown-content th, .markdown-content td { padding: .38em .62em; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+.markdown-content th { background: var(--color-f1f1ee); font-weight: 650; }
+.markdown-content img { display: block; max-width: 100%; height: auto; margin: .7em 0; border-radius: 8px; }
+/* An image whose bytes the surface has not produced stands as its own alternative
+   text: a broken-image glyph says the document is wrong when only the read is late. */
+.markdown-content__image-missing { color: var(--faint); font-style: italic; }
+/* Formulas are MathJax SVG drawings measured in `ex`, so they scale with the text around them and
+   take its colour through `currentColor`. A display formula scrolls sideways rather than breaking,
+   since the drawing is made without knowing the column it lands in. */
+.math-formula { position: relative; }
+.math-formula svg { overflow: visible; }
+.math-formula--display {
+  display: block; max-width: 100%; margin: .72em 0; padding: .15em 0;
+  overflow-x: auto; overflow-y: hidden; text-align: left;
+}
+/* The source rides along out of sight, so a selection across a formula copies its TeX. */
+.math-formula__source {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}
+/* Until MathJax answers, and for a formula it cannot read, the source stands in: quiet while it
+   waits, underlined with the reason on hover when it failed. */
+.math-formula--source > code { padding: 0; background: none; color: var(--muted); font-size: .92em; }
+.math-formula[data-math-state="error"] > code {
+  color: var(--color-a23737); text-decoration: underline dotted; text-underline-offset: 3px; cursor: help;
+}
+/* Model-written HTML: key caps look like keys, and a disclosure says it can be opened. */
+.markdown-content kbd {
+  padding: .05em .4em; border: 1px solid var(--border-strong); border-bottom-width: 2px; border-radius: 4px;
+  background: var(--panel); font: .86em var(--mono);
+}
+.markdown-content details { margin: .5em 0; }
+.markdown-content summary { cursor: pointer; }
+.markdown-content mark { padding: 0 .15em; border-radius: 3px; background: var(--color-fff5e5); color: inherit; }
+.markdown-content sup, .markdown-content sub { line-height: 0; }
+/* The cat is drawn one text line tall, so the line height is pinned rather than
+   left to the font: `normal` differs between Inter and the CJK fallback. */
+.stream-waiting { --stream-waiting-line: 16px; margin-top: 12px; padding: 2px 3px; display: flex; align-items: center; gap: 6px; color: var(--color-65655f); --pulse-color: var(--color-343431); }
+/* One line per call in flight. Usually there is exactly one; async tools are
+   what make it a column rather than a single row. */
+.stream-waiting__activities { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.stream-waiting__activity { min-width: 0; display: inline-flex; align-items: baseline; gap: 5px; overflow: hidden; white-space: nowrap; font-size: 11.5px; font-weight: 570; line-height: var(--stream-waiting-line); animation: stream-waiting-activity-in .22s cubic-bezier(.2, .75, .25, 1); }
+.stream-waiting__activity-title { flex: 0 0 auto; }
+.stream-waiting__activity-target { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 10.5px/1.5 var(--mono); color: var(--faint); }
+.stream-waiting__activity-count { flex: 0 0 auto; font: 500 10.5px/1.5 var(--mono); color: var(--faint); }
+.stream-waiting__dots { height: 5px; display: inline-flex; align-items: center; gap: 2px; }
+.stream-waiting__dots i { width: 2.5px; height: 2.5px; display: block; border-radius: 50%; background: currentColor; animation: stream-waiting-dot 1.2s ease-in-out infinite; }
+.stream-waiting__dots i:nth-child(2) { animation-delay: .14s; }
+.stream-waiting__dots i:nth-child(3) { animation-delay: .28s; }
+/* Tasks still running beside the round: a link to the tasks pane, not a wait. */
+.stream-waiting__tasks { align-self: flex-start; max-width: 100%; padding: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: none; color: var(--color-315eae); font-size: 11.5px; font-weight: 570; line-height: var(--stream-waiting-line); text-align: left; text-underline-offset: 2px; animation: stream-waiting-activity-in .22s cubic-bezier(.2, .75, .25, 1); }
+.stream-waiting__tasks:hover { text-decoration: underline; }
+.stream-waiting--retry { color: var(--color-92600d); --pulse-color: var(--color-92600d); }
+.stream-waiting--retry .stream-waiting__cat { color: var(--color-c98a1b); }
+.stream-waiting__retry-message { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-ab7d3c); font-size: 10px; }
+@keyframes stream-waiting-activity-in { from { opacity: 0; transform: translateX(-4px); } }
+@keyframes stream-waiting-dot { 0%, 60%, 100% { opacity: .28; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
+
+/*
+ * Streaming mascot: the composer's cat, at its laptop.
+ *
+ * The same drawing in the same scene as `.composer-cat`, lying on a ledge of its
+ * own, but only one line of the waiting text tall, about a third of the
+ * composer's. `transform-box: view-box` makes every origin below a raw scene
+ * coordinate: the figure and the tail turn about points on the ledge
+ * (y=730.9), and the far paw about the wrist it was cut round, which sits inside
+ * the group that lowers the cat onto the ledge and so is written in the
+ * drawing's own coordinates — `CAT_WRIST` in catArt.ts, compared by test.
+ *
+ * Each mood is a pose plus loops. The pose is where the pupils sit and how far
+ * the lids hang, and it eases across a mood change on `transition`. The loops
+ * run on the elements inside the posed ones, all on one period per mood, and
+ * every one of them starts and ends at rest: the change waits for that moment,
+ * so tearing them down never jumps.
+ */
+/* The scene's 724:610 at one line; the ledge's thickness in StreamWaitingIndicator.tsx assumes 16px. */
+.stream-waiting__cat { width: calc(var(--stream-waiting-line) * 724 / 610); height: var(--stream-waiting-line); flex: 0 0 auto; color: var(--color-343431); fill: currentColor; }
+.stream-cat-ledge { fill: var(--border-strong); }
+.stream-cat-figure, .stream-cat-tail, .stream-cat-paw, .stream-cat-gaze, .stream-cat-pupils,
+.stream-cat-lids, .stream-cat-blink { transform-box: view-box; }
+.stream-cat-figure { transform-origin: 653.7px 730.9px; }
+.stream-cat-tail { transform-origin: 431.6px 730.9px; }
+.stream-cat-paw--far { transform-origin: 688px 624px; }
+.stream-cat-gaze, .stream-cat-lids { transition: transform .8s cubic-bezier(.45, 0, .25, 1); }
+
+/* Working. Eyes on the screen. A burst of typing with the far paw, then the
+   near paw takes the mouse, nudges it one way and the other and clicks, while
+   the pupils follow the pointer; the tail wags a little the whole time and a
+   blink comes every other round. */
+.stream-waiting__cat--work .stream-cat-gaze { transform: translateX(13px); }
+.stream-waiting__cat--work .stream-cat-figure { animation: stream-cat-breathe 2400ms ease-in-out infinite; }
+.stream-waiting__cat--work .stream-cat-tail { animation: stream-cat-wag 2400ms ease-in-out infinite; }
+.stream-waiting__cat--work .stream-cat-paw--far { animation: stream-cat-type 2400ms ease-in-out infinite; }
+.stream-waiting__cat--work .stream-cat-paw--near { animation: stream-cat-mouse 2400ms ease-in-out infinite; }
+.stream-waiting__cat--work .stream-cat-pupils { animation: stream-cat-follow 2400ms ease-in-out infinite; }
+.stream-waiting__cat--work .stream-cat-blink { animation: stream-cat-blink 4800ms linear infinite; }
+
+/* Slacking. The laptop stays open and both paws stay put. The eyes drift off
+   the screen and half close, glance back once as if something might have
+   happened, and give a long slow blink; the breath deepens and the tail swings
+   wider and slower. */
+.stream-waiting__cat--slack .stream-cat-gaze { transform: translateX(-16px); }
+.stream-waiting__cat--slack .stream-cat-lids { transform: translateY(24px); }
+.stream-waiting__cat--slack .stream-cat-figure { animation: stream-cat-breathe-deep 4800ms ease-in-out infinite; }
+.stream-waiting__cat--slack .stream-cat-tail { animation: stream-cat-swish 4800ms ease-in-out infinite; }
+.stream-waiting__cat--slack .stream-cat-pupils { animation: stream-cat-glance-back 4800ms ease-in-out infinite; }
+.stream-waiting__cat--slack .stream-cat-blink { animation: stream-cat-doze 4800ms ease-in-out infinite; }
+
+@keyframes stream-cat-breathe { 0%, 100% { transform: scaleY(1); } 50% { transform: scaleY(1.015); } }
+@keyframes stream-cat-breathe-deep { 0%, 100% { transform: scaleY(1); } 50% { transform: scaleY(1.035); } }
+@keyframes stream-cat-wag { 0%, 100% { transform: rotate(0deg); } 30% { transform: rotate(5deg); } 70% { transform: rotate(-3deg); } }
+@keyframes stream-cat-swish { 0%, 100% { transform: rotate(0deg); } 35% { transform: rotate(8deg); } 75% { transform: rotate(-6deg); } }
+/* Five keystrokes in two bursts, each a quick lift of the paw off the keys
+   about the wrist, then the paw rests while the other one works the mouse. */
+@keyframes stream-cat-type {
+  0%, 38%, 100% { transform: rotate(0deg); }
+  3% { transform: rotate(-11deg); }
+  6% { transform: rotate(0deg); }
+  9% { transform: rotate(-8deg); }
+  12% { transform: rotate(0deg); }
+  15% { transform: rotate(-12deg); }
+  18%, 26% { transform: rotate(0deg); }
+  29% { transform: rotate(-10deg); }
+  32% { transform: rotate(0deg); }
+  35% { transform: rotate(-12deg); }
+}
+/* The near paw slides along the desk and back — the far end of its reach is
+   what `CAT_NEAR_PAW_OVERLAP` in catArt.ts has to cover — and presses down
+   once at the end for the click. */
+@keyframes stream-cat-mouse {
+  0%, 40%, 100% { transform: translate(0, 0); }
+  50%, 57% { transform: translate(-9px, 0); }
+  68%, 75% { transform: translate(7px, 0); }
+  78% { transform: translate(7px, 3px); }
+  81% { transform: translate(7px, 0); }
+  93% { transform: translate(0, 0); }
+}
+/* Reading along the line being typed, then following the pointer. */
+@keyframes stream-cat-follow {
+  0%, 100% { transform: translateX(0); }
+  36%, 42% { transform: translateX(7px); }
+  50%, 57% { transform: translateX(-5px); }
+  68%, 82% { transform: translateX(6px); }
+  93% { transform: translateX(0); }
+}
+/* A lid is parked 54 units above its eye (`CAT_LID_LIFT`); lowering it 62
+   closes the eye with 8 to spare, which is what keeps a closed eye from leaving
+   a ghost of its outline. Slacking lids already hang 24, so they need 38. */
+@keyframes stream-cat-blink { 0%, 18%, 100% { transform: translateY(0); } 21% { transform: translateY(62px); } 24% { transform: translateY(0); } }
+@keyframes stream-cat-doze { 0%, 74%, 100% { transform: translateY(0); } 82%, 87% { transform: translateY(38px); } 95% { transform: translateY(0); } }
+@keyframes stream-cat-glance-back {
+  0%, 30%, 72%, 100% { transform: translateX(0); }
+  40%, 58% { transform: translateX(22px); }
+}
+
+/*
+ * Work blocks.
+ *
+ * Everything that is a record of work rather than a message — tool calls,
+ * reasoning, hooks, workflow runs — is one row of a block: a marker, a name,
+ * and one line of what it did, opening onto its own detail. One shape for all
+ * of them is the point: the reader learns to read a row once.
+ */
+/*
+ * A block is its rows and nothing more: no heading, no fold, and no scrollport of
+ * its own. Every row's body already caps its own height, and a block that
+ * scrolled inside a scrolling transcript would swallow the wheel wherever the
+ * pointer happened to be. It spans the column edge to edge, so its rows' controls
+ * end on the same line as every message's.
+ */
+.timeline-block { width: 100%; position: relative; padding: 1px 0 3px; scroll-margin: 120px; }
+.timeline-block:focus-visible { outline-offset: 3px; }
+
+.timeline-row { position: relative; min-width: 0; background: transparent; }
+.timeline-row__header { min-width: 0; position: relative; display: flex; align-items: center; border-radius: 6px; background: transparent; }
+.timeline-row__header:hover, .timeline-row:focus-visible > .timeline-row__header { background: var(--color-000000-ap2_6); }
+.timeline-row__main { flex: 1; min-width: 0; display: flex; }
+.timeline-row__summary { flex: 1; min-width: 0; min-height: 30px; padding: 1px 5px 1px 3px; display: flex; align-items: center; gap: 6px; background: transparent; text-align: left; }
+.timeline-row__summary[aria-disabled="true"] { cursor: default; }
+.timeline-row__icon { width: 18px; height: 18px; flex: 0 0 18px; display: grid; place-items: center; color: var(--color-777771); }
+.timeline-row__name { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-4f4f4a); font: 570 11.25px/1.5 var(--app-font-family); }
+/* Only a row that also carries a line rations the name: on its own the name is
+   the whole of what the row says, and capping it would ellipsize a phrase that
+   had room to finish. */
+.timeline-row__summary:has(.timeline-row__line) .timeline-row__name { max-width: 40%; }
+.timeline-row__line { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font: 9.75px var(--mono); }
+/* A file a tool row names opens in the file pane; it shows it can only when the
+   pointer is on it, so a column of rows does not read as a column of links. */
+.timeline-row__file { cursor: pointer; text-underline-offset: 2px; }
+.timeline-row__file:hover { text-decoration: underline; }
+.timeline-row__code { font: 10.5px var(--mono); }
+/* Outside the name, so cutting a long file name short never takes the counts with it. */
+.timeline-row__figures { flex: 0 0 auto; display: inline-flex; align-items: baseline; gap: 4px; color: var(--faint); font: 9.75px var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.timeline-row__figures b { color: var(--success); font-weight: 500; }
+.timeline-row__figures em { color: var(--danger); font-style: normal; }
+/*
+ * Against the end of the row's own words, and lit for as long as the row is
+ * open — the same rule the block's heading follows.
+ *
+ * `:has(:focus-visible)` is deliberately absent from every rule below. A
+ * `:has()` holding a dynamic pseudo-class is not invalidated when it sits ahead
+ * of a descendant combinator, and one such selector silently voids the whole
+ * list it is written in — the hover clauses beside it stop applying too. The
+ * focused element itself anchors these instead.
+ */
+.timeline-row__chevron { flex: 0 0 auto; color: var(--color-94948d); opacity: 0; transition: opacity .12s ease; }
+.timeline-row__header:hover .timeline-row__chevron { opacity: 1; }
+.timeline-row__summary:focus-visible .timeline-row__chevron { opacity: 1; }
+.timeline-row__summary[aria-expanded="true"] .timeline-row__chevron { opacity: 1; }
+.timeline-row__stat { margin-left: auto; padding-left: 10px; flex: 0 0 auto; color: var(--faint); font: 9.5px var(--mono); transition: opacity .12s ease; }
+.timeline-row__badge { flex: 0 0 auto; margin-right: 4px; padding: 1px 5px; border: 1px solid var(--color-a9c5b5); border-radius: 999px; color: var(--color-356449); background: var(--color-edf7f0); font-size: 9px; font-weight: 650; white-space: nowrap; }
+.timeline-row--system .timeline-row__badge { border-color: var(--color-d6c5a6); color: var(--color-795d2e); background: var(--color-fbf6eb); }
+/* The controls take the right end of the row while the pointer is on it, so the
+   figures that live there step aside rather than being read through a button:
+   an agent count half-hidden under a delete icon is worse than no count at all.
+   They keep their width, so nothing else on the line moves. The controls stand
+   on the header's own end, past a badge or a status mark, which step aside too. */
+.timeline-row__header:hover .timeline-row__stat { opacity: 0; }
+.timeline-row__summary:focus-visible .timeline-row__stat { opacity: 0; }
+.timeline-row__header:hover:has(.timeline-row__actions) > :is(.timeline-row__badge, .execution-status) { opacity: 0; }
+.timeline-row__actions { position: absolute; right: var(--timeline-actions-inset); top: 50%; translate: 0 -50%; opacity: 0; transition: opacity .12s ease; }
+.timeline-row__header:hover .timeline-row__actions { opacity: 1; }
+.timeline-row__summary:focus-visible ~ .timeline-row__actions, .timeline-row__actions:focus-within { opacity: 1; }
+/* Only as much of the line's tail as the revealed controls actually cover. */
+.timeline-row__header:hover:has(.timeline-row__actions) .timeline-row__summary {
+  -webkit-mask-image: linear-gradient(to right, var(--color-000000) calc(100% - var(--context-actions-width) - var(--timeline-actions-inset) - 16px), transparent calc(100% - var(--context-actions-width) - var(--timeline-actions-inset) + 4px));
+  mask-image: linear-gradient(to right, var(--color-000000) calc(100% - var(--context-actions-width) - var(--timeline-actions-inset) - 16px), transparent calc(100% - var(--context-actions-width) - var(--timeline-actions-inset) + 4px));
+}
+
+.execution-status { width: 18px; height: 18px; margin-left: 1px; padding: 0; flex: 0 0 18px; display: grid; place-items: center; border-radius: 50%; background: transparent; color: var(--accent); }
+.timeline-row--announced .timeline-row__summary, .timeline-row--ready .timeline-row__summary { color: var(--color-66665f); }
+.timeline-row--running .timeline-row__name, .timeline-row--running .timeline-row__line { color: var(--accent); }
+.timeline-row--error .timeline-row__name, .timeline-row--error .timeline-row__line { color: var(--danger); }
+.timeline-row--halted .timeline-row__name { color: var(--warning); }
+/* Reasoning is prose, not an argument, so its line is set in the body face. The
+   system prompt is the same kind of row and reads the same way. */
+.timeline-row--reasoning .timeline-row__line,
+.timeline-row--system .timeline-row__line { font: 11px/1.5 var(--app-font-family); color: var(--color-666660); }
+/* "system" and "think" are fixed labels, not phrases that can afford to lose a
+   tail: the line beside them absorbs the squeeze instead. Specificity matches
+   the name-rationing rules, including the narrow-viewport one in feedback.css,
+   so the exemption holds at every width. */
+.timeline-row--reasoning .timeline-row__summary:has(.timeline-row__line) .timeline-row__name,
+.timeline-row--system .timeline-row__summary:has(.timeline-row__line) .timeline-row__name { flex: 0 0 auto; max-width: none; }
+
+.timeline-row__details { margin: 2px 3px 8px 6px; background: transparent; }
+.timeline-row__details .tool-renderer { box-shadow: 0 1px 2px var(--color-000000-ap2_5); }
+/* Marks a card carries above its body, such as an interrupted reply's. */
+.context-card__marks { display: flex; margin: 0 0 4px; }
+/* A line about the row itself, above its body: what an edit of it will and will not change. */
+.timeline-row__note { margin: 0 0 6px 13px; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+.timeline-row__prose { padding: 2px 0 4px 13px; border-left: 1px solid var(--color-d4d4ce); overflow-wrap: anywhere; color: var(--color-5f5f5a); font-size: 12.5px; line-height: 1.62; }
+/* A native compaction card's body: what it means, then the messages it kept. */
+.context-compaction p { margin: 0 0 6px; }
+.context-compaction__retained { display: flex; flex-direction: column; gap: 3px; margin: 0; padding: 0; list-style: none; }
+.context-compaction__retained li { display: flex; gap: 8px; min-width: 0; }
+.context-compaction__role { flex: 0 0 auto; color: var(--faint); font-size: 11px; }
+.context-compaction__text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timeline-row__prose .markdown-content h1, .timeline-row__prose .markdown-content h2,
+.timeline-row__prose .markdown-content h3, .timeline-row__prose .markdown-content h4,
+.timeline-row__prose .markdown-content h5, .timeline-row__prose .markdown-content h6 { color: var(--color-4d4d48); }
+.timeline-row__output { max-height: 240px; margin: 0; padding: 2px 0 4px 13px; overflow: auto scroll; border-left: 1px solid var(--color-d4d4ce); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--color-5f5f5a); font: 11.5px/1.55 var(--mono); }
+
+/* A run failure, read where it happened. Matches the composer failure notice so
+   the same failure reads the same way wherever it lands. */
+.turn-error { padding: 7px 7px 7px 9px; display: flex; align-items: center; gap: 7px; border: 1px solid var(--color-efd0cd); border-radius: 8px; background: var(--color-fff6f5); color: var(--danger); }
+.turn-error > span { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.turn-error strong { font-size: 10px; }
+.turn-error small { margin-top: 1px; color: var(--color-8e5a56); font-size: 9px; overflow-wrap: anywhere; }
+.turn-error > button { min-height: 25px; padding: 0 8px; border: 0; border-radius: 6px; background: var(--color-f6dedb); color: var(--color-8e3630); font-size: 9.5px; font-weight: 650; }
+.turn-error > button:hover { background: var(--color-efcfcb); }
+
+/* In-place editors. A card gives up its body rather than opening a dialog. */
+.context-card--editing { box-shadow: 0 0 0 1px var(--focus); }
+.inline-text-editor { position: relative; display: flex; flex-direction: column; gap: 6px; border-radius: 12px; }
+.inline-text-editor .attachment-notice { margin: 0; }
+/* The attach control keeps to the left under the field, the way it sits in the composer. */
+.inline-text-editor__footer { display: flex; align-items: center; }
+/*
+ * An editor's Cancel and Save stand where the card's edit and delete buttons
+ * were, Save in delete's spot. Over a message the bar heads the editor, so they
+ * cover nothing being typed; inside a row they are laid over the end of its
+ * header, which stays in place above the editor.
+ */
+.inline-text-editor__bar { order: -1; min-height: 24px; padding-right: var(--timeline-actions-inset); display: flex; align-items: center; gap: 8px; }
+.inline-text-editor__actions { margin-left: auto; }
+.inline-text-editor__bar .editor-kind { margin-bottom: 0; }
+.timeline-row .inline-text-editor { position: static; }
+.timeline-row .inline-text-editor__bar,
+.inline-tool-editor__actions { position: absolute; z-index: 1; top: 3px; right: var(--timeline-actions-inset); min-height: 0; padding: 0; }
+/* What the bar covers of the header steps aside while it is there. */
+.timeline-row:has(> .timeline-row__details :is(.inline-text-editor, .inline-tool-editor)) > .timeline-row__header {
+  --context-actions-width: 74px;
+}
+.timeline-row:has(> .timeline-row__details :is(.inline-text-editor, .inline-tool-editor)) > .timeline-row__header :is(.timeline-row__stat, .timeline-row__badge, .execution-status) { opacity: 0; }
+.timeline-row:has(> .timeline-row__details :is(.inline-text-editor, .inline-tool-editor)) > .timeline-row__header .timeline-row__summary {
+  -webkit-mask-image: linear-gradient(to right, var(--color-000000) calc(100% - var(--context-actions-width) - var(--timeline-actions-inset) - 16px), transparent calc(100% - var(--context-actions-width) - var(--timeline-actions-inset) + 4px));
+  mask-image: linear-gradient(to right, var(--color-000000) calc(100% - var(--context-actions-width) - var(--timeline-actions-inset) - 16px), transparent calc(100% - var(--context-actions-width) - var(--timeline-actions-inset) + 4px));
+}
+/* The bare editor stands in for a card that had its own width and side, so it
+   keeps them: otherwise an edit reads as a full-width strip where the card was.
+   A reply's spans the column, as the reply does, for its bar to reach the end. */
+.inline-text-editor--assistant > :not(.inline-text-editor__bar) { max-width: 86%; }
+.inline-text-editor--user { width: 78%; margin-left: auto; }
+/* The editor mounts already holding focus, which keeps a `content-visibility: auto`
+   slot rendered without WebKit ever measuring whether it is on screen. Pressing
+   Save blurs the textarea first, WebKit then skips the slot's contents, and the
+   release lands on the empty slot: no click, and the editor returns on the next
+   interaction. The slot holds one editor, so there is nothing to defer. */
+.context-slot--inserting { padding: 4px 0; content-visibility: visible; }
+
+/*
+ * One shape for a call, read or edited: each thing worth knowing named at the
+ * left with its value boxed beside it, and the result as a last box spanning
+ * the card. The result needs no name — it is the one row every card has, and a
+ * label saying so would be the only label that carried no information.
+ *
+ * The name column sizes to the longest name so every box starts on the same
+ * edge, and stops at a width past which a name is no longer worth the room it
+ * takes from the value it names.
+ */
+.tool-kv { margin: 0; display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); gap: 5px 9px; align-items: start; }
+.tool-kv__row { display: contents; }
+.tool-kv__key { max-width: 104px; padding-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font: 10px var(--mono); }
+.tool-kv__value { min-width: 0; margin: 0; padding: 3px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--color-ffffff); }
+.tool-kv__row--result .tool-kv__value { grid-column: 1 / -1; }
+.tool-kv__value > pre { margin: 0; max-height: 232px; overflow: auto scroll; white-space: pre-wrap; overflow-wrap: anywhere; font: 10.5px/1.55 var(--mono); }
+.tool-kv__value:focus-within { border-color: var(--focus); }
+.tool-kv__value--invalid { border-color: var(--danger); }
+/* Editing a card keeps the boxes it is read in. The box is the field's frame, so
+   the field brings none of its own: a second outline inside this one read as a
+   control nested in a control. Focus and errors colour the box instead. */
+.tool-kv__value > .plain-field { border-radius: 0; font: 10.5px/1.55 var(--mono); }
+.tool-kv__value > .plain-field:hover,
+.tool-kv__value > .plain-field:focus-within,
+.tool-kv__value > .plain-field--error { background: transparent; box-shadow: none; }
+.tool-kv__value > .plain-field > textarea, .tool-kv__value > .plain-field::after { padding: 0; }
+.tool-renderer .tool-kv { padding: 9px 10px; }
+
+.inline-tool-editor { display: flex; flex-direction: column; gap: 5px; }
+.inline-tool-editor__failure { min-width: 0; margin: 0; color: var(--danger); font-size: 10px; line-height: 1.45; }
+.timeline-block__insertion { z-index: 3; }
+.diff-output { --diff-gutter: 2ch; margin: 6px 10px 10px; overflow: hidden; border: 1px solid var(--border); border-radius: 7px; background: var(--color-ffffff); }
+.diff-output__header { min-height: 31px; padding: 5px 8px 5px 10px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); background: var(--color-fafaf8); }
+.diff-output__header .diff-output__path { flex: 1; color: var(--color-4e4e49); font: 9.75px var(--mono); }
+.diff-output__stats { flex: 0 0 auto; display: inline-flex; gap: 4px; }
+.diff-output__stat { min-width: 25px; padding: 2px 5px; border-radius: 4px; font: 650 8.5px var(--mono); text-align: center; }
+.diff-output__stat--addition { color: var(--success); background: var(--success-soft); }
+.diff-output__stat--deletion { color: var(--danger); background: var(--danger-soft); }
+.diff-output__body { max-height: 240px; overflow: auto scroll; background: var(--color-fdfdfc); }
+/* One gutter, exactly as wide as the widest number it holds (plus its 1px rule) and
+   unpadded, so the numbers sit at the left edge instead of inside a column reserved
+   for a longer file. */
+.diff-output__line { min-width: max-content; min-height: 20px; display: grid; grid-template-columns: calc(var(--diff-gutter) + 1px) minmax(220px, 1fr); font: 10px/20px var(--mono); color: var(--color-50504c); }
+.diff-output__line-number { padding: 0; border-right: 1px solid var(--color-000000-ap5); color: var(--color-a0a099); text-align: right; -webkit-user-select: none; user-select: none; }
+.diff-output__content { min-height: 20px; padding: 0 9px 0 3px; white-space: pre; }
+/* A change colours its line, not its number: the gutter stays the body's own surface. */
+.diff-output__line--addition .diff-output__content { color: var(--color-246b4e); background: var(--color-eaf7f0); }
+.diff-output__line--deletion .diff-output__content { color: var(--color-994040); background: var(--color-fff0f0); }
+.diff-output__line--meta { min-width: 100%; color: var(--color-8a7655); background: var(--color-fff9ec); font-style: italic; }
+.diff-output__line--meta .diff-output__line-number { display: none; }
+.diff-output__line--meta .diff-output__content { grid-column: 1 / -1; padding: 0 10px; }
+.diff-output__empty { padding: 16px 10px; color: var(--faint); font-size: 10px; text-align: center; }

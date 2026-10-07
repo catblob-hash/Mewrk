@@ -1,0 +1,105 @@
+import type { ApiProvider } from "../types";
+import { createId } from "./id";
+
+export const CLAUDE_AGENT_PROVIDER_FAMILY = "claude_agent" as const;
+export const CLAUDE_AGENT_PROVIDER_NAME = "Claude Agent";
+/** Anthropic's terms for driving Claude Code as an agent runtime. */
+export const CLAUDE_AGENT_LEGAL_URL = "https://code.claude.com/docs/en/legal-and-compliance";
+
+/**
+ * Starting models for this family, mirroring the host's seed table
+ * (`model_discovery.rs::CLAUDE_AGENT_SEED_MODELS`): what a fresh install ships
+ * with, and the browser preview's fetch fixture. The real model fetch asks the
+ * bundled CLI, so its list follows the user's login rather than these rows.
+ *
+ * No id carries Claude Code's `[1m]` budget suffix: the sidecar derives it from
+ * the model's context window (above 200k asks the CLI for its 1M budget).
+ */
+export const CLAUDE_AGENT_REGISTRY: ReadonlyArray<{
+  id: string;
+  name: string;
+  contextWindow: number;
+  maxOutputTokens: number;
+}> = [
+  { id: "claude-fable-5-1", name: "Claude Fable 5.1", contextWindow: 1000000, maxOutputTokens: 128000 },
+  { id: "claude-fable-5", name: "Claude Fable 5", contextWindow: 1000000, maxOutputTokens: 128000 },
+  { id: "claude-opus-5-5", name: "Claude Opus 5.5", contextWindow: 1000000, maxOutputTokens: 128000 },
+  { id: "claude-opus-5", name: "Claude Opus 5", contextWindow: 200000, maxOutputTokens: 128000 },
+  { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", contextWindow: 1000000, maxOutputTokens: 128000 },
+  { id: "claude-sonnet-5", name: "Claude Sonnet 5", contextWindow: 1000000, maxOutputTokens: 128000 },
+  { id: "claude-opus-4-8", name: "Claude Opus 4.8", contextWindow: 200000, maxOutputTokens: 128000 },
+  { id: "claude-opus-4-7", name: "Claude Opus 4.7", contextWindow: 200000, maxOutputTokens: 128000 },
+  { id: "claude-opus-4-6", name: "Claude Opus 4.6", contextWindow: 200000, maxOutputTokens: 128000 },
+  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", contextWindow: 200000, maxOutputTokens: 128000 },
+  { id: "claude-opus-4-5", name: "Claude Opus 4.5", contextWindow: 200000, maxOutputTokens: 64000 },
+  { id: "claude-opus-4-1", name: "Claude Opus 4.1", contextWindow: 200000, maxOutputTokens: 32000 },
+  { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5", contextWindow: 200000, maxOutputTokens: 64000 },
+  { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", contextWindow: 200000, maxOutputTokens: 64000 },
+];
+
+/**
+ * The Claude Agent family drives Mewrk's bundled, version-locked Claude Code
+ * executable through the official Claude Agent SDK instead of speaking HTTP itself,
+ * and it reuses that CLI's own login: it has neither an API key nor a base URL.
+ * Like Codex it is a built-in row identified by family, not by a fixed id: ids stay
+ * random UUIDs so credentials never collide across data domains.
+ */
+export function isClaudeAgentProvider(provider: Pick<ApiProvider, "family">): boolean {
+  return provider.family === CLAUDE_AGENT_PROVIDER_FAMILY;
+}
+
+/**
+ * Ensure exactly one Claude Agent row: keep the first existing one (and drop
+ * later duplicates), or append a fresh disabled row. Existing row order is
+ * retained. A `baseUrl` and `familySettings.claude_executable` left over from
+ * older versions are flattened rather than rejected — the host ignores both.
+ */
+export function ensureClaudeAgentProvider(providers: ApiProvider[]): ApiProvider[] {
+  let found = false;
+  const deduplicated = providers.filter((provider) => {
+    if (!isClaudeAgentProvider(provider)) {
+      return true;
+    }
+    if (found) {
+      return false;
+    }
+    found = true;
+    return true;
+  }).map((provider) => {
+    if (!isClaudeAgentProvider(provider)) return provider;
+    const hasLegacyExecutable = Object.prototype.hasOwnProperty.call(
+      provider.familySettings,
+      "claude_executable"
+    );
+    if (provider.baseUrl === "" && !hasLegacyExecutable) return provider;
+    const familySettings = hasLegacyExecutable
+      ? Object.fromEntries(
+        Object.entries(provider.familySettings).filter(([key]) => key !== "claude_executable")
+      )
+      : provider.familySettings;
+    return {
+      ...provider,
+      baseUrl: "",
+      familySettings,
+    };
+  });
+
+  if (found) {
+    return deduplicated;
+  }
+
+  return [
+    ...deduplicated,
+    {
+      id: createId("provider"),
+      name: CLAUDE_AGENT_PROVIDER_NAME,
+      enabled: false,
+      family: CLAUDE_AGENT_PROVIDER_FAMILY,
+      baseUrl: "",
+      familySettings: {},
+      notes: "",
+      models: [],
+      activeModelId: null,
+    },
+  ];
+}

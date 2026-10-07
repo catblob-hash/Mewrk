@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for Mewrk.app's own executable when the bundle is signed with the hardened
+  runtime. The Chromium helper apps get their own, narrower sets from
+  scripts/stage-macos-cef.mjs. Nothing else in the bundle takes entitlements from here: the
+  bundled remote agent is signed by scripts/sign-macos-remote-agents.mjs, and the AI SDK sidecar
+  and the Claude Code CLI are not in the bundle at all. The app downloads them into its app data
+  folder (components/aisdk, components/claude-agent) and runs them as separate processes, each
+  under the signature it was published with; a child process does not inherit these entitlements.
+
+  - allow-jit / allow-unsigned-executable-memory: Chromium's browser process, which runs inside
+    this executable, generates code at run time. (The Node sidecar's V8 and the Claude Code CLI
+    used to be a reason as well, back when both were signed into the bundle.)
+  - disable-library-validation: the Chromium Embedded Framework is loaded from the bundle;
+    a signature without a Team ID (ad-hoc or self-signed) would otherwise refuse it.
+  - automation.apple-events, device.audio-input, device.camera: programs the user runs in
+    Mewrk ask for these as Mewrk; the hardened runtime denies them outright without the
+    entitlement, before macOS can ask the user. No App Sandbox: Mewrk is a development
+    environment and must reach the user's projects and tools.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <key>com.apple.security.automation.apple-events</key>
+  <true/>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+  <key>com.apple.security.device.camera</key>
+  <true/>
+</dict>
+</plist>

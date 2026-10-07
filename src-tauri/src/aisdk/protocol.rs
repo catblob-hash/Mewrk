@@ -1,0 +1,801 @@
+//! Rust endpoint for the sidecar protocol.
+//!
+//! This must exactly match `aisdk-service/src/protocol.ts`. Both sides restart on a
+//! `v` mismatch; they do not negotiate backward compatibility.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Protocol generation. Must exactly equal the TypeScript `PROTOCOL_VERSION`.
+///
+/// Increment this when a stale sidecar could silently suppress required behavior;
+/// the generation gate turns that condition into an explicit startup failure.
+///
+/// The sidecar is not shipped inside the application: it is published on
+/// Mewrk's own channel separately for each protocol generation, and a host
+/// fetches the newest build of the generation it speaks
+/// (`components/aisdk/p<PROTOCOL_VERSION>/…`, see `crate::components::aisdk`).
+/// So any host↔sidecar change that an older host or an older sidecar cannot
+/// handle — a field the other side must understand, a new meaning for an old
+/// one, a frame it would reject — must bump this, or the channel pairs the two
+/// and they fail silently instead of at the handshake.
+pub(crate) const PROTOCOL_VERSION: u32 = 17;
+
+/// Maximum line size (128 MiB). Both sides enforce it because neither side
+/// trusts the other.
+///
+/// A step's messages may take half of it ([`super::project::enforce_frame_budget`]),
+/// 64 MiB, which is past what any provider takes in one request (Anthropic's
+/// Messages API takes 32 MB): images and attachments are not budgeted, so the
+/// frame must not become the budget in their place, and a request too large
+/// for its provider is refused by the provider, in its own words.
+pub(crate) const MAX_LINE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Adapter family. Maps one-to-one to `crate::model::ProviderFamily`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Family {
+    OpenaiResponses,
+    OpenaiCodex,
+    OpenaiChat,
+    Anthropic,
+    /// Claude Agent SDK driving the locally installed Claude Code executable.
+    /// Not an HTTP dialect: the sidecar owns a CLI session per host run and
+    /// parks the CLI's tool handlers between steps.
+    ClaudeAgent,
+    Google,
+    Xai,
+    Azure,
+    Bedrock,
+    Vertex,
+    OpenaiCompatible,
+}
+
+impl Family {
+    /// Map a persisted family to its wire-format slug.
+    ///
+    /// Keep these enums separate because persistence uses `snake_case` while the
+    /// sidecar protocol uses `kebab-case`; each has an independent compatibility
+    /// boundary. This exhaustive mapping must reject newly added families at compile
+    /// time rather than silently routing them through a generic adapter.
+    pub(crate) fn for_format(family: crate::model::ProviderFamily) -> Self {
+        use crate::model::ProviderFamily as Persisted;
+        match family {
+            Persisted::OpenaiResponses => Self::OpenaiResponses,
+            Persisted::OpenaiCodex => Self::OpenaiCodex,
+            Persisted::OpenaiChat => Self::OpenaiChat,
+            Persisted::Anthropic => Self::Anthropic,
+            Persisted::ClaudeAgent => Self::ClaudeAgent,
+            Persisted::Google => Self::Google,
+            Persisted::Xai => Self::Xai,
+            Persisted::Azure => Self::Azure,
+            Persisted::Bedrock => Self::Bedrock,
+            Persisted::Vertex => Self::Vertex,
+            Persisted::OpenaiCompatible => Self::OpenaiCompatible,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ToolSpec {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    /// Copied verbatim from the `input_schema` in `builtin_schemas` or the descriptor.
+    #[serde(rename = "inputSchema")]
+    pub(crate) input_schema: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct NativeSearch {
+    #[serde(rename = "maxUses")]
+    pub(crate) max_uses: u32,
+    #[serde(rename = "previousCallIds", skip_serializing_if = "Vec::is_empty")]
+    pub(crate) previous_call_ids: Vec<String>,
+    /// Which version of the Messages `web_search` tool to attach, as the `type`
+    /// the sidecar will write. Absent for every family that has no version to
+    /// pick, which leaves the sidecar on its own default for that family.
+    #[serde(rename = "toolType", skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_type: Option<&'static str>,
+}
+
+/// Attaches the family's server-side page-fetch tool to this request.
+///
+/// Separate from [`NativeSearch`] because the two capabilities do not come
+/// together upstream: only Anthropic exposes fetching as its own server tool,
+/// and only its result carries the page as readable text.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct NativeFetch {
+    #[serde(rename = "maxUses")]
+    pub(crate) max_uses: u32,
+    /// The Messages `web_fetch` version, read the same way as
+    /// [`NativeSearch::tool_type`].
+    #[serde(rename = "toolType", skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_type: Option<&'static str>,
+    /// The upstream's own cap on how many tokens of one page the fetch tool
+    /// returns, written to the tool as `max_content_tokens`. Absent means the
+    /// conversation asked for no cap, and the upstream's default stands rather
+    /// than an invented number standing in for "unlimited".
+    #[serde(rename = "maxContentTokens", skip_serializing_if = "Option::is_none")]
+    pub(crate) max_content_tokens: Option<u32>,
+}
+
+/// Claude Code session parameters for the `claude-agent` family.
+///
+/// Absent for every other family. The sidecar keys its parked CLI session by
+/// `session`; the host mints one per run and sends `release` when the run ends.
+/// `executable` (the CLI) and `sdk` (the absolute path of the Agent SDK's root
+/// entry, `sdk.mjs`, which the sidecar loads at run time) are the installed
+/// Claude Agent components (`crate::components::claude_agent`), host-resolved
+/// so the sidecar never searches the disk; the two come from one install, so
+/// they are always the pair npm published together. `env` carries only the
+/// profile-location variables the CLI needs to find its own configuration
+/// (the sidecar spawns with a cleared environment). This
+/// family has no credential at all — the CLI uses its own login — so
+/// `api_key`/`base_url` are always absent; `env` is the sole channel by which a
+/// loopback test double can be pointed at, and the sidecar rejects a remote one.
+///
+/// `tool_changes` is per step: whether Claude Code appends tools mid-session
+/// for this step's model ([`crate::tool_append::known`]). A session the
+/// sidecar rebuilds hands the CLI the history's tool additions only then; on
+/// any other model the CLI would announce them in words of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct AgentSession {
+    pub(crate) session: String,
+    pub(crate) executable: String,
+    pub(crate) sdk: String,
+    pub(crate) cwd: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) env: BTreeMap<String, String>,
+    #[serde(rename = "toolChanges")]
+    pub(crate) tool_changes: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StepRequest {
+    pub(crate) family: Family,
+    /// Address that passed the host security gate. The sidecar must not revalidate it.
+    ///
+    /// The explicit rename is required because serde's `camelCase` yields `baseUrl`,
+    /// while the sidecar reads the AI SDK spelling, `baseURL`.
+    ///
+    /// Absence selects the provider default. Vertex and Bedrock derive endpoints from
+    /// `project`, `location`, or `region` in `settings`.
+    #[serde(rename = "baseURL", skip_serializing_if = "Option::is_none")]
+    pub(crate) base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) api_key: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) headers: BTreeMap<String, String>,
+    /// Family-specific identity fields keyed by `FamilySetting::wire_name()`
+    /// (`region`, `project`, `location`, or `apiVersion`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) settings: BTreeMap<String, String>,
+    pub(crate) model_id: String,
+    /// The stable system prompt: everything assembled once at run start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) system: Option<String>,
+    /// The per-step tail of the system prompt (the web-safety and preview
+    /// sections, conversation system contexts). The sidecar appends it to
+    /// `system` after a blank line for every family, so the prompt a provider
+    /// sees is unchanged; the Anthropic dialect also reads it as Claude Code's
+    /// dynamic boundary and gives the prefix and the tail separate cache
+    /// breakpoints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) system_dynamic: Option<String>,
+    /// AI SDK `ModelMessage[]` produced by the host's canonical projection.
+    pub(crate) messages: Vec<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tools: Vec<ToolSpec>,
+    /// Always 1 for ordinary turns; host-created one-shot native-search requests may exceed it.
+    pub(crate) max_steps: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_output_tokens: Option<u64>,
+    /// The model's context window, sent only to the `claude-agent` family, where it
+    /// picks the CLI's own context budget: the sidecar asks for the `[1m]` budget
+    /// when the window exceeds the CLI's standard 200k. No other family reads it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) context_window: Option<u64>,
+    /// Reasoning effort: AI SDK 7's levels `low`, `medium`, `high`, `xhigh`,
+    /// plus `max`, which the SDK has no shared name for. Not a provider
+    /// dialect: the sidecar maps it per family and model (`reasoning.ts`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning: Option<&'static str>,
+    /// The model's reasoning response form: `"plaintext"` or `"encrypted"`.
+    ///
+    /// The stored model attribute is always one of the two, so this carries no
+    /// default policy. Absence means this provider has no reasoning-form
+    /// consumer. Plaintext mode enables response dialect translation, but all
+    /// Responses modes request encrypted replay data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_content: Option<&'static str>,
+    /// The model's `prompt_cache` attribute, sent only to families whose
+    /// dialect places cache breakpoints. `false` turns Claude Code's markers
+    /// off for this model; absence means this family has no consumer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_options: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) native_search: Option<NativeSearch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) native_fetch: Option<NativeFetch>,
+    /// Present only for the `claude-agent` family; see [`AgentSession`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) agent: Option<AgentSession>,
+    /// Whether this model, at this endpoint, takes a tool mid-conversation
+    /// through the protocol's append interface
+    /// (`tool_append::appends_tools`: what Mewrk knows, else the user's
+    /// answer on the model). Only then does the sidecar hand the history's
+    /// tool additions over in place; otherwise it drops them and every tool
+    /// stays declared.
+    #[serde(rename = "toolAppend", skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) tool_append: bool,
+    /// Whether this model, at this endpoint, takes a system message in the
+    /// middle of the conversation (`system_append::appends_system`, decided
+    /// the same way). Where it does not, the sidecar lifts every appended
+    /// system prompt in `messages` into the system prompt's tail.
+    #[serde(rename = "systemAppend", skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) system_append: bool,
+    /// The tools this request declares asynchronous (`async: true`), where the
+    /// model takes asynchronous calls (`async_tools::takes_async_tools`).
+    /// Only then does the sidecar leave a deferred launch without an output
+    /// and send its task's result as that call's output; otherwise both stay
+    /// what the host projected.
+    #[serde(rename = "asyncTools", skip_serializing_if = "Vec::is_empty")]
+    pub(crate) async_tools: Vec<String>,
+}
+
+/// Sidecar-to-host frame.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub(crate) enum SidecarFrame {
+    Ready { protocol: u32 },
+    Event { id: String, event: StepEvent },
+    Done { id: String, result: StepResult },
+    Error { id: String, error: StepError },
+}
+
+impl SidecarFrame {
+    /// Return this frame's request, if any. `ready` is not tied to a request.
+    pub(crate) fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Ready { .. } => None,
+            Self::Event { id, .. } | Self::Done { id, .. } | Self::Error { id, .. } => Some(id),
+        }
+    }
+}
+
+/// Stream event. Values map one-to-one to `crate::model::ModelStreamEvent`; the
+/// host passes them through.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "k", rename_all = "kebab-case")]
+pub(crate) enum StepEvent {
+    TextDelta {
+        delta: String,
+    },
+    /// A provider opened a reasoning item.
+    ///
+    /// This is not a `ReasoningDelta` prefix: an item may produce no summary text,
+    /// making this event the only live reasoning signal. `item` is a zero-based
+    /// sequence number among evidence-gated items and identifies each reasoning
+    /// segment consistently in host and renderer projections.
+    ReasoningStart {
+        #[serde(default)]
+        item: usize,
+        #[serde(default)]
+        form: Option<crate::model::ReasoningForm>,
+    },
+    ReasoningDelta {
+        #[serde(default)]
+        item: usize,
+        delta: String,
+    },
+    ReasoningDone {
+        #[serde(default)]
+        item: usize,
+        /// Cumulative reasoning wall-clock milliseconds for this step. The sidecar
+        /// measures stream timing and sends this value both live and in
+        /// `StepResult::reasoning_ms` so reloads retain the same duration.
+        #[serde(rename = "durationMs", default)]
+        duration_ms: Option<u64>,
+    },
+    /// Live estimate of what an open item has thought without streaming it as
+    /// text (omitted thinking), cumulative for the item. Display only; usage
+    /// stays the authority.
+    #[serde(rename_all = "camelCase")]
+    ReasoningProgress {
+        #[serde(default)]
+        item: usize,
+        estimated_tokens: u64,
+    },
+    #[serde(rename_all = "camelCase")]
+    ToolCallAnnounced {
+        call_id: String,
+        tool_name: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    ToolCall {
+        call_id: String,
+        input: Value,
+    },
+    Usage {
+        usage: SidecarUsage,
+    },
+    /// Emitted every 500 ms. The host uses it as a cancellation probe.
+    Heartbeat,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SidecarUsage {
+    pub(crate) input_tokens: Option<u64>,
+    pub(crate) output_tokens: Option<u64>,
+    pub(crate) total_tokens: Option<u64>,
+    pub(crate) reasoning_tokens: Option<u64>,
+    pub(crate) cache_read_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SidecarSource {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) url: Option<String>,
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+}
+
+/// One page a provider-executed fetch tool retrieved, with its body as text.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SidecarWebDocument {
+    pub(crate) url: String,
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    #[serde(default)]
+    pub(crate) text: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SidecarCall {
+    pub(crate) call_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) input: Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StepResult {
+    #[serde(default)]
+    pub(crate) text: String,
+    #[serde(default)]
+    pub(crate) reasoning: Vec<String>,
+    /// Cumulative reasoning wall-clock milliseconds for this step.
+    ///
+    /// Unlike `reasoning`, which only contains nonempty summaries, this may exist
+    /// for encrypted reasoning with no summary text. Its presence determines whether
+    /// the host renders a reasoning card; absence means no reasoning item occurred.
+    #[serde(default)]
+    pub(crate) reasoning_ms: Option<u64>,
+    /// Contains only client-side tool calls. The sidecar filters provider-executed calls.
+    #[serde(default)]
+    pub(crate) calls: Vec<SidecarCall>,
+    #[serde(default)]
+    pub(crate) usage: SidecarUsage,
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+    #[serde(default)]
+    pub(crate) finish_reason: Option<String>,
+    /// Raw upstream stop reason, without AI SDK normalization.
+    ///
+    /// `pause_turn` normalizes to `finishReason:"stop"`, so continuation decisions
+    /// must use this field. Absence means the provider did not report or forward it.
+    #[serde(default)]
+    pub(crate) raw_finish_reason: Option<String>,
+    /// Opaque continuation blocks from AI SDK `response.messages`. The host persists
+    /// and replays them without interpretation so encrypted content, reasoning
+    /// signatures, and reasoning items survive across turns.
+    #[serde(default)]
+    pub(crate) response_messages: Vec<Value>,
+    #[serde(default)]
+    pub(crate) sources: Vec<SidecarSource>,
+    /// Pages a provider-executed fetch tool retrieved, already converted to text.
+    ///
+    /// The only channel on which an upstream hands the host readable page
+    /// content. Search results never carry text — Anthropic seals them in
+    /// `encrypted_content` and Responses does not return them at all — so this
+    /// field is populated by `web_fetch` steps and empty on search steps.
+    #[serde(default)]
+    pub(crate) web_documents: Vec<SidecarWebDocument>,
+    /// Newly executed unique provider search calls, including failed calls and
+    /// excluding IDs replayed in request history. Present on native-search steps.
+    #[serde(default)]
+    pub(crate) native_search_uses: Option<u32>,
+    #[serde(default)]
+    pub(crate) native_search_call_ids: Vec<String>,
+    /// Failures from provider-executed tools such as server-side search or fetch.
+    /// These calls must never be executed again by the host; native search uses the
+    /// failures to report an accurate result envelope.
+    #[serde(default)]
+    pub(crate) provider_tool_errors: Vec<ProviderToolError>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderToolError {
+    #[serde(default)]
+    pub(crate) tool_name: String,
+    #[serde(default)]
+    pub(crate) message: String,
+}
+
+/// Failure classification. The host retry loop uses only `kind`.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ErrorKind {
+    Transient,
+    Permanent,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct StepError {
+    pub(crate) kind: ErrorKind,
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) status: Option<u16>,
+    #[serde(default, rename = "retryAfterMs")]
+    pub(crate) retry_after_ms: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_hint_decodes_and_is_optional() {
+        let error: StepError = serde_json::from_value(serde_json::json!({
+            "kind": "transient", "message": "later", "status": 429, "retryAfterMs": 60000
+        }))
+        .unwrap();
+        assert_eq!(error.retry_after_ms, Some(60000));
+        let bare: StepError = serde_json::from_value(serde_json::json!({
+            "kind": "transient", "message": "later"
+        }))
+        .unwrap();
+        assert_eq!(bare.retry_after_ms, None);
+    }
+
+    /// Family slugs must exactly match the TypeScript `ProviderFamily` literals.
+    #[test]
+    fn family_slugs_match_the_sidecar() {
+        let cases = [
+            (Family::OpenaiResponses, "openai-responses"),
+            (Family::OpenaiCodex, "openai-codex"),
+            (Family::OpenaiChat, "openai-chat"),
+            (Family::Anthropic, "anthropic"),
+            (Family::ClaudeAgent, "claude-agent"),
+            (Family::Google, "google"),
+            (Family::Xai, "xai"),
+            (Family::Azure, "azure"),
+            (Family::Bedrock, "bedrock"),
+            (Family::Vertex, "vertex"),
+            (Family::OpenaiCompatible, "openai-compatible"),
+        ];
+        for (family, slug) in cases {
+            assert_eq!(
+                serde_json::to_value(family).unwrap(),
+                Value::String(slug.into())
+            );
+        }
+    }
+
+    #[test]
+    fn stream_events_decode_from_the_sidecar_shape() {
+        let text: StepEvent = serde_json::from_str(r#"{"k":"text-delta","delta":"你好"}"#).unwrap();
+        assert!(matches!(text, StepEvent::TextDelta { delta } if delta == "你好"));
+
+        let announced: StepEvent =
+            serde_json::from_str(r#"{"k":"tool-call-announced","callId":"c1","toolName":"ls"}"#)
+                .unwrap();
+        assert!(
+            matches!(announced, StepEvent::ToolCallAnnounced { call_id, tool_name } if call_id == "c1" && tool_name == "ls")
+        );
+
+        let heartbeat: StepEvent = serde_json::from_str(r#"{"k":"heartbeat"}"#).unwrap();
+        assert!(matches!(heartbeat, StepEvent::Heartbeat));
+    }
+
+    /// `reasoning-start` is the only reasoning event without text, so it signals
+    /// live reasoning when encrypted reasoning produces no delta. All three events
+    /// carry the `item` sequence number.
+    #[test]
+    fn reasoning_events_carry_the_start_signal_and_the_duration() {
+        let start: StepEvent = serde_json::from_str(r#"{"k":"reasoning-start","item":0}"#).unwrap();
+        assert!(matches!(
+            start,
+            StepEvent::ReasoningStart {
+                item: 0,
+                form: None
+            }
+        ));
+
+        let second: StepEvent =
+            serde_json::from_str(r#"{"k":"reasoning-delta","item":1,"delta":"想"}"#).unwrap();
+        assert!(matches!(second, StepEvent::ReasoningDelta { item: 1, delta } if delta == "想"));
+
+        let done: StepEvent =
+            serde_json::from_str(r#"{"k":"reasoning-done","item":1,"durationMs":1840}"#).unwrap();
+        assert!(matches!(
+            done,
+            StepEvent::ReasoningDone { item: 1, duration_ms } if duration_ms == Some(1840)
+        ));
+
+        // A missing duration remains decodable for cancelled streams or providers
+        // that omit `reasoning-start`. Missing `item` defaults to 0 for test fixtures.
+        let bare: StepEvent = serde_json::from_str(r#"{"k":"reasoning-done"}"#).unwrap();
+        assert!(matches!(
+            bare,
+            StepEvent::ReasoningDone { item: 0, duration_ms } if duration_ms.is_none()
+        ));
+
+        // Omitted thinking streams no text, only this estimate.
+        let progress: StepEvent =
+            serde_json::from_str(r#"{"k":"reasoning-progress","item":2,"estimatedTokens":1536}"#)
+                .unwrap();
+        assert!(matches!(
+            progress,
+            StepEvent::ReasoningProgress {
+                item: 2,
+                estimated_tokens: 1536
+            }
+        ));
+    }
+
+    /// `reasoningMs` remains present for encrypted reasoning with no summary text,
+    /// allowing the host to create a textless reasoning card.
+    #[test]
+    fn a_step_result_reports_reasoning_time_even_with_no_summary_text() {
+        let result: StepResult = serde_json::from_str(
+            r#"{"text":"","reasoning":[],"reasoningMs":2400,"calls":[],
+                "usage":{"outputTokens":700,"reasoningTokens":512},
+                "responseMessages":[],"sources":[]}"#,
+        )
+        .unwrap();
+        assert!(result.reasoning.is_empty());
+        assert_eq!(result.reasoning_ms, Some(2400));
+        assert_eq!(result.usage.reasoning_tokens, Some(512));
+        // Older frames without `providerToolErrors` remain decodable.
+        assert!(result.provider_tool_errors.is_empty());
+    }
+
+    #[test]
+    fn native_search_consumption_decodes_and_reaches_the_host() {
+        let result: StepResult =
+            serde_json::from_str(r#"{"nativeSearchUses":2,"nativeSearchCallIds":["a","b"]}"#)
+                .unwrap();
+        assert_eq!(result.native_search_uses, Some(2));
+        let parsed = super::super::ParsedModelResponse::from(result);
+        assert_eq!(parsed.native_search_uses, Some(2));
+        assert_eq!(parsed.native_search_call_ids, vec!["a", "b"]);
+        assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":-1}"#).is_err());
+        assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":1.5}"#).is_err());
+        assert_eq!(PROTOCOL_VERSION, 17);
+    }
+
+    /// Provider-executed tool failures use cross-language field names, so pin each
+    /// field's decoding.
+    #[test]
+    fn provider_tool_errors_decode_from_the_sidecar_spelling() {
+        let result: StepResult = serde_json::from_str(
+            r#"{"text":"","reasoning":[],"calls":[],"usage":{},
+                "responseMessages":[],"sources":[],
+                "providerToolErrors":[{"toolName":"web_search","message":"max_uses_exceeded"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.provider_tool_errors.len(), 1);
+        let failure = &result.provider_tool_errors[0];
+        assert_eq!(failure.tool_name, "web_search");
+        assert_eq!(failure.message, "max_uses_exceeded");
+    }
+
+    /// `pause_turn` normalizes to `stop`, so continuation logic must decode the
+    /// raw stop-reason field.
+    #[test]
+    fn the_raw_finish_reason_decodes_from_the_sidecar_spelling() {
+        let result: StepResult = serde_json::from_str(
+            r#"{"text":"稍等","reasoning":[],"calls":[],"usage":{},
+                "finishReason":"stop","rawFinishReason":"pause_turn",
+                "responseMessages":[],"sources":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(result.raw_finish_reason.as_deref(), Some("pause_turn"));
+
+        // Older frames without `rawFinishReason` remain decodable.
+        let bare: StepResult = serde_json::from_str(
+            r#"{"text":"","reasoning":[],"calls":[],"usage":{},
+                "responseMessages":[],"sources":[]}"#,
+        )
+        .unwrap();
+        assert!(bare.raw_finish_reason.is_none());
+    }
+
+    #[test]
+    fn a_step_request_omits_absent_options_instead_of_sending_null() {
+        let request = StepRequest {
+            family: Family::Anthropic,
+            base_url: Some("https://example.test/v1".into()),
+            api_key: None,
+            headers: BTreeMap::new(),
+            settings: BTreeMap::new(),
+            model_id: "m".into(),
+            system: None,
+            system_dynamic: None,
+            messages: vec![],
+            tools: vec![],
+            max_steps: 1,
+            max_output_tokens: None,
+            context_window: None,
+            reasoning: None,
+            reasoning_content: None,
+            prompt_cache: None,
+            provider_options: None,
+            native_search: None,
+            native_fetch: None,
+            agent: None,
+            tool_append: false,
+            system_append: false,
+            async_tools: Vec::new(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        // Upstream options distinguish explicit null from an omitted field.
+        for absent in [
+            "apiKey",
+            "system",
+            "systemDynamic",
+            "maxOutputTokens",
+            "contextWindow",
+            "reasoning",
+            "reasoningContent",
+            "promptCache",
+            "providerOptions",
+            "nativeSearch",
+            "headers",
+            "tools",
+            "agent",
+        ] {
+            assert!(value.get(absent).is_none(), "{absent} 不该出现");
+        }
+        assert_eq!(value["maxSteps"], 1);
+    }
+
+    #[test]
+    fn the_step_request_field_names_are_pinned_to_the_sidecar_spelling() {
+        // These names are the cross-language contract and must match the sidecar.
+        let request = StepRequest {
+            family: Family::OpenaiCompatible,
+            base_url: Some("https://example.test/v1".into()),
+            api_key: Some("k".into()),
+            headers: BTreeMap::from([("x-a".to_owned(), "b".to_owned())]),
+            settings: BTreeMap::from([("region".to_owned(), "us-east-1".to_owned())]),
+            model_id: "m".into(),
+            system: Some("s".into()),
+            system_dynamic: Some("tail".into()),
+            messages: vec![Value::Null],
+            tools: vec![ToolSpec {
+                name: "t".into(),
+                description: "d".into(),
+                input_schema: serde_json::json!({}),
+            }],
+            max_steps: 1,
+            max_output_tokens: Some(8),
+            context_window: None,
+            reasoning: Some("high"),
+            reasoning_content: Some("plaintext"),
+            prompt_cache: Some(false),
+            provider_options: Some(Value::Null),
+            native_search: Some(NativeSearch {
+                max_uses: 3,
+                previous_call_ids: vec!["old-call".into()],
+                tool_type: Some("web_search_20260209"),
+            }),
+            native_fetch: None,
+            agent: None,
+            tool_append: false,
+            system_append: false,
+            async_tools: Vec::new(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["nativeSearch"]["previousCallIds"],
+            serde_json::json!(["old-call"])
+        );
+        assert_eq!(value["promptCache"], serde_json::json!(false));
+        assert_eq!(value["systemDynamic"], serde_json::json!("tail"));
+        for expected in [
+            "family",
+            "baseURL",
+            "apiKey",
+            "headers",
+            "modelId",
+            "system",
+            "systemDynamic",
+            "messages",
+            "tools",
+            "maxSteps",
+            "maxOutputTokens",
+            // Pin this field to catch a spelling drift that would select the provider default.
+            "reasoning",
+            "reasoningContent",
+            "promptCache",
+            "providerOptions",
+            "nativeSearch",
+        ] {
+            assert!(value.get(expected).is_some(), "缺少字段 {expected}");
+        }
+        assert_eq!(value["tools"][0]["inputSchema"], serde_json::json!({}));
+        assert_eq!(value["nativeSearch"]["maxUses"], 3);
+        // The Messages tool version rides inside `nativeSearch` rather than
+        // beside it: the sidecar reads it only where it is building that tool.
+        assert_eq!(
+            value["nativeSearch"]["toolType"],
+            serde_json::json!("web_search_20260209")
+        );
+        // The default serde spelling must not appear.
+        assert!(value.get("baseUrl").is_none(), "baseUrl 是错误拼法");
+    }
+
+    #[test]
+    fn an_error_frame_carries_the_retry_decision() {
+        let frame: SidecarFrame = serde_json::from_str(
+            r#"{"v":1,"seq":3,"type":"error","id":"r1","error":{"kind":"transient","message":"上游临时故障","status":500}}"#,
+        )
+        .unwrap();
+        let SidecarFrame::Error { id, error } = frame else {
+            panic!("应当是 error 帧");
+        };
+        assert_eq!(id, "r1");
+        assert_eq!(error.kind, ErrorKind::Transient);
+        assert_eq!(error.status, Some(500));
+    }
+
+    /// The `agent` block is the `claude-agent` wire contract: its six field
+    /// names are read by the sidecar's session table, so pin them byte-for-byte.
+    /// `env` is omitted when empty, like every other optional map.
+    #[test]
+    fn the_agent_session_serializes_to_the_sidecar_spelling() {
+        let session = AgentSession {
+            session: "run-1".into(),
+            executable: r"C:\components\claude-agent\0.3.292\claude.exe".into(),
+            sdk: r"C:\components\claude-agent\0.3.292\sdk\sdk.mjs".into(),
+            cwd: r"C:\data\claude-agent".into(),
+            env: BTreeMap::from([("USERPROFILE".to_owned(), r"C:\Users\me".to_owned())]),
+            tool_changes: true,
+        };
+        let value = serde_json::to_value(&session).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "session": "run-1",
+                "executable": r"C:\components\claude-agent\0.3.292\claude.exe",
+                "sdk": r"C:\components\claude-agent\0.3.292\sdk\sdk.mjs",
+                "cwd": r"C:\data\claude-agent",
+                "env": { "USERPROFILE": r"C:\Users\me" },
+                "toolChanges": true
+            })
+        );
+
+        let bare = AgentSession {
+            env: BTreeMap::new(),
+            ..session
+        };
+        let value = serde_json::to_value(&bare).unwrap();
+        assert!(value.get("env").is_none(), "空 env 不该出现");
+        assert_eq!(value["session"], "run-1");
+    }
+}

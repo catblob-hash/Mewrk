@@ -1,0 +1,120 @@
+/* Sidebar */
+.sidebar {
+  grid-column: 1; width: var(--sidebar-width); min-width: 0; height: 100%; position: relative; display: flex; flex-direction: column;
+  background: var(--sidebar); border-right: 1px solid var(--border); padding: 0 9px 8px; overflow: hidden;
+  /* Flush with the window on the left, round where it meets the top bar and the gutter. */
+  border-radius: 0 var(--tile-radius) var(--tile-radius) 0;
+}
+.sidebar--closed { visibility: hidden; pointer-events: none; }
+.sidebar-resize-handle { position: absolute; z-index: 12; top: 0; right: 0; width: 8px; height: 100%; cursor: col-resize; touch-action: none; }
+.sidebar-resize-handle::after { content: ""; position: absolute; top: 0; right: 0; width: 2px; height: 100%; background: var(--focus); opacity: 0; transition: opacity .14s ease; }
+.sidebar-resize-handle:hover::after, .sidebar-resize-handle:focus-visible::after, .sidebar-resize-active .sidebar-resize-handle::after { opacity: .72; }
+.sidebar-resize-handle:focus-visible { outline-offset: -3px; }
+.sidebar-resize-active, .sidebar-resize-active * { cursor: col-resize !important; -webkit-user-select: none !important; user-select: none !important; }
+/*
+ * Every row in the sidebar is one line of text tall, and every row shares one grid: a 14px
+ * lead column (the new-task plus, a project's folder, a conversation's status mark) at the
+ * row's own padding, then the text at 28px from the list's edge.
+ */
+.sidebar { --sidebar-row: 28px; --sidebar-row-button: 22px; }
+/* The window's top row: room for the traffic lights and `ShellNav`, which float over it. */
+.sidebar__chrome-row { flex: 0 0 var(--topbar-height); height: var(--topbar-height); margin: 0 -9px; }
+.new-task-button {
+  width: 100%; height: var(--sidebar-row); display: flex; align-items: center; gap: 7px; padding: 0 7px; background: transparent;
+  border: 0; border-radius: 7px; font-size: 12.5px; font-weight: 600;
+}
+.new-task-button:hover { background: var(--hover); }
+.new-task-button svg { flex: 0 0 auto; }
+.new-task-button span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+kbd { font-family: inherit; font-size: 10px; color: var(--faint); font-weight: 500; }
+.sidebar__section-heading { height: var(--sidebar-row); margin-top: 14px; padding: 0 3px 0 7px; display: flex; align-items: center; }
+.sidebar__section-heading > span { flex: 1; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; font-weight: 700; color: var(--faint); }
+.sidebar__section-heading .icon-button { width: var(--sidebar-row-button); height: var(--sidebar-row-button); flex-basis: var(--sidebar-row-button); border-radius: 6px; }
+.workspace-list { flex: 1; overflow: auto scroll; min-height: 0; padding-bottom: 12px; }
+.workspace-group { position: relative; border-radius: 8px; transition: opacity .14s, transform .14s, background .14s, box-shadow .14s; }
+.workspace-group + .workspace-group { margin-top: 6px; }
+.workspace-heading { height: var(--sidebar-row); display: flex; align-items: center; gap: 1px; border-radius: 7px; }
+.workspace-heading:hover { background: var(--hover); }
+.workspace-heading__toggle { flex: 1; min-width: 0; height: var(--sidebar-row); display: flex; align-items: center; gap: 7px; padding: 0 7px; background: transparent; border-radius: 7px; color: var(--color-4e4e4a); font-size: 12px; font-weight: 650; }
+.workspace-heading__toggle > svg { flex: 0 0 auto; }
+/* The name takes only its own width, so the chevron sits right after it. */
+.workspace-heading__name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.workspace-heading__chevron { margin-left: -3px; color: var(--faint); }
+.workspace-heading__chevron--open { transform: rotate(90deg); }
+.workspace-heading .icon-button { width: var(--sidebar-row-button); height: var(--sidebar-row-button); flex-basis: var(--sidebar-row-button); border-radius: 6px; opacity: 0; }
+.workspace-heading .icon-button:hover:not(:disabled) { background: var(--active); }
+.workspace-heading > :last-child { margin-right: 3px; }
+.workspace-heading:hover .icon-button, .workspace-heading:focus-within .icon-button { opacity: 1; }
+.workspace-options { flex: 0 0 auto; display: inline-flex; }
+/* The menu is portaled to document.body, so :focus-within no longer holds while it
+   is open. Keep its trigger visible to prevent the row's actions from fading. */
+.workspace-heading .icon-button.popover-menu__trigger--open { opacity: 1; }
+/* Collapsing regions elsewhere in the app (the terminal panel) share these. */
+.collapse-region {
+  display: grid; grid-template-rows: 1fr; opacity: 1; visibility: visible;
+  transition: grid-template-rows .26s cubic-bezier(.4, 0, .2, 1), opacity .2s cubic-bezier(.4, 0, .2, 1), visibility 0s;
+}
+.collapse-region--closed {
+  grid-template-rows: 0fr; opacity: 0; visibility: hidden; pointer-events: none;
+  transition: grid-template-rows .26s cubic-bezier(.4, 0, .2, 1), opacity .2s cubic-bezier(.4, 0, .2, 1), visibility 0s linear .26s;
+}
+.collapse-region__inner { min-height: 0; overflow: hidden; transform: translateY(0); transition: transform .26s cubic-bezier(.4, 0, .2, 1); }
+.collapse-region--closed > .collapse-region__inner { transform: translateY(-5px); }
+.disclosure-chevron { flex: 0 0 auto; transform: rotate(0deg); transition: transform .22s cubic-bezier(.4, 0, .2, 1); }
+.disclosure-chevron--open { transform: rotate(90deg); }
+.conversation-list--closed { display: none; }
+.conversation-row { height: var(--sidebar-row); display: flex; align-items: center; margin: 1px 0; border-radius: 7px; position: relative; transition: opacity .14s, transform .14s, background .14s, box-shadow .14s; }
+.conversation-row:hover { background: var(--color-e8e8e3); }
+.conversation-row--active { background: var(--color-deded8); }
+.conversation-row--active:hover { background: var(--color-dcdcd6); }
+/*
+ * The status mark: the brand's eared cursor in the lead column. Hollow while idle, a
+ * blinking cursor while working, amber while it waits on the user, blue when a run finished
+ * out of sight. Always drawn, so a title never shifts when the state changes.
+ */
+.conversation-status { position: absolute; left: 7px; top: 50%; width: 14px; height: 12px; margin-top: -6px; display: flex; align-items: center; justify-content: center; color: var(--faint); pointer-events: none; }
+.conversation-status__mark { display: block; height: 12px; width: auto; overflow: visible; }
+.conversation-status--idle .conversation-status__mark path { fill: none; stroke: currentColor; stroke-width: 1.15px; vector-effect: non-scaling-stroke; }
+.conversation-status--running { color: var(--text); }
+.conversation-status--running .conversation-status__mark { animation: conversation-status-blink 1.06s steps(1, end) infinite; }
+.conversation-status--blocked { color: var(--color-c98a1b); }
+.conversation-status--completed { color: var(--color-3769bb); }
+@keyframes conversation-status-blink { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .conversation-status--running .conversation-status__mark { animation: none; } }
+.conversation-row__main { flex: 1; min-width: 0; height: var(--sidebar-row); padding: 0 7px 0 28px; display: flex; align-items: center; background: transparent; }
+.conversation-row__title { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; line-height: 16px; text-align: left; }
+.conversation-row__actions { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 1px; margin-right: 3px; opacity: 0; transition: opacity .12s; }
+.conversation-row__actions .icon-button { width: var(--sidebar-row-button); height: var(--sidebar-row-button); flex-basis: var(--sidebar-row-button); border-radius: 6px; }
+.conversation-row__actions .icon-button:hover:not(:disabled) { background: var(--color-dcdcd6); }
+/* Armed, it gives up the fixed width so the word it now carries has room. */
+.conversation-row__actions .icon-button.confirm-delete--armed { width: auto; flex-basis: auto; padding: 0 6px; }
+.conversation-row:hover .conversation-row__actions, .conversation-row:focus-within .conversation-row__actions { opacity: 1; }
+.conversation-row--editing { padding-left: 25px; }
+.conversation-row--editing .conversation-row__actions { opacity: 1; }
+.conversation-row__rename-input { flex: 1; min-width: 0; height: 22px; padding: 0 2px; border: 1px solid var(--color-aeb9d2); border-radius: 6px; outline: 0; background: var(--color-ffffff); font: 12.5px var(--sans); box-shadow: 0 0 0 2px var(--color-5f5f5a-ap10); }
+.conversation-list__empty { margin: 0; height: var(--sidebar-row); padding-left: 28px; display: flex; align-items: center; font-size: 11px; color: var(--faint); }
+.sortable-surface { position: relative; cursor: grab; -webkit-user-select: none; user-select: none; }
+.sortable-surface:active { cursor: grabbing; }
+button.sortable-surface:not(:disabled),
+.workspace-heading.sortable-surface > .workspace-heading__toggle,
+.conversation-row.sortable-surface > .conversation-row__main { cursor: grab; }
+button.sortable-surface:active,
+.workspace-heading.sortable-surface > .workspace-heading__toggle:active,
+.conversation-row.sortable-surface > .conversation-row__main:active { cursor: grabbing; }
+/* Settings rails sort by drag, but the whole row is also the click target that
+   opens the entry, so hovering one must not promise a drag. An actual drag still
+   shows `grabbing` through `.pointer-sort-active` below. */
+.provider-rail__row.sortable-surface,
+.provider-rail__row.sortable-surface:active { cursor: default; }
+.sortable-surface--dragging { opacity: .38 !important; transform: scale(.985); }
+.pointer-sort-active, .pointer-sort-active * { cursor: grabbing !important; -webkit-user-select: none !important; user-select: none !important; }
+.conversation-row--dragging, .workspace-group--dragging { opacity: .38; transform: scale(.985); }
+.drop-target--before::before, .drop-target--after::after { content: ""; position: absolute; z-index: 4; left: 4px; right: 4px; height: 2px; border-radius: 99px; background: var(--accent); pointer-events: none; }
+.workspace-group.drop-target--before::before, .conversation-row.drop-target--before::before { top: 0; }
+.workspace-group.drop-target--after::after, .conversation-row.drop-target--after::after { bottom: 0; }
+.sidebar__footer { min-height: 42px; border-top: 1px solid var(--border); padding-top: 7px; display: flex; align-items: center; }
+/* Settings is a row like the others: the list's full width, its gear in the lead column. */
+.sidebar__footer > button { flex: 1; min-width: 0; height: var(--sidebar-row); display: flex; align-items: center; gap: 7px; padding: 0 7px; background: transparent; border-radius: 7px; font-size: 12.5px; text-align: left; }
+.sidebar__footer > button:hover { background: var(--hover); }
+.sidebar__footer > button svg { flex: 0 0 auto; }
+.sidebar__footer > button span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -1,0 +1,35 @@
+/* The key a first connection met: host, type and fingerprint, label beside value. */
+.ssh-prompt__key {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 12px;
+  margin: 12px 0;
+  font-size: 12px;
+}
+
+.ssh-prompt__key dt {
+  color: var(--muted);
+}
+
+.ssh-prompt__key dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.ssh-prompt__key code {
+  font: 11.5px/1.5 var(--mono);
+}
+
+/* What `ssh` asked, as it asked it, when it is shown whole. */
+.ssh-prompt__raw {
+  margin: 0 0 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font: 11.5px/1.5 var(--mono);
+}
+
+.ssh-prompt__form {
+  margin-bottom: 12px;
+}

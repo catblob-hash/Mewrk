@@ -1,0 +1,66 @@
+/* The roles page's own control under the catalog list: a new role is a new
+ * file, so the way to write one sits where the list ends rather than in a
+ * header the eye has already left. */
+.agent-role-add {
+  width: 100%;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px dashed var(--border);
+  border-radius: 7px;
+  margin-top: 8px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 10.5px;
+}
+
+.agent-role-add:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.agent-role-add:disabled {
+  opacity: .5;
+}
+
+/* ---- The role editor ----
+
+   The window takes the settings windows' shared layout (`SettingsLayout`), and
+   its pages are drawn with the conversation-settings pane's page rules. These
+   rules add only what a role's pages have and a preset's do not. */
+
+/* The name and the description are stacked fields, not rows: both take prose
+   wider than a row's control slot. The page stack already spaces sections, so
+   the fields drop their own trailing margin. */
+.conversation-settings__field.agent-role-editor__identity { gap: 12px; }
+.agent-role-editor__identity .field { margin-bottom: 0; }
+
+/* The rows share one left edge with the stacked fields above them. */
+.agent-role-editor__rows { padding: 0; }
+
+.agent-role-editor__warning {
+  margin: 0;
+  color: var(--warning);
+  font-size: 9px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* Where an existing role's file is: read, not chosen, so it is text in the
+   picker's slot rather than a control — the row keeps the right edge the pickers
+   above it share. A path is one unbroken word, so it may break anywhere. */
+.field-row .field > .agent-role-editor__location {
+  grid-area: 1 / 2 / span 2 / auto;
+  max-width: 280px;
+  min-height: 25px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+  text-align: right;
+  overflow-wrap: anywhere;
+}

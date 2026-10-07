@@ -1,0 +1,204 @@
+{
+  "name": "Mewrk built-in tool context redesign baseline",
+  "note": "Each entry's description replaces the built-in tool description. Copy this file to ~/.mewrk/tool-descriptions only when you want Mewrk to discover it (only the global folder is read, never a workspace's), then explicitly select it in the conversation preset.",
+  "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
+  "toolCount": 49,
+  "tools": [
+    {
+      "toolName": "ls",
+      "description": ""
+    },
+    {
+      "toolName": "grep",
+      "description": ""
+    },
+    {
+      "toolName": "powershell",
+      "description": ""
+    },
+    {
+      "toolName": "bash",
+      "description": ""
+    },
+    {
+      "toolName": "zsh",
+      "description": ""
+    },
+    {
+      "toolName": "sh",
+      "description": ""
+    },
+    {
+      "toolName": "write",
+      "description": ""
+    },
+    {
+      "toolName": "edit",
+      "description": ""
+    },
+    {
+      "toolName": "find",
+      "description": ""
+    },
+    {
+      "toolName": "read",
+      "description": ""
+    },
+    {
+      "toolName": "lsp",
+      "description": ""
+    },
+    {
+      "toolName": "web_search",
+      "description": ""
+    },
+    {
+      "toolName": "web_fetch",
+      "description": ""
+    },
+    {
+      "toolName": "preview_start",
+      "description": ""
+    },
+    {
+      "toolName": "preview_stop",
+      "description": ""
+    },
+    {
+      "toolName": "preview_list",
+      "description": ""
+    },
+    {
+      "toolName": "preview_logs",
+      "description": ""
+    },
+    {
+      "toolName": "preview_console_logs",
+      "description": ""
+    },
+    {
+      "toolName": "preview_screenshot",
+      "description": ""
+    },
+    {
+      "toolName": "preview_snapshot",
+      "description": ""
+    },
+    {
+      "toolName": "preview_inspect",
+      "description": ""
+    },
+    {
+      "toolName": "preview_click",
+      "description": ""
+    },
+    {
+      "toolName": "preview_fill",
+      "description": ""
+    },
+    {
+      "toolName": "preview_eval",
+      "description": ""
+    },
+    {
+      "toolName": "preview_network",
+      "description": ""
+    },
+    {
+      "toolName": "preview_resize",
+      "description": ""
+    },
+    {
+      "toolName": "preview_upload_image",
+      "description": ""
+    },
+    {
+      "toolName": "preview_dialog",
+      "description": ""
+    },
+    {
+      "toolName": "agent_spawn",
+      "description": ""
+    },
+    {
+      "toolName": "task_wait",
+      "description": ""
+    },
+    {
+      "toolName": "task_list",
+      "description": ""
+    },
+    {
+      "toolName": "box",
+      "description": ""
+    },
+    {
+      "toolName": "skill",
+      "description": ""
+    },
+    {
+      "toolName": "tool_search",
+      "description": ""
+    },
+    {
+      "toolName": "read_global_memory",
+      "description": ""
+    },
+    {
+      "toolName": "read_project_memory",
+      "description": ""
+    },
+    {
+      "toolName": "create_global_memory",
+      "description": ""
+    },
+    {
+      "toolName": "create_project_memory",
+      "description": ""
+    },
+    {
+      "toolName": "edit_global_memory",
+      "description": ""
+    },
+    {
+      "toolName": "edit_project_memory",
+      "description": ""
+    },
+    {
+      "toolName": "workflow",
+      "description": ""
+    },
+    {
+      "toolName": "ask_user",
+      "description": ""
+    },
+    {
+      "toolName": "fork",
+      "description": ""
+    },
+    {
+      "toolName": "plan",
+      "description": ""
+    },
+    {
+      "toolName": "exit_plan_mode",
+      "description": ""
+    },
+    {
+      "toolName": "read_handoff_note",
+      "description": ""
+    },
+    {
+      "toolName": "create_handoff_note",
+      "description": ""
+    },
+    {
+      "toolName": "edit_handoff_note",
+      "description": ""
+    },
+    {
+      "toolName": "handoff",
+      "description": ""
+    }
+  ]
+}

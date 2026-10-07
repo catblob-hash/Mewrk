@@ -1,0 +1,98 @@
+/*
+ * The window's own top row (see `lib/windowChrome.ts` and `WindowChrome.tsx`).
+ *
+ * Every platform shares one row with the chat's top bar: the sidebar's first row holds
+ * `ShellNav` (after the traffic lights on macOS), and the top bar runs along beside it. On
+ * Windows the caption buttons float over the row's right end, and the top bar leaves room
+ * for them as the sidebar's first row does for the lights.
+ */
+:root {
+  /* Where `ShellNav` starts: past the traffic lights on macOS, at the gutter elsewhere. */
+  --shell-nav-inset: 10px;
+  --shell-nav-button: 28px;
+  --shell-nav-gap: 2px;
+  --shell-nav-closed-width: calc(4 * var(--shell-nav-button) + 3 * var(--shell-nav-gap));
+  /*
+   * What the Windows caption buttons take of the top row's right end. They are sized and
+   * spaced like the pane toolbar beside them (`.icon-button`), and keep the top bar's own
+   * right gutter.
+   */
+  --window-caption-button: 32px;
+  --window-caption-gap: 2px;
+  --window-caption-inset: 12px;
+  --window-caption-width: 0px;
+  --window-caption-height: 0px;
+}
+/* The host puts the first light's left edge 16px in; three lights end at 76px. */
+:root[data-window-chrome="mac"] { --shell-nav-inset: 84px; }
+/* Full screen takes the lights away, and the room kept for them with it. */
+:root[data-window-chrome="mac"][data-window-fullscreen="true"] { --shell-nav-inset: 10px; }
+:root[data-window-chrome="windows"] {
+  --window-caption-width: calc(3 * var(--window-caption-button) + 2 * var(--window-caption-gap) + var(--window-caption-inset));
+  --window-caption-height: var(--topbar-height);
+}
+
+.window-frame { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; background: var(--app); }
+.window-frame > .app-shell, .window-frame > .app-loading, .window-frame > .fatal-state { flex: 1 1 0; height: auto; min-height: 0; }
+.window-drag-strip { position: absolute; z-index: 1; top: 0; left: 0; right: var(--window-caption-width); height: var(--topbar-height); }
+
+/*
+ * Over the sidebar's first row, it spans from the lights to the sidebar's edge so the search
+ * button can sit at the far end; with the sidebar closed it shrinks to its four buttons and
+ * the search button follows the arrows onto the chat's top bar.
+ */
+.shell-nav {
+  position: absolute; z-index: 720; top: 0; left: var(--shell-nav-inset);
+  width: calc(var(--sidebar-width) - var(--shell-nav-inset) - 12px); height: var(--topbar-height);
+  display: flex; align-items: center; gap: var(--shell-nav-gap);
+  transition: left .16s ease;
+}
+.app-shell--sidebar-closed .shell-nav { width: var(--shell-nav-closed-width); }
+.shell-nav .icon-button { width: var(--shell-nav-button); height: var(--shell-nav-button); flex-basis: var(--shell-nav-button); border-radius: 7px; }
+.shell-nav__search { margin-left: auto; }
+
+/*
+ * Over the window's top right corner, above the dialogs' dimming as the system's own caption
+ * buttons would be; the image viewer and the stacked model editor still cover it.
+ */
+.window-caption {
+  position: absolute; z-index: 1250; top: 0; right: 0; width: var(--window-caption-width); height: var(--window-caption-height);
+  padding-right: var(--window-caption-inset); display: flex; align-items: center; justify-content: flex-end; gap: var(--window-caption-gap);
+  -webkit-user-select: none; user-select: none;
+}
+.window-caption__button {
+  width: var(--window-caption-button); height: var(--window-caption-button); flex: 0 0 var(--window-caption-button);
+  padding: 0; display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 7px; background: transparent; color: var(--muted); transition: background .14s, color .14s;
+}
+.window-caption__button:hover { background: var(--hover); color: var(--text); }
+.window-caption__button:active { background: var(--active); color: var(--text); }
+.window-caption__button--close:hover, .window-caption__button--close:active { background: var(--danger); color: var(--color-ffffff); }
+/* Two overlapping squares, turned so the front one sits lower left like the system's. */
+.window-caption__restore { transform: scaleX(-1); }
+
+/* The conversation search: a palette at the top of the window, over everything. */
+.conversation-search-backdrop {
+  position: fixed; inset: 0; z-index: 1200; display: flex; align-items: flex-start; justify-content: center;
+  padding: 64px 24px 24px; background: var(--color-1e1e1c-ap24); animation: fade-in .12s ease-out;
+}
+.conversation-search {
+  width: min(560px, 100%); max-height: min(520px, calc(100vh - 128px)); display: flex; flex-direction: column;
+  border: 1px solid var(--color-d3d3cd); border-radius: 12px; background: var(--panel); overflow: hidden;
+  box-shadow: 0 24px 80px var(--color-000000-ap20), 0 3px 10px var(--color-000000-ap9);
+  animation: dialog-pop-in .16s cubic-bezier(.2, .75, .25, 1);
+}
+.conversation-search__field { flex: 0 0 auto; height: 44px; display: flex; align-items: center; gap: 9px; padding: 0 14px; border-bottom: 1px solid var(--border); color: var(--faint); }
+.conversation-search__input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 13.5px; }
+.conversation-search__input::placeholder { color: var(--faint); }
+.conversation-search__results { flex: 1 1 auto; min-height: 0; padding: 5px; overflow-y: scroll; }
+.conversation-search__results:empty { display: none; }
+.conversation-search__result { height: 32px; display: flex; align-items: center; gap: 12px; padding: 0 10px; border-radius: 7px; cursor: pointer; }
+.conversation-search__result--current { background: var(--hover); }
+.conversation-search__title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
+.conversation-search__result--open .conversation-search__title { font-weight: 650; }
+.conversation-search__project { flex: 0 1 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--faint); }
+.conversation-search__empty { margin: 0; padding: 18px 16px; font-size: 12px; color: var(--faint); }
+
+/* The cursor of the plateless icon carries the brand amber wherever it is drawn. */
+.mewrk-icon__mark { fill: var(--color-c98a1b); }

@@ -1,0 +1,2191 @@
+//! `claude-agent` family: the Claude Code executable the host installs, driven
+//! through the official `@anthropic-ai/claude-agent-sdk`, which this sidecar
+//! loads from disk rather than carrying.
+//!
+//! Boundary. One host round is still one sidecar `step`, and inside the CLI it is
+//! one Claude API call. Claude Code's own behaviour is switched off (no built-in
+//! tools, no CLAUDE.md/settings/hooks, no user MCP servers, no compaction, no
+//! background tasks); the host keeps owning approvals, tool execution, hooks and
+//! the round loop. The CLI's tool loop is only borrowed: every host tool is
+//! published by one in-process MCP server, and when the model calls one the
+//! handler *parks*. The step then ends with `done` carrying `calls`; the host
+//! executes them; the next step for the same `agent.session` resolves the parked
+//! handlers with the results and streams the following model reply.
+//!
+//! Version. Neither the SDK nor the CLI is part of this sidecar. The host
+//! installs both from npm as one matched pair — the SDK, and the CLI inside its
+//! own platform package, the Claude Code build the SDK declares as
+//! `claudeCodeVersion` — updates them without touching the sidecar, and sends the
+//! paths with every request: `agent.sdk` (the SDK's root entry `sdk.mjs`) and
+//! `agent.executable`. The user's own Claude Code install is never consulted. This
+//! module imports SDK *types* only; the runtime comes from `loadClaudeAgentSdk`.
+//! What this module knows of the SDK and CLI — which switches exist, what the CLI
+//! prepends, how it normalizes a transcript — was written and is checked against
+//! the version pinned in this package's devDependencies (`selfcheck-claude-agent.mjs`
+//! drives exactly that pair), and the host offers only versions on the same line
+//! (`^<that pin>`), so it holds from one update to the next.
+//!
+//! Context. The environment the model sees is the host's, per machine; the CLI's
+//! own environment block, model line and date are left out by a plugin this
+//! module writes and loads (`claude-context-plugin.ts`).
+//!
+//! Tools that join mid-conversation. A live session lists them and the CLI hands
+//! them over itself (`publishTools`). Every new turn runs in a session rebuilt
+//! from the host's history, and there the host's tool-append markers become the
+//! CLI's own record of those additions (`toolAdditionEntries`), on the models
+//! the host says take them (`agent.toolChanges`): the tools stay deferred where
+//! they joined and the declared list stays what the conversation began with.
+//!
+//! Tool names. The CLI is started with `CLAUDE_AGENT_SDK_MCP_NO_PREFIX=1`, under
+//! which in-process MCP tools register under their bare names, so the model sees
+//! the host's tool names verbatim (no `mcp__mewrk__` prefix). The prefix is still
+//! stripped defensively wherever a name comes back from the CLI.
+//!
+//! Compliance. Authentication is the user's own Claude Code login and nothing
+//! else — installing the executable changes nothing about that. Mewrk sends no
+//! credential for this family: every authentication channel that could ride in
+//! from the sidecar's environment is stripped before the CLI is spawned, and
+//! `apiKey` / `baseURL` on the request are not read at all. This module never
+//! reads, copies or moves `~/.claude/.credentials.json`. When a session resumes
+//! from a host-synthesized transcript, the SDK's resume path materializes a
+//! temporary `CLAUDE_CONFIG_DIR` (and drops a refresh-token-less copy of the
+//! credentials into it); `CLAUDE_SECURESTORAGE_CONFIG_DIR` keeps the CLI reading
+//! and refreshing the user's own login instead of that copy. The identity line
+//! and billing header the CLI prepends to a custom system prompt are the SDK's;
+//! Mewrk neither writes nor alters them.
+//!
+//! Filesystem and environment. Unlike the AI SDK families this module checks that
+//! the host-resolved executable and SDK entry exist and derives the CLI's environment from the
+//! sidecar's own environment with the credential variables removed, plus the
+//! profile-location variables the host sends in `agent.env` (`USER` among them:
+//! it names the macOS Keychain account). `CLAUDE_CONFIG_DIR` is never set here:
+//! the login lives in the CLI's default `~/.claude`, and on macOS the SDK only
+//! falls through to the Keychain while that variable is absent.
+//! The one upstream override this family accepts is a local test stub — an
+//! `ANTHROPIC_BASE_URL` in `agent.env` addressing a loopback host, which alone
+//! also lets a key from `agent.env` through; a remote one fails the request rather
+//! than pointing the user's own login at a third party.
+
+import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+
+// Types only: esbuild erases this import and the SDK stays out of the bundle
+// (`build.mjs` also lists it as external and asserts the bundle is clean). The
+// runtime module is the one `loadClaudeAgentSdk` loads from `agent.sdk`.
+import type {
+  McpSdkServerConfigWithInstance,
+  Options,
+  Query,
+  SpawnOptions,
+  SDKMessage,
+  SDKUserMessage,
+  SessionStoreEntry,
+} from "@anthropic-ai/claude-agent-sdk";
+
+import { contextPluginDir } from "./claude-context-plugin.js";
+import { redactError, secretsOf } from "./error-redaction.js";
+import { dropForeignSignedReasoning, stripReplayTags } from "./anthropic-dialect.js";
+import { isHostMessage } from "./async-tools.js";
+import { markerTools } from "./tool-append.js";
+import {
+  MAX_STREAM_TEXT,
+  MAX_TOOL_ARGUMENTS,
+  fullSystemPrompt,
+  type AgentSession,
+  type StepError,
+  type StepEvent,
+  type StepRequest,
+  type StepResult,
+  type ToolSpec,
+  type Usage,
+} from "./protocol.js";
+
+// ---------------------------------------------------------------- host-facing surface
+
+/** Frame writers and request bookkeeping supplied by `main.ts`. */
+interface AgentIo {
+  emit(id: string, event: StepEvent): void;
+  done(id: string, result: StepResult): void;
+  fail(id: string, error: StepError): void;
+  /** Registers a cancellable request; `streaming` requests also receive heartbeats. */
+  begin(id: string, controller: AbortController, streaming: boolean): void;
+  end(id: string): void;
+}
+
+interface ClaudeAgentRuntime {
+  step(id: string, request: StepRequest): Promise<void>;
+  release(session: string): void;
+  shutdown(): Promise<void>;
+}
+
+/** Name of the in-process MCP server that publishes the host's tools. */
+const SERVER_NAME = "mewrk";
+/** Prefix the CLI would apply without `CLAUDE_AGENT_SDK_MCP_NO_PREFIX`. */
+const TOOL_PREFIX = `mcp__${SERVER_NAME}__`;
+/** How long a parked tool handler may wait for the host: a week, i.e. never in practice. */
+const PARK_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
+/** Parked sessions the host never released are evicted after this idle period. */
+const IDLE_EVICTION_MS = 24 * 60 * 60 * 1000;
+const EVICTION_SWEEP_MS = 60 * 60 * 1000;
+/**
+ * CLI version stamped on synthesized transcript entries when neither the CLI's
+ * own `init` nor the loaded SDK's `claudeCodeVersion` has named one: a last
+ * resort for an SDK package.json that lacks the field, never the normal path
+ * (the CLI is the installed SDK's own pair, whose version the SDK declares).
+ */
+const FALLBACK_CLI_VERSION = "2.1.284";
+/** What the user should do about any problem with the installed SDK or CLI. */
+const REINSTALL_HINT = "请在「设置 → 提供商 → 模型提供商 → Claude Agent」里重新安装。";
+/**
+ * Prompt used when a tool round must continue in a fresh CLI session (the parked
+ * session is gone). The transcript then already ends with the tool results, and
+ * the CLI does not resume a turn without a prompt. The text lives only in that
+ * CLI session: the host's own history never contains it.
+ */
+const CONTINUE_NOTICE = "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThe tool results above are complete. Continue the task.";
+/**
+ * Text markers that identify carrier user messages riding behind tool results:
+ * the image bridge, and host notices from builds that wrote them as user text
+ * before they carried the host's mark (`async-tools.ts`, `isHostMessage`).
+ */
+const LEGACY_HOST_NOTICE_MARKER = "[SYSTEM NOTIFICATION - NOT USER INPUT]";
+const IMAGE_BRIDGE_MARKER = "[Mewrk tool image]";
+/**
+ * No-op host tool whose call/result pair the host writes for each host message
+ * where the conversation's host messages come in `box` (Rust
+ * `aisdk::project::host_messages_in_box`).
+ */
+const BOX_TOOL_NAME = "box";
+/** Placeholder Claude Code writes for an assistant message emptied by repair. */
+const NO_CONTENT_PLACEHOLDER = "(no content)";
+/** Lines of CLI stderr retained for error messages. */
+const STDERR_TAIL_LINES = 40;
+/** Authentication channels that must never reach the CLI from the sidecar's own environment. */
+const CREDENTIAL_ENV = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_CUSTOM_HEADERS",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+];
+/** Variables `agent.env` may only supply together with a loopback endpoint. */
+const UPSTREAM_OVERRIDE_ENV = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+
+const log = (line: string): void => {
+  process.stderr.write(`[claude-agent] ${line}\n`);
+};
+
+type JsonObject = Record<string, unknown>;
+
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stripToolPrefix(name: string): string {
+  return name.startsWith(TOOL_PREFIX) ? name.slice(TOOL_PREFIX.length) : name;
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+function isAbortError(error: unknown): boolean {
+  const name = (error as { name?: string })?.name;
+  return name === "AbortError" || name === "TimeoutError";
+}
+
+// ---------------------------------------------------------------- in-process MCP server
+//
+// Hand-written JSON-RPC rather than the SDK's `tool()` helper: the helper needs
+// zod and rewrites schemas, while the host schema must reach the model verbatim.
+// The SDK only requires an object with `connect(transport)`; the transport it hands
+// over has `onmessage`, `send`, `start` and `close`.
+
+type JsonRpcId = string | number | null;
+
+interface JsonRpcMessage {
+  jsonrpc: "2.0";
+  id?: JsonRpcId;
+  method?: string;
+  params?: JsonObject;
+  result?: unknown;
+  error?: { code: number; message: string };
+}
+
+interface McpTransport {
+  onmessage?: (message: JsonRpcMessage) => void;
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  send(message: JsonRpcMessage): Promise<void>;
+  start(): Promise<void>;
+  close(): Promise<void>;
+}
+
+/** MCP `CallToolResult` content items this sidecar produces. */
+type McpContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+
+interface McpToolResult {
+  content: McpContent[];
+  isError?: boolean;
+}
+
+/** The MCP protocol revision answered when the client's own is not a string. */
+const MCP_PROTOCOL_FALLBACK = "2025-06-18";
+const MCP_METHOD_NOT_FOUND = -32601;
+const MCP_INTERNAL_ERROR = -32603;
+
+class MewrkMcpServer {
+  private transport: McpTransport | null = null;
+  private tools: ToolSpec[];
+  /** Waiters for the CLI's next `tools/list`, which follows a `list_changed`. */
+  private relisted: Array<() => void> = [];
+
+  constructor(
+    tools: ToolSpec[],
+    private readonly onCall: (toolUseId: string | undefined, name: string, args: unknown) => Promise<McpToolResult>,
+  ) {
+    this.tools = [...tools];
+  }
+
+  /**
+   * Adds the tools this server has not listed yet and tells the CLI its list
+   * changed; resolves once the CLI has listed it again. Never withdraws a tool:
+   * the CLI would tell the model about a withdrawal in words of its own.
+   */
+  publish(tools: readonly ToolSpec[]): Promise<void> {
+    const listed = new Set(this.tools.map((tool) => tool.name));
+    const added = tools.filter((tool) => !listed.has(tool.name));
+    if (added.length === 0) return Promise.resolve();
+    this.tools = [...this.tools, ...added];
+    const relisted = new Promise<void>((resolve) => this.relisted.push(resolve));
+    const transport = this.transport;
+    if (!transport) return Promise.reject(new Error("MCP 传输已关闭"));
+    return transport
+      .send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" })
+      .then(() => relisted);
+  }
+
+  /** Called by the SDK with its in-process transport. */
+  async connect(transport: McpTransport): Promise<void> {
+    this.transport = transport;
+    transport.onmessage = (message) => this.handle(message);
+    await transport.start();
+  }
+
+  async close(): Promise<void> {
+    const transport = this.transport;
+    this.transport = null;
+    if (transport) await transport.close().catch(() => {});
+  }
+
+  private respond(id: JsonRpcId, result: unknown): void {
+    void this.transport?.send({ jsonrpc: "2.0", id, result }).catch((error) => {
+      log(`MCP 回复写入失败：${errorMessage(error)}`);
+    });
+  }
+
+  private respondError(id: JsonRpcId, code: number, message: string): void {
+    void this.transport?.send({ jsonrpc: "2.0", id, error: { code, message } }).catch(() => {});
+  }
+
+  private handle(message: JsonRpcMessage): void {
+    if (typeof message.method !== "string") return;
+    const id = message.id ?? null;
+    const isRequest = message.id !== undefined && message.id !== null;
+    const params = isObject(message.params) ? message.params : {};
+    switch (message.method) {
+      case "initialize": {
+        const requested = params.protocolVersion;
+        this.respond(id, {
+          protocolVersion: typeof requested === "string" ? requested : MCP_PROTOCOL_FALLBACK,
+          // `listChanged`: a tool that joins mid-session is announced rather
+          // than rebuilt in (`publishTools`).
+          capabilities: { tools: { listChanged: true } },
+          serverInfo: { name: SERVER_NAME, version: "1.0.0" },
+        });
+        break;
+      }
+      case "ping":
+        this.respond(id, {});
+        break;
+      case "tools/list":
+        this.respond(id, {
+          tools: this.tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            // Verbatim host schema; the CLI validates it against what the API accepts.
+            inputSchema: tool.inputSchema,
+            // Keep every host tool in the model's context regardless of the CLI's
+            // deferred-tool heuristics.
+            _meta: { "anthropic/alwaysLoad": true },
+          })),
+        });
+        for (const wake of this.relisted.splice(0)) wake();
+        break;
+      case "tools/call": {
+        const meta = isObject(params._meta) ? params._meta : {};
+        const toolUseId = meta["claudecode/toolUseId"];
+        const name = typeof params.name === "string" ? params.name : "";
+        this.onCall(typeof toolUseId === "string" ? toolUseId : undefined, name, params.arguments).then(
+          (result) => this.respond(id, result),
+          (error) => this.respondError(id, MCP_INTERNAL_ERROR, errorMessage(error)),
+        );
+        break;
+      }
+      default:
+        // Notifications (`notifications/initialized`, `notifications/cancelled`) need
+        // no reply; unknown requests are refused rather than guessed.
+        if (isRequest) this.respondError(id, MCP_METHOD_NOT_FOUND, `Method not found: ${message.method}`);
+        break;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- message shapes
+//
+// Host messages arrive in AI SDK `ModelMessage` shape; the CLI speaks Anthropic
+// Messages blocks. Both directions are handled here so the rest of the module can
+// stay in one vocabulary.
+
+interface ToolResultPart {
+  toolCallId: string;
+  toolName: string;
+  output: unknown;
+}
+
+function toolResultParts(message: unknown): ToolResultPart[] {
+  if (!isObject(message) || message.role !== "tool" || !Array.isArray(message.content)) return [];
+  const parts: ToolResultPart[] = [];
+  for (const part of message.content) {
+    if (!isObject(part) || part.type !== "tool-result" || typeof part.toolCallId !== "string") continue;
+    parts.push({
+      toolCallId: part.toolCallId,
+      toolName: typeof part.toolName === "string" ? part.toolName : "",
+      output: part.output,
+    });
+  }
+  return parts;
+}
+
+function parseDataUrl(value: unknown): { mediaType: string; data: string } | null {
+  if (typeof value !== "string") return null;
+  const match = /^data:([^;,]+);base64,(.*)$/s.exec(value);
+  if (!match) return null;
+  return { mediaType: match[1] ?? "application/octet-stream", data: match[2] ?? "" };
+}
+
+/** Bounded JSON text for a value that must become a text block. */
+function jsonText(value: unknown): string {
+  try {
+    return typeof value === "string" ? value : JSON.stringify(value ?? null);
+  } catch {
+    return String(value);
+  }
+}
+
+/** AI SDK tool-result `output` → MCP result content. */
+function mcpResultOf(output: unknown): McpToolResult {
+  if (!isObject(output)) return { content: [{ type: "text", text: jsonText(output) }] };
+  const value = output.value;
+  switch (output.type) {
+    case "text":
+      return { content: [{ type: "text", text: typeof value === "string" ? value : jsonText(value) }] };
+    case "error-text":
+      return { content: [{ type: "text", text: typeof value === "string" ? value : jsonText(value) }], isError: true };
+    case "json":
+      return { content: [{ type: "text", text: jsonText(value) }] };
+    case "error-json":
+      return { content: [{ type: "text", text: jsonText(value) }], isError: true };
+    case "content": {
+      const content: McpContent[] = [];
+      for (const item of Array.isArray(value) ? value : []) {
+        if (!isObject(item)) continue;
+        if (item.type === "text" && typeof item.text === "string") {
+          content.push({ type: "text", text: item.text });
+        } else if (item.type === "media" && typeof item.data === "string" && typeof item.mediaType === "string") {
+          content.push({ type: "image", data: item.data, mimeType: item.mediaType });
+        }
+      }
+      return { content };
+    }
+    default:
+      return { content: [{ type: "text", text: jsonText(output) }] };
+  }
+}
+
+/** AI SDK user-message parts → MCP content items (used to fold carriers into a tool result). */
+function mcpContentOfUserMessage(message: unknown): McpContent[] {
+  if (!isObject(message)) return [];
+  if (typeof message.content === "string") {
+    return message.content.length > 0 ? [{ type: "text", text: message.content }] : [];
+  }
+  const content: McpContent[] = [];
+  for (const part of Array.isArray(message.content) ? message.content : []) {
+    if (!isObject(part)) continue;
+    if (part.type === "text" && typeof part.text === "string") {
+      content.push({ type: "text", text: part.text });
+    } else if (part.type === "image") {
+      const parsed = parseDataUrl(part.image);
+      if (parsed) content.push({ type: "image", data: parsed.data, mimeType: parsed.mediaType });
+    }
+  }
+  return content;
+}
+
+/** Anthropic content blocks of a user message; `null` when it carries nothing. */
+function anthropicUserBlocks(message: JsonObject): JsonObject[] | null {
+  if (typeof message.content === "string") {
+    return message.content.length > 0 ? [{ type: "text", text: message.content }] : null;
+  }
+  const blocks: JsonObject[] = [];
+  for (const part of Array.isArray(message.content) ? message.content : []) {
+    if (!isObject(part)) continue;
+    if (part.type === "text" && typeof part.text === "string") {
+      blocks.push({ type: "text", text: part.text });
+    } else if (part.type === "image") {
+      const parsed = parseDataUrl(part.image);
+      if (parsed) {
+        blocks.push({ type: "image", source: { type: "base64", media_type: parsed.mediaType, data: parsed.data } });
+      } else if (typeof part.image === "string") {
+        blocks.push({ type: "image", source: { type: "url", url: part.image } });
+      }
+    } else if (part.type === "file" && part.mediaType === "application/pdf") {
+      // A short PDF the host sends as the document itself, as Claude Code's
+      // Read hands one to the model; the CLI passes `document` blocks through.
+      const parsed = parseDataUrl(part.data);
+      if (parsed) {
+        blocks.push({
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: parsed.data },
+          ...(typeof part.filename === "string" && part.filename ? { title: part.filename } : {}),
+        });
+      }
+    }
+  }
+  return blocks.length > 0 ? blocks : null;
+}
+
+function anthropicToolResultBlock(part: ToolResultPart): JsonObject {
+  const result = mcpResultOf(part.output);
+  const content = result.content.map((item) =>
+    item.type === "text"
+      ? { type: "text", text: item.text }
+      : { type: "image", source: { type: "base64", media_type: item.mimeType, data: item.data } },
+  );
+  return {
+    type: "tool_result",
+    tool_use_id: part.toolCallId,
+    content,
+    ...(result.isError ? { is_error: true } : {}),
+  };
+}
+
+/**
+ * Whether a user message is a host carrier — a message the host wrote (a task
+ * notification, a reminder) or a tool-image bridge — not a prompt. A host
+ * message in `box` is a carrier too: its call is skipped and its result folded
+ * the same way (`isBoxCallMessage`, `isBoxResultPart`).
+ */
+function isCarrierMessage(message: unknown): boolean {
+  if (isHostMessage(message)) return true;
+  if (!isObject(message) || message.role !== "user") return false;
+  let text: string | undefined;
+  if (typeof message.content === "string") {
+    text = message.content;
+  } else if (Array.isArray(message.content)) {
+    const first = message.content.find((part) => isObject(part) && part.type === "text");
+    text = isObject(first) && typeof first.text === "string" ? first.text : undefined;
+  }
+  if (text === undefined) return false;
+  const trimmed = text.trimStart();
+  return trimmed.startsWith(LEGACY_HOST_NOTICE_MARKER) || trimmed.startsWith(IMAGE_BRIDGE_MARKER);
+}
+
+/** Whether an assistant message is the host's fabricated `box` call, not a turn the CLI produced. */
+function isBoxCallMessage(message: unknown): boolean {
+  if (!isObject(message) || message.role !== "assistant" || !Array.isArray(message.content)) return false;
+  if (message.content.length === 0) return false;
+  return message.content.every(
+    (part) =>
+      isObject(part) &&
+      part.type === "tool-call" &&
+      typeof part.toolName === "string" &&
+      stripToolPrefix(part.toolName) === BOX_TOOL_NAME,
+  );
+}
+
+function isBoxResultPart(part: ToolResultPart): boolean {
+  return stripToolPrefix(part.toolName) === BOX_TOOL_NAME;
+}
+
+/**
+ * Splits the request messages into what the CLI must already know (`history`),
+ * the results owed for a parked tool round (`results`, with carriers folded in),
+ * and the user prompt that starts a new turn (`prompt`, with the tool additions
+ * that follow it).
+ */
+interface SplitMessages {
+  history: unknown[];
+  /** Tool results after the last assistant message, by tool_use id. */
+  results: Map<string, McpToolResult>;
+  /** Carrier content (bridge images, notices) that rides behind the results. */
+  carriers: McpContent[];
+  /** Genuine trailing user message(s) merged into one prompt, or `null`. */
+  prompt: JsonObject[] | null;
+  /**
+   * Tool-append markers after the prompt: the tools that joined the
+   * conversation with it. `history` stops before the prompt, so they are not
+   * part of it.
+   */
+  promptAdditions: string[][];
+}
+
+function splitMessages(messages: unknown[]): SplitMessages {
+  let lastAssistant = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (isObject(message) && message.role === "assistant" && !isBoxCallMessage(message)) {
+      lastAssistant = index;
+      break;
+    }
+  }
+  const tail = messages.slice(lastAssistant + 1);
+  const results = new Map<string, McpToolResult>();
+  const carriers: McpContent[] = [];
+  const promptBlocks: JsonObject[] = [];
+  const promptAdditions: string[][] = [];
+  let promptStart = -1;
+  tail.forEach((message, offset) => {
+    if (!isObject(message)) return;
+    const added = markerTools(message);
+    if (added !== null) {
+      if (promptStart !== -1) promptAdditions.push(added);
+      return;
+    }
+    if (message.role === "tool") {
+      for (const part of toolResultParts(message)) {
+        if (isBoxResultPart(part)) carriers.push(...mcpResultOf(part.output).content);
+        else results.set(part.toolCallId, mcpResultOf(part.output));
+      }
+      return;
+    }
+    // The `box` call the scan skipped; it is history, never a prompt.
+    if (message.role === "assistant") return;
+    if (message.role !== "user") return;
+    if (promptStart === -1 && isCarrierMessage(message)) {
+      carriers.push(...mcpContentOfUserMessage(message));
+      return;
+    }
+    if (promptStart === -1) promptStart = offset;
+    const blocks = anthropicUserBlocks(message);
+    if (blocks) promptBlocks.push(...blocks);
+  });
+  const history = promptStart === -1 ? messages : messages.slice(0, lastAssistant + 1 + promptStart);
+  return { history, results, carriers, prompt: promptBlocks.length > 0 ? promptBlocks : null, promptAdditions };
+}
+
+// ---------------------------------------------------------------- transcript synthesis
+//
+// The CLI resumes from a Claude Code transcript (JSONL entries) supplied through
+// `sessionStore.load()`. Host `ModelMessage[]` history is rewritten into that
+// shape: signed reasoning becomes `thinking`, redacted reasoning becomes
+// `redacted_thinking`, unsigned reasoning is dropped (the CLI would strip it),
+// tool messages become `tool_result` user entries with any following carrier
+// messages folded into the same entry, and a tool-append marker becomes the
+// pair of entries the CLI itself writes when a tool joins its session.
+
+interface TranscriptContext {
+  sessionId: string;
+  cwd: string;
+  cliVersion: string;
+  /** Model name stamped on assistant entries. */
+  model: string;
+  /**
+   * The session's tools by name, when the CLI takes tool changes for this
+   * model; `null` drops every tool addition, and the tools it named are then
+   * declared like any other.
+   */
+  appendable: ReadonlyMap<string, ToolSpec> | null;
+  /** Tool additions that follow the prompt the session starts with. */
+  promptAdditions: readonly string[][];
+}
+
+/**
+ * The entries the CLI writes when tools join its session mid-way (a
+ * `list_changed` that widened the pool): a `deferred_tools_delta` naming them,
+ * then a `deferred_tools_record` with the definitions it declared for them.
+ * Resumed, the pair is what makes the CLI keep them where they joined: each
+ * declared `defer_loading` and handed over by a `tool_addition` at that point,
+ * with the line of text the CLI puts beside it. Without the record the CLI only
+ * announces the names in words and declares the tools like the rest; without
+ * either it declares them like the rest, and a list that changes in place loses
+ * the prompt cache behind it. The shape is the CLI's own (2.1.284), field for
+ * field; `rendered` is left out and rendered afresh.
+ */
+function toolAdditionEntries(tools: readonly ToolSpec[]): JsonObject[] {
+  const names = tools.map((tool) => tool.name).sort();
+  return [
+    {
+      type: "attachment",
+      attachment: {
+        type: "deferred_tools_delta",
+        addedNames: names,
+        addedLines: names,
+        removedNames: [],
+        wireHiddenNames: [],
+        readdedNames: [],
+        pendingMcpServers: [],
+        needsAuthMcpServers: [],
+        failedMcpServers: [],
+        surfacedNames: names,
+        toolSearchAbsent: true,
+      },
+    },
+    {
+      type: "attachment",
+      attachment: {
+        type: "deferred_tools_record",
+        entries: tools.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          input_schema: tool.inputSchema,
+          defer_loading: true,
+        })),
+      },
+    },
+  ];
+}
+
+function reasoningPayload(part: JsonObject): { signature?: string; redactedData?: string } {
+  const options = part.providerOptions;
+  if (!isObject(options)) return {};
+  for (const bucket of Object.values(options)) {
+    if (!isObject(bucket)) continue;
+    if (typeof bucket.signature === "string" && bucket.signature.length > 0) return { signature: bucket.signature };
+    if (typeof bucket.redactedData === "string" && bucket.redactedData.length > 0) {
+      return { redactedData: bucket.redactedData };
+    }
+  }
+  return {};
+}
+
+function anthropicAssistantBlocks(message: JsonObject): JsonObject[] {
+  if (typeof message.content === "string") {
+    return message.content.length > 0 ? [{ type: "text", text: message.content }] : [];
+  }
+  const blocks: JsonObject[] = [];
+  for (const part of Array.isArray(message.content) ? message.content : []) {
+    if (!isObject(part)) continue;
+    switch (part.type) {
+      case "reasoning": {
+        const payload = reasoningPayload(part);
+        if (payload.signature) {
+          blocks.push({ type: "thinking", thinking: typeof part.text === "string" ? part.text : "", signature: payload.signature });
+        } else if (payload.redactedData) {
+          blocks.push({ type: "redacted_thinking", data: payload.redactedData });
+        }
+        break;
+      }
+      case "text":
+        if (typeof part.text === "string" && part.text.length > 0) blocks.push({ type: "text", text: part.text });
+        break;
+      case "tool-call":
+        if (typeof part.toolCallId === "string" && typeof part.toolName === "string") {
+          blocks.push({
+            type: "tool_use",
+            id: part.toolCallId,
+            name: stripToolPrefix(part.toolName),
+            input: isObject(part.input) ? part.input : {},
+          });
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  return blocks;
+}
+
+function synthesizeTranscript(history: unknown[], context: TranscriptContext): JsonObject[] {
+  const entries: JsonObject[] = [];
+  let parentUuid: string | null = null;
+  // Timestamps only need to be monotonic; place them in the past so the CLI never
+  // sees a future clock.
+  let clock = Date.now() - history.length * 2000;
+  const push = (entry: JsonObject): void => {
+    const uuid = randomUUID();
+    entries.push({
+      parentUuid,
+      isSidechain: false,
+      userType: "external",
+      cwd: context.cwd,
+      sessionId: context.sessionId,
+      version: context.cliVersion,
+      gitBranch: "HEAD",
+      ...entry,
+      uuid,
+      timestamp: new Date(clock).toISOString(),
+    });
+    parentUuid = uuid;
+    clock += 1000;
+  };
+  // Consecutive user-side messages (tool results, carriers, a new prompt) are
+  // laid out the way the CLI writes them: one entry per tool result, then one
+  // entry for the remaining blocks.
+  let pendingBlocks: JsonObject[] = [];
+  const flushUser = (): void => {
+    if (pendingBlocks.length > 0) push({ type: "user", message: { role: "user", content: pendingBlocks } });
+    pendingBlocks = [];
+  };
+  // Consecutive assistant messages become one entry, as the AI SDK merges them
+  // for the API. The host projects a round's reasoning card after that round's
+  // tool exchange, i.e. as an assistant message of its own; left alone, the CLI
+  // drops a thinking-only message and the signed reasoning is lost. Thinking
+  // blocks lead the merged message because the API requires it.
+  let assistantCount = 0;
+  let pendingAssistant: JsonObject[] | null = null;
+  // Each tool joins once; a marker naming it again, or naming a tool the
+  // session no longer lists, adds nothing.
+  const announced = new Set<string>();
+  const addTools = (names: readonly string[]): void => {
+    const appendable = context.appendable;
+    if (appendable === null) return;
+    const tools: ToolSpec[] = [];
+    for (const name of names) {
+      const tool = appendable.get(name);
+      if (tool === undefined || announced.has(name)) continue;
+      announced.add(name);
+      tools.push(tool);
+    }
+    if (tools.length > 0) for (const entry of toolAdditionEntries(tools)) push(entry);
+  };
+  // The role of the last message that was not a marker. A tool addition goes
+  // right after a user turn (a tool result is one), as the Messages API
+  // requires; the host places its markers there, and one anywhere else is
+  // dropped rather than moved.
+  let lastRole: unknown = undefined;
+  const flushAssistant = (): void => {
+    if (pendingAssistant === null) return;
+    const thinking = pendingAssistant.filter((block) => block.type === "thinking" || block.type === "redacted_thinking");
+    const rest = pendingAssistant.filter((block) => block.type !== "thinking" && block.type !== "redacted_thinking");
+    const blocks = [...thinking, ...rest];
+    if (blocks.length === 0) blocks.push({ type: "text", text: NO_CONTENT_PLACEHOLDER });
+    assistantCount += 1;
+    push({
+      type: "assistant",
+      message: {
+        id: `msg_mewrk_${assistantCount}`,
+        type: "message",
+        role: "assistant",
+        model: context.model,
+        content: blocks,
+        stop_reason: blocks.some((block) => block.type === "tool_use") ? "tool_use" : "end_turn",
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    });
+    pendingAssistant = null;
+  };
+  for (const message of history) {
+    if (!isObject(message)) continue;
+    const added = markerTools(message);
+    if (added !== null) {
+      if (lastRole === "user" || lastRole === "tool") {
+        flushUser();
+        addTools(added);
+      }
+      continue;
+    }
+    lastRole = message.role;
+    switch (message.role) {
+      case "user": {
+        flushAssistant();
+        const blocks = anthropicUserBlocks(message);
+        if (blocks) pendingBlocks.push(...blocks);
+        break;
+      }
+      case "tool": {
+        flushAssistant();
+        flushUser();
+        for (const part of toolResultParts(message)) {
+          const block = anthropicToolResultBlock(part);
+          push({ type: "user", message: { role: "user", content: [block] }, toolUseResult: block.content });
+        }
+        break;
+      }
+      case "assistant": {
+        flushUser();
+        pendingAssistant ??= [];
+        pendingAssistant.push(...anthropicAssistantBlocks(message));
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  flushAssistant();
+  flushUser();
+  // After the history, before the prompt the session starts with; the CLI
+  // hands the tools over behind that prompt, where the host's markers stand.
+  for (const added of context.promptAdditions) addTools(added);
+  return entries;
+}
+
+// ---------------------------------------------------------------- CLI environment and options
+
+function defaultProfileEnv(): Record<string, string> {
+  const home = os.homedir();
+  if (process.platform === "win32") {
+    const parsed = path.win32.parse(home);
+    return {
+      USERPROFILE: home,
+      HOMEDRIVE: parsed.root.replace(/[\\/]+$/, ""),
+      HOMEPATH: home.slice(parsed.root.length - 1) || "\\",
+      APPDATA: path.win32.join(home, "AppData", "Roaming"),
+      LOCALAPPDATA: path.win32.join(home, "AppData", "Local"),
+    };
+  }
+  // The CLI names its macOS Keychain account after `$USER`; without it the
+  // CLI looks up a different account, and the sidecar's cleared
+  // environment would hide a signed-in user's login.
+  const env: Record<string, string> = { HOME: home };
+  try {
+    env.USER = os.userInfo().username;
+  } catch {
+    // No passwd entry for this uid; the host's `agent.env` may still supply it.
+  }
+  return env;
+}
+
+/** Behaviour switches: everything Claude Code would do on its own is off. */
+const CLI_CONTROL_ENV: Record<string, string> = {
+  CLAUDE_AGENT_SDK_MCP_NO_PREFIX: "1",
+  CLAUDE_AGENT_SDK_CLIENT_APP: "mewrk/1.0",
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+  DISABLE_AUTOUPDATER: "1",
+  DISABLE_ERROR_REPORTING: "1",
+  DISABLE_TELEMETRY: "1",
+  DISABLE_BUG_COMMAND: "1",
+  DISABLE_COST_WARNINGS: "1",
+  CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1",
+  DISABLE_AUTO_COMPACT: "1",
+  DISABLE_COMPACT: "1",
+  // Attachments stay on: a tool that joins mid-session reaches the model as the
+  // CLI's own `tool_addition`, which only the attachment pipeline produces
+  // (`deferred_tools_delta`). The context plugin leaves every other attachment
+  // out, so switching the pipeline on adds nothing else to the prompt.
+  CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+  CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
+  DISABLE_BUILTIN_AGENTS: "1",
+  CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS: "1",
+  CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+  CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
+  MCP_TOOL_TIMEOUT: String(PARK_TIMEOUT_MS),
+  CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
+  // Loads the hooks module of the context plugin (`claude-context-plugin.ts`),
+  // which leaves the CLI's own environment block, model line and date out of the
+  // prompt. Load-bearing rather than best-effort: without it the model is told
+  // about Mewrk's private session folder as if it were a workspace. The CLI
+  // has to be one that loads function hooks under this switch (the host only
+  // offers versions on the line this sidecar was written against), and
+  // `selfcheck-claude-agent.mjs` asserts the upstream request carries none of it.
+  CLAUDE_CODE_ENABLE_FUNCTION_HOOKS: "1",
+};
+
+interface CliEnvKnobs {
+  maxOutputTokens?: number;
+}
+
+/**
+ * Whether an endpoint address belongs to this machine. `0.0.0.0` is a wildcard
+ * bind address rather than a destination and does not qualify.
+ */
+function isLoopbackEndpoint(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  const host = url.hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+  if (host === "localhost" || host === "::1") return true;
+  const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!octets) return false;
+  return octets.slice(1).every((octet) => Number(octet) <= 255) && octets[1] === "127";
+}
+
+/**
+ * `agent.env` after the upstream rule. Everything but the three authentication
+ * variables passes through; those exist for one purpose only, a local test stub,
+ * so a remote endpoint fails the whole request instead of being dropped quietly,
+ * and a key without such an endpoint is discarded.
+ */
+function agentEnvOverrides(agent: AgentSession): Record<string, string> {
+  const source = agent.env ?? {};
+  const overrides: Record<string, string> = {};
+  for (const [name, value] of Object.entries(source)) {
+    if (typeof value === "string" && !UPSTREAM_OVERRIDE_ENV.includes(name)) overrides[name] = value;
+  }
+  const baseURL = typeof source.ANTHROPIC_BASE_URL === "string" ? source.ANTHROPIC_BASE_URL.trim() : "";
+  if (baseURL.length > 0) {
+    if (!isLoopbackEndpoint(baseURL)) {
+      throw new Error("agent.env 里的 ANTHROPIC_BASE_URL 只允许本机测试桩");
+    }
+    overrides.ANTHROPIC_BASE_URL = baseURL;
+  }
+  for (const name of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] as const) {
+    const key = source[name];
+    if (typeof key !== "string" || key.length === 0) continue;
+    if (baseURL.length === 0) {
+      log(`丢弃 agent.env 里的 ${name}：没有随附本机测试桩地址`);
+      continue;
+    }
+    overrides[name] = key;
+  }
+  return overrides;
+}
+
+/** The context budget the CLI gives a model id without `[1m]` under a Console login. */
+const STANDARD_CONTEXT_BUDGET = 200_000;
+const ONE_MILLION_SUFFIX = /\[1m\]$/i;
+
+/**
+ * The model id the CLI is started with. Mewrk keeps a model without Claude
+ * Code's `[1m]` suffix and states its context window instead, and the suffix is
+ * derived here: a window above the CLI's standard budget asks for the 1M one.
+ *
+ * The CLI enforces its budget locally, before any request: auto-compact is off,
+ * so a prompt past it ends the step with "Prompt is too long". For a bare id
+ * that budget is 200k under a Console login and 1M under a subscription, so
+ * without the suffix a Console user would hit a wall the host does not plan
+ * for. The suffix never reaches the API (the CLI strips it and sends the 1M
+ * beta header instead), and under a subscription it changes nothing. An id
+ * that already carries it — a model installed by an earlier version — passes
+ * through as it is.
+ */
+function cliModelId(modelId: string, contextWindow: number | undefined): string {
+  if (ONE_MILLION_SUFFIX.test(modelId)) return modelId;
+  return contextWindow !== undefined && contextWindow > STANDARD_CONTEXT_BUDGET ? `${modelId}[1m]` : modelId;
+}
+
+/**
+ * The four model variables the CLI consults for its own routing. Only a real
+ * model id is pinned: an alias (`sonnet`, `opus[1m]`) is the CLI's own
+ * vocabulary, and feeding it back through the environment would only make the
+ * alias resolve to itself.
+ */
+function pinnedModelEnv(modelId: string): Record<string, string> {
+  if (!/^claude-/i.test(modelId)) return {};
+  return {
+    ANTHROPIC_MODEL: modelId,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: modelId,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: modelId,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: modelId,
+  };
+}
+
+function cliEnv(agent: AgentSession, modelId: string, knobs: CliEnvKnobs = {}) {
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (typeof value === "string") env[name] = value;
+  }
+  // The CLI must authenticate with its own login. A developer shell's ambient
+  // credentials would override it silently, and the SDK only falls back to the
+  // stored login when no credential is forced through the environment.
+  for (const name of CREDENTIAL_ENV) delete env[name];
+  // A Claude Code session the sidecar was started from (a developer's shell,
+  // the selfcheck) exports its own entrypoint. Inherited, it relabels this CLI
+  // and makes it prefer the stored login over a stub key in `agent.env`; absent,
+  // the SDK stamps its own `sdk-ts`, as it does for the host's cleared
+  // environment.
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+  Object.assign(env, defaultProfileEnv(), CLI_CONTROL_ENV);
+  env.CLAUDE_CODE_USE_BEDROCK = "0";
+  env.CLAUDE_CODE_USE_VERTEX = "0";
+  env.CLAUDE_CODE_USE_FOUNDRY = "0";
+  Object.assign(env, agentEnvOverrides(agent), pinnedModelEnv(modelId));
+  // Where the CLI keeps its login — the Keychain entry name, the plaintext
+  // `.credentials.json`, and the lock that serializes token refreshes — follows
+  // `CLAUDE_CONFIG_DIR` unless this names it. A resumed session runs under the
+  // SDK's temporary `CLAUDE_CONFIG_DIR`, where the only credential is a copy
+  // with its refresh token removed: the session fails once the access token
+  // expires. Pinning the storage to the user's own directory (empty: the
+  // default `~/.claude`) keeps every session on the real login. The SDK already
+  // does this for a resume on Windows; this makes it hold everywhere.
+  env.CLAUDE_SECURESTORAGE_CONFIG_DIR = env.CLAUDE_CONFIG_DIR ?? "";
+  const { maxOutputTokens } = knobs;
+  if (maxOutputTokens !== undefined && Number.isFinite(maxOutputTokens) && maxOutputTokens > 0) {
+    env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(Math.floor(maxOutputTokens));
+  }
+  return env;
+}
+
+/**
+ * Every level goes to Claude Code's `--effort` as named: the CLI knows each
+ * model's efforts and drops one the model lacks to `high` (`max` and `xhigh` on
+ * the 4.5 and older models, `xhigh` on the 4.6 ones), and sends none to a model
+ * without effort support. Nothing turns thinking off.
+ */
+function reasoningOptions(level: StepRequest["reasoning"]): Pick<Options, "effort"> {
+  return level === undefined ? {} : { effort: level };
+}
+
+function validateAgent(agent: AgentSession | undefined): AgentSession {
+  if (!agent) throw new Error("claude-agent 请求缺少 agent 会话参数");
+  if (typeof agent.executable !== "string" || agent.executable.length === 0) {
+    throw new Error("claude-agent 请求缺少 Claude Code 可执行文件路径");
+  }
+  if (!existsSync(agent.executable)) {
+    throw new Error(`找不到已安装的 Claude Code：${agent.executable}。${REINSTALL_HINT}`);
+  }
+  if (typeof agent.sdk !== "string" || agent.sdk.length === 0) {
+    throw new Error("claude-agent 请求缺少 Claude Agent SDK 入口路径");
+  }
+  checkSdkEntry(agent.sdk);
+  if (typeof agent.cwd !== "string" || agent.cwd.length === 0) throw new Error("claude-agent 请求缺少工作目录");
+  return agent;
+}
+
+// ---------------------------------------------------------------- the installed SDK
+//
+// The Agent SDK is not bundled: the host installs it (and the matching CLI) from
+// npm and sends the path of its root entry, `sdk.mjs`, in `agent.sdk`. That entry
+// imports only Node built-ins, so loading it needs nothing beside it on disk.
+// `createRequire(import.meta.url)` reaches it from both builds: the ESM bundle has a
+// real `import.meta.url`, and the CommonJS single-file executable gets one from
+// `build.mjs`, which defines it from `__filename` — and where a SEA's own
+// `require` only knows built-ins, a `createRequire` one reads the disk. Node's
+// `require(esm)` runs the (top-level-await-free) module synchronously.
+
+/** The runtime module of `@anthropic-ai/claude-agent-sdk`. */
+type ClaudeAgentSdk = typeof import("@anthropic-ai/claude-agent-sdk");
+
+interface LoadedSdk {
+  module: ClaudeAgentSdk;
+  /** The Claude Code build this SDK declares (`claudeCodeVersion` in its package.json). */
+  cliVersion: string | undefined;
+}
+
+/**
+ * Loaded SDKs by entry path. Only successes are kept here, and a missing entry
+ * is re-checked on every step, so an SDK installed after a failed step loads on
+ * the next one. A module that *threw while loading* is different: Node's module
+ * map keeps the failure per file, so the same path stays broken until the
+ * sidecar restarts. The host installs each SDK version into a directory of its
+ * own and switches to it only after verifying it, so a repair arrives as a new path.
+ */
+const loadedSdks = new Map<string, LoadedSdk>();
+
+function sdkProblem(reason: string): Error {
+  return new Error(`无法加载已安装的 Claude Agent SDK：${reason}。${REINSTALL_HINT}`);
+}
+
+/** The entry must be the absolute path of an existing `sdk.mjs`. */
+function checkSdkEntry(entry: string): void {
+  if (!path.isAbsolute(entry)) throw sdkProblem(`入口路径不是绝对路径（${entry}）`);
+  if (path.basename(entry) !== "sdk.mjs") throw sdkProblem(`入口文件应是 sdk.mjs（${entry}）`);
+  if (!existsSync(entry)) throw sdkProblem(`找不到 ${entry}`);
+}
+
+/** `claudeCodeVersion` from the package.json beside the SDK's entry, if it has one. */
+function declaredCliVersion(entry: string): string | undefined {
+  try {
+    const manifest: unknown = JSON.parse(readFileSync(path.join(path.dirname(entry), "package.json"), "utf8"));
+    const version = isObject(manifest) ? manifest.claudeCodeVersion : undefined;
+    return typeof version === "string" && version.length > 0 ? version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function loadSdk(entry: string): LoadedSdk {
+  const cached = loadedSdks.get(entry);
+  if (cached) return cached;
+  checkSdkEntry(entry);
+  let loaded: unknown;
+  try {
+    loaded = createRequire(import.meta.url)(entry);
+  } catch (error) {
+    throw sdkProblem(`${entry} 加载失败：${errorMessage(error)}`);
+  }
+  if (!isObject(loaded) || typeof loaded.query !== "function") {
+    throw sdkProblem(`${entry} 没有导出 query`);
+  }
+  const sdk: LoadedSdk = { module: loaded as unknown as ClaudeAgentSdk, cliVersion: declaredCliVersion(entry) };
+  loadedSdks.set(entry, sdk);
+  return sdk;
+}
+
+/**
+ * The Claude Agent SDK installed at `entry` (the absolute path of its `sdk.mjs`),
+ * loaded once per path. A failure throws an `Error` whose message says the
+ * installed SDK could not be loaded and where to reinstall it (the step turns it
+ * into a permanent StepError).
+ */
+export function loadClaudeAgentSdk(entry: string): ClaudeAgentSdk {
+  return loadSdk(entry).module;
+}
+
+/**
+ * Spawns the CLI ourselves so teardown can kill it at once. The SDK's own abort
+ * path first closes stdin and only kills after a grace window; during that
+ * window the CLI finishes its turn gracefully — including one more billable
+ * API request when a tool round was in flight. A run the host ended must not
+ * cost anything more.
+ */
+class CliProcess {
+  private child: ChildProcess | null = null;
+
+  constructor(private readonly stderr: StderrTail) {}
+
+  spawnHook(): NonNullable<Options["spawnClaudeCodeProcess"]> {
+    return (options: SpawnOptions) => {
+      const child = spawn(options.command, options.args, {
+        cwd: options.cwd,
+        env: options.env,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      child.stderr?.setEncoding("utf8");
+      child.stderr?.on("data", (data: string) => this.stderr.push(data));
+      this.child = child;
+      return child as unknown as ReturnType<NonNullable<Options["spawnClaudeCodeProcess"]>>;
+    };
+  }
+
+  kill(): void {
+    const child = this.child;
+    this.child = null;
+    if (child && child.exitCode === null && child.signalCode === null) {
+      try {
+        // SIGKILL, not the default SIGTERM: this is the immediate-termination
+        // contract, and a TERM the CLI survives would also mark the child
+        // `killed` and make the SDK skip its own KILL escalation. Windows
+        // terminates on either signal.
+        child.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+  }
+}
+
+/** Ring buffer of CLI stderr for diagnostics. */
+class StderrTail {
+  private lines: string[] = [];
+
+  push(chunk: string): void {
+    for (const line of chunk.split(/\r?\n/)) {
+      if (line.length === 0) continue;
+      this.lines.push(line.slice(0, 500));
+      if (this.lines.length > STDERR_TAIL_LINES) this.lines.shift();
+    }
+  }
+
+  text(): string {
+    return this.lines.join("\n");
+  }
+}
+
+/** A prompt stream the sidecar can feed and close explicitly. */
+class InputQueue implements AsyncIterable<SDKUserMessage> {
+  private queue: Array<SDKUserMessage | null> = [];
+  private wake: (() => void) | null = null;
+
+  push(message: SDKUserMessage): void {
+    this.queue.push(message);
+    this.wake?.();
+  }
+
+  end(): void {
+    this.queue.push(null);
+    this.wake?.();
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage, void> {
+    for (;;) {
+      if (this.queue.length === 0) {
+        await new Promise<void>((resolve) => {
+          this.wake = resolve;
+        });
+        this.wake = null;
+        continue;
+      }
+      const next = this.queue.shift();
+      if (next === null || next === undefined) return;
+      yield next;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- step translation
+//
+// Raw Anthropic stream events (the SDK's `stream_event` messages) are translated to
+// host `StepEvent`s the same way `main.ts` translates the AI SDK stream. A step is
+// the one API message the CLI makes for this round; it ends either when that
+// message stops at `tool_use` (the handlers park) or when the CLI's `result`
+// arrives for a final reply.
+
+interface ThinkingBlock {
+  kind: "thinking";
+  text: string;
+  signature: string;
+  ordinal: number;
+  /**
+   * Tokens this block thought without streaming them as text: the API's
+   * `estimated_tokens` progress while the thinking itself is omitted, floored at
+   * what the signature's size implies once it is complete.
+   */
+  hiddenTokens: number;
+  openedAt: number;
+}
+
+interface RedactedBlock {
+  kind: "redacted";
+  data: string;
+  ordinal: number;
+}
+
+interface TextBlock {
+  kind: "text";
+  text: string;
+}
+
+interface ToolUseBlock {
+  kind: "tool_use";
+  id: string;
+  name: string;
+  json: string;
+  input: unknown;
+  parsed: boolean;
+  /** Whether the host publishes this tool; other names belong to the CLI's own loop. */
+  known: boolean;
+}
+
+type Block = ThinkingBlock | RedactedBlock | TextBlock | ToolUseBlock;
+
+/**
+ * The reasoning item a run of consecutive `thinking` blocks shares.
+ *
+ * Under the CLI's default `display: "updates"` a model such as Opus 5.5 answers
+ * with a thinking block whose text is omitted, directly followed by a second
+ * thinking block whose signature the server tagged `narration`: a plain-text
+ * summary of the step. Claude Code draws that summary in place of the hidden
+ * thinking, so the pair is one item — one card whose body is the summary and
+ * whose duration covers both. Each block still keeps its own signed part, in
+ * order, because both must reach the API again exactly as they came.
+ *
+ * The item opens with the run's first block rather than with its first text:
+ * the omitted thinking is most of the step's wall time and streams no text at
+ * all, and an item that only opened once it ended would leave the host nothing
+ * to show while the model thinks.
+ */
+interface ThinkingRun {
+  ordinal: number;
+  text: string;
+  /** `hiddenTokens` of the run's finished blocks. */
+  hiddenTokens: number;
+}
+
+interface StepOutcome {
+  kind: "done";
+  result: StepResult;
+}
+
+class StepTranslator {
+  private text = "";
+  private readonly reasoning: string[] = [];
+  private reasoningOrdinals = 0;
+  private reasoningMs = 0;
+  private reasoningSeen = false;
+  private readonly calls: StepResult["calls"] = [];
+  private readonly parts: JsonObject[] = [];
+  private blocks = new Map<number, Block>();
+  /** Open while the latest block of the message is a thinking block. */
+  private thinkingRun: ThinkingRun | null = null;
+  /** The thinking block still streaming, if the latest block is one. */
+  private openThinking: ThinkingBlock | null = null;
+  private usage: Usage = {};
+  private messageUsage: Usage = {};
+  private model: string | undefined;
+  private stopReason: string | null = null;
+  private messageStopped = false;
+  private settled = false;
+  private readonly finish: (outcome: StepOutcome | StepError) => void;
+  readonly outcome: Promise<StepOutcome | StepError>;
+
+  constructor(
+    private readonly id: string,
+    private readonly io: AgentIo,
+    private readonly knownTools: ReadonlySet<string>,
+  ) {
+    let resolve!: (outcome: StepOutcome | StepError) => void;
+    this.outcome = new Promise<StepOutcome | StepError>((done) => {
+      resolve = done;
+    });
+    this.finish = resolve;
+  }
+
+  /** Tool_use ids of this step's reported calls. */
+  get callIds(): string[] {
+    return this.calls.map((call) => call.callId);
+  }
+
+  get modelName(): string | undefined {
+    return this.model;
+  }
+
+  fail(error: StepError): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.finish(error);
+  }
+
+  /** Supplies a tool input the stream could not parse, from the CLI's own call. */
+  supplyToolInput(toolUseId: string, input: unknown): void {
+    for (const block of this.blocks.values()) {
+      if (block.kind === "tool_use" && block.id === toolUseId && !block.parsed) {
+        block.input = isObject(input) ? input : {};
+        block.parsed = true;
+        this.emitToolCall(block);
+      }
+    }
+    this.maybeSettleToolRound();
+  }
+
+  handle(message: SDKMessage): void {
+    if (this.settled) return;
+    switch (message.type) {
+      case "stream_event":
+        if (message.parent_tool_use_id === null) this.handleEvent(message.event as unknown as JsonObject);
+        break;
+      case "assistant": {
+        if (message.parent_tool_use_id !== null) break;
+        const error = (message as { error?: string }).error;
+        const content = (message.message as { content?: unknown }).content;
+        for (const block of Array.isArray(content) ? content : []) {
+          if (isObject(block) && block.type === "tool_use" && typeof block.id === "string") {
+            this.supplyToolInput(block.id, block.input);
+          }
+        }
+        if (error) {
+          const text = Array.isArray(content)
+            ? content
+                .filter((block): block is JsonObject => isObject(block) && block.type === "text")
+                .map((block) => String(block.text ?? ""))
+                .join("")
+            : "";
+          this.fail({ kind: "permanent", message: text.length > 0 ? text : `Claude Code 报告错误：${error}` });
+        }
+        break;
+      }
+      case "result": {
+        const failed = message.is_error || message.subtype !== "success";
+        if (failed) {
+          const detail = message.subtype === "success"
+            ? message.result
+            : [message.subtype, ...(message.errors ?? [])].join(": ");
+          this.fail({ kind: "permanent", message: detail.length > 0 ? detail : "Claude Code 回合失败" });
+          break;
+        }
+        this.settle("stop");
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  private handleEvent(event: JsonObject): void {
+    switch (event.type) {
+      case "message_start": {
+        const message = isObject(event.message) ? event.message : {};
+        if (typeof message.model === "string") this.model = message.model;
+        this.closeThinkingRun();
+        this.blocks = new Map();
+        this.messageStopped = false;
+        this.stopReason = null;
+        this.messageUsage = usageOf(isObject(message.usage) ? message.usage : {});
+        break;
+      }
+      case "content_block_start": {
+        const index = typeof event.index === "number" ? event.index : this.blocks.size;
+        const block = isObject(event.content_block) ? event.content_block : {};
+        this.startBlock(index, block);
+        break;
+      }
+      case "content_block_delta": {
+        const index = typeof event.index === "number" ? event.index : -1;
+        const delta = isObject(event.delta) ? event.delta : {};
+        this.applyDelta(index, delta);
+        break;
+      }
+      case "content_block_stop": {
+        const index = typeof event.index === "number" ? event.index : -1;
+        this.stopBlock(index);
+        break;
+      }
+      case "message_delta": {
+        const delta = isObject(event.delta) ? event.delta : {};
+        if (typeof delta.stop_reason === "string") this.stopReason = delta.stop_reason;
+        if (isObject(event.usage)) this.messageUsage = mergeUsage(this.messageUsage, usageOf(event.usage));
+        break;
+      }
+      case "message_stop": {
+        this.closeThinkingRun();
+        this.messageStopped = true;
+        this.usage = addUsage(this.usage, this.messageUsage);
+        this.io.emit(this.id, { k: "usage", usage: this.usage });
+        this.maybeSettleToolRound();
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  private startBlock(index: number, block: JsonObject): void {
+    this.openThinking = null;
+    if (block.type !== "thinking") this.closeThinkingRun();
+    switch (block.type) {
+      case "text":
+        this.blocks.set(index, { kind: "text", text: "" });
+        break;
+      case "thinking": {
+        this.thinkingRun ??= { ordinal: this.openReasoning(), text: "", hiddenTokens: 0 };
+        const thinking: ThinkingBlock = {
+          kind: "thinking",
+          text: "",
+          signature: typeof block.signature === "string" ? block.signature : "",
+          ordinal: this.thinkingRun.ordinal,
+          hiddenTokens: 0,
+          openedAt: Date.now(),
+        };
+        this.blocks.set(index, thinking);
+        this.openThinking = thinking;
+        break;
+      }
+      case "redacted_thinking": {
+        // A whole encrypted item: its start is the only evidence, so the card opens
+        // and closes at once.
+        if (typeof block.data !== "string" || block.data.length === 0) break;
+        const ordinal = this.openReasoning("encrypted");
+        this.blocks.set(index, { kind: "redacted", data: typeof block.data === "string" ? block.data : "", ordinal });
+        this.io.emit(this.id, { k: "reasoning-done", item: ordinal, durationMs: this.reasoningMs });
+        break;
+      }
+      case "tool_use": {
+        const id = typeof block.id === "string" ? block.id : "";
+        const name = stripToolPrefix(typeof block.name === "string" ? block.name : "");
+        const known = this.knownTools.has(name);
+        this.blocks.set(index, { kind: "tool_use", id, name, json: "", input: undefined, parsed: false, known });
+        if (known) this.io.emit(this.id, { k: "tool-call-announced", callId: id, toolName: name });
+        else log(`模型调用了宿主未发布的工具 ${name}（${id}），交由 Claude Code 自行回绝`);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  private openReasoning(form?: "plaintext" | "encrypted"): number {
+    const ordinal = this.reasoningOrdinals;
+    this.reasoningOrdinals += 1;
+    this.reasoningSeen = true;
+    this.reasoning[ordinal] = "";
+    this.io.emit(this.id, { k: "reasoning-start", item: ordinal, form });
+    return ordinal;
+  }
+
+  /** Ends the current thinking run, closing its item. */
+  private closeThinkingRun(): void {
+    const run = this.thinkingRun;
+    this.thinkingRun = null;
+    this.openThinking = null;
+    if (run) {
+      this.io.emit(this.id, { k: "reasoning-done", item: run.ordinal, durationMs: this.reasoningMs });
+    }
+  }
+
+  /**
+   * Reports how much the open run has thought that its text does not show.
+   * Text the run streams is left out: the host can count that itself, and
+   * counting it here too would make every delta a second frame.
+   */
+  private emitThinkingProgress(): void {
+    const run = this.thinkingRun;
+    if (!run) return;
+    const open = this.openThinking;
+    const estimatedTokens = run.hiddenTokens + (open?.hiddenTokens ?? 0);
+    this.io.emit(this.id, { k: "reasoning-progress", item: run.ordinal, estimatedTokens });
+  }
+
+  private applyDelta(index: number, delta: JsonObject): void {
+    const block = this.blocks.get(index);
+    if (!block) return;
+    switch (delta.type) {
+      case "text_delta": {
+        if (block.kind !== "text" || typeof delta.text !== "string") break;
+        if (this.text.length + delta.text.length > MAX_STREAM_TEXT) {
+          throw new Error(`单轮可见文本超过 ${MAX_STREAM_TEXT} 字节上限`);
+        }
+        block.text += delta.text;
+        this.text += delta.text;
+        this.io.emit(this.id, { k: "text-delta", delta: delta.text });
+        break;
+      }
+      case "thinking_delta": {
+        if (block.kind !== "thinking") break;
+        // Omitted thinking streams progress instead of text: an increment of the
+        // tokens thought so far, which is all there is to show until it ends.
+        // (The SDK also digests these into `system`/`thinking_tokens` messages,
+        // interleaved with the raw events; reading both would count twice.)
+        if (typeof delta.estimated_tokens === "number" && delta.estimated_tokens > 0) {
+          block.hiddenTokens += delta.estimated_tokens;
+          this.emitThinkingProgress();
+        }
+        if (typeof delta.thinking !== "string" || delta.thinking.length === 0) break;
+        if (this.thinkingRun) this.thinkingRun.text += delta.thinking;
+        block.text += delta.thinking;
+        this.io.emit(this.id, { k: "reasoning-delta", item: block.ordinal, delta: delta.thinking });
+        break;
+      }
+      case "signature_delta": {
+        if (block.kind === "thinking" && typeof delta.signature === "string") block.signature += delta.signature;
+        break;
+      }
+      case "input_json_delta": {
+        if (block.kind !== "tool_use" || typeof delta.partial_json !== "string") break;
+        if (block.json.length + delta.partial_json.length > MAX_TOOL_ARGUMENTS) {
+          throw new Error(`工具 ${block.name} 的参数超过 ${MAX_TOOL_ARGUMENTS} 字节上限`);
+        }
+        block.json += delta.partial_json;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  private stopBlock(index: number): void {
+    const block = this.blocks.get(index);
+    if (!block) return;
+    switch (block.kind) {
+      case "text":
+        if (block.text.length > 0) this.parts.push({ type: "text", text: block.text });
+        break;
+      case "thinking": {
+        // The item stays open until the run ends: a narration block may follow.
+        this.reasoningMs += Date.now() - block.openedAt;
+        this.reasoning[block.ordinal] = this.thinkingRun?.text ?? block.text;
+        if (this.openThinking === block) this.openThinking = null;
+        if (block.text.length === 0) {
+          // The signature carries the omitted thinking, so its size bounds how
+          // much there was — the same floor Claude Code puts under its estimate.
+          const signatureBytes = Math.round(block.signature.length * 0.75);
+          block.hiddenTokens = Math.max(block.hiddenTokens, Math.ceil(signatureBytes / 4));
+        }
+        if (this.thinkingRun && block.hiddenTokens > 0) {
+          this.thinkingRun.hiddenTokens += block.hiddenTokens;
+          this.emitThinkingProgress();
+        }
+        if (block.signature.length > 0) {
+          this.parts.push({
+            type: "reasoning",
+            text: block.text,
+            providerOptions: { anthropic: { signature: block.signature } },
+          });
+        } else if (block.text.length > 0) {
+          this.parts.push({ type: "reasoning", text: block.text });
+        }
+        break;
+      }
+      case "redacted":
+        this.parts.push({ type: "reasoning", text: "", providerOptions: { anthropic: { redactedData: block.data } } });
+        break;
+      case "tool_use": {
+        const json = block.json.trim();
+        if (json.length === 0) {
+          block.input = {};
+          block.parsed = true;
+        } else {
+          try {
+            const parsed: unknown = JSON.parse(json);
+            block.input = isObject(parsed) ? parsed : {};
+            block.parsed = true;
+          } catch {
+            // The CLI's own `assistant` message or its tools/call carries the full input.
+            block.parsed = false;
+          }
+        }
+        if (block.parsed) this.emitToolCall(block);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  private emitToolCall(block: ToolUseBlock): void {
+    if (!block.known) return;
+    if (this.calls.some((call) => call.callId === block.id)) return;
+    this.calls.push({ callId: block.id, toolName: block.name, input: block.input });
+    this.parts.push({ type: "tool-call", toolCallId: block.id, toolName: block.name, input: block.input });
+    this.io.emit(this.id, { k: "tool-call", callId: block.id, input: block.input });
+  }
+
+  /**
+   * Ends the step once the message is complete and every known call has its input.
+   *
+   * The stop reason is deliberately not consulted: the CLI invokes the handler of
+   * every complete `tool_use` block even when the message was cut off by
+   * `max_tokens`, so waiting for `tool_use` there would park the handler against a
+   * host round that never starts. The raw stop reason still travels in the result.
+   */
+  private maybeSettleToolRound(): void {
+    if (!this.messageStopped) return;
+    const toolBlocks = [...this.blocks.values()].filter((block): block is ToolUseBlock => block.kind === "tool_use");
+    if (toolBlocks.some((block) => block.known && !block.parsed)) return;
+    // A message whose only calls target tools the host does not publish is the CLI's
+    // own business: it answers them itself and keeps streaming into this step.
+    if (!toolBlocks.some((block) => block.known)) return;
+    this.settle("tool-calls");
+  }
+
+  private settle(finishReason: "stop" | "tool-calls"): void {
+    if (this.settled) return;
+    this.closeThinkingRun();
+    this.settled = true;
+    const orderedReasoning = [...this.reasoning];
+    const result: StepResult = {
+      text: this.text,
+      reasoning: orderedReasoning,
+      ...(this.reasoningSeen ? { reasoningMs: this.reasoningMs } : {}),
+      calls: this.calls,
+      usage: this.usage,
+      model: this.model,
+      finishReason: finishReason === "tool-calls" ? "tool-calls" : stopReasonOf(this.stopReason),
+      ...(this.stopReason ? { rawFinishReason: this.stopReason } : {}),
+      responseMessages: this.parts.length > 0 ? [{ role: "assistant", content: this.parts }] : [],
+      sources: [],
+    };
+    this.finish({ kind: "done", result });
+  }
+}
+
+function stopReasonOf(stopReason: string | null): string {
+  switch (stopReason) {
+    case "end_turn":
+    case "stop_sequence":
+    case null:
+      return "stop";
+    case "max_tokens":
+      return "length";
+    case "tool_use":
+      return "tool-calls";
+    default:
+      return "other";
+  }
+}
+
+function number(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Anthropic `usage` object → host usage, with cache reads and writes counted as input. */
+function usageOf(usage: JsonObject): Usage {
+  const input = number(usage.input_tokens);
+  const cacheWrite = number(usage.cache_creation_input_tokens);
+  const cacheRead = number(usage.cache_read_input_tokens);
+  const output = number(usage.output_tokens);
+  const details = isObject(usage.output_tokens_details) ? usage.output_tokens_details : {};
+  const reasoning = number(details.thinking_tokens);
+  const inputTotal = input === undefined && cacheWrite === undefined && cacheRead === undefined
+    ? undefined
+    : (input ?? 0) + (cacheWrite ?? 0) + (cacheRead ?? 0);
+  return {
+    inputTokens: inputTotal,
+    outputTokens: output,
+    totalTokens: inputTotal === undefined && output === undefined ? undefined : (inputTotal ?? 0) + (output ?? 0),
+    reasoningTokens: reasoning,
+    cacheReadTokens: cacheRead,
+  };
+}
+
+/** `message_delta` usage restates counters; later values win, absent ones keep the earlier. */
+function mergeUsage(base: Usage, update: Usage): Usage {
+  const merged: Usage = { ...base };
+  for (const key of Object.keys(update) as Array<keyof Usage>) {
+    if (update[key] !== undefined) merged[key] = update[key];
+  }
+  const input = merged.inputTokens;
+  const output = merged.outputTokens;
+  merged.totalTokens = input === undefined && output === undefined ? undefined : (input ?? 0) + (output ?? 0);
+  return merged;
+}
+
+/** Sums two usage records; a step spanning several API messages reports the total. */
+function addUsage(base: Usage, next: Usage): Usage {
+  const sum: Usage = {};
+  for (const key of ["inputTokens", "outputTokens", "totalTokens", "reasoningTokens", "cacheReadTokens"] as const) {
+    const left = base[key];
+    const right = next[key];
+    if (left === undefined && right === undefined) continue;
+    sum[key] = (left ?? 0) + (right ?? 0);
+  }
+  return sum;
+}
+
+// ---------------------------------------------------------------- sessions
+
+interface ParkedCall {
+  name: string;
+  resolve: (result: McpToolResult) => void;
+}
+
+interface Session {
+  key: string;
+  query: Query;
+  abort: AbortController;
+  input: InputQueue;
+  server: MewrkMcpServer;
+  stderr: StderrTail;
+  process: CliProcess;
+  /** Request secrets to strip from any failure text this session produces. */
+  secrets: string[];
+  /** Handlers that arrived before their result. */
+  parked: Map<string, ParkedCall>;
+  /** Results that arrived before their handler. */
+  results: Map<string, McpToolResult>;
+  /** Tool_use ids the last step reported; the next step must answer them. */
+  awaiting: Set<string>;
+  /** Carrier content folded into the last result once every result is known. */
+  step: StepTranslator | null;
+  /** Messages received while no step was attached. */
+  inbox: SDKMessage[];
+  /** Set once the query iterator finished, with the failure if any. */
+  ended: StepError | "ok" | null;
+  pump: Promise<void>;
+  lastUsedAt: number;
+  cliVersion: string | undefined;
+  /** The CLI this session runs (`agent.executable`); keys the version its `init` reported. */
+  executable: string;
+  knownTools: ReadonlySet<string>;
+  /** Model id the host requested; keys the served-model cache. */
+  modelId: string;
+}
+
+/** Messages worth buffering between steps. Everything else is chatter. */
+function isStepMessage(message: SDKMessage): boolean {
+  return message.type === "stream_event" || message.type === "assistant" || message.type === "result";
+}
+
+/**
+ * Whether a live session can still serve this step's tool set.
+ *
+ * The CLI lists the in-process MCP server's tools when it connects and again
+ * whenever the server says its list changed. The host widens its set mid-run —
+ * the handoff tools arm, a `tool_search` call hands out a schema — and a
+ * session that never listed the new tool answers a call to it with "No such
+ * tool available", so `publishTools` lists it first. A rebuild, which
+ * synthesizes the transcript from the history the step carries, is the
+ * fallback when the CLI does not confirm.
+ *
+ * Narrowing is not a mismatch. A step may legitimately offer fewer tools (plan
+ * mode withdraws `exit_plan_mode`, a role intersects the set), and the CLI
+ * simply never calls what the model was not shown.
+ */
+function sessionServesToolSet(session: Session, tools: readonly { name: string }[]): boolean {
+  return tools.every((tool) => session.knownTools.has(tool.name));
+}
+
+/** How long a live session gets to list a tool that joined before it is rebuilt instead. */
+const PUBLISH_TIMEOUT_MS = 5_000;
+
+/**
+ * Hands the tools that joined mid-run to a live session: the in-process server
+ * adds them to its list, `tools/list_changed` makes the CLI ask for the list
+ * again, and the answer to that request is the confirmation. The CLI reads
+ * its stdin in order, so the new list is in its pool before the parked result
+ * that follows it resumes the round, and it refreshes the pool after every
+ * tool batch. From there the CLI appends the tool itself: on a model its
+ * catalogue lists as taking tool changes, a mid-conversation `tool_addition`
+ * (with one line of text beside it) and the tool declared `defer_loading`,
+ * which leaves the cached tool list alone; on any other model, a plain entry
+ * in that list. The CLI's own `mcpServerStatus()` is no witness here: it
+ * reports no tools for an in-process server.
+ *
+ * `false` when the CLI does not ask in time; the caller rebuilds instead.
+ */
+async function publishTools(session: Session, tools: readonly ToolSpec[]): Promise<boolean> {
+  const expired = new Promise<"expired">((resolve) =>
+    setTimeout(() => resolve("expired"), PUBLISH_TIMEOUT_MS).unref());
+  try {
+    if (await Promise.race([session.server.publish(tools).then(() => "listed" as const), expired]) === "expired") {
+      log(`会话 ${session.key} 的 CLI 没有重新列出工具`);
+      return false;
+    }
+  } catch (error) {
+    log(`会话 ${session.key} 发布新工具失败：${errorMessage(error)}`);
+    return false;
+  }
+  session.knownTools = new Set(tools.map((tool) => tool.name));
+  return true;
+}
+
+export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
+  const sessions = new Map<string, Session>();
+  /** Requested model id → model name the CLI actually served, for transcript stamps. */
+  const servedModels = new Map<string, string>();
+  /**
+   * CLI executable → the version its own `init` last reported. Keyed by path:
+   * the host updates the CLI under a running sidecar, and a version learned from
+   * the old one must not be stamped on a transcript for the new one.
+   */
+  const reportedCliVersions = new Map<string, string>();
+
+  const sweep = setInterval(() => {
+    const now = Date.now();
+    for (const session of sessions.values()) {
+      if (session.step === null && now - session.lastUsedAt > IDLE_EVICTION_MS) {
+        log(`会话 ${session.key} 闲置超过 24 小时，回收`);
+        teardown(session);
+      }
+    }
+  }, EVICTION_SWEEP_MS);
+  sweep.unref();
+
+  function teardown(session: Session): void {
+    if (sessions.get(session.key) === session) sessions.delete(session.key);
+    // Kill first: a parked handler must never be answered, or the CLI would run
+    // one more API call before the SDK's graceful shutdown reaches it.
+    session.process.kill();
+    session.abort.abort();
+    session.input.end();
+    session.parked.clear();
+    session.results.clear();
+    session.awaiting.clear();
+    void session.server.close();
+  }
+
+  function deliver(session: Session, message: SDKMessage): void {
+    session.lastUsedAt = Date.now();
+    if (message.type === "system" && message.subtype === "init") {
+      session.cliVersion = message.claude_code_version;
+      reportedCliVersions.set(session.executable, message.claude_code_version);
+      log(
+        `会话 ${session.key} 就绪：Claude Code ${message.claude_code_version}，模型 ${message.model}，` +
+          `凭据来源 ${message.apiKeySource}，工具 ${message.tools.length} 个`,
+      );
+      return;
+    }
+    if (message.type === "stream_event" && message.parent_tool_use_id === null) {
+      const event = message.event as unknown as JsonObject;
+      if (event.type === "message_start" && isObject(event.message) && typeof event.message.model === "string") {
+        servedModels.set(session.modelId, event.message.model);
+      }
+    }
+    if (message.type === "system" && message.subtype === "api_retry") {
+      log(`会话 ${session.key}：Claude Code 正在重试上游请求`);
+    }
+    if (session.step) {
+      try {
+        session.step.handle(message);
+      } catch (error) {
+        session.step.fail({ kind: "permanent", message: errorMessage(error) });
+        teardown(session);
+      }
+      return;
+    }
+    if (isStepMessage(message)) session.inbox.push(message);
+  }
+
+  async function pump(session: Session): Promise<void> {
+    try {
+      for await (const message of session.query) deliver(session, message);
+      session.ended = "ok";
+    } catch (error) {
+      session.ended = classifyQueryError(error, session.stderr);
+    }
+    // A step still attached when the iterator ends never got its message.
+    if (session.step) {
+      session.step.fail(
+        session.ended === "ok" ? { kind: "permanent", message: "Claude Code 会话在回复完成前结束" } : session.ended,
+      );
+    }
+    if (sessions.get(session.key) === session) sessions.delete(session.key);
+  }
+
+  function classifyQueryError(error: unknown, stderr: StderrTail): StepError {
+    if (isAbortError(error)) return { kind: "cancelled", message: "请求已取消" };
+    const tail = stderr.text();
+    const message = errorMessage(error);
+    return { kind: "permanent", message: tail.length > 0 ? `${message}\n${tail}` : message };
+  }
+
+  function startSession(
+    request: StepRequest,
+    agent: AgentSession,
+    prompt: SDKUserMessage,
+    history: unknown[],
+    promptAdditions: readonly string[][],
+  ): Session {
+    // The installed SDK first: nothing below is worth doing without it.
+    const sdk = loadSdk(agent.sdk);
+    // Then, and throwing: a session without the plugin must not start at all.
+    const plugin = contextPluginDir(agent.cwd);
+    const tools = request.tools ?? [];
+    const knownTools = new Set(tools.map((tool) => tool.name));
+    const abort = new AbortController();
+    const input = new InputQueue();
+    const stderr = new StderrTail();
+    const cli = new CliProcess(stderr);
+    const sessionRef: { current: Session | null } = { current: null };
+    const server = new MewrkMcpServer(tools, (toolUseId, name, args) => {
+      const session = sessionRef.current;
+      if (!session) return Promise.reject(new Error("session is gone"));
+      const id = toolUseId ?? "";
+      const bare = stripToolPrefix(name);
+      session.step?.supplyToolInput(id, args);
+      const ready = session.results.get(id);
+      if (ready) {
+        session.results.delete(id);
+        return Promise.resolve(ready);
+      }
+      return new Promise<McpToolResult>((resolve) => {
+        session.parked.set(id, { name: bare, resolve });
+      });
+    });
+
+    // What the CLI runs; `request.modelId` stays the host's name for the model
+    // (signature tags, served-model stamps).
+    const cliModel = cliModelId(request.modelId, request.contextWindow);
+    const resumed = history.length > 0;
+    const sessionId = randomUUID();
+    const transcript = resumed
+      ? synthesizeTranscript(history, {
+          sessionId,
+          cwd: agent.cwd,
+          cliVersion: reportedCliVersions.get(agent.executable) ?? sdk.cliVersion ?? FALLBACK_CLI_VERSION,
+          model: servedModels.get(request.modelId) ?? request.modelId,
+          appendable: agent.toolChanges === true ? new Map(tools.map((tool) => [tool.name, tool])) : null,
+          promptAdditions,
+        })
+      : [];
+
+    const options: Options = {
+      abortController: abort,
+      cwd: agent.cwd,
+      pathToClaudeCodeExecutable: agent.executable,
+      spawnClaudeCodeProcess: cli.spawnHook(),
+      env: cliEnv(agent, cliModel, { maxOutputTokens: request.maxOutputTokens }),
+      // Rendered fresh on every request, never recorded. By default the CLI records
+      // a session's system prompt on its first request and replays that record
+      // afterwards, even across a resume that passes different text; the host
+      // rebuilds its prompt every step (the environment it states follows the
+      // machines a run is on), and only the text it sent may reach the model.
+      systemPrompt: { type: "custom", prompt: fullSystemPrompt(request) ?? "", snapshot: false },
+      tools: [],
+      settingSources: [],
+      strictMcpConfig: true,
+      // The one plugin the CLI loads: `settingSources: []` keeps every installed one
+      // out, and this one is Mewrk's own (see `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS`).
+      plugins: [{ type: "local", path: plugin }],
+      mcpServers: {
+        [SERVER_NAME]: {
+          type: "sdk",
+          name: SERVER_NAME,
+          // The SDK only ever calls `instance.connect(transport)`; the hand-written
+          // server satisfies that contract without the MCP SDK's `McpServer` class.
+          instance: server as unknown as McpSdkServerConfigWithInstance["instance"],
+          timeout: PARK_TIMEOUT_MS,
+        },
+      },
+      // The host has already approved every call it sends back, so the CLI's own
+      // permission layer answers "allow" for everything. The callback rather than
+      // `allowedTools` rules: rules are matched by name syntax, the callback is not.
+      canUseTool: async (_toolName, toolInput) => ({ behavior: "allow", updatedInput: toolInput }),
+      permissionMode: "default",
+      includePartialMessages: true,
+      model: cliModel,
+      ...reasoningOptions(request.reasoning),
+      settings: { totalTokensReminder: "off" },
+      ...(resumed
+        ? {
+            resume: sessionId,
+            persistSession: true,
+            sessionStore: {
+              load: async () => transcript as unknown as SessionStoreEntry[],
+              append: async () => {},
+            },
+          }
+        : { persistSession: false }),
+    };
+
+    input.push(prompt);
+    const created = sdk.module.query({ prompt: input, options });
+    const session: Session = {
+      key: agent.session,
+      query: created,
+      abort,
+      input,
+      server,
+      stderr,
+      process: cli,
+      secrets: secretsOf(request),
+      parked: new Map(),
+      results: new Map(),
+      awaiting: new Set(),
+      step: null,
+      inbox: [],
+      ended: null,
+      pump: Promise.resolve(),
+      lastUsedAt: Date.now(),
+      cliVersion: undefined,
+      executable: agent.executable,
+      knownTools,
+      modelId: request.modelId,
+    };
+    sessionRef.current = session;
+    session.pump = pump(session);
+    sessions.set(agent.session, session);
+    return session;
+  }
+
+  /** Runs one step against a session: attach, drain the inbox, wait for the outcome. */
+  async function runAttached(session: Session, id: string, controller: AbortController): Promise<void> {
+    const translator = new StepTranslator(id, io, session.knownTools);
+    session.step = translator;
+    const onAbort = (): void => {
+      translator.fail({ kind: "cancelled", message: "请求已取消" });
+      teardown(session);
+    };
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      if (session.ended) {
+        translator.fail(session.ended === "ok" ? { kind: "permanent", message: "Claude Code 会话已结束" } : session.ended);
+      }
+      const inbox = session.inbox.splice(0);
+      for (const message of inbox) deliver(session, message);
+      const outcome = await translator.outcome;
+      if (outcome.kind === "done") {
+        session.awaiting = new Set(translator.callIds);
+        io.done(id, outcome.result);
+      } else {
+        io.fail(id, redactError(outcome, session.secrets));
+        if (outcome.kind !== "cancelled") teardown(session);
+      }
+    } finally {
+      controller.signal.removeEventListener("abort", onAbort);
+      if (session.step === translator) session.step = null;
+      session.lastUsedAt = Date.now();
+    }
+  }
+
+  async function step(id: string, request: StepRequest): Promise<void> {
+    const controller = new AbortController();
+    io.begin(id, controller, true);
+    try {
+      const agent = validateAgent(request.agent);
+      // The host's tool-append markers stay in the history. A live session has
+      // its new tools handed over by the CLI itself (`publishTools`); a rebuilt
+      // one gets them back as the CLI's own record of them
+      // (`toolAdditionEntries`).
+      // Replayed reasoning parts are tagged by the host with the model that signed
+      // them; Anthropic binds a signature to that model, so a switched conversation
+      // drops them and the tag itself never reaches the CLI.
+      dropForeignSignedReasoning(request.messages, request.modelId);
+      stripReplayTags(request.messages);
+      const split = splitMessages(request.messages);
+      const live = sessions.get(agent.session);
+
+      // Continuation: the parked round gets its results.
+      if (live && live.ended === null && live.awaiting.size > 0 && split.prompt === null) {
+        const missing = [...live.awaiting].filter((callId) => !split.results.has(callId));
+        // The parked call is answerable, but the step that follows it may need
+        // a tool this session never listed. The session lists it before the
+        // round resumes; only when the CLI will not confirm it do the results go
+        // into a rebuilt session's transcript instead — `split.results` is what
+        // carries them.
+        const served = missing.length === 0
+          && (sessionServesToolSet(live, request.tools ?? []) || await publishTools(live, request.tools ?? []));
+        if (missing.length === 0 && !served) {
+          log(`会话 ${agent.session} 未能列出新增工具，改为重建会话`);
+        } else if (missing.length === 0) {
+          const ordered = [...live.awaiting];
+          live.awaiting = new Set();
+          const carriers = split.carriers;
+          const attach = runAttached(live, id, controller);
+          ordered.forEach((callId, index) => {
+            const base = split.results.get(callId) ?? { content: [] };
+            const result: McpToolResult = index === ordered.length - 1 && carriers.length > 0
+              ? { ...base, content: [...base.content, ...carriers] }
+              : base;
+            const parked = live.parked.get(callId);
+            if (parked) {
+              live.parked.delete(callId);
+              parked.resolve(result);
+            } else {
+              live.results.set(callId, result);
+            }
+          });
+          await attach;
+          return;
+        }
+        if (missing.length > 0) {
+          log(`会话 ${agent.session} 缺少工具结果 ${missing.join(", ")}，改为重建会话`);
+        }
+      }
+
+      if (live) teardown(live);
+      let prompt: SDKUserMessage;
+      let history: unknown[];
+      let promptAdditions: string[][] = [];
+      if (split.prompt) {
+        prompt = { type: "user", message: { role: "user", content: split.prompt as never }, parent_tool_use_id: null };
+        history = split.history;
+        promptAdditions = split.promptAdditions;
+      } else if (split.results.size > 0 || split.carriers.length > 0) {
+        // The parked session is gone; the transcript already carries the results.
+        // Carriers alone happen when a background delivery wakes a round of its own.
+        prompt = { type: "user", message: { role: "user", content: CONTINUE_NOTICE }, parent_tool_use_id: null };
+        history = request.messages;
+      } else {
+        throw new Error("Claude Code 需要一条用户消息才能开始回合");
+      }
+      const session = startSession(request, agent, prompt, history, promptAdditions);
+      await runAttached(session, id, controller);
+    } catch (error) {
+      io.fail(
+        id,
+        isAbortError(error)
+          ? { kind: "cancelled", message: "请求已取消" }
+          : redactError({ kind: "permanent", message: errorMessage(error) }, secretsOf(request)),
+      );
+    } finally {
+      io.end(id);
+    }
+  }
+
+  function release(key: string): void {
+    const session = sessions.get(key);
+    if (session) teardown(session);
+  }
+
+  async function shutdown(): Promise<void> {
+    clearInterval(sweep);
+    const pumps = [...sessions.values()].map((session) => session.pump);
+    for (const session of [...sessions.values()]) teardown(session);
+    await Promise.race([
+      Promise.allSettled(pumps),
+      new Promise<void>((resolve) => setTimeout(resolve, 3000).unref()),
+    ]);
+  }
+
+  return { step, release, shutdown };
+}

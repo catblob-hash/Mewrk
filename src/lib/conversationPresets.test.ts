@@ -1,0 +1,370 @@
+import { describe, expect, it } from "vitest";
+import { createTestDocument as createSeedDocument } from "../test/fixtures";
+import { defaultConversationWebSearchSettings } from "./runtime";
+import type { ConversationPresetSettings, ConversationSettings } from "../types";
+import {
+  applyConversationPresetSettings,
+  captureConversationPresetSettings,
+  cloneConversationSettings,
+  conversationPresetById,
+  defaultConversationPreset,
+  emptyConversationPresetSettings,
+  isBuiltinConversationPreset,
+  sameConversationPresetSettings
+} from "./conversationPresets";
+import { BUILTIN_PRESET_ID } from "../seed";
+
+/** Reusable preset fields after flattening. */
+const PRESET_FIELDS = [
+  "agentIds",
+  "allowRolelessSubagents",
+  "enabledTools",
+  "globalMemoryEnabled",
+  "hookIds",
+  "hostMessageContainer",
+  "mcpIds",
+  "mcpToolDiscoveryEnabled",
+  "projectMemoryEnabled",
+  "securityLevel",
+  "skillIds",
+  "skillToolEnabled",
+  "toolDescriptionFileId",
+  "webSearch",
+  "webSearchEnabled"
+];
+
+describe("conversation presets", () => {
+  it("uses the configured default preset ID", () => {
+    const document = createSeedDocument();
+    const second = {
+      ...document.globalSettings.conversationPresets[0],
+      id: "conversation_second",
+      name: "Second"
+    };
+    document.globalSettings.conversationPresets.push(second);
+    document.globalSettings.defaultConversationPresetId = second.id;
+    expect(defaultConversationPreset(document.globalSettings)?.id).toBe(second.id);
+  });
+
+  it("falls back to the first preset, and to none when there is none", () => {
+    const document = createSeedDocument();
+    document.globalSettings.defaultConversationPresetId = "preset-gone";
+    expect(defaultConversationPreset(document.globalSettings)?.id)
+      .toBe(document.globalSettings.conversationPresets[0].id);
+    // The host keeps the built-in preset in every document, so an empty list
+    // only answers a document that never went through it: nothing to apply.
+    document.globalSettings.conversationPresets = [];
+    expect(defaultConversationPreset(document.globalSettings)).toBeNull();
+  });
+
+  it("recognizes the built-in preset by its id alone", () => {
+    expect(isBuiltinConversationPreset(BUILTIN_PRESET_ID)).toBe(true);
+    expect(isBuiltinConversationPreset("preset_codex")).toBe(false);
+    expect(isBuiltinConversationPreset("")).toBe(false);
+  });
+
+  it("keeps the empty preset shape flat", () => {
+    expect(emptyConversationPresetSettings()).toEqual({
+      enabledTools: [],
+      toolDescriptionFileId: null,
+      agentIds: [],
+      allowRolelessSubagents: false,
+      hookIds: [],
+      skillIds: [],
+      mcpIds: [],
+      webSearch: defaultConversationWebSearchSettings(),
+      webSearchEnabled: false,
+      securityLevel: "request_approval",
+      globalMemoryEnabled: false,
+      projectMemoryEnabled: false,
+      skillToolEnabled: false,
+      mcpToolDiscoveryEnabled: false,
+      hostMessageContainer: "user"
+    });
+    expect(Object.keys(emptyConversationPresetSettings()).sort()).toEqual(PRESET_FIELDS);
+  });
+
+  it("captures the reusable subset from one settings argument", () => {
+    const document = createSeedDocument();
+    const settings = document.workspaces[0].conversations[0].settings;
+    settings.hookIds = ["hook_format"];
+    settings.toolDescriptionFileId = "tooldesc_user_main_0f0f0f0f";
+    settings.agentIds = ["agent_a", "agent_b"];
+
+    const captured = captureConversationPresetSettings(settings);
+
+    // Presets contain no resolvable references, so capture needs only conversation settings.
+    expect(captured).toEqual({
+      enabledTools: settings.enabledTools,
+      toolDescriptionFileId: "tooldesc_user_main_0f0f0f0f",
+      agentIds: ["agent_a", "agent_b"],
+      allowRolelessSubagents: settings.allowRolelessSubagents,
+      hookIds: ["hook_format"],
+      skillIds: ["skill_code_review"],
+      mcpIds: ["mcp_workspace"],
+      webSearch: settings.webSearch,
+      webSearchEnabled: true,
+      securityLevel: settings.securityLevel,
+      globalMemoryEnabled: settings.globalMemoryEnabled,
+      projectMemoryEnabled: settings.projectMemoryEnabled,
+      skillToolEnabled: settings.skillToolEnabled,
+      mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled,
+      hostMessageContainer: "user"
+    });
+    // Conversation-only fields — plan mode among them — do not enter presets;
+    // web search, security, and memory tiers do.
+    expect(Object.keys(captured).sort()).toEqual(PRESET_FIELDS);
+    captured.enabledTools.push("mutated");
+    // Roles are selected by id, so the copy is of the id list and nothing else.
+    captured.agentIds.push("agent_mutated");
+    captured.webSearch.provider = { kind: "unavailable" };
+    expect(settings.enabledTools).not.toContain("mutated");
+    expect(settings.agentIds).toEqual(["agent_a", "agent_b"]);
+    // Mutating the captured settings must not affect the conversation.
+    expect(settings.webSearch.provider).toEqual({ kind: "native" });
+  });
+
+  it("applies a preset straight onto conversation settings and keeps conversation-only fields", () => {
+    const document = createSeedDocument();
+    const current = document.workspaces[0].conversations[0].settings;
+    current.webSearch = { ...current.webSearch, maxSearchesPerCall: 7 };
+    current.agentIds = ["agent_old"];
+    const preset: ConversationPresetSettings = {
+      enabledTools: ["read", "read", "extinct-tool"],
+      toolDescriptionFileId: "tooldesc_user_preset_11112222",
+      agentIds: ["agent_a", "agent_a", "agent_b"],
+      allowRolelessSubagents: true,
+      hookIds: ["hook_a", "hook_a"],
+      skillIds: ["skill_installer"],
+      mcpIds: [],
+      webSearch: {
+        ...defaultConversationWebSearchSettings(),
+        maxSearchesPerCall: 42
+      },
+      webSearchEnabled: true,
+      securityLevel: "full_access",
+      globalMemoryEnabled: true,
+      projectMemoryEnabled: false,
+      skillToolEnabled: true,
+      mcpToolDiscoveryEnabled: true,
+      hostMessageContainer: "box"
+    };
+
+    const applied: ConversationSettings = applyConversationPresetSettings(
+      current,
+      preset,
+      new Set(document.tools.map((tool) => tool.name))
+    );
+
+    // Return `ConversationSettings` directly without a wrapper.
+    expect(applied).not.toHaveProperty("settings");
+    expect(applied).not.toHaveProperty("missingReferences");
+    expect(applied.enabledTools).toEqual(["read"]);
+    expect(applied.hookIds).toEqual(["hook_a"]);
+    expect(applied.toolDescriptionFileId).toBe("tooldesc_user_preset_11112222");
+    // The preset's roles replace the conversation's rather than joining them,
+    // de-duplicated like every other id list.
+    expect(applied.agentIds).toEqual(["agent_a", "agent_b"]);
+    expect(current.agentIds).toEqual(["agent_old"]);
+    applied.agentIds.push("agent_mutated");
+    expect(preset.agentIds).toEqual(["agent_a", "agent_a", "agent_b"]);
+    // Applying a preset replaces web-search behavior with a deep copy.
+    expect(applied.webSearch).toEqual(preset.webSearch);
+    applied.webSearch.provider = { kind: "unavailable" };
+    expect(preset.webSearch.provider).toEqual({ kind: "native" });
+    // Security policy is a preset component.
+    expect(applied.securityLevel).toBe("full_access");
+    expect(applied.reasoningEffort).toBe(current.reasoningEffort);
+    // Memory-tier switches are preset components and replace their respective values.
+    expect(current.globalMemoryEnabled).toBe(false);
+    expect(applied.globalMemoryEnabled).toBe(true);
+    expect(applied.projectMemoryEnabled).toBe(false);
+    // So is the container host messages come in.
+    expect(current.hostMessageContainer ?? "user").toBe("user");
+    expect(applied.hostMessageContainer).toBe("box");
+  });
+
+  it("applies a preset over a conversation that has run, moving everything but the pins", () => {
+    const document = createSeedDocument();
+    const current: ConversationSettings = {
+      ...document.workspaces[0].conversations[0].settings,
+      skillIds: ["skill_locked"],
+      skillToolEnabled: false,
+      webSearchEnabled: true,
+      toolLock: {
+        tools: [],
+        mcpIds: [],
+        globalMemory: false,
+        projectMemory: false,
+        skillTool: false,
+        mcpToolDiscovery: false,
+        webSearch: true,
+        planMode: false,
+        skillIds: ["skill_locked"],
+        promptSkillIds: ["skill_locked"],
+        searchBackend: { kind: "native" },
+        fetchBackend: { kind: "native" },
+        webFetch: true,
+        searchProvider: { kind: "native" },
+        fetchProvider: { kind: "native" },
+        lastRequest: null,
+        modelRequests: [],
+        hookIds: null,
+        promptProfile: null,
+        hostMessageContainer: null
+      }
+    };
+    const preset = {
+      ...captureConversationPresetSettings(current),
+      skillIds: ["skill_other"],
+      skillToolEnabled: true,
+      webSearch: {
+        ...defaultConversationWebSearchSettings(),
+        provider: { kind: "explicit" as const, providerKind: "tavily" as const },
+        fetchProvider: { kind: "explicit" as const, providerKind: "jina" as const }
+      }
+    };
+
+    const applied = applyConversationPresetSettings(current, preset);
+
+    // The surface is the preset's: the lock only warns before a warm cache is
+    // thrown away, on every model, and never holds the surface where it was.
+    expect(applied.skillIds).toEqual(["skill_other"]);
+    expect(applied.skillToolEnabled).toBe(true);
+    // A backend the transcript already used cannot be swapped part-way through.
+    expect(applied.webSearch.provider).toEqual({ kind: "native" });
+    expect(applied.webSearch.fetchProvider).toEqual({ kind: "native" });
+    // The rest of the preset's web-search body still applies.
+    expect(applied.webSearch.maxSearchesPerCall).toBe(preset.webSearch.maxSearchesPerCall);
+  });
+
+  it("keeps dangling capability IDs on both sides of a capture/apply round trip", () => {
+    // Capability IDs may outlive installation, so they must not be filtered by the catalog.
+    const document = createSeedDocument();
+    const current = document.workspaces[0].conversations[0].settings;
+    current.hookIds = ["hook_not_installed"];
+    current.skillIds = ["skill_not_installed"];
+    current.mcpIds = ["mcp_not_installed"];
+    current.agentIds = ["agent_not_installed"];
+
+    const captured = captureConversationPresetSettings(current);
+    const applied = applyConversationPresetSettings(current, captured);
+
+    expect(captured).toMatchObject({
+      hookIds: ["hook_not_installed"],
+      skillIds: ["skill_not_installed"],
+      mcpIds: ["mcp_not_installed"],
+      agentIds: ["agent_not_installed"]
+    });
+    expect(applied).toMatchObject({
+      hookIds: ["hook_not_installed"],
+      skillIds: ["skill_not_installed"],
+      mcpIds: ["mcp_not_installed"],
+      agentIds: ["agent_not_installed"]
+    });
+  });
+
+  it("deep-copies a remembered snapshot so the new conversation cannot edit the workspace's copy", () => {
+    const document = createSeedDocument();
+    const snapshot: ConversationSettings = {
+      ...document.workspaces[0].conversations[0].settings,
+      reasoningEffort: "high",
+      securityLevel: "full_access",
+      enabledTools: ["read", "read", "no-such-tool"],
+      agentIds: ["agent_a", "agent_a", "agent_b"],
+      globalMemoryEnabled: true
+    };
+
+    const cloned = cloneConversationSettings(
+      snapshot,
+      new Set(document.tools.map((tool) => tool.name))
+    );
+
+    // Snapshot-only fields distinguish remembered settings from a preset application.
+    expect(cloned.reasoningEffort).toBe("high");
+    expect(cloned.securityLevel).toBe("full_access");
+    // Remove duplicate or retired tool names.
+    expect(cloned.enabledTools).toEqual(["read"]);
+    expect(cloned.globalMemoryEnabled).toBe(true);
+    // Selected roles are de-duplicated and copied, like the other id lists.
+    expect(cloned.agentIds).toEqual(["agent_a", "agent_b"]);
+    expect(cloned.agentIds).not.toBe(snapshot.agentIds);
+    cloned.agentIds.push("agent_mutated");
+    expect(snapshot.agentIds).toEqual(["agent_a", "agent_a", "agent_b"]);
+    // Nested settings must not be shared with the workspace snapshot.
+    cloned.webSearch.provider = { kind: "explicit", providerKind: "tavily" };
+    expect(snapshot.webSearch.provider).toEqual({ kind: "native" });
+    expect(cloned.hookIds).not.toBe(snapshot.hookIds);
+  });
+
+  it("resolves a preset id leniently", () => {
+    const document = createSeedDocument();
+    document.globalSettings.conversationPresets = [
+      {
+        id: "preset-a",
+        name: "审阅",
+        description: "",
+        templateId: "",
+        settings: emptyConversationPresetSettings()
+      }
+    ];
+
+    expect(conversationPresetById(document.globalSettings, "preset-a")?.name).toBe("审阅");
+    // Missing and empty IDs resolve to no preset rather than throwing or falling back.
+    expect(conversationPresetById(document.globalSettings, "preset-gone")).toBeNull();
+    expect(conversationPresetById(document.globalSettings, "")).toBeNull();
+  });
+
+  it("treats reordered tool and resource lists as the same preset body", () => {
+    const base: ConversationPresetSettings = {
+      ...emptyConversationPresetSettings(),
+      enabledTools: ["read_file", "write_file", "bash"],
+      hookIds: ["hook-a", "hook-b"],
+      skillIds: ["skill-a"],
+      mcpIds: ["mcp-a"],
+      agentIds: ["agent-a", "agent-b"]
+    };
+    // The settings panel rewrites `enabledTools` in view order; that is not an edit.
+    expect(sameConversationPresetSettings(base, {
+      ...base,
+      enabledTools: ["bash", "write_file", "read_file"],
+      hookIds: ["hook-b", "hook-a"],
+      agentIds: ["agent-b", "agent-a"]
+    })).toBe(true);
+    expect(sameConversationPresetSettings(base, {
+      ...base,
+      enabledTools: ["read_file", "write_file"]
+    })).toBe(false);
+    expect(sameConversationPresetSettings(base, { ...base, securityLevel: "full_access" })).toBe(false);
+    expect(sameConversationPresetSettings(base, {
+      ...base,
+      webSearch: { ...base.webSearch, maxSearchesPerCall: base.webSearch.maxSearchesPerCall + 1 }
+    })).toBe(false);
+  });
+
+  it("compares the selected roles as a set: reordering is no edit, adding or removing one is", () => {
+    const withRoles = (agentIds: string[]): ConversationPresetSettings => ({
+      ...emptyConversationPresetSettings(),
+      agentIds
+    });
+    const original = withRoles(["agent_a", "agent_b"]);
+    // Applying a preset copies its ids, so equality can never rely on identity.
+    expect(sameConversationPresetSettings(
+      original,
+      captureConversationPresetSettings({
+        ...emptyConversationPresetSettings(),
+        reasoningEffort: "medium",
+        agentIds: ["agent_a", "agent_b"]
+      } as ConversationSettings)
+    )).toBe(true);
+    // A selection has no order: ticking the same roles in another order is no edit.
+    expect(sameConversationPresetSettings(original, withRoles(["agent_b", "agent_a"]))).toBe(true);
+    expect(sameConversationPresetSettings(original, withRoles(["agent_a", "agent_a", "agent_b"]))).toBe(true);
+    expect(sameConversationPresetSettings(original, withRoles(["agent_a"]))).toBe(false);
+    expect(sameConversationPresetSettings(original, withRoles(["agent_a", "agent_b", "agent_c"]))).toBe(false);
+    // Same size, different member: a count check alone would miss it.
+    expect(sameConversationPresetSettings(original, withRoles(["agent_a", "agent_c"]))).toBe(false);
+    expect(sameConversationPresetSettings(original, withRoles([]))).toBe(false);
+    expect(sameConversationPresetSettings(withRoles([]), withRoles([]))).toBe(true);
+  });
+});

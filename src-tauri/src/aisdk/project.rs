@@ -1,0 +1,760 @@
+//! Canonical timeline to AI SDK `ModelMessage[]`.
+//!
+//! This is the second stage of the `wire_history` projection. The first stage,
+//! [`crate::wire_history::canonical_history`], folds editable `ContextItem`s into
+//! provider-neutral `CanonicalHistoryBlock`s shared by editing, folds, and branch
+//! replay. This stage renders the sole remaining form; the sidecar lets AI SDK
+//! translate it for each provider.
+//!
+//! The shape follows installed `@ai-sdk/provider-utils` type definitions because
+//! documentation may diverge from the installed `ai@7` types.
+//!
+//! User messages carry host-owned placeholders instead of attachment content:
+//! an `ImagePart` whose `image` is an image placeholder, and a
+//! `{ type: "mewrk-file", file: FileAttachment }` part per attached file.
+//! `aisdk::step` hydrates both after taking the wire-ledger copy, so the ledger
+//! and the incremental projection cache never hold base64 or file text; the
+//! file parts become text parts (or plain string content), which is the only
+//! form every provider family — the text-only `claude-agent` transcript
+//! included — accepts for a document.
+//!
+//! ```text
+//! user      { role, content: string | Array<TextPart | ImagePart | FilePart> }
+//! assistant { role, content: string | Array<TextPart | … | ToolCallPart | ToolResultPart> }
+//! tool      { role, content: Array<ToolResultPart> }
+//!
+//! ToolCallPart   { type: "tool-call",   toolCallId, toolName, input }
+//! ToolResultPart { type: "tool-result", toolCallId, toolName, output: ToolResultOutput }
+//! ToolResultOutput = { type: "text", value } | { type: "error-text", value } | …
+//! ```
+
+use serde_json::{json, Value};
+
+use crate::model::{FileAttachment, ImageAttachment};
+use crate::wire_history::{
+    canonical_history, CanonicalAssistantTurn, CanonicalHistoryBlock, CanonicalToolExchange,
+};
+
+use super::protocol::{Family, MAX_LINE_BYTES};
+
+/// Wire representation of a tool result.
+///
+/// Successful and failed results map to `text` and `error-text`, respectively.
+/// AI SDK translates the latter to each provider's error representation.
+pub(crate) fn tool_output(success: bool, output: &str) -> Value {
+    json!({
+        "type": if success { "text" } else { "error-text" },
+        "value": output,
+    })
+}
+
+/// Image placeholder.
+///
+/// The host hydrates actual bytes only after enforcing image count, byte, pixel,
+/// and `supports_vision` limits. This layer contains only coordinates and reuses
+/// `image_attachments::placeholder`.
+///
+/// The value occupies an AI SDK `ImagePart` `image` field and uses a `DataUrl`,
+/// the only `DataContent` form that carries its MIME type.
+///
+/// `image_attachments::hydrate_ai_sdk_images` recognizes only this output shape
+/// in user messages. It must not recursively search model-controlled tool input
+/// or continuation JSON for lookalike values.
+pub(crate) fn image_part(image: &ImageAttachment) -> Value {
+    json!({
+        "type": "image",
+        "image": crate::image_attachments::placeholder(image, crate::image_attachments::WireEncoding::DataUrl),
+        "mediaType": image.mime,
+    })
+}
+
+/// File attachment placeholder.
+///
+/// Carries only the attachment's metadata; `step::hydrate_files` replaces it
+/// with the file's text, read and checked from the store, after the history
+/// has recorded this form. Like image slots, only this part type in a user
+/// message is recognized — never a lookalike nested in model-controlled JSON.
+pub(crate) fn file_part(file: &FileAttachment) -> Value {
+    json!({
+        "type": crate::file_attachments::FILE_PART_TYPE,
+        "file": file,
+    })
+}
+
+fn user_message(
+    content: &str,
+    images: &[ImageAttachment],
+    files: &[FileAttachment],
+) -> Option<Value> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() && images.is_empty() && files.is_empty() {
+        return None;
+    }
+    if images.is_empty() && files.is_empty() {
+        // Use string content for text-only messages because it is the most widely
+        // exercised provider path.
+        return Some(json!({ "role": "user", "content": trimmed }));
+    }
+    // Documents precede the question: models answer long-context prompts best
+    // when the material comes first and the ask comes last.
+    let mut parts = files.iter().map(file_part).collect::<Vec<_>>();
+    if !trimmed.is_empty() {
+        parts.push(json!({ "type": "text", "text": trimmed }));
+    }
+    parts.extend(images.iter().map(image_part));
+    Some(json!({ "role": "user", "content": parts }))
+}
+
+/// Key under a message's or part's `providerOptions` for the host's own
+/// markers. The sidecar reads and strips it before any provider sees it
+/// (`aisdk-service/src/async-tools.ts`).
+pub(crate) const MARKER_OPTIONS_KEY: &str = "mewrk";
+/// Marks a user-role message as one the host wrote (`HostDelivery`), not the
+/// user — what the Claude Code session folds behind a parked round's results.
+pub(crate) const HOST_MESSAGE_MARKER: &str = "hostMessage";
+/// On a host message: the deferred call it is the result of, and that result
+/// as the call's output (`{ toolCallId, output }`), for a request that
+/// declares asynchronous tools.
+pub(crate) const ASYNC_RESULT_MARKER: &str = "asyncResult";
+/// On a tool-result part: the call started a background task whose result is
+/// still to come as its own output (`async_tools::is_deferred_launch`).
+pub(crate) const ASYNC_LAUNCH_MARKER: &str = "asyncLaunch";
+/// On a host message: the delivery card's id, which the `box` exchange a
+/// request whose host messages come in `box` turns it into mints its call id
+/// from ([`host_messages_in_box`]). Consumed there; it never reaches the
+/// sidecar.
+const HOST_MESSAGE_ID_MARKER: &str = "hostMessageId";
+
+/// A message the host hands the model, as the user-role message it is on
+/// every protocol — the way Claude Code delivers a background task's
+/// `<task-notification>` and its own reminders.
+///
+/// A deferred call's result also names the call and carries the output that
+/// call takes, so a request that declares asynchronous tools can send it
+/// there instead; the sidecar decides, because the same transcript replays to
+/// whichever model the conversation is on. Where the conversation's host
+/// messages come in `box`, the request turns the message into that exchange
+/// once it is assembled ([`host_messages_in_box`]): the projection itself is
+/// the same for both, so the cached prefix of a turn serves either.
+pub(crate) fn host_delivery_messages(delivery: &crate::wire_history::HostDelivery, out: &mut Vec<Value>) {
+    let message = delivery.message.trim();
+    if message.is_empty() {
+        return;
+    }
+    let mut marker = json!({
+        HOST_MESSAGE_MARKER: true,
+        HOST_MESSAGE_ID_MARKER: delivery.local_id,
+    });
+    if let Some(answers) = &delivery.answers {
+        marker[ASYNC_RESULT_MARKER] = json!({
+            "toolCallId": answers.call_id,
+            "output": answers.output,
+        });
+    }
+    out.push(json!({
+        "role": "user",
+        "content": message,
+        "providerOptions": { MARKER_OPTIONS_KEY: marker },
+    }));
+}
+
+/// The host's marks on a message or part (`providerOptions.mewrk`), if any.
+fn marks(holder: &Value) -> Option<&serde_json::Map<String, Value>> {
+    holder
+        .get("providerOptions")?
+        .get(MARKER_OPTIONS_KEY)?
+        .as_object()
+}
+
+/// Hands this request's host messages to the model in the container its
+/// conversation chose ([`crate::model::HostMessageContainer`]), once the
+/// request is assembled — after `system_append::carry`, whose reminders are
+/// host messages too.
+///
+/// Where it is `user`, every host message stays the user-role message it was
+/// projected as. Where it is `box`, each becomes the exchange the host writes
+/// for it: a `box` call with its one empty argument, and the message's
+/// [`box_result`] as the call's result — the form a delivery took when it
+/// went out in `box`, so such a card replays byte for byte. The call id is
+/// minted from the delivery card's id, which keeps the exchange the same on
+/// every request.
+///
+/// The one host message that stays a user message in `box` is a deferred
+/// call's result that becomes the output of that call instead: `native` is
+/// the request declaring asynchronous tools (`StepRequest.async_tools`), and
+/// the sidecar converts exactly the results whose launch went out earlier in
+/// the same request still owed its output (`aisdk-service/src/async-tools.ts`).
+///
+/// [`box_result`]: crate::wire_history::box_result
+pub(crate) fn host_messages_in_box(
+    family: Family,
+    container: crate::model::HostMessageContainer,
+    native: bool,
+    messages: Vec<Value>,
+) -> Vec<Value> {
+    let in_box = container == crate::model::HostMessageContainer::Box;
+    let mut out = Vec::with_capacity(messages.len());
+    // Launches still owed their output, which a native request answers on the
+    // call rather than in `box`.
+    let mut pending_launches = std::collections::HashSet::new();
+    for mut message in messages {
+        if message["role"] == "tool" {
+            for part in message["content"].as_array().into_iter().flatten() {
+                let launch = marks(part)
+                    .and_then(|marks| marks.get(ASYNC_LAUNCH_MARKER))
+                    .and_then(Value::as_bool)
+                    == Some(true);
+                if launch {
+                    if let Some(call_id) = part["toolCallId"].as_str() {
+                        pending_launches.insert(call_id.to_owned());
+                    }
+                }
+            }
+            out.push(message);
+            continue;
+        }
+        let Some(host) = marks(&message)
+            .filter(|marks| marks.get(HOST_MESSAGE_MARKER).and_then(Value::as_bool) == Some(true))
+            .filter(|_| message["role"] == "user")
+        else {
+            out.push(message);
+            continue;
+        };
+        let local_id = host
+            .get(HOST_MESSAGE_ID_MARKER)
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let on_call = native
+            && host
+                .get(ASYNC_RESULT_MARKER)
+                .and_then(|result| result.get("toolCallId"))
+                .and_then(Value::as_str)
+                .is_some_and(|call_id| pending_launches.remove(call_id));
+        if let Some(marks) = message
+            .pointer_mut(&format!("/providerOptions/{MARKER_OPTIONS_KEY}"))
+            .and_then(Value::as_object_mut)
+        {
+            marks.remove(HOST_MESSAGE_ID_MARKER);
+        }
+        let text = message["content"].as_str().map(str::to_owned);
+        let (true, false, Some(local_id), Some(text)) = (in_box, on_call, local_id, text) else {
+            out.push(message);
+            continue;
+        };
+        let body = crate::wire_history::box_result(&text);
+        if body.is_empty() {
+            continue;
+        }
+        let call_id = wire_tool_id(family, &local_id);
+        let mut call = json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool-call",
+                "toolCallId": call_id,
+                "toolName": crate::api::BOX_TOOL,
+                "input": crate::wire_history::box_call_input(),
+            }],
+        });
+        // The host issued this call, so it has no reasoning to replay. Chat-shaped
+        // thinking endpoints reject an assistant message that carries a tool call
+        // without one, the same reason `CanonicalFold` marks host-synthesized turns
+        // as explicitly-empty reasoning.
+        if matches!(family, Family::OpenaiChat | Family::OpenaiCompatible) {
+            call["providerOptions"] = json!({ "openaiCompatible": { "reasoning_content": "" } });
+        }
+        out.push(call);
+        out.push(json!({
+            "role": "tool",
+            "content": [{
+                "type": "tool-result",
+                "toolCallId": call_id,
+                "toolName": crate::api::BOX_TOOL,
+                "output": tool_output(true, &body),
+            }],
+        }));
+    }
+    out
+}
+
+/// A tool-result part for one exchange: its output, and for a launch whose
+/// result is still to come, the marker that lets an asynchronous request leave
+/// the call without an output.
+pub(crate) fn tool_result_part(call_id: &str, tool_name: &str, result: &crate::model::ToolResult) -> Value {
+    let mut part = json!({
+        "type": "tool-result",
+        "toolCallId": call_id,
+        "toolName": tool_name,
+        "output": tool_output(result.success, &result.output),
+    });
+    if crate::async_tools::is_deferred_launch(tool_name, result) {
+        part["providerOptions"] = json!({ MARKER_OPTIONS_KEY: { ASYNC_LAUNCH_MARKER: true } });
+    }
+    part
+}
+
+/// Tool-result images become a labeled user-message payload.
+///
+/// All providers use this bridge because `openai-compatible` serializes file
+/// output as JSON text. The source label is required to associate the images with
+/// their originating tool call.
+pub(crate) fn push_tool_image_bridge(
+    content: &mut Vec<Value>,
+    tool_name: &str,
+    call_id: &str,
+    images: &[ImageAttachment],
+) {
+    if images.is_empty() {
+        return;
+    }
+    content.push(json!({
+        "type": "text",
+        "text": crate::wire_history::chat_tool_image_source_label(tool_name, call_id),
+    }));
+    content.extend(images.iter().map(image_part));
+}
+
+/// Wire ID for a persisted tool exchange.
+///
+/// Local IDs never leave the host. The digest produces valid, unique provider IDs;
+/// Anthropic-shaped endpoints (including the Claude Code transcript the sidecar
+/// synthesizes) use `toolu_`, while other families use `call_`.
+///
+/// This is the fallback, not the first choice: see [`exchange_wire_id`].
+pub(crate) fn wire_tool_id(family: Family, local_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(local_id.as_bytes());
+    let suffix = digest
+        .iter()
+        .take(24)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    match family {
+        Family::Anthropic | Family::Bedrock | Family::ClaudeAgent => format!("toolu_{suffix}"),
+        _ => format!("call_{suffix}"),
+    }
+}
+
+/// The id one persisted tool exchange goes out under: the provider's own call
+/// id when the card kept one, and a digest of the local id otherwise.
+///
+/// Every wire protocol treats this id as an opaque key whose only job is to
+/// pair a call with its result — none of them derive it from the arguments or
+/// check that it is one they issued. So the original is always valid, and
+/// sending it is what keeps an exchange's identity stable for its whole life.
+/// Minting unconditionally used to rewrite every tool call in a turn the first
+/// time the next turn replayed it from the timeline, because the live leg sends
+/// the provider's id (`step::exchange_messages`) while replay had nothing but
+/// the one-way digest in the card's local id. That forfeited the prompt cache
+/// for the previous turn on every turn.
+///
+/// `wire_tool_id` still covers cards that never had a provider id — manual
+/// cards, archives written before the field existed — and those the screen in
+/// [`replayable_provider_call_id`] refused.
+///
+/// [`replayable_provider_call_id`]: crate::wire_history::replayable_provider_call_id
+pub(crate) fn exchange_wire_id(family: Family, exchange: &CanonicalToolExchange) -> String {
+    exchange
+        .provider_call_id
+        .clone()
+        .unwrap_or_else(|| wire_tool_id(family, &exchange.local_id))
+}
+
+/// Families whose reasoning history is only meaningful with the provider's own
+/// payload: an Anthropic thinking block needs its signature, a Responses
+/// reasoning item its id and ciphertext. Claude Code and Codex replay exactly
+/// the blocks they stored; a card without one is omitted rather than replayed
+/// as unsigned text the endpoint would reject or discard.
+fn replays_signed_reasoning(family: Family) -> bool {
+    matches!(
+        family,
+        Family::Anthropic
+            | Family::Bedrock
+            | Family::ClaudeAgent
+            | Family::OpenaiResponses
+            | Family::Azure
+    )
+}
+
+fn assistant_messages(family: Family, turn: &CanonicalAssistantTurn, out: &mut Vec<Value>) {
+    let mut parts: Vec<Value> = Vec::new();
+
+    // Reasoning precedes visible text because providers require this order for
+    // replayed signed reasoning blocks.
+    let replayed = replays_signed_reasoning(family);
+    if replayed {
+        for part in &turn.reasoning_replay {
+            let mut part = part.clone();
+            if let Some(object) = part.as_object_mut() {
+                object.insert("type".into(), json!("reasoning"));
+            }
+            parts.push(part);
+        }
+    } else if turn.reasoning_present {
+        for text in &turn.reasoning {
+            parts.push(json!({ "type": "reasoning", "text": text }));
+        }
+    }
+    let content =
+        if turn.content.trim().is_empty() && !(replayed && !turn.reasoning_replay.is_empty()) {
+            // Fall back to visible text when manually supplied reasoning lacks the
+            // provider-specific ID or signature needed for lossless replay. A turn
+            // that replays its signed parts needs no such copy.
+            turn.visible_content.as_str()
+        } else {
+            turn.content.as_str()
+        };
+    if !content.trim().is_empty() {
+        parts.push(json!({ "type": "text", "text": content }));
+    }
+    for exchange in &turn.tools {
+        parts.push(json!({
+            "type": "tool-call",
+            "toolCallId": exchange_wire_id(family, exchange),
+            "toolName": exchange.tool_name,
+            "input": exchange.requested_input,
+        }));
+    }
+
+    if parts.is_empty() {
+        return;
+    }
+    let mut message = json!({ "role": "assistant", "content": parts });
+    // AI SDK drops empty reasoning parts. Message metadata preserves the explicit
+    // presence contract without overriding nonempty reasoning or signed families.
+    if matches!(family, Family::OpenaiChat | Family::OpenaiCompatible)
+        && !turn.tools.is_empty()
+        && turn.reasoning_present
+        && turn.reasoning.iter().all(String::is_empty)
+    {
+        message["providerOptions"] = json!({ "openaiCompatible": { "reasoning_content": "" } });
+    }
+    out.push(message);
+
+    // Tool results form a `tool` message immediately after the calling assistant message.
+    if turn.tools.is_empty() {
+        return;
+    }
+    let results = turn
+        .tools
+        .iter()
+        .map(|exchange| {
+            tool_result_part(
+                &exchange_wire_id(family, exchange),
+                &exchange.tool_name,
+                &exchange.result,
+            )
+        })
+        .collect::<Vec<_>>();
+    out.push(json!({ "role": "tool", "content": results }));
+
+    // Historical tool-result images use the same bridge to preserve visibility
+    // across subsequent turns.
+    let mut bridge = Vec::new();
+    for exchange in &turn.tools {
+        push_tool_image_bridge(
+            &mut bridge,
+            &exchange.tool_name,
+            &exchange_wire_id(family, exchange),
+            &exchange.result.images,
+        );
+    }
+    if !bridge.is_empty() {
+        out.push(json!({ "role": "user", "content": bridge }));
+    }
+}
+
+/// Projects one canonical block into `ModelMessage`s appended to `out`.
+///
+/// Project blocks individually because `wire_history` incrementally caches them;
+/// full projection is a fold over this function.
+///
+/// Do not merge adjacent roles here. The AI SDK Anthropic provider handles that
+/// protocol requirement, so cached projections compose with `Vec::extend`.
+pub(crate) fn project_block(family: Family, block: &CanonicalHistoryBlock, out: &mut Vec<Value>) {
+    match block {
+        CanonicalHistoryBlock::User {
+            content,
+            images,
+            files,
+        } => {
+            out.extend(user_message(content, images, files));
+        }
+        CanonicalHistoryBlock::Assistant(turn) => assistant_messages(family, turn, out),
+        CanonicalHistoryBlock::HostDelivery(delivery) => host_delivery_messages(delivery, out),
+        CanonicalHistoryBlock::ToolAddition(tools) => {
+            out.push(crate::tool_append::marker_message(tools));
+        }
+        CanonicalHistoryBlock::SystemAppend { local_id, content } => {
+            out.push(crate::system_append::marker_message(local_id, content));
+        }
+        // The item goes back as the assistant content it arrived as; the AI
+        // SDK turns it into the Responses `compaction` input item.
+        CanonicalHistoryBlock::Compaction(parts) => {
+            out.push(json!({ "role": "assistant", "content": parts }));
+        }
+    }
+}
+
+/// Projects a canonical timeline into AI SDK `ModelMessage[]`.
+pub(crate) fn project_messages(
+    family: Family,
+    contexts: &[crate::model::ContextItem],
+) -> Vec<Value> {
+    let mut messages = Vec::new();
+    for block in canonical_history(contexts) {
+        project_block(family, &block, &mut messages);
+    }
+    messages
+}
+
+/// Serialization-size guard for the complete message array.
+///
+/// Host and sidecar both limit a single NDJSON line. Reject oversized histories
+/// before writing the step frame rather than restarting the sidecar on a protocol
+/// violation.
+pub(crate) fn enforce_frame_budget(messages: &[Value]) -> Result<(), String> {
+    let bytes = serde_json::to_vec(messages)
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX);
+    // Reserve space for the envelope, tool definitions, system prompt, and options.
+    let budget = MAX_LINE_BYTES / 2;
+    if bytes > budget {
+        return Err(format!(
+            "本次请求的对话历史序列化后为 {} MiB，超过侧车单帧 {} MiB 的上限；请先压缩或分支该对话",
+            bytes / 1024 / 1024,
+            budget / 1024 / 1024
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assistant(content: &str, reasoning: &str) -> CanonicalAssistantTurn {
+        CanonicalAssistantTurn {
+            content: content.into(),
+            reasoning: if reasoning.is_empty() {
+                Vec::new()
+            } else {
+                vec![reasoning.into()]
+            },
+            reasoning_present: !reasoning.is_empty(),
+            reasoning_replay: Vec::new(),
+            visible_content: content.into(),
+            tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_plain_user_turn_projects_as_a_string_content() {
+        let message = user_message("你好", &[], &[]).expect("非空用户消息");
+        assert_eq!(message["role"], "user");
+        // Text-only messages use string content because it is the most exercised
+        // provider path.
+        assert_eq!(message["content"], "你好");
+    }
+
+    #[test]
+    fn an_empty_user_turn_projects_to_nothing() {
+        // Empty user messages must not reach upstream providers, which may reject them.
+        assert!(user_message("   ", &[], &[]).is_none());
+    }
+
+    fn file(name: &str) -> FileAttachment {
+        FileAttachment {
+            id: format!("{:064x}", name.len()),
+            name: name.into(),
+            format: crate::model::FileAttachmentFormat::Text,
+            bytes: 1,
+            tokens: 1,
+            pages: None,
+        }
+    }
+
+    fn image() -> ImageAttachment {
+        ImageAttachment {
+            id: "c".repeat(64),
+            name: "shot.png".into(),
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 1,
+            short_id: None,
+        }
+    }
+
+    /// Files come first, then the question, then images; the file parts are
+    /// the metadata-only placeholders the ledger records.
+    #[test]
+    fn attachments_project_as_placeholders_before_the_question() {
+        let files = [file("a.md"), file("bb.pdf")];
+        let message = user_message(" 比较一下 ", &[image()], &files).expect("非空用户消息");
+        let parts = message["content"].as_array().expect("带附件时是数组");
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0], json!({ "type": "mewrk-file", "file": files[0] }));
+        assert_eq!(parts[1], json!({ "type": "mewrk-file", "file": files[1] }));
+        assert_eq!(parts[2], json!({ "type": "text", "text": "比较一下" }));
+        assert_eq!(parts[3]["type"], "image");
+    }
+
+    #[test]
+    fn a_file_alone_is_a_message() {
+        let message = user_message("", &[], &[file("a.md")]).expect("只有文件也是消息");
+        let parts = message["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "mewrk-file");
+    }
+
+    #[test]
+    fn a_user_context_carries_its_files_through_the_canonical_fold() {
+        let contexts = vec![crate::model::ContextItem::User {
+            id: "u1".into(),
+            content: "看看".into(),
+            images: Vec::new(),
+            files: vec![file("a.md")],
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        let messages = project_messages(Family::Anthropic, &contexts);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"][0]["type"], "mewrk-file");
+        assert_eq!(messages[0]["content"][1]["text"], "看看");
+    }
+
+    #[test]
+    fn a_tool_exchange_becomes_a_call_part_and_a_following_tool_message() {
+        let mut turn = assistant("好的", "");
+        turn.tools.push(crate::wire_history::CanonicalToolExchange {
+            local_id: "call_1".into(),
+            tool_name: "ls".into(),
+            provider_call_id: None,
+            requested_input: serde_json::from_str(r#"{"path":"src"}"#).unwrap(),
+            result: crate::model::ToolResult {
+                success: true,
+                output: "src/main.rs".into(),
+                images: Vec::new(),
+                diff: None,
+                executed_at: "2026-08-27T00:00:00Z".into(),
+                duration_ms: 1,
+            },
+        });
+
+        let mut out = Vec::new();
+        assistant_messages(Family::Anthropic, &turn, &mut out);
+        assert_eq!(out.len(), 2, "一条 assistant + 一条 tool");
+        assert_eq!(out[0]["role"], "assistant");
+        let call = out[0]["content"]
+            .as_array()
+            .expect("assistant 内容是数组")
+            .iter()
+            .find(|part| part["type"] == "tool-call")
+            .expect("必须有 tool-call 部件");
+        // A card that never kept a provider id falls back to a digest of the
+        // local id, with a family-specific prefix.
+        let wire_id = wire_tool_id(Family::Anthropic, "call_1");
+        assert!(wire_id.starts_with("toolu_"), "{wire_id}");
+        assert_eq!(call["toolCallId"], wire_id);
+        assert_eq!(call["toolName"], "ls");
+        assert_eq!(call["input"]["path"], "src");
+
+        // A result must immediately follow its call and use the same ID.
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[1]["content"][0]["toolCallId"], wire_id);
+        assert_eq!(out[1]["content"][0]["output"]["type"], "text");
+    }
+
+    /// The live leg sends the provider's own call id (`step::exchange_messages`
+    /// replays the sidecar's response messages verbatim), so replay has to send
+    /// the same one. Minting here instead renamed every tool call in the turn
+    /// the first time the next turn replayed it, which cost the prompt cache for
+    /// that turn on every turn — for no protocol reason, since the id is only a
+    /// key pairing a call with its result.
+    #[test]
+    fn a_kept_provider_call_id_is_replayed_instead_of_a_fresh_digest() {
+        let mut turn = assistant("好的", "");
+        turn.tools.push(crate::wire_history::CanonicalToolExchange {
+            local_id: "ctx_tool_1".into(),
+            tool_name: "ls".into(),
+            provider_call_id: Some("toolu_01DijKBKyyWKCXcHTjEoAuJz".into()),
+            requested_input: serde_json::from_str(r#"{"path":"src"}"#).unwrap(),
+            result: crate::model::ToolResult {
+                success: true,
+                output: "src/main.rs".into(),
+                images: Vec::new(),
+                diff: None,
+                executed_at: "2026-08-27T00:00:00Z".into(),
+                duration_ms: 1,
+            },
+        });
+
+        let mut out = Vec::new();
+        assistant_messages(Family::Anthropic, &turn, &mut out);
+        let call = out[0]["content"]
+            .as_array()
+            .expect("assistant 内容是数组")
+            .iter()
+            .find(|part| part["type"] == "tool-call")
+            .expect("必须有 tool-call 部件");
+        assert_eq!(call["toolCallId"], "toolu_01DijKBKyyWKCXcHTjEoAuJz");
+        assert_ne!(
+            call["toolCallId"],
+            Value::String(wire_tool_id(Family::Anthropic, "ctx_tool_1")),
+            "留着 provider id 的卡不该再铸摘要"
+        );
+        // Both legs of the exchange have to agree, or the provider sees a result
+        // with nothing to attach it to.
+        assert_eq!(
+            out[1]["content"][0]["toolCallId"],
+            "toolu_01DijKBKyyWKCXcHTjEoAuJz"
+        );
+    }
+
+    /// The same exchange keeps its id whatever family it goes out to: it is the
+    /// provider's own string, not something derived per family.
+    #[test]
+    fn a_kept_provider_call_id_is_family_independent() {
+        let exchange = crate::wire_history::CanonicalToolExchange {
+            local_id: "ctx_tool_1".into(),
+            tool_name: "ls".into(),
+            provider_call_id: Some("call_9xQabc".into()),
+            requested_input: crate::model::JsonObject::new(),
+            result: crate::model::ToolResult {
+                success: true,
+                output: String::new(),
+                images: Vec::new(),
+                diff: None,
+                executed_at: String::new(),
+                duration_ms: 0,
+            },
+        };
+        for family in [Family::Anthropic, Family::OpenaiResponses, Family::OpenaiChat] {
+            assert_eq!(exchange_wire_id(family, &exchange), "call_9xQabc");
+        }
+    }
+
+    #[test]
+    fn a_failed_tool_result_is_marked_as_an_error_not_as_prose() {
+        // Failed results must not be represented as successful text.
+        assert_eq!(tool_output(false, "权限不足")["type"], "error-text");
+        assert_eq!(tool_output(true, "ok")["type"], "text");
+    }
+
+    #[test]
+    fn reasoning_precedes_the_visible_answer() {
+        let mut out = Vec::new();
+        assistant_messages(Family::OpenaiChat, &assistant("答案", "先想一想"), &mut out);
+        let parts = out[0]["content"].as_array().expect("数组");
+        assert_eq!(parts[0]["type"], "reasoning");
+        assert_eq!(parts[1]["type"], "text");
+    }
+
+    #[test]
+    fn an_oversized_history_is_refused_with_a_repairable_message() {
+        let big = vec![json!({ "role": "user", "content": "x".repeat(MAX_LINE_BYTES) })];
+        let error = enforce_frame_budget(&big).expect_err("超预算必须被拒绝");
+        assert!(error.contains("单帧"), "{error}");
+        // Ordinary histories must remain within the budget.
+        assert!(enforce_frame_budget(&[json!({ "role": "user", "content": "hi" })]).is_ok());
+    }
+}

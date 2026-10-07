@@ -1,0 +1,7374 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
+
+pub type JsonObject = Map<String, Value>;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppDocument {
+    pub schema_version: u32,
+    pub global_settings: GlobalSettings,
+    /// User-managed assets. API keys are stored separately in the OS credential
+    /// store and never appear here.
+    #[serde(default)]
+    pub assets: AssetLibrary,
+    /// Flat conversation presets contain system prompts, tool allowlists, inline
+    /// descriptions, and selected skill, MCP, and hook resource IDs.
+    #[serde(default)]
+    pub presets: PresetLibrary,
+    pub workspaces: Vec<Workspace>,
+    pub tools: Vec<ToolDescriptor>,
+    pub capabilities: CapabilityCatalog,
+}
+
+/// User-managed assets. API keys are kept exclusively in the OS credential store.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetLibrary {
+    #[serde(default)]
+    pub api_providers: Vec<ApiProvider>,
+    /// Search provider configuration. Search behavior belongs to
+    /// [`ConversationWebSearchSettings`].
+    #[serde(default)]
+    pub web_search: WebSearchAssets,
+    /// SSH machine catalog and each workspace's variables and sandbox.
+    /// Conversations own their selected execution environment.
+    #[serde(default)]
+    pub execution_environments: ExecutionEnvironmentAssets,
+}
+
+/// Execution-environment assets.
+///
+/// WSL distributions are enumerated at runtime rather than persisted, because
+/// installation and renaming would make a stored list stale. Environment
+/// variables are plaintext launch configuration, not rotatable secrets.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionEnvironmentAssets {
+    #[serde(default)]
+    pub ssh_machines: Vec<SshMachineConfig>,
+    /// Workspace key to variables: variables belong to a workspace — a
+    /// directory on a machine — not to the machine. Keyed by
+    /// [`workspace_env_key`](crate::run_environment::workspace_env_key).
+    /// Dangling keys are allowed so removing a workspace or deleting a machine
+    /// does not invalidate the document.
+    #[serde(default)]
+    pub env_vars: BTreeMap<String, BTreeMap<String, String>>,
+    /// Workspace key to the sandbox its commands run in, keyed like
+    /// [`env_vars`](Self::env_vars). A missing entry is off; an entry the user
+    /// switched off stays, so it records that answer. Dangling keys are allowed
+    /// for the same reason as there.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sandboxes: BTreeMap<String, SandboxSettings>,
+    /// The agent shell each WSL distribution runs Mewrk's own scripts in,
+    /// keyed by distribution name. Distributions are found rather than
+    /// registered, so their one setting lives here instead of on a catalog row;
+    /// a missing entry is a distribution Mewrk has not set up yet, and a
+    /// stale one for a renamed or removed distribution is harmless.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "crate::model::lenient_backend_map"
+    )]
+    pub wsl_agent_shells: BTreeMap<String, crate::shell_backend::ShellBackend>,
+}
+
+/// The sandbox a workspace's commands run in when it is on: sandboxed agent
+/// processes on the workspace's machine (see `remote_agent::agent::sandbox`),
+/// one per conversation working there, which can write the workspace and
+/// nothing that runs outside it later, cannot read the account's credentials,
+/// and reach the network only through a proxy that applies
+/// [`SandboxNetworkSettings`].
+///
+/// A setting of each workspace ([`ExecutionEnvironmentAssets::sandboxes`]),
+/// like its variables: whether the code in a directory is trusted is a
+/// question about the directory, so every conversation working in it gets the
+/// same answer.
+///
+/// A machine that cannot sandbox — no bubblewrap, WSL 1, an SSH machine the
+/// agent does not serve — refuses the command rather than running it
+/// unsandboxed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub network: SandboxNetworkSettings,
+    /// Further directories the workspace's sandbox may write, on its machine:
+    /// absolute, or starting with `~`.
+    #[serde(default)]
+    pub writable: Vec<String>,
+    /// Further paths the workspace's sandbox may not read, besides the
+    /// built-in credential locations.
+    #[serde(default)]
+    pub deny_read: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxNetworkSettings {
+    #[serde(default = "default_sandbox_network_mode")]
+    pub mode: SandboxNetworkMode,
+    /// Host patterns reachable in [`SandboxNetworkMode::Allowlist`]:
+    /// `example.com`, `*.example.com` (its subdomains), optionally `:port`.
+    #[serde(default = "default_sandbox_allowlist")]
+    pub allow: Vec<String>,
+    /// Host patterns never reachable, in any mode.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl Default for SandboxNetworkSettings {
+    fn default() -> Self {
+        Self {
+            mode: default_sandbox_network_mode(),
+            allow: default_sandbox_allowlist(),
+            deny: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxNetworkMode {
+    /// No connection leaves the sandbox.
+    Off,
+    /// Only the hosts on the allowlist.
+    #[default]
+    Allowlist,
+    /// Any public host.
+    Open,
+}
+
+fn default_sandbox_network_mode() -> SandboxNetworkMode {
+    SandboxNetworkMode::Allowlist
+}
+
+/// Where packages and source come from, so installing dependencies and
+/// fetching code works out of the box. Every entry is a host a sandbox could
+/// also send data to; the list is the user's to shorten.
+pub const DEFAULT_SANDBOX_ALLOWLIST: &[&str] = &[
+    "github.com",
+    "*.github.com",
+    "*.githubusercontent.com",
+    "gitlab.com",
+    "*.gitlab.com",
+    "bitbucket.org",
+    "registry.npmjs.org",
+    "*.npmjs.org",
+    "registry.yarnpkg.com",
+    "*.yarnpkg.com",
+    "nodejs.org",
+    "pypi.org",
+    "*.pypi.org",
+    "files.pythonhosted.org",
+    "crates.io",
+    "*.crates.io",
+    "static.rust-lang.org",
+    "proxy.golang.org",
+    "sum.golang.org",
+    "repo.maven.apache.org",
+    "repo1.maven.org",
+    "plugins.gradle.org",
+    "services.gradle.org",
+    "rubygems.org",
+    "*.rubygems.org",
+    "api.nuget.org",
+    "*.nuget.org",
+    "pub.dev",
+    "*.pub.dev",
+    "repo.packagist.org",
+    "cdn.jsdelivr.net",
+];
+
+fn default_sandbox_allowlist() -> Vec<String> {
+    DEFAULT_SANDBOX_ALLOWLIST.iter().map(|host| (*host).to_owned()).collect()
+}
+
+impl SandboxSettings {
+    /// The network policy the agent applies.
+    pub fn network_policy(&self) -> remote_agent::protocol::NetworkPolicy {
+        use remote_agent::protocol::{NetworkMode, NetworkPolicy};
+        NetworkPolicy {
+            mode: match self.network.mode {
+                SandboxNetworkMode::Off => NetworkMode::Off,
+                SandboxNetworkMode::Allowlist => NetworkMode::Allowlist,
+                SandboxNetworkMode::Open => NetworkMode::Open,
+            },
+            allow: self.network.allow.clone(),
+            deny: self.network.deny.clone(),
+        }
+    }
+}
+
+/// A backend identifier this build does not know — one a newer Mewrk wrote —
+/// is dropped instead of failing the whole document: it names a shell this
+/// build could not run anyway.
+fn lenient_backend<'de, D>(deserializer: D) -> Result<Option<crate::shell_backend::ShellBackend>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.as_deref().and_then(crate::shell_backend::ShellBackend::parse))
+}
+
+fn lenient_backend_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, crate::shell_backend::ShellBackend>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = BTreeMap::<String, String>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|(key, value)| {
+            crate::shell_backend::ShellBackend::parse(&value).map(|backend| (key, backend))
+        })
+        .collect())
+}
+
+/// A user-registered SSH execution machine.
+///
+/// Authentication material is not persisted. OpenSSH resolves identities and
+/// agents at connection time; a password or passphrase it asks for is asked in
+/// the app and kept in memory only (`ssh_askpass`).
+///
+/// The machine carries no working directory. A directory on this machine is a
+/// workspace like any other — picked through the remote directory browser and
+/// recorded on the conversation, where it gets a number the model can address.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SshMachineConfig {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    /// Zero uses the default SSH port, 22.
+    #[serde(default)]
+    pub port: u16,
+    /// Empty delegates identity selection to OpenSSH defaults.
+    #[serde(default)]
+    pub identity_file: String,
+    /// The shell the machine's agent runs Mewrk's own scripts in — the remote
+    /// file tools and language servers. `None` until the machine is first
+    /// probed, when the renderer records its OS's preferred backend here; the
+    /// host reads a missing or no-longer-present choice the same way.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::model::lenient_backend"
+    )]
+    pub agent_shell: Option<crate::shell_backend::ShellBackend>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// MCP server transport. Only stdio and Streamable HTTP are supported.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransportKind {
+    #[default]
+    Stdio,
+    StreamableHttp,
+}
+
+/// One server entry read from an `mcp.json` (`~/.mewrk/mcp.json` or
+/// `<workspace>/.mewrk/mcp.json`), in the `mcpServers` shape Claude Code and
+/// most MCP clients share. `id` is minted by discovery from the file and the
+/// entry's name; `name` is the entry's key.
+///
+/// Command lines, URLs, headers, and environment variables are launch
+/// configuration rather than rotatable secrets; runtime Debug output redacts them.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub transport: McpTransportKind,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+    /// Optional stdio package-registry mirror. Explicit user environment values
+    /// take precedence over this convenience setting.
+    #[serde(default)]
+    pub registry_url: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Zero uses the host default timeout.
+    #[serde(default)]
+    pub timeout_seconds: u32,
+    #[serde(default)]
+    pub long_running: bool,
+    /// An empty list leaves every server tool available. Exclusions let newly
+    /// exposed server tools remain available by default.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+    #[serde(default)]
+    pub disabled_auto_approve_tools: Vec<String>,
+    /// `"workspace": true` in the entry: the server's tools work on a
+    /// workspace's files or depend on the folder they run in. Read for a
+    /// global server only, which runs on this computer: in a conversation
+    /// with more than one workspace here, each of its tools takes a
+    /// `workspace` parameter naming one of them, and the call goes to an
+    /// instance of the server started in that workspace.
+    #[serde(default)]
+    pub workspace_parameter: bool,
+    /// The machine a server declared by a WSL or SSH workspace's `mcp.json`
+    /// belongs to: a stdio server starts there and an http one is reached
+    /// through its network. `None` for this computer. Host-only, from
+    /// discovery; never stored or accepted from the renderer.
+    #[serde(skip)]
+    pub machine: Option<crate::remote_capabilities::RemoteLevel>,
+}
+
+/// Conversation preset container.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetLibrary {
+    #[serde(default)]
+    pub conversation_presets: Vec<ConversationPreset>,
+    /// New conversations link to this preset. Never empty in a real document:
+    /// the built-in preset is always there, and storage re-points a default
+    /// that no longer resolves at it.
+    #[serde(default)]
+    pub default_conversation_preset_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalSettings {
+    /// Missing values belong to records that predate this field and retain the old Chinese UI.
+    #[serde(default)]
+    pub app_language: AppLanguage,
+    /// What `app_language` currently resolves to, mirrored here by the renderer.
+    ///
+    /// This resolved value determines host-rendered UI text (language-server
+    /// descriptors) and the language a *user-written* prompt profile carries: such
+    /// a file declares none of its own, so its tool labels and fork bindings follow
+    /// this, while the keys it omits keep the built-in English wording. Selecting
+    /// the built-in profile — or selecting nothing, which is the same thing — pins
+    /// the language to English instead. Only the renderer can resolve `auto` —
+    /// the host links no OS-locale crate — so it writes the resolved value here
+    /// and the backend reads this field rather than re-deriving it.
+    #[serde(default)]
+    pub resolved_app_language: ResolvedLanguage,
+    /// Missing values belong to records that predate this field and retain the old day theme.
+    #[serde(default)]
+    pub theme: ThemePreference,
+    #[serde(default)]
+    pub last_reasoning_effort: ReasoningEffort,
+    /// The globally selected default Composer model.
+    #[serde(default)]
+    pub active_provider_id: Option<String>,
+    /// Renderer-owned appearance preferences must round-trip unchanged.
+    #[serde(default, deserialize_with = "deserialize_appearance")]
+    pub appearance: AppearancePreferences,
+    /// User-modified shortcuts. The command catalog is renderer-owned.
+    #[serde(default)]
+    pub shortcuts: BTreeMap<String, ShortcutPreference>,
+    /// User-added environment dependencies; built-ins are code constants.
+    #[serde(default)]
+    pub environment_tools: Vec<EnvironmentToolDefinition>,
+    /// When a conversation hands its work over to a fresh one (`handoff.rs`).
+    /// Read by the run loop at every round boundary, so a change applies to a
+    /// run that is already going.
+    #[serde(default)]
+    pub auto_compact: AutoCompactSettings,
+}
+
+/// The composer's "auto-compact" settings: one switch for both methods, the
+/// handoff's threshold, and native compaction's. Which method a conversation
+/// uses is its own (`ConversationSettings::compaction_method`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoCompactSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Percent of the model's context window at which a conversation is armed
+    /// to hand off, 20–97. The token threshold is this share of the window,
+    /// rounded down.
+    #[serde(default = "default_auto_compact_threshold")]
+    pub threshold_percent: u32,
+    /// Native compaction (`native_compaction.rs`), for models that take it.
+    #[serde(default)]
+    pub native: NativeCompactSettings,
+}
+
+impl Default for AutoCompactSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold_percent: default_auto_compact_threshold(),
+            native: NativeCompactSettings::default(),
+        }
+    }
+}
+
+/// Native compaction's threshold and budget. Independent of the handoff's:
+/// each method has its own threshold over the same range.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeCompactSettings {
+    /// Percent of the model's context window at which the context is
+    /// compacted, 20–97, rounded down to tokens as the handoff's is.
+    #[serde(default = "default_native_threshold")]
+    pub threshold_percent: u32,
+    /// Tokens of the latest user messages kept verbatim ahead of the
+    /// compaction item (Codex keeps 64,000), applied as set.
+    #[serde(default = "default_native_retained_tokens")]
+    pub retained_tokens: u32,
+}
+
+impl Default for NativeCompactSettings {
+    fn default() -> Self {
+        Self {
+            threshold_percent: default_native_threshold(),
+            retained_tokens: default_native_retained_tokens(),
+        }
+    }
+}
+
+fn default_native_threshold() -> u32 {
+    crate::native_compaction::DEFAULT_THRESHOLD_PERCENT
+}
+
+fn default_native_retained_tokens() -> u32 {
+    crate::native_compaction::DEFAULT_RETAINED_TOKENS
+}
+
+fn default_auto_compact_threshold() -> u32 {
+    crate::handoff::DEFAULT_THRESHOLD_PERCENT
+}
+
+/// What of a project's new-task draft outlives the process.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftConversationSnapshot {
+    pub settings: ConversationSettings,
+    /// A trace like `Conversation::preset_id`, never a link.
+    #[serde(default)]
+    pub preset_id: String,
+}
+
+/// Persisted preference for one shortcut.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutPreference {
+    #[serde(default)]
+    pub binding: Vec<String>,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// An executable to detect on PATH. This version detects but does not install it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentToolDefinition {
+    pub name: String,
+    pub executable: String,
+    #[serde(default)]
+    pub version_args: Vec<String>,
+}
+
+/// Appearance preferences.
+///
+/// Defaults must match `src/seed.ts` so both sides normalize a document identically.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppearancePreferences {
+    #[serde(default)]
+    pub theme_color: String,
+    #[serde(default = "default_zoom")]
+    pub zoom: f64,
+    #[serde(default)]
+    pub ui_font_family: String,
+    #[serde(default)]
+    pub mono_font_family: String,
+    #[serde(default = "default_message_font_size")]
+    pub message_font_size: u32,
+    #[serde(default)]
+    pub serif_messages: bool,
+    #[serde(default)]
+    pub wide_messages: bool,
+    #[serde(default = "default_send_shortcut")]
+    pub send_shortcut: Vec<String>,
+    #[serde(default = "default_newline_shortcut")]
+    pub newline_shortcut: Vec<String>,
+    #[serde(default)]
+    pub spell_check: bool,
+    #[serde(default)]
+    pub render_user_markdown: bool,
+    /// Disabled by default because message deletion is reversible.
+    #[serde(default)]
+    pub confirm_message_delete: bool,
+    #[serde(default = "default_true")]
+    pub collapse_reasoning: bool,
+    #[serde(default)]
+    pub code_block_collapsible: bool,
+    #[serde(default)]
+    pub code_block_wrappable: bool,
+    #[serde(default = "default_true")]
+    pub single_dollar_math: bool,
+    #[serde(default)]
+    pub custom_css: String,
+    /// Panes of glass over the window's background instead of opaque ones. Light or
+    /// dark glass follows `GlobalSettings::theme`.
+    #[serde(default)]
+    pub liquid_glass: bool,
+    /// The window's background: `solid` (the theme's own ground, following the theme),
+    /// `solid:day` / `solid:night` (one theme's ground, kept until the theme changes),
+    /// `builtin:<name>` (a picture the renderer bundles), or an image id in `background_images`.
+    #[serde(default = "default_background")]
+    pub background: String,
+    /// The local helper model's uses and prompts (Appearance → Local model).
+    #[serde(default)]
+    pub local_model: LocalModelPreferences,
+}
+
+/// What the local helper model is used for, and its system prompts. Empty
+/// prompts mean the built-in ones in the app language.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalModelPreferences {
+    /// Name conversations from their first message.
+    #[serde(default)]
+    pub titles: bool,
+    /// Describe each shell command in one line on its card.
+    #[serde(default)]
+    pub shell_explanations: bool,
+    /// Say in a few words why a failed tool call or shell command failed,
+    /// on its card's title.
+    #[serde(default)]
+    pub error_explanations: bool,
+    /// The uses above reach subagents and workflow steps too: their commands
+    /// and failures are explained, and each workflow step gets a title.
+    /// Their requests wait behind the conversation's own.
+    #[serde(default)]
+    pub subagents: bool,
+    #[serde(default)]
+    pub title_prompt: String,
+    #[serde(default)]
+    pub shell_prompt: String,
+    #[serde(default)]
+    pub error_prompt: String,
+}
+
+fn default_zoom() -> f64 {
+    1.0
+}
+
+fn default_message_font_size() -> u32 {
+    14
+}
+
+fn default_send_shortcut() -> Vec<String> {
+    vec!["Enter".to_owned()]
+}
+
+fn default_newline_shortcut() -> Vec<String> {
+    vec!["Shift".to_owned(), "Enter".to_owned()]
+}
+
+impl Default for AppearancePreferences {
+    fn default() -> Self {
+        Self {
+            theme_color: String::new(),
+            zoom: default_zoom(),
+            ui_font_family: String::new(),
+            mono_font_family: String::new(),
+            message_font_size: default_message_font_size(),
+            serif_messages: false,
+            wide_messages: false,
+            send_shortcut: default_send_shortcut(),
+            newline_shortcut: default_newline_shortcut(),
+            spell_check: false,
+            render_user_markdown: false,
+            confirm_message_delete: false,
+            collapse_reasoning: true,
+            code_block_collapsible: false,
+            code_block_wrappable: false,
+            single_dollar_math: true,
+            custom_css: String::new(),
+            liquid_glass: false,
+            background: default_background(),
+            local_model: LocalModelPreferences::default(),
+        }
+    }
+}
+
+pub const MAX_AGENT_TYPE_CHARS: usize = 64;
+
+/// What a role may be called.
+///
+/// Free text, deliberately. A role name is prose the user writes and the model
+/// reads back out of a listing — it is never a path segment, a file name, or an
+/// address anything is constructed from — so `代码审查` and `Code Reviewer` are
+/// as legitimate as `reviewer`. Resolution to a persisted definition remains a
+/// host responsibility: `resolve_agent_definition` matches exactly first and
+/// then, only when that finds nothing, accepts a case-, whitespace- and
+/// separator-insensitive reading that lands on exactly one role.
+///
+/// Three things are still refused, and none is about shape. Empty, because
+/// there would be nothing to name. Longer than the host stores. And control
+/// characters, because a name carrying one cannot survive being echoed back in
+/// the listing the model picks from or in the error it gets for picking wrong —
+/// which would make the role unaddressable in practice rather than merely ugly.
+pub fn validate_agent_type_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.chars().count() > MAX_AGENT_TYPE_CHARS {
+        return Err(format!("agent_type 必须是 1–{MAX_AGENT_TYPE_CHARS} 个字符"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err("agent_type 不能包含控制字符".into());
+    }
+    Ok(())
+}
+
+/// Valid persisted model ID shape.
+///
+/// Model IDs are opaque provider-defined strings. Preserve case, punctuation,
+/// slashes, colons, and non-ASCII characters; validation only rejects empty,
+/// oversized, and control-character values.
+pub fn validate_model_id(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("模型 ID 不能为空".into());
+    }
+    if trimmed.len() > MAX_MODEL_ID_BYTES {
+        return Err(format!("模型 ID 超过 {MAX_MODEL_ID_BYTES} 个 UTF-8 字节"));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("模型 ID 不能包含控制字符".into());
+    }
+    Ok(())
+}
+
+pub const MAX_MODEL_ID_BYTES: usize = 512;
+
+/// Length of a lowercase hexadecimal SHA-256 digest.
+pub const LOWER_HEX_DIGEST_LEN: usize = 64;
+
+/// Whether a string is a lowercase hexadecimal SHA-256 digest.
+pub fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == LOWER_HEX_DIGEST_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Rewrites every number into a form that is stable across a JSON round trip
+/// through JavaScript, so a value compared before and after that trip is the
+/// same value.
+///
+/// Tool cards are built here, handed to the renderer over IPC, held as
+/// JavaScript objects, and handed back on save. `serde_json` preserves the
+/// literal a provider wrote (`1.0` stays `1.0`, integers stay exact past
+/// 2^53); JavaScript has only `f64`, so the same card comes back as `1` and
+/// large integers come back rounded. Anything that compares tool payloads
+/// across that boundary — attestation above all — must compare this form
+/// rather than the original bytes, or a provider writing `3.0` where the
+/// schema says `number` silently makes its card unsaveable forever.
+///
+/// Applying this twice changes nothing, and applying it to a payload that
+/// already made the round trip changes nothing, which is the property
+/// attestation depends on. It is deliberately lossy in the same way
+/// JavaScript is lossy: integers beyond 2^53 collapse onto the `f64` they
+/// would become. It is *not* a promise to reproduce JavaScript's exact digits
+/// — `serde_json::Number` cannot even hold `1e20` in positional form — only a
+/// promise that both sides converge on one value after one trip.
+pub fn canonicalize_json_numbers(value: &mut Value) {
+    match value {
+        Value::Number(number) => {
+            if let Some(canonical) = canonical_json_number(number) {
+                *number = canonical;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                canonicalize_json_numbers(item);
+            }
+        }
+        Value::Object(entries) => {
+            for (_, entry) in entries.iter_mut() {
+                canonicalize_json_numbers(entry);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::String(_) => {}
+    }
+}
+
+/// The round-trip-stable form of one number, or `None` when it already is
+/// that form.
+fn canonical_json_number(number: &serde_json::Number) -> Option<serde_json::Number> {
+    // Integers up to 2^53 survive f64 exactly and cross unchanged. Larger
+    // ones are re-derived from the f64 JavaScript would hold. The magnitude
+    // decides this, not a round-trip cast: casting `i64::MAX` to f64 and back
+    // saturates to `i64::MAX` again and would wrongly look lossless.
+    if let Some(value) = number.as_i64() {
+        if value.unsigned_abs() <= MAX_EXACT_JSON_INTEGER {
+            return None;
+        }
+        return rounded_integer(value as f64);
+    }
+    if let Some(value) = number.as_u64() {
+        if value <= MAX_EXACT_JSON_INTEGER {
+            return None;
+        }
+        return rounded_integer(value as f64);
+    }
+    let value = number.as_f64()?;
+    // JavaScript has no -0 in JSON output and prints an integral f64 without a
+    // fractional part; serde_json keeps `-0.0` and `1.0`. Collapse both.
+    if value == 0.0 {
+        return (number.to_string() != "0").then(|| 0.into());
+    }
+    // An integral f64 within the exact range becomes the integer JavaScript
+    // would hand back, so `1.0` and `9007199254740992.0` stop being distinct
+    // from `1` and `9007199254740992`.
+    if value.fract() == 0.0 && value.abs() <= MAX_EXACT_JSON_INTEGER as f64 {
+        return Some((value as i64).into());
+    }
+    None
+}
+
+/// The integer an out-of-range integer literal rounds to once JavaScript has
+/// held it. `Number::from_f64` would render an integral value with a trailing
+/// `.0`, which JavaScript hands straight back as a bare integer — so the two
+/// sides would trade `9007199254740992.0` and `9007199254740992` forever.
+/// Values too large for an `i64` keep the float form, which both sides agree
+/// on because JavaScript also prints them in exponent notation.
+fn rounded_integer(value: f64) -> Option<serde_json::Number> {
+    if value.abs() <= MAX_EXACT_JSON_INTEGER as f64 {
+        return Some((value as i64).into());
+    }
+    serde_json::Number::from_f64(value)
+}
+
+/// 2^53: the largest integer an f64 represents exactly, and so the largest one
+/// that crosses the renderer boundary unchanged.
+const MAX_EXACT_JSON_INTEGER: u64 = 9_007_199_254_740_992;
+
+/// [`canonicalize_json_numbers`] for a tool payload object.
+pub fn canonicalize_object_numbers(object: &mut JsonObject) {
+    for (_, entry) in object.iter_mut() {
+        canonicalize_json_numbers(entry);
+    }
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDefinitionSource {
+    User,
+    Project,
+    Plugin,
+    Managed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDefinitionMemory {
+    #[default]
+    None,
+    User,
+    Project,
+    Local,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentModelSelection {
+    #[default]
+    Inherit,
+    Explicit {
+        #[serde(rename = "providerId")]
+        provider_id: String,
+        #[serde(rename = "modelId")]
+        model_id: String,
+    },
+    /// A binding recorded as broken by an older build, which used to rewrite a
+    /// dangling `Explicit` pair into this and discard both IDs.
+    ///
+    /// NOTHING WRITES THIS ANY MORE. An `Explicit` pair is now kept verbatim
+    /// however long it fails to resolve, because "the provider is signed out"
+    /// and "the model row is gone forever" are indistinguishable at rest, and
+    /// only one of them justifies destroying the user's choice. Resolution is
+    /// asked at call time instead, so a role recovers by itself once its model
+    /// is fetched again. The variant survives so archives written before that
+    /// change still deserialize.
+    ///
+    /// A role in this state is NOT callable: it is absent from the listing the
+    /// model sees, and naming it fails with its own wording rather than the
+    /// unknown-name text, because "you configured this and it broke" is a
+    /// different fact from "no such role" and only the former is actionable.
+    /// The role itself stays in the document so the user can see and fix it.
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDefinition {
+    /// Host-owned. A user-authored role lives inside a conversation preset, so
+    /// the preset is already its on/off switch and the renderer always writes
+    /// `true`; a trusted project/plugin/managed source may still ship a disabled
+    /// definition, and that one keeps shadowing a user role of the same name.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Host-retained identity tombstone. Renderer saves cannot author this
+    /// bit; deletion keeps the identity epoch durable so delete/re-add never
+    /// reconnects to an older named-agent memory partition.
+    #[serde(default)]
+    pub deleted: bool,
+    /// Trusted type slug selected by `agent_spawn.agent_type`.
+    pub name: String,
+    /// What this role is FOR, in the user's own words, rendered into the
+    /// model-facing description of whichever of `agent_spawn` / `workflow`
+    /// carries it (`builtin_schemas::append_role_descriptions`). Empty means
+    /// "say nothing", and the role's line disappears from that block entirely.
+    ///
+    /// This model-facing description complements the machine-readable constraint:
+    /// the `enum` says which names are legal, and this says what each one is for.
+    ///
+    /// NOT capability-bearing, and that is what keeps it out of three places on
+    /// purpose. It is absent from the frozen `AgentDefinitionBindingV1`
+    /// projection, so it cannot move execution-mode payload bytes. It is absent
+    /// from `storage::same_user_agent_configuration`, so rewording a role does
+    /// not advance `revision` — and therefore does not make
+    /// `api::validate_current_agent_definition` refuse every child already
+    /// bound to it. And it is absent from the renderer's own stricter
+    /// `sameUserAgentConfiguration` for the same reason.
+    #[serde(default)]
+    pub description: String,
+    pub source: AgentDefinitionSource,
+    /// Stable host-origin key (for example a workspace, plugin, or policy ID).
+    pub source_key: String,
+    /// Monotonic positive source revision used to reject stale definitions.
+    pub revision: u64,
+    /// Host-owned identity epoch. Ordinary edits retain it; a definition
+    /// recreated after deletion receives the next value.
+    #[serde(default = "default_agent_definition_epoch")]
+    pub memory_epoch: u64,
+    #[serde(default)]
+    pub model_selection: AgentModelSelection,
+    #[serde(default)]
+    pub memory: AgentDefinitionMemory,
+    /// Reasoning effort for this definition's runs; `None` inherits the parent's.
+    ///
+    /// CAPABILITY-BEARING, like `tools` and `disallowed_tools` below, so it
+    /// joins the identity payload: an offline edit must not be able to widen a
+    /// definition while a receipt still verifies.
+    ///
+    /// It carries no `skip_serializing_if`. That would round-trip an old record
+    /// byte-identically, but it makes "absent" and "at the default"
+    /// indistinguishable, so stripping the key from the persisted document would
+    /// silently restore the PERMISSIVE default — which is the substitution these
+    /// payloads exist to detect. `Option`/`Vec` defaults handle legacy records
+    /// instead: a definition written before this field existed simply lacks the
+    /// key and reads as "no override".
+    #[serde(default)]
+    pub effort: Option<ReasoningEffort>,
+    /// Exact tool allowlist. `None` means "whatever the child would otherwise
+    /// get" — for a named child that is the parent conversation's enabled set
+    /// minus `api::SUBAGENT_DISABLED_TOOL_NAMES`.
+    ///
+    /// `Some` is an independent SELECTION out of the trusted tool catalogue, not
+    /// an intersection with the caller's set: a role may grant a catalogue tool
+    /// the calling conversation had switched off. It still cannot name anything
+    /// on `SUBAGENT_DISABLED_TOOL_NAMES` — that
+    /// list is re-applied to the catalogue side and stays the absolute floor —
+    /// and it neither grants nor revokes a host-derived name
+    /// (`api::host_derived_child_tool`), because those follow switches and task
+    /// producers rather than lists.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Names removed from this definition's runs, applied after `tools`.
+    #[serde(default)]
+    pub disallowed_tools: Vec<String>,
+    /// This role's own skills, MCP servers and hooks, by catalog id, in the
+    /// same shape as `tools`: `None` follows the calling conversation's
+    /// selection, and `Some` is the role's own selection out of the catalog
+    /// the conversation can reach — the global level and its workspaces.
+    /// For skills and servers an empty list is a real "none": they replace
+    /// the caller's. Hooks only ever add: the child always runs the guards it
+    /// inherited from its caller (`api::hook_runs_in_subagent`), and the
+    /// role's own hooks on top of them, so an empty `hook_ids` means "no
+    /// hooks of its own", never "no guards".
+    ///
+    /// Resolved when the child is configured
+    /// (`api::apply_role_capabilities`), from the files, never from the
+    /// renderer: a selected id discovery cannot find fails the spawn the way
+    /// it fails a conversation's run. Capability-bearing, and no
+    /// `skip_serializing_if`, for the reason spelled out on `effort`.
+    #[serde(default)]
+    pub skill_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub mcp_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub hook_ids: Option<Vec<String>>,
+    /// Which search backend this role's `web_search` uses. `None` follows the
+    /// calling conversation's own selection, which is why this is an `Option`
+    /// around an enum that already has a `Native` default — "follow the
+    /// conversation" and "explicitly native" are different answers, and a role
+    /// on a model whose family cannot run provider-executed search needs to be
+    /// able to say the first one.
+    ///
+    /// Capability-bearing, and carries no `skip_serializing_if`, for the same
+    /// reason spelled out on `effort` above.
+    #[serde(default)]
+    pub search_provider: Option<SearchProviderSelection>,
+    /// The same question on the other leg: which backend this role's
+    /// `web_fetch` uses, with `None` following the calling conversation.
+    ///
+    /// Its own answer rather than a rider on the search selection, for the same
+    /// reason a conversation is asked twice — upstreams disagree about how many
+    /// web tools there are, so "who searches" and "who fetches" are genuinely
+    /// two questions. Like the search leg it cannot decide WHETHER this child
+    /// reaches the web: both web tool names are host-derived from the calling
+    /// conversation's own switch (`api::host_derived_child_tool`), so a role can
+    /// only redirect a leg the conversation already granted.
+    ///
+    /// Capability-bearing, and no `skip_serializing_if`, for the same reason.
+    #[serde(default)]
+    pub fetch_provider: Option<FetchProviderSelection>,
+    /// This role's own result shaping, in the same units and with the same
+    /// `0 = unlimited` reading as [`ConversationWebSearchSettings`]:
+    /// `max_results` and `compression_cutoff` belong to its search leg,
+    /// `fetch_compression_cutoff` to its fetch leg.
+    ///
+    /// Plain numbers rather than `Option`, unlike every override above: 0 is
+    /// already an answer — "no cap" — so there is no value left over to spell
+    /// "follow the conversation" with, and a role therefore always answers for
+    /// itself. An absent key reads as the shared default rather than as 0,
+    /// because a role persisted before these existed asked for the ordinary
+    /// shaping and must not start asking for everything. That includes the
+    /// fetch cap, which did not exist when the older roles were written: they
+    /// get the shared default for it rather than a copy of their search cap.
+    #[serde(default = "default_search_max_results")]
+    pub max_results: u32,
+    #[serde(default = "default_search_cutoff_limit")]
+    pub compression_cutoff: u32,
+    #[serde(default = "default_search_cutoff_limit")]
+    pub fetch_compression_cutoff: u32,
+    /// This role's own domain filtering. `None` filters the way the calling
+    /// conversation does, ITS LISTS INCLUDED; naming a mode takes over both the
+    /// mode and the two lists below, so a role that filters filters by its own
+    /// rules alone rather than layering onto the caller's.
+    ///
+    /// An `Option` for the same reason `search_provider` is: `Off` and "follow
+    /// the conversation" are different answers, and a role needs to be able to
+    /// say the second one. Capability-bearing on the same reading the backends
+    /// are — it decides which results a child may see at all.
+    #[serde(default)]
+    pub domain_filter: Option<SearchDomainFilterMode>,
+    /// Read only when `domain_filter` names a mode. Plain `Vec`s rather than
+    /// `Option`s: an empty list under a named mode is a real configuration
+    /// ("allow nothing", "block nothing"), not an absent one.
+    #[serde(default)]
+    pub include_domains: Vec<String>,
+    #[serde(default)]
+    pub exclude_domains: Vec<String>,
+    /// This role's own provider-native search limit per `web_search` call and
+    /// the Messages tool versions its two native legs send. `None` keeps the
+    /// calling conversation's; a role read from a file always names all three
+    /// (`agent_roles::definition_of`), so its whole web configuration is its
+    /// own. Only the caller's web-access switch still decides whether the
+    /// child reaches the web at all.
+    #[serde(default)]
+    pub max_searches_per_call: Option<u32>,
+    #[serde(default)]
+    pub native_search_tool: Option<NativeSearchTool>,
+    #[serde(default)]
+    pub native_fetch_tool: Option<NativeFetchTool>,
+    /// Conversation template seeded as this role's opening history, or `None` for
+    /// a child that starts from the task alone. Resolved against the host's own
+    /// template store at spawn time, so what the renderer stores here is a name,
+    /// never a body — a forged tool result cannot enter a child this way.
+    ///
+    /// NOT capability-bearing, on the same reading as `description` above: it is
+    /// prose the child reads, and it grants no tool and binds no model. Keeping
+    /// it out of `same_user_agent_configuration` means rebinding a role's
+    /// template does not advance `revision` and revoke the children already
+    /// bound to it.
+    ///
+    /// May dangle. A deleted template leaves the id in place and seeds nothing.
+    #[serde(default)]
+    pub template_id: Option<String>,
+}
+
+/// Persisted host resolution for one trusted named-agent definition.
+///
+/// The model only selects the public definition name. Mewrk records the
+/// exact source revision and the exact provider/model chosen for the initial
+/// spawn so reload and follow-up turns can fail closed instead of silently
+/// rebinding to a different definition or inherited model. `model_id` remains
+/// raw and case-sensitive; this record never contains a hash or synthetic
+/// owner ID.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDefinitionBinding {
+    pub source: AgentDefinitionSource,
+    pub source_key: String,
+    pub name: String,
+    pub revision: u64,
+    pub memory_epoch: u64,
+    pub provider_id: String,
+    pub model_id: String,
+    pub memory: AgentDefinitionMemory,
+    pub scope_key: String,
+    /// Keyed receipt over the complete trusted definition/model binding.
+    /// This detects same-revision offline substitution without persisting a
+    /// plain prompt digest.
+    #[serde(default)]
+    pub configuration_receipt: String,
+    /// Which payload shape `configuration_receipt` was signed over.
+    ///
+    /// A record written before versioning existed simply lacks the key and
+    /// defaults to 1. That absence IS the version marker, and no MIGRATION ever
+    /// rewrites a persisted record to stamp a version onto it: a migration
+    /// would have to re-render the payload and re-sign, which is precisely what
+    /// would invalidate the receipts the stamp was meant to preserve.
+    ///
+    /// Ordinary serialization is a separate matter and does write the key.
+    /// There is deliberately no `skip_serializing_if` here, so every save emits
+    /// whatever value the in-memory record already carries — which is the value
+    /// its receipt was signed at, because
+    /// `api::initial_agent_definition_binding` stamps and signs from the same
+    /// constant. Verification recomputes at the recorded version through
+    /// `api::agent_definition_receipt_payload_at`, so a stamped record and a
+    /// legacy keyless one both verify against their own bytes.
+    #[serde(default = "default_receipt_version")]
+    pub receipt_version: u8,
+}
+
+/// Receipts predating explicit versioning are v1.
+pub fn default_receipt_version() -> u8 {
+    1
+}
+
+/// Persisted receipt for the exact provider/model and parent-memory snapshot
+/// selected when a conversation fork was created.
+///
+/// Provider and model IDs remain raw, case-sensitive host values. The optional
+/// receipt is a keyed authenticity check over the exact rendered auto-memory
+/// prompt; it is not model identity and contains neither the prompt nor a plain
+/// content digest.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkModelBinding {
+    pub provider_id: String,
+    pub model_id: String,
+    pub memory_language: ResolvedLanguage,
+    /// Exact sorted subset of the parent's enabled main-memory tools. The
+    /// child may regain precisely these capabilities on reload, never a
+    /// boolean-derived expansion to the complete tool family.
+    #[serde(default)]
+    pub memory_tool_names: Vec<String>,
+    /// Exact host-generated child prompt used at fork creation. It is already
+    /// user-owned document policy, not model-authored memory; the keyed
+    /// receipt prevents offline same-record substitution on reload.
+    #[serde(default)]
+    pub system_prompt_snapshot: String,
+    #[serde(default)]
+    pub system_prompt_receipt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_snapshot_receipt: Option<String>,
+    /// Domain-separated HMAC over every field above. Content receipts protect
+    /// their individual snapshots; this receipt protects the exact raw
+    /// provider/model identity and the complete capability binding.
+    #[serde(default)]
+    pub binding_receipt: String,
+    /// Which payload shape `binding_receipt` was signed over. Absence means v1.
+    ///
+    /// No MIGRATION rewrites a persisted record to stamp this — re-rendering
+    /// and re-signing is exactly what would invalidate the receipt. Ordinary
+    /// serialization does write the key on every save (there is no
+    /// `skip_serializing_if`), carrying forward the value the record already
+    /// holds, which is the value its receipt was signed at.
+    /// `api::fork_model_binding_receipt_payload` dispatches verification to
+    /// that recorded version and hard-errors on a version this build cannot
+    /// render, so a v2 record can never be silently checked as v1.
+    ///
+    /// There is deliberately no `prompt_version` companion:
+    /// `system_prompt_receipt` is signed over `system_prompt_snapshot` and
+    /// verified against that same stored snapshot, never recomputed, so the
+    /// snapshot is self-authenticating and a version would cost bytes for
+    /// nothing. `memory_snapshot_receipt` needs none either: it is a content
+    /// receipt over one opaque host-rendered string, with no field set that
+    /// could grow, and its whole purpose is to REJECT a changed render.
+    #[serde(default = "default_receipt_version")]
+    pub receipt_version: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AppLanguage {
+    #[serde(rename = "auto")]
+    Auto,
+    #[default]
+    #[serde(rename = "zh-CN")]
+    ZhCn,
+    #[serde(rename = "en-US")]
+    EnUs,
+}
+
+/// An application language with `auto` already resolved.
+///
+/// Used both for the mirrored UI language and for the language in which a
+/// tool-description set is authored. A conversation's tool descriptions follow
+/// the application language, which a selected tool-description file cannot override.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ResolvedLanguage {
+    #[default]
+    #[serde(rename = "zh-CN")]
+    ZhCn,
+    #[serde(rename = "en-US")]
+    EnUs,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ThemePreference {
+    #[default]
+    #[serde(rename = "day")]
+    Day,
+    #[serde(rename = "night")]
+    Night,
+    #[serde(rename = "system")]
+    System,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiProvider {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub family: ProviderFamily,
+    pub base_url: String,
+    /// Family-specific identity fields, such as Bedrock `region`, Vertex
+    /// `project`/`location`, and Azure `api_version`. They are provider-factory
+    /// inputs, not URL components; `normalized_base_url` forbids query strings.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub family_settings: BTreeMap<FamilySetting, String>,
+    // A provider has one address, `base_url`. Documents written before the
+    // image, speech and transcription overrides were retired still carry an
+    // `endpointBaseUrls` key; nothing ever read it, and serde skips it as an
+    // unknown field, so those documents open unchanged.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
+    #[serde(default)]
+    pub models: Vec<ModelProfile>,
+    #[serde(default)]
+    pub active_model_id: Option<String>,
+}
+
+/// Fixed search-provider catalog. `kind` is both entry identity and credential
+/// store key. The ten entries mirror Cherry Studio's catalog: identical IDs,
+/// display names, capabilities, and default endpoints. These are host-side
+/// `searchKeywords`/`fetchUrls` providers, distinct from a model's own
+/// server-side search tool. Adding an entry must update this enum, the
+/// TypeScript mirror `src/lib/searchProviders.ts`, and the documentation
+/// together.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum SearchProviderKind {
+    Zhipu,
+    Tavily,
+    Searxng,
+    Exa,
+    ExaMcp,
+    Bocha,
+    Querit,
+    Fetch,
+    Jina,
+    Firecrawl,
+}
+
+/// An operation the host can perform through a search provider.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub enum SearchCapability {
+    SearchKeywords,
+    FetchUrls,
+}
+
+/// Built-in declaration for one catalog capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchCapabilitySpec {
+    /// Empty means the capability requires no endpoint, as with local `fetch`.
+    pub default_api_host: &'static str,
+    /// Whether the capability requires an API key.
+    pub requires_api_key: bool,
+    /// Most results this capability's own count field takes, or `None` when it
+    /// has none (every fetch capability, and every search that cannot be asked
+    /// for a count).
+    ///
+    /// The number is the backend's ceiling, not a default: a conversation's
+    /// `max_results` is sent as `min(max_results, ceiling)` so an upstream that
+    /// rejects an oversized count never sees one. Searxng is the odd row — its
+    /// API takes no count at all, so its ceiling bounds how many result pages
+    /// mewrk itself reads, which is the same question asked of mewrk instead
+    /// of the upstream.
+    pub max_results: Option<u32>,
+    /// Smallest non-zero per-result token cap this capability takes, or `None`
+    /// when it has no content cap to offer.
+    ///
+    /// Where the cap is an upstream parameter (Exa's `maxCharacters`, Jina's
+    /// `X-Max-Tokens`) this is the smallest value that parameter accepts; for
+    /// the two mewrk-run legs that truncate locally — Searxng search and the
+    /// local `fetch` — it is 1, since mewrk can honour any positive budget.
+    /// A request for less than this floor is raised to it rather than refused,
+    /// and zero always means "no cap" and is never raised.
+    pub min_content_tokens: Option<u32>,
+}
+
+impl SearchCapabilitySpec {
+    /// Whether the capability requires a usable HTTP(S) endpoint.
+    pub fn requires_api_host(&self) -> bool {
+        !self.default_api_host.is_empty()
+    }
+}
+
+/// Canonical catalog. Keep each entry on one line: the cross-language guard
+/// compares this table line by line with its TypeScript mirror.
+#[rustfmt::skip]
+pub const SEARCH_PROVIDER_CATALOG: &[SearchProviderCatalogEntry] = &[
+    SearchProviderCatalogEntry { kind: SearchProviderKind::Zhipu, slug: "zhipu", label: "Zhipu", search: Some(SearchCapabilitySpec { default_api_host: "https://open.bigmodel.cn/api/paas/v4/web_search", requires_api_key: true, max_results: Some(50), min_content_tokens: None }), fetch: None },
+    SearchProviderCatalogEntry { kind: SearchProviderKind::Tavily, slug: "tavily", label: "Tavily", search: Some(SearchCapabilitySpec { default_api_host: "https://api.tavily.com", requires_api_key: true, max_results: Some(20), min_content_tokens: None }), fetch: None },
+    SearchProviderCatalogEntry { kind: SearchProviderKind::Searxng, slug: "searxng", label: "Searxng", search: Some(SearchCapabilitySpec { default_api_host: "http://localhost:8080", requires_api_key: false, max_results: Some(50), min_content_tokens: Some(1) }), fetch: None },
+    SearchProviderCatalogEntry { kind: SearchProviderKind::Exa, slug: "exa", label: "Exa", search: Some(SearchCapabilitySpec { default_api_host: "https://api.exa.ai", requires_api_key: true, max_results: Some(100), min_content_tokens: Some(1) }), fetch: None },
+    SearchProviderCatalogEntry { kind: SearchProviderKind::ExaMcp, slug: "exa-mcp", label: "ExaMCP", search: Some(SearchCapabilitySpec { default_api_host: "https://mcp.exa.ai/mcp", requires_api_key: false, max_results: Some(100), min_content_tokens: None }), fetch: None },
+    SearchProviderCatalogEntry { kind: SearchProviderKind::Bocha, slug: "bocha", label: "Bocha", search: Some(SearchCapabilitySpec { default_api_host: "https://api.bochaai.com", requires_api_key: true, max_results: Some(50), min_content_tokens: None }), fetch: None },
+    SearchProviderCatalogEntry { kind: SearchProviderKind::Querit, slug: "querit", label: "Querit", search: Some(SearchCapabilitySpec { default_api_host: "https://api.querit.ai", requires_api_key: true, max_results: Some(100), min_content_tokens: None }), fetch: Some(SearchCapabilitySpec { default_api_host: "https://api.querit.ai", requires_api_key: true, max_results: None, min_content_tokens: None }) },
+    SearchProviderCatalogEntry { kind: SearchProviderKind::Fetch, slug: "fetch", label: "fetch", search: None, fetch: Some(SearchCapabilitySpec { default_api_host: "", requires_api_key: false, max_results: None, min_content_tokens: Some(1) }) },
+    SearchProviderCatalogEntry { kind: SearchProviderKind::Jina, slug: "jina", label: "Jina", search: Some(SearchCapabilitySpec { default_api_host: "https://s.jina.ai", requires_api_key: true, max_results: Some(20), min_content_tokens: Some(500) }), fetch: Some(SearchCapabilitySpec { default_api_host: "https://r.jina.ai", requires_api_key: false, max_results: None, min_content_tokens: Some(500) }) },
+    SearchProviderCatalogEntry { kind: SearchProviderKind::Firecrawl, slug: "firecrawl", label: "Firecrawl", search: Some(SearchCapabilitySpec { default_api_host: "https://api.firecrawl.dev", requires_api_key: false, max_results: Some(100), min_content_tokens: None }), fetch: Some(SearchCapabilitySpec { default_api_host: "https://api.firecrawl.dev", requires_api_key: false, max_results: None, min_content_tokens: None }) },
+];
+
+#[derive(Clone, Copy, Debug)]
+pub struct SearchProviderCatalogEntry {
+    pub kind: SearchProviderKind,
+    pub slug: &'static str,
+    pub label: &'static str,
+    pub search: Option<SearchCapabilitySpec>,
+    pub fetch: Option<SearchCapabilitySpec>,
+}
+
+impl SearchProviderKind {
+    pub const CATALOG: &'static [Self] = &[
+        Self::Zhipu,
+        Self::Tavily,
+        Self::Searxng,
+        Self::Exa,
+        Self::ExaMcp,
+        Self::Bocha,
+        Self::Querit,
+        Self::Fetch,
+        Self::Jina,
+        Self::Firecrawl,
+    ];
+
+    fn entry(self) -> &'static SearchProviderCatalogEntry {
+        SEARCH_PROVIDER_CATALOG
+            .iter()
+            .find(|entry| entry.kind == self)
+            .expect("every kind has a catalog row")
+    }
+
+    /// Catalog identity used by credentials, documents, and the frontend.
+    pub fn slug(self) -> &'static str {
+        self.entry().slug
+    }
+
+    pub fn label(self) -> &'static str {
+        self.entry().label
+    }
+
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        SEARCH_PROVIDER_CATALOG
+            .iter()
+            .find(|entry| entry.slug == slug)
+            .map(|entry| entry.kind)
+    }
+
+    /// Built-in declaration for this capability, or `None` if unsupported.
+    pub fn capability(self, capability: SearchCapability) -> Option<&'static SearchCapabilitySpec> {
+        let entry = self.entry();
+        match capability {
+            SearchCapability::SearchKeywords => entry.search.as_ref(),
+            SearchCapability::FetchUrls => entry.fetch.as_ref(),
+        }
+    }
+
+    pub fn supports(self, capability: SearchCapability) -> bool {
+        self.capability(capability).is_some()
+    }
+
+    /// Empty means this capability needs no endpoint, as with `fetch`.
+    pub fn default_api_host(self, capability: SearchCapability) -> &'static str {
+        self.capability(capability)
+            .map(|spec| spec.default_api_host)
+            .unwrap_or("")
+    }
+}
+
+/// Default per-result token cap, for the search leg and the fetch leg alike.
+pub const DEFAULT_SEARCH_CUTOFF_LIMIT: u32 = 2_000;
+/// Default maximum search-result count.
+pub const DEFAULT_SEARCH_MAX_RESULTS: u32 = 5;
+/// Ceilings for the shaping numbers. Both floors are 0, which is the
+/// "no limit" answer rather than a value below the range.
+///
+/// The result-count ceiling is the largest any backend's own ceiling goes
+/// (`SearchCapabilitySpec::max_results`), so storage never refuses a count some
+/// backend would take; the per-backend ceiling is applied when the request is
+/// built. The token ceiling bounds the search leg's and the fetch leg's cap
+/// alike.
+pub const MAX_SEARCH_MAX_RESULTS: u32 = 100;
+pub const MAX_SEARCH_CUTOFF_LIMIT: u32 = 200_000;
+/// Characters per token when a token cap has to be spelled in characters, as
+/// Exa's `contents.text.maxCharacters` is. Four is the same estimate
+/// `api::estimate_tokens` uses for ASCII, so a cap converted here and a cap
+/// measured there agree about what a token is.
+pub const EXA_CHARS_PER_TOKEN: u32 = 4;
+/// Maximum input count per call.
+pub const MAX_SEARCH_INPUTS: usize = 20;
+/// Rules one domain list may hold. A list is maintained by hand; past this many
+/// entries the extra ones are dropped rather than carried into every search.
+pub const MAX_SEARCH_DOMAIN_RULES: usize = 512;
+
+fn default_search_cutoff_limit() -> u32 {
+    DEFAULT_SEARCH_CUTOFF_LIMIT
+}
+
+fn default_search_max_results() -> u32 {
+    DEFAULT_SEARCH_MAX_RESULTS
+}
+
+/// Search-provider assets: the catalog and nothing else.
+///
+/// Everything about how a search BEHAVES — how many results come back, how hard
+/// they are compressed, which domains are admitted — belongs to the conversation
+/// that runs it, because it is that conversation's context window being spent.
+/// What is left here is what genuinely has one value per installation: which
+/// providers exist, where they point, and whether they are switched on.
+///
+/// Providers must come from [`SearchProviderKind::CATALOG`] at most once; API
+/// keys stay in the OS credential store.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSearchAssets {
+    #[serde(default)]
+    pub providers: Vec<SearchProviderConfig>,
+}
+
+impl WebSearchAssets {
+    pub fn find(&self, kind: SearchProviderKind) -> Option<&SearchProviderConfig> {
+        self.providers.iter().find(|entry| entry.kind == kind)
+    }
+}
+
+/// User configuration for a catalog search provider. `kind` is the entry
+/// identity; there is no separate ID.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchProviderConfig {
+    pub kind: SearchProviderKind,
+    #[serde(default)]
+    pub enabled: bool,
+    /// Empty uses the catalog `searchKeywords` endpoint. Search and fetch may
+    /// use separate hosts.
+    #[serde(default)]
+    pub search_api_host: String,
+    /// Empty uses the catalog `fetchUrls` endpoint.
+    #[serde(default)]
+    pub fetch_api_host: String,
+    /// Searxng engines. When empty, read `/config` and select enabled `general`
+    /// and `web` engines.
+    #[serde(default)]
+    pub engines: Vec<String>,
+    /// Searxng Basic Auth username. Its password is kept in the OS credential store.
+    #[serde(default)]
+    pub basic_auth_username: String,
+}
+
+impl SearchProviderConfig {
+    pub fn new(kind: SearchProviderKind) -> Self {
+        Self {
+            kind,
+            enabled: false,
+            search_api_host: String::new(),
+            fetch_api_host: String::new(),
+            engines: Vec::new(),
+            basic_auth_username: String::new(),
+        }
+    }
+
+    pub fn enabled(kind: SearchProviderKind) -> Self {
+        Self {
+            enabled: true,
+            ..Self::new(kind)
+        }
+    }
+
+    /// Effective endpoint for a capability. Empty means none is required.
+    pub fn effective_api_host(&self, capability: SearchCapability) -> &str {
+        let override_host = match capability {
+            SearchCapability::SearchKeywords => self.search_api_host.trim(),
+            SearchCapability::FetchUrls => self.fetch_api_host.trim(),
+        };
+        if override_host.is_empty() {
+            self.kind.default_api_host(capability)
+        } else {
+            override_host
+        }
+    }
+
+    pub fn effective_engines(&self) -> Vec<String> {
+        self.engines
+            .iter()
+            .map(|engine| engine.trim().to_owned())
+            .filter(|engine| !engine.is_empty())
+            .collect()
+    }
+}
+
+/// Which version of the Anthropic Messages server-side `web_search` tool the
+/// native search leg sends.
+///
+/// The wire carries the version inside the tool's own `type`, so this is the
+/// one native-backend choice that is a protocol detail rather than a backend:
+/// every version names the same tool and returns the same block shapes, and
+/// only Messages spells it this way. Families that speak another protocol have
+/// no `type` to choose, so they ignore this and send whatever their own native
+/// tool is — which is why the selection survives a model change untouched
+/// rather than being rewritten to something the new family could express.
+///
+/// The variants are exactly the versions this build can actually emit, which is
+/// bounded by the AI SDK's Anthropic provider rather than by the API: a version
+/// the SDK does not know is dropped from the request with a warning, so offering
+/// it would silently take web search away. `web_search::NATIVE_SEARCH_TOOL_TYPES`
+/// holds the same list for the renderer and is kept in step with the sidecar by
+/// a parity test.
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub enum NativeSearchTool {
+    /// Basic server-side search. Results arrive as `web_search_tool_result`
+    /// blocks the host reads directly.
+    #[default]
+    #[serde(rename = "web_search_20250305")]
+    WebSearch20250305,
+    /// Adds dynamic filtering: results are filtered by code the model writes
+    /// before they reach the context window. Upstream defaults this version's
+    /// `allowed_callers` to code execution, so the API provisions a container
+    /// for the request on its own.
+    #[serde(rename = "web_search_20260209")]
+    WebSearch20260209,
+}
+
+impl NativeSearchTool {
+    pub const ALL: &'static [Self] = &[Self::WebSearch20250305, Self::WebSearch20260209];
+
+    /// The `type` this version writes into the Messages tool definition.
+    pub fn wire_type(self) -> &'static str {
+        match self {
+            Self::WebSearch20250305 => "web_search_20250305",
+            Self::WebSearch20260209 => "web_search_20260209",
+        }
+    }
+
+    pub fn from_wire_type(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.wire_type() == value)
+    }
+}
+
+/// Which version of the Anthropic Messages server-side `web_fetch` tool the
+/// native fetch leg sends. The same protocol detail as [`NativeSearchTool`],
+/// on the other web tool.
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub enum NativeFetchTool {
+    /// Basic server-side fetch. The result carries the page as plain text the
+    /// host parses itself.
+    #[default]
+    #[serde(rename = "web_fetch_20250910")]
+    WebFetch20250910,
+    /// Adds dynamic filtering, the same way `web_search_20260209` does.
+    #[serde(rename = "web_fetch_20260209")]
+    WebFetch20260209,
+}
+
+impl NativeFetchTool {
+    pub const ALL: &'static [Self] = &[Self::WebFetch20250910, Self::WebFetch20260209];
+
+    pub fn wire_type(self) -> &'static str {
+        match self {
+            Self::WebFetch20250910 => "web_fetch_20250910",
+            Self::WebFetch20260209 => "web_fetch_20260209",
+        }
+    }
+
+    pub fn from_wire_type(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.wire_type() == value)
+    }
+}
+
+/// An unknown version reads as the default rather than failing the document.
+///
+/// A build that removes a version — or one that opens a document written by a
+/// newer build — must still load the conversation. Falling back to the basic
+/// version costs the user a preference; refusing the field would cost them the
+/// conversation.
+impl<'de> Deserialize<'de> for NativeSearchTool {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Option::<String>::deserialize(deserializer)?;
+        Ok(raw
+            .as_deref()
+            .and_then(Self::from_wire_type)
+            .unwrap_or_default())
+    }
+}
+
+impl<'de> Deserialize<'de> for NativeFetchTool {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Option::<String>::deserialize(deserializer)?;
+        Ok(raw
+            .as_deref()
+            .and_then(Self::from_wire_type)
+            .unwrap_or_default())
+    }
+}
+
+/// Search backend selected by a conversation. Unavailable selections are saved
+/// and reported as recoverable runtime errors. Mirrored, variant for variant,
+/// by [`FetchProviderSelection`]: the two legs follow one rule.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SearchProviderSelection {
+    /// Provider-native web search for this conversation's own model.
+    #[default]
+    Native,
+    Explicit {
+        #[serde(rename = "providerKind")]
+        provider_kind: SearchProviderKind,
+    },
+    /// No backend searches here, and `web_search` is withheld from the model
+    /// entirely.
+    ///
+    /// Deliberately not the same as [`Self::Unavailable`], which is a binding
+    /// that BROKE: that one keeps the tool exposed and fails the call with a
+    /// fixable error naming the setting to change, because the user asked for a
+    /// search and should be told why it did not happen. This one is the user
+    /// saying this conversation does not search, so there is nothing to tell
+    /// them and no tool to hand over.
+    Disabled,
+    /// A missing or disabled explicit entry is persisted without its old identifier.
+    Unavailable,
+}
+
+/// Which backend retrieves a named page for `web_fetch`.
+///
+/// Separate from [`SearchProviderSelection`] because fetching and searching are
+/// different upstream capabilities, and a backend may have one without the
+/// other: DeepSeek and OpenAI expose only a server-side search tool and keep
+/// page retrieval internal to it, while Anthropic exposes search and fetch as
+/// two distinct server tools.
+///
+/// Every variant names a backend outright. There is deliberately no "automatic"
+/// here: a selector that resolved to something else — the search backend, or a
+/// global default — reads as a choice while being an alias for one, and the
+/// thing it aliased could be changed from another screen without this one
+/// saying so.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum FetchProviderSelection {
+    /// The conversation's own model provider retrieves the page, independently
+    /// of which backend searches.
+    ///
+    /// It is deliberately selectable even for families that have no separate
+    /// fetch tool, because "the model's own provider fetches" is true of them
+    /// too — OpenAI simply performs retrieval inside its one `web_search` tool,
+    /// so the conversation ends up with a single web tool rather than two.
+    /// Anthropic splits the same capability into two server tools, so there the
+    /// same choice grants `web_fetch` beside `web_search`.
+    #[default]
+    Native,
+    Explicit {
+        #[serde(rename = "providerKind")]
+        provider_kind: SearchProviderKind,
+    },
+    /// No fetch leg at all: `web_fetch` is withheld from the model.
+    Disabled,
+    /// A named provider this build no longer knows, persisted without its old
+    /// identifier. Like [`SearchProviderSelection::Unavailable`] it keeps
+    /// `web_fetch` offered, and every call fails naming the setting to change.
+    Unavailable,
+}
+
+/// Which domain list, if either, filters a conversation's search results.
+///
+/// A choice rather than a pair of switches: a result admitted by one list and
+/// refused by the other has no obvious answer, and a selector that can only be
+/// in one state never asks that question.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SearchDomainFilterMode {
+    /// Nothing is filtered. Both lists are kept: turning filtering off is not
+    /// the same as throwing away what was written.
+    #[default]
+    Off,
+    /// Drop any result matching `exclude_domains`.
+    Exclude,
+    /// Keep only results matching `include_domains`, so an empty list under
+    /// this mode keeps nothing.
+    Include,
+}
+
+/// Conversation web-search behavior. Presets hold the same shape as a template
+/// copied into new conversations.
+///
+/// The feature switch itself is [`ConversationSettings::web_search_enabled`],
+/// not a tool-list entry: `web_search` and `web_fetch` are derived from that
+/// switch the way the memory tools are derived from their two tier switches.
+/// This struct only says *how* search runs once it is on — which backends, and
+/// what shape the results come back in. All of it lives here rather than in the
+/// global assets because it is this conversation's context window being spent.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationWebSearchSettings {
+    /// Maximum provider-native searches per `web_search` call. Zero is unlimited
+    /// and applies only to the `Native` backend.
+    pub max_searches_per_call: u32,
+    /// Selected search backend for this conversation.
+    pub provider: SearchProviderSelection,
+    /// Selected fetch backend for this conversation.
+    pub fetch_provider: FetchProviderSelection,
+    /// Which Messages `web_search` version the native search leg sends.
+    ///
+    /// It sits beside the backend selection rather than inside
+    /// [`SearchProviderSelection::Native`] so that leaving native — for a
+    /// catalog provider, or for a model whose family has no `type` to pick —
+    /// only stops it from being *used*, never erases it. Coming back to a
+    /// Messages model finds the version the user last chose still here.
+    pub native_search_tool: NativeSearchTool,
+    /// Which Messages `web_fetch` version the native fetch leg sends, kept for
+    /// the same reason as `native_search_tool`.
+    pub native_fetch_tool: NativeFetchTool,
+    /// How many results one search asks a catalog provider for. Zero sends no
+    /// count and takes whatever the upstream returns; a backend whose API has no
+    /// count field ignores it, and a native backend decides its own search depth
+    /// and ignores it too. SearXNG reads it as how many result pages mewrk
+    /// reads itself, with zero meaning every one.
+    pub max_results: u32,
+    /// Per-result token cap for the search leg: the most body text kept from each
+    /// result, 0 for none. It is the backend's own request parameter where the
+    /// backend has one (Exa, Jina) and mewrk's local truncation of each page it
+    /// reads itself (SearXNG); a backend without a content-length parameter
+    /// returns what it returns and never sees it.
+    pub compression_cutoff: u32,
+    /// Per-page token cap for the fetch leg, 0 for none. The same idea on the
+    /// other leg: Jina Reader's header, the local `fetch` provider's own
+    /// truncation, and the native fetch tool's `max_content_tokens` on the
+    /// families that have one.
+    ///
+    /// A document stored before the legs had separate caps has no such key and
+    /// reads the old single knob's value, so a user who chose 0 for "unlimited"
+    /// keeps it on fetch. The renderer's `runtime.ts` must answer the same way.
+    pub fetch_compression_cutoff: u32,
+    /// Which of the two lists below filters results, if either.
+    pub domain_filter: SearchDomainFilterMode,
+    /// Result allowlist, in effect under [`SearchDomainFilterMode::Include`].
+    ///
+    /// Rule syntax for both lists: `<all_urls>`, a `scheme://host/path` match
+    /// pattern (`*` wildcards, `*.` matches subdomains), or `/regex/`.
+    pub include_domains: Vec<String>,
+    /// Result blocklist, in effect under [`SearchDomainFilterMode::Exclude`].
+    pub exclude_domains: Vec<String>,
+}
+
+impl Default for ConversationWebSearchSettings {
+    fn default() -> Self {
+        Self {
+            max_searches_per_call: 0,
+            provider: SearchProviderSelection::default(),
+            fetch_provider: FetchProviderSelection::default(),
+            native_search_tool: NativeSearchTool::default(),
+            native_fetch_tool: NativeFetchTool::default(),
+            max_results: DEFAULT_SEARCH_MAX_RESULTS,
+            compression_cutoff: DEFAULT_SEARCH_CUTOFF_LIMIT,
+            fetch_compression_cutoff: DEFAULT_SEARCH_CUTOFF_LIMIT,
+            domain_filter: SearchDomainFilterMode::default(),
+            include_domains: Vec::new(),
+            exclude_domains: Vec::new(),
+        }
+    }
+}
+
+/// Hand-written so a document that predates the exhaustive fetch selector keeps
+/// opening, and opens on the backend it was actually fetching with.
+///
+/// That old `auto` named no backend of its own: it took fetching from the
+/// search backend when that backend could fetch, and fell back to a global
+/// default provider when it could not. It is resolved here the way it would
+/// have resolved then — against this conversation's own search selection, which
+/// is why this cannot live on `FetchProviderSelection`'s own `Deserialize`. The
+/// global default is gone, so `Native` stands in for that last resort, which is
+/// what `auto` picked whenever the search leg was native anyway. The renderer's
+/// `runtime.ts::normalizeFetchProviderSelection` must give the same answer;
+/// otherwise the two sides would overwrite each other on every load.
+impl<'de> Deserialize<'de> for ConversationWebSearchSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "camelCase")]
+        enum StoredFetchProvider {
+            Auto,
+            Native,
+            Explicit {
+                #[serde(rename = "providerKind")]
+                provider_kind: SearchProviderKind,
+            },
+            Disabled,
+            Unavailable,
+        }
+
+        impl Default for StoredFetchProvider {
+            fn default() -> Self {
+                Self::Native
+            }
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Stored {
+            #[serde(default)]
+            max_searches_per_call: u32,
+            #[serde(default)]
+            provider: SearchProviderSelection,
+            #[serde(default)]
+            fetch_provider: StoredFetchProvider,
+            #[serde(default)]
+            native_search_tool: NativeSearchTool,
+            #[serde(default)]
+            native_fetch_tool: NativeFetchTool,
+            #[serde(default = "default_search_max_results")]
+            max_results: u32,
+            #[serde(default = "default_search_cutoff_limit")]
+            compression_cutoff: u32,
+            #[serde(default)]
+            fetch_compression_cutoff: Option<u32>,
+            #[serde(default)]
+            domain_filter: SearchDomainFilterMode,
+            #[serde(default)]
+            include_domains: Vec<String>,
+            #[serde(default)]
+            exclude_domains: Vec<String>,
+        }
+
+        let stored = Stored::deserialize(deserializer)?;
+        let fetch_provider = match stored.fetch_provider {
+            StoredFetchProvider::Auto => match stored.provider {
+                SearchProviderSelection::Explicit { provider_kind }
+                    if provider_kind
+                        .capability(SearchCapability::FetchUrls)
+                        .is_some() =>
+                {
+                    FetchProviderSelection::Explicit { provider_kind }
+                }
+                _ => FetchProviderSelection::Native,
+            },
+            StoredFetchProvider::Native => FetchProviderSelection::Native,
+            StoredFetchProvider::Explicit { provider_kind } => {
+                FetchProviderSelection::Explicit { provider_kind }
+            }
+            StoredFetchProvider::Disabled => FetchProviderSelection::Disabled,
+            StoredFetchProvider::Unavailable => FetchProviderSelection::Unavailable,
+        };
+        Ok(Self {
+            max_searches_per_call: stored.max_searches_per_call,
+            provider: stored.provider,
+            fetch_provider,
+            native_search_tool: stored.native_search_tool,
+            native_fetch_tool: stored.native_fetch_tool,
+            max_results: stored.max_results,
+            compression_cutoff: stored.compression_cutoff,
+            // The single knob that used to cover both legs.
+            fetch_compression_cutoff: stored
+                .fetch_compression_cutoff
+                .unwrap_or(stored.compression_cutoff),
+            domain_filter: stored.domain_filter,
+            include_domains: stored.include_domains,
+            exclude_domains: stored.exclude_domains,
+        })
+    }
+}
+
+impl ConversationWebSearchSettings {
+    /// Runtime shaping passed unchanged to the execution layer.
+    pub fn execution(&self) -> SearchExecutionConfig {
+        SearchExecutionConfig {
+            max_results: self.max_results.min(MAX_SEARCH_MAX_RESULTS),
+            compression_cutoff: self.compression_cutoff.min(MAX_SEARCH_CUTOFF_LIMIT),
+            fetch_compression_cutoff: self.fetch_compression_cutoff.min(MAX_SEARCH_CUTOFF_LIMIT),
+            domain_filter: self.domain_filter,
+            include_domains: self.include_domains.clone(),
+            exclude_domains: self.exclude_domains.clone(),
+        }
+    }
+}
+
+/// Effective, host-built web-search view for one run. It is not persisted and
+/// is skipped in `RunModelRequest`, so the renderer cannot assert it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSearchSettings {
+    /// Provider-native search limit per `Native` call. Zero is unlimited.
+    #[serde(default)]
+    pub max_searches_per_call: u32,
+    /// Resolved backend. `None` means search is unavailable with no implicit fallback.
+    #[serde(default)]
+    pub backend: Option<SearchBackend>,
+    /// Whether `web_search` is withheld from the model outright.
+    ///
+    /// Distinct from `backend: None`, which is a backend that FAILED to resolve:
+    /// there the tool is still handed over and the call returns a recoverable
+    /// error naming the setting to fix, because the user asked for a search and
+    /// deserves to be told why it did not happen. This flag is the conversation
+    /// having named no search backend at all, so there is nothing to explain and
+    /// no tool to grant.
+    #[serde(default)]
+    pub search_withheld: bool,
+    /// Resolved fetch backend. `None` with `fetch_withheld` unset is a backend
+    /// that failed to resolve — switched off, unknown, unable to fetch — and,
+    /// exactly as on the search leg, `web_fetch` is still offered and every
+    /// call fails naming the setting to change.
+    #[serde(default)]
+    pub fetch: Option<SearchFetchBackend>,
+    /// Whether `web_fetch` is withheld from the model outright: the fetch
+    /// provider is Off, or it is Native on a family that folds page retrieval
+    /// into its search tool — the upstream shape where search is the only web
+    /// tool. The twin of `search_withheld`, decided by the selection and the
+    /// family alone, never by whether a backend is configured.
+    #[serde(default)]
+    pub fetch_withheld: bool,
+    /// Execution options used by catalog-provider backends. The one exception
+    /// is `fetch_compression_cutoff`, which a native fetch leg also reads
+    /// because it is that tool's own `max_content_tokens`; native search takes
+    /// nothing from here.
+    #[serde(default)]
+    pub execution: SearchExecutionConfig,
+    /// The Messages server-tool versions the two native legs would send,
+    /// carried verbatim from the conversation. Whether they are honoured is a
+    /// question about the protocol family, which this module does not know, so
+    /// the step builder applies them and every other family ignores them.
+    #[serde(default)]
+    pub native_search_tool: NativeSearchTool,
+    #[serde(default)]
+    pub native_fetch_tool: NativeFetchTool,
+}
+
+/// Runtime options for one search execution.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchExecutionConfig {
+    /// Zero sends no result count; the upstream's own default stands.
+    pub max_results: u32,
+    /// Per-result token cap for the search leg. Zero is no cap.
+    #[serde(default)]
+    pub compression_cutoff: u32,
+    /// Per-page token cap for the fetch leg. Zero is no cap.
+    #[serde(default = "default_search_cutoff_limit")]
+    pub fetch_compression_cutoff: u32,
+    #[serde(default)]
+    pub domain_filter: SearchDomainFilterMode,
+    #[serde(default)]
+    pub include_domains: Vec<String>,
+    #[serde(default)]
+    pub exclude_domains: Vec<String>,
+}
+
+impl Default for SearchExecutionConfig {
+    fn default() -> Self {
+        Self {
+            max_results: DEFAULT_SEARCH_MAX_RESULTS,
+            compression_cutoff: DEFAULT_SEARCH_CUTOFF_LIMIT,
+            fetch_compression_cutoff: DEFAULT_SEARCH_CUTOFF_LIMIT,
+            domain_filter: SearchDomainFilterMode::default(),
+            include_domains: Vec::new(),
+            exclude_domains: Vec::new(),
+        }
+    }
+}
+
+/// Resolved search backend for one run.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SearchBackend {
+    /// The conversation's provider and model. Unsupported protocol families
+    /// return a recoverable `web_search` error.
+    Native,
+    /// A catalog search provider called by the host.
+    Provider(ResolvedSearchProvider),
+}
+
+/// Resolved `web_fetch` backend for one run.
+///
+/// `Native` exists only for families whose server-side fetch tool returns the
+/// page as readable text ([`crate::web_search::family_supports_native_fetch`]);
+/// every other family has to borrow a catalog provider.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SearchFetchBackend {
+    Native,
+    Provider(ResolvedSearchProvider),
+}
+
+/// Resolved provider with concrete endpoint and instance settings. Credentials
+/// are read from the OS credential store only when a request is sent.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedSearchProvider {
+    pub kind: SearchProviderKind,
+    /// Endpoint for this capability. Empty means none is required.
+    pub api_host: String,
+    /// Used only by Searxng.
+    #[serde(default)]
+    pub engines: Vec<String>,
+    /// Used only by Searxng.
+    #[serde(default)]
+    pub basic_auth_username: String,
+}
+
+impl WebSearchSettings {
+    /// Combine persisted conversation behavior with assets into an effective view.
+    /// Native always resolves. Missing or disabled explicit entries leave the
+    /// corresponding backend absent for a recoverable tool error.
+    ///
+    /// Which tools the model is offered is answered here too, separately from
+    /// what resolved and from the assets: `search_withheld` and `fetch_withheld`
+    /// read the conversation's own selections (and, for native fetch, the
+    /// family) and nothing else, so switching a provider in global settings
+    /// never adds a web tool to a conversation or takes one away.
+    ///
+    /// `native_fetch` says whether this conversation's own provider family has a
+    /// server-side fetch tool the host can read text out of. It is passed in
+    /// rather than derived here because this module knows nothing about protocol
+    /// families — the table lives in `web_search::family_supports_native_fetch`.
+    pub fn effective(
+        conversation: &ConversationWebSearchSettings,
+        assets: &WebSearchAssets,
+        native_fetch: bool,
+    ) -> Self {
+        let resolve = |kind: SearchProviderKind, capability: SearchCapability| {
+            assets
+                .find(kind)
+                .filter(|entry| entry.enabled && entry.kind.supports(capability))
+                .map(|entry| ResolvedSearchProvider {
+                    kind: entry.kind,
+                    api_host: entry.effective_api_host(capability).to_owned(),
+                    engines: entry.effective_engines(),
+                    basic_auth_username: entry.basic_auth_username.trim().to_owned(),
+                })
+        };
+        let backend = match &conversation.provider {
+            SearchProviderSelection::Native => Some(SearchBackend::Native),
+            SearchProviderSelection::Explicit { provider_kind } => {
+                resolve(*provider_kind, SearchCapability::SearchKeywords)
+                    .map(SearchBackend::Provider)
+            }
+            SearchProviderSelection::Disabled | SearchProviderSelection::Unavailable => None,
+        };
+        // Both legs read their own selection and nothing else. What searches has
+        // no say in what fetches, so a conversation may fetch pages it is given
+        // the address of while never going looking for one, and the reverse.
+        let fetch = match &conversation.fetch_provider {
+            FetchProviderSelection::Disabled | FetchProviderSelection::Unavailable => None,
+            FetchProviderSelection::Native => native_fetch.then_some(SearchFetchBackend::Native),
+            FetchProviderSelection::Explicit { provider_kind } => {
+                resolve(*provider_kind, SearchCapability::FetchUrls)
+                    .map(SearchFetchBackend::Provider)
+            }
+        };
+        let fetch_withheld = match &conversation.fetch_provider {
+            FetchProviderSelection::Disabled => true,
+            // Asking the conversation's own provider to fetch is satisfiable
+            // only where that provider exposes retrieval as its own server
+            // tool. Where it folds retrieval into search instead, the honest
+            // answer is no second web tool — the upstream's own shape — rather
+            // than a silent fallback to someone else's credentials.
+            FetchProviderSelection::Native => !native_fetch,
+            FetchProviderSelection::Explicit { .. } | FetchProviderSelection::Unavailable => false,
+        };
+        Self {
+            max_searches_per_call: conversation.max_searches_per_call,
+            backend,
+            search_withheld: matches!(conversation.provider, SearchProviderSelection::Disabled),
+            fetch,
+            fetch_withheld,
+            execution: conversation.execution(),
+            native_search_tool: conversation.native_search_tool,
+            native_fetch_tool: conversation.native_fetch_tool,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyStatus {
+    pub configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_length: Option<usize>,
+}
+
+/// Provider adapter family. A family selects an AI SDK provider factory, not a
+/// vendor; compatible endpoints can share one family.
+///
+/// `OpenaiCodex` is the one vendor-shaped exception: the ChatGPT-subscription
+/// Codex backend speaks Responses but authenticates with an OAuth session the
+/// host owns (`codex_oauth`), so it cannot be expressed as "a base URL plus a key".
+///
+/// `ClaudeAgent` is not an HTTP dialect at all: the sidecar drives the Claude
+/// Code executable Mewrk ships — the CLI out of the pinned Agent SDK's platform
+/// package — through the official Claude Agent SDK, and the CLI makes the
+/// Anthropic Messages calls itself. It has no key (the CLI authenticates with the
+/// user's own login), no base URL, and no identity fields: the host resolves the
+/// executable on its own (`aisdk::agent::bundled_executable`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFamily {
+    OpenaiResponses,
+    OpenaiCodex,
+    OpenaiChat,
+    Anthropic,
+    ClaudeAgent,
+    Google,
+    Xai,
+    Azure,
+    Bedrock,
+    Vertex,
+    OpenaiCompatible,
+}
+
+/// Family-specific identity fields. This closed enum prevents misspelled keys
+/// from silently doing nothing.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FamilySetting {
+    /// AWS region, which determines the Bedrock endpoint host.
+    Region,
+    /// GCP project ID used in Vertex model paths.
+    Project,
+    /// GCP region used in Vertex endpoint hosts and model paths.
+    Location,
+    /// Optional Azure OpenAI `api-version`; an empty value uses the AI SDK default.
+    ApiVersion,
+}
+
+impl FamilySetting {
+    /// Sidecar wire name. Keep this aligned with `aisdk-service/src/providers.ts`.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Region => "region",
+            Self::Project => "project",
+            Self::Location => "location",
+            Self::ApiVersion => "apiVersion",
+        }
+    }
+
+    /// The field as Provider settings names it, in the app language (the
+    /// renderer's `familySettingMeta`), with an article where English wants one.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Region => crate::ui_text::pick("AWS 区域", "an AWS region"),
+            Self::Project => crate::ui_text::pick("GCP 项目", "a GCP project"),
+            Self::Location => crate::ui_text::pick("GCP 区域", "a GCP location"),
+            Self::ApiVersion => "api-version",
+        }
+    }
+}
+
+impl ProviderFamily {
+    /// All families, for exhaustive tests. Production matches are exhaustive at
+    /// compile time; tests need an iterable catalog.
+    #[cfg(test)]
+    pub const CATALOG: &'static [Self] = &[
+        Self::OpenaiResponses,
+        Self::OpenaiCodex,
+        Self::OpenaiChat,
+        Self::Anthropic,
+        Self::ClaudeAgent,
+        Self::Google,
+        Self::Xai,
+        Self::Azure,
+        Self::Bedrock,
+        Self::Vertex,
+        Self::OpenaiCompatible,
+    ];
+
+    /// Chat endpoint type for this family. This exhaustive match requires new
+    /// families to declare one. Vocabulary only: every model is a chat model, so
+    /// nothing at runtime picks an endpoint by family any more.
+    #[cfg(test)]
+    pub fn chat_endpoint(self) -> EndpointType {
+        match self {
+            Self::OpenaiResponses | Self::OpenaiCodex => EndpointType::OpenaiResponses,
+            // XAI and the generic compatibility layer use `/chat/completions`.
+            Self::OpenaiChat | Self::Xai | Self::OpenaiCompatible => {
+                EndpointType::OpenaiChatCompletions
+            }
+            // The CLI speaks Messages upstream; the endpoint type is a model
+            // vocabulary, not a host-issued request path.
+            Self::Anthropic | Self::ClaudeAgent => EndpointType::AnthropicMessages,
+            Self::Google | Self::Vertex => EndpointType::GoogleGenerative,
+            Self::Azure => EndpointType::AzureOpenai,
+            Self::Bedrock => EndpointType::BedrockConverse,
+        }
+    }
+
+    /// Required identity fields. Missing fields cause recoverable, named runtime
+    /// errors rather than unrelated upstream failures.
+    pub fn required_settings(self) -> &'static [FamilySetting] {
+        match self {
+            Self::Bedrock => &[FamilySetting::Region],
+            Self::Vertex => &[FamilySetting::Project, FamilySetting::Location],
+            Self::OpenaiResponses
+            | Self::OpenaiCodex
+            | Self::OpenaiChat
+            | Self::Anthropic
+            | Self::ClaudeAgent
+            | Self::Google
+            | Self::Xai
+            // Azure `api_version` is optional because the AI SDK has a default.
+            | Self::Azure
+            | Self::OpenaiCompatible => &[],
+        }
+    }
+
+    /// Whether this family's chat base URL has a host-known default so `base_url`
+    /// may be left empty. Vertex and Bedrock derive theirs from identity fields;
+    /// Codex has one fixed backend (`codex_oauth::CODEX_DEFAULT_BASE_URL`) and a
+    /// non-empty value exists only to point at a loopback test double. Claude
+    /// Agent leaves the address to the CLI unless the user overrides it.
+    pub fn derives_base_url(self) -> bool {
+        matches!(
+            self,
+            Self::Vertex | Self::Bedrock | Self::OpenaiCodex | Self::ClaudeAgent
+        )
+    }
+
+    /// Whether this family has a model catalog to read when `base_url` is
+    /// empty. Codex reads its fixed backend and Claude Agent asks the CLI;
+    /// Bedrock and Vertex derive a chat endpoint from identity fields, but
+    /// nothing there lists models, so their model IDs are added by hand.
+    /// Mirrored by TS `modelCapabilities.ts::hasModelCatalog`.
+    pub fn lists_models_without_address(self) -> bool {
+        matches!(self, Self::OpenaiCodex | Self::ClaudeAgent)
+    }
+
+    /// Whether this family has an effective `ReasoningContent` request option.
+    /// Keep this projection aligned with the sidecar's provider-options mapping.
+    pub fn reasoning_content_takes_effect(self) -> bool {
+        matches!(
+            self,
+            Self::OpenaiResponses | Self::OpenaiCodex | Self::Azure
+        )
+    }
+
+    /// Whether this family's dialect places prompt-cache breakpoints, so the
+    /// model's `prompt_cache` attribute reaches the wire. Only the Messages
+    /// protocol takes explicit `cache_control` markers; Bedrock's Converse
+    /// cache points are a different wire and are not driven by this attribute,
+    /// and Claude Agent caches inside the CLI on its own.
+    pub fn prompt_cache_takes_effect(self) -> bool {
+        matches!(self, Self::Anthropic)
+    }
+
+    /// Whether this family has a tool-append interface, so a model's
+    /// `ToolAppend` capability is read: Messages' `tool_addition`, Responses'
+    /// `additional_tools`, Claude Code's own. Elsewhere the capability is
+    /// stored but idle, and every tool is declared up front.
+    pub fn tool_append_takes_effect(self) -> bool {
+        matches!(
+            self,
+            Self::Anthropic | Self::OpenaiResponses | Self::OpenaiCodex | Self::Azure | Self::ClaudeAgent
+        )
+    }
+
+    /// Whether this family can carry a system message mid-conversation, so a
+    /// model's `SystemAppend` capability is read. Google's, Bedrock's and
+    /// Vertex's protocols put every system message at the head, and the Claude
+    /// Code CLI writes its own requests.
+    pub fn system_append_takes_effect(self) -> bool {
+        matches!(
+            self,
+            Self::Anthropic
+                | Self::OpenaiResponses
+                | Self::OpenaiCodex
+                | Self::Azure
+                | Self::OpenaiChat
+                | Self::OpenaiCompatible
+                | Self::Xai
+        )
+    }
+
+    /// Whether this family can mark a function tool asynchronous, so a model's
+    /// `AsyncTools` capability is read: the Responses protocol's `async: true`
+    /// (on OpenAI's API, Azure and the Codex backend alike). No other protocol
+    /// has a call whose result may come back in a later request.
+    pub fn async_tools_take_effect(self) -> bool {
+        matches!(
+            self,
+            Self::OpenaiResponses | Self::OpenaiCodex | Self::Azure
+        )
+    }
+
+    /// Whether this family can compact a conversation's context natively, so
+    /// a model's `NativeCompaction` capability is read: the Responses
+    /// protocol's `compaction` item (on OpenAI's API, Azure and the Codex
+    /// backend alike). No other protocol hands back a compacted context the
+    /// next request can carry.
+    pub fn native_compaction_takes_effect(self) -> bool {
+        matches!(
+            self,
+            Self::OpenaiResponses | Self::OpenaiCodex | Self::Azure
+        )
+    }
+
+    /// Identity fields this family recognizes, including optional fields. Claude
+    /// Agent has none: Mewrk ships the Claude Code build it drives, so there is
+    /// no path for the user to name.
+    pub fn known_settings(self) -> &'static [FamilySetting] {
+        match self {
+            Self::Bedrock => &[FamilySetting::Region],
+            Self::Vertex => &[FamilySetting::Project, FamilySetting::Location],
+            Self::Azure => &[FamilySetting::ApiVersion],
+            Self::OpenaiResponses
+            | Self::OpenaiCodex
+            | Self::OpenaiChat
+            | Self::Anthropic
+            | Self::ClaudeAgent
+            | Self::Google
+            | Self::Xai
+            | Self::OpenaiCompatible => &[],
+        }
+    }
+}
+
+/// Provider endpoint shape. Endpoint identity, rather than vendor identity,
+/// covers shared OpenAI-compatible image and audio paths.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointType {
+    OpenaiChatCompletions,
+    OpenaiResponses,
+    AnthropicMessages,
+    GoogleGenerative,
+    AzureOpenai,
+    BedrockConverse,
+    OpenaiImageGeneration,
+    OpenaiImageEdit,
+    OpenaiTextToSpeech,
+    OpenaiAudioTranscription,
+}
+
+impl EndpointType {
+    /// Catalog order must match the TypeScript mirror. It exists only for
+    /// vocabulary and cross-language tests.
+    #[cfg(test)]
+    pub const CATALOG: &'static [Self] = &[
+        Self::OpenaiChatCompletions,
+        Self::OpenaiResponses,
+        Self::AnthropicMessages,
+        Self::GoogleGenerative,
+        Self::AzureOpenai,
+        Self::BedrockConverse,
+        Self::OpenaiImageGeneration,
+        Self::OpenaiImageEdit,
+        Self::OpenaiTextToSpeech,
+        Self::OpenaiAudioTranscription,
+    ];
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::OpenaiChatCompletions => "openai_chat_completions",
+            Self::OpenaiResponses => "openai_responses",
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::GoogleGenerative => "google_generative",
+            Self::AzureOpenai => "azure_openai",
+            Self::BedrockConverse => "bedrock_converse",
+            Self::OpenaiImageGeneration => "openai_image_generation",
+            Self::OpenaiImageEdit => "openai_image_edit",
+            Self::OpenaiTextToSpeech => "openai_text_to_speech",
+            Self::OpenaiAudioTranscription => "openai_audio_transcription",
+        }
+    }
+
+    #[cfg(test)]
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::CATALOG
+            .iter()
+            .copied()
+            .find(|entry| entry.slug() == slug)
+    }
+}
+
+/// Explicit model capabilities. They are inferred once for unknown models and
+/// then persisted; runtime decisions never re-guess them.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapability {
+    ImageRecognition,
+    /// Takes a tool appended mid-conversation through its protocol's append
+    /// interface at its provider's endpoint (`tool_append.rs`). Read only
+    /// where `ProviderFamily::tool_append_takes_effect` holds.
+    ToolAppend,
+    /// Takes a system message in the middle of the conversation at its
+    /// provider's endpoint (`system_append.rs`). Read only where
+    /// `ProviderFamily::system_append_takes_effect` holds.
+    SystemAppend,
+    /// Takes a tool call whose result arrives in a later request, on the
+    /// call's own id, while it goes on working (`async_tools.rs`). Read only
+    /// where `ProviderFamily::async_tools_take_effect` holds.
+    AsyncTools,
+    /// Compacts its own context: past the native-compaction threshold the
+    /// provider hands back an opaque item that stands in for the history
+    /// before it (`native_compaction.rs`). Read only where
+    /// `ProviderFamily::native_compaction_takes_effect` holds.
+    NativeCompaction,
+}
+
+impl ModelCapability {
+    /// Catalog and chip-rendering order, matched by TypeScript tests.
+    #[cfg(test)]
+    pub const CATALOG: &'static [Self] = &[
+        Self::ImageRecognition,
+        Self::ToolAppend,
+        Self::SystemAppend,
+        Self::AsyncTools,
+        Self::NativeCompaction,
+    ];
+
+    /// This declaration is read only by cross-language tests and must agree with
+    /// serde's `snake_case` persistence form.
+    #[cfg(test)]
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::ImageRecognition => "image_recognition",
+            Self::ToolAppend => "tool_append",
+            Self::SystemAppend => "system_append",
+            Self::AsyncTools => "async_tools",
+            Self::NativeCompaction => "native_compaction",
+        }
+    }
+
+    #[cfg(test)]
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::CATALOG
+            .iter()
+            .copied()
+            .find(|entry| entry.slug() == slug)
+    }
+}
+
+/// Form in which a model returns reasoning.
+///
+/// This is a model attribute, not a protocol attribute: compatible Responses
+/// endpoints can return either plaintext or encrypted reasoning. Only families
+/// with a request-side control currently consume it.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningContent {
+    /// Readable reasoning text with no replayable ciphertext.
+    #[default]
+    Plaintext,
+    /// Opaque encrypted reasoning that survives tool turns only by replay.
+    Encrypted,
+}
+
+impl ReasoningContent {
+    /// Selector order, matched by TypeScript tests.
+    #[cfg(test)]
+    pub const CATALOG: &'static [Self] = &[Self::Plaintext, Self::Encrypted];
+
+    #[cfg(test)]
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Plaintext => "plaintext",
+            Self::Encrypted => "encrypted",
+        }
+    }
+
+    #[cfg(test)]
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::CATALOG
+            .iter()
+            .copied()
+            .find(|entry| entry.slug() == slug)
+    }
+}
+
+/// Effective body form of a reasoning card after `ReasoningContent` is
+/// resolved. Plaintext cards are editable; encrypted cards are delete-only
+/// because their body never reaches local storage.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningForm {
+    Plaintext,
+    Encrypted,
+}
+
+impl From<ReasoningContent> for ReasoningForm {
+    fn from(content: ReasoningContent) -> Self {
+        match content {
+            ReasoningContent::Plaintext => Self::Plaintext,
+            ReasoningContent::Encrypted => Self::Encrypted,
+        }
+    }
+}
+
+/// Provider-owned reasoning payload replayed verbatim on later turns.
+///
+/// Holds the AI SDK reasoning parts (`{ "text", "providerOptions" }`) the
+/// producing provider handed back for one card: an Anthropic `signature` or
+/// `redactedData`, or a Responses `itemId` plus `reasoningEncryptedContent`.
+/// The card's visible `content` is presentation; these parts are the bytes the
+/// provider signed, so editing the card cannot invalidate a signature. Absent
+/// for cards written before this field existed and for providers that return
+/// nothing replayable, in which case history projects the plain card text.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReasoningReplay {
+    /// Model id that produced the payload. Anthropic signatures are bound to
+    /// the model, so a switched conversation must not replay them.
+    pub model: String,
+    /// AI SDK reasoning parts in provider order. Each is
+    /// `{ "text": string, "providerOptions": object }`; the host never reads
+    /// inside `providerOptions`.
+    pub parts: Vec<Value>,
+}
+
+/// The five reasoning levels the composer offers, lowest first. There is no
+/// "off": every request asks the model to think, and how each level reaches a
+/// provider is the sidecar's per-family mapping (`aisdk-service/src/reasoning.ts`).
+///
+/// Older archives spell levels this no longer has: `disabled` (thinking off)
+/// and `minimal` read as the lowest level there is, `xhigh` is `extra` under
+/// its former name.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    #[serde(alias = "minimal", alias = "disabled")]
+    Low,
+    #[default]
+    Medium,
+    High,
+    #[serde(alias = "xhigh")]
+    Extra,
+    Max,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityLevel {
+    /// `plan` is what archives written while plan mode was a security level
+    /// hold. Plan mode is a conversation setting of its own now
+    /// (`ConversationSettings::plan_mode_enabled`), and the loaders move the
+    /// old value there (`migrate_legacy_plan_level`); the alias only keeps a
+    /// stray one from failing a whole document.
+    #[default]
+    #[serde(alias = "plan")]
+    RequestApproval,
+    AllowEdits,
+    FullAccess,
+}
+
+impl SecurityLevel {
+    /// Every level, so exhaustiveness can be asserted at run time where the
+    /// compiler cannot (serde names, the `LiveSecurityLevel` byte mapping).
+    #[cfg(test)]
+    pub const ALL: [SecurityLevel; 3] = [
+        SecurityLevel::RequestApproval,
+        SecurityLevel::AllowEdits,
+        SecurityLevel::FullAccess,
+    ];
+
+    const fn as_byte(self) -> u8 {
+        match self {
+            SecurityLevel::RequestApproval => 1,
+            SecurityLevel::AllowEdits => 2,
+            SecurityLevel::FullAccess => 3,
+        }
+    }
+
+    const fn from_byte(byte: u8) -> SecurityLevel {
+        match byte {
+            2 => SecurityLevel::AllowEdits,
+            3 => SecurityLevel::FullAccess,
+            // Only `as_byte` writes the cell, so this is the `RequestApproval`
+            // arm; an impossible byte falls back to the strictest prompting
+            // level rather than widening authority.
+            _ => SecurityLevel::RequestApproval,
+        }
+    }
+}
+
+/// Moves the security level `plan`, which archives from when plan mode was a
+/// level hold, to what it means now: the strictest level, with the plan-mode
+/// setting on. Walks the whole value, because the level sits in every settings
+/// carrier — a conversation's own, a preset's, a workspace's last-used ones.
+pub fn migrate_legacy_plan_level(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.get("securityLevel").and_then(serde_json::Value::as_str) == Some("plan") {
+                object.insert("securityLevel".into(), serde_json::json!("request_approval"));
+                object.insert("planModeEnabled".into(), serde_json::json!(true));
+            }
+            for child in object.values_mut() {
+                migrate_legacy_plan_level(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                migrate_legacy_plan_level(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The level a live run is executing under right now, as opposed to the level
+/// it started with. The user may move the level at any time, mid-turn
+/// included, so every gate that runs after the switch must read this cell
+/// rather than the snapshot the run began with.
+pub struct LiveSecurityLevel(std::sync::atomic::AtomicU8);
+
+impl LiveSecurityLevel {
+    pub fn new(level: SecurityLevel) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(level.as_byte()))
+    }
+
+    pub fn get(&self) -> SecurityLevel {
+        SecurityLevel::from_byte(self.0.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub fn set(&self, level: SecurityLevel) {
+        self.0
+            .store(level.as_byte(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl std::fmt::Debug for LiveSecurityLevel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("LiveSecurityLevel")
+            .field(&self.get())
+            .finish()
+    }
+}
+
+/// `RunModelRequest` derives `PartialEq`; compare the level the cell holds,
+/// because the atomic itself is not comparable.
+impl PartialEq for LiveSecurityLevel {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+/// Whether a conversation is in plan mode right now, as opposed to when its
+/// run started. The user turns it on and off from the composer at any time,
+/// and an approved plan turns it off in the middle of the turn that asked, so
+/// everything that reads the mode after the run started reads this cell.
+pub struct LivePlanMode(std::sync::atomic::AtomicBool);
+
+impl LivePlanMode {
+    pub fn new(enabled: bool) -> Self {
+        Self(std::sync::atomic::AtomicBool::new(enabled))
+    }
+
+    pub fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set(&self, enabled: bool) {
+        self.0.store(enabled, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl std::fmt::Debug for LivePlanMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("LivePlanMode").field(&self.get()).finish()
+    }
+}
+
+/// Compared by the value the cell holds, like [`LiveSecurityLevel`].
+impl PartialEq for LivePlanMode {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+/// Where a plan document stands with the user.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    /// Written by the model, not yet presented for approval.
+    #[default]
+    Draft,
+    Approved,
+    Rejected,
+}
+
+impl PlanStatus {
+    /// The SQLite column is a text CHECK constraint, so the stored spelling is
+    /// part of the schema rather than an implementation detail of serde.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanStatus::Draft => "draft",
+            PlanStatus::Approved => "approved",
+            PlanStatus::Rejected => "rejected",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<PlanStatus> {
+        match value {
+            "draft" => Some(PlanStatus::Draft),
+            "approved" => Some(PlanStatus::Approved),
+            "rejected" => Some(PlanStatus::Rejected),
+            _ => None,
+        }
+    }
+}
+
+/// The plan document one conversation is working from: the markdown the model
+/// writes with the `plan` tool and the user reads before approving
+/// implementation. At most one per conversation — a write replaces the whole
+/// document, so history lives in the timeline rather than here.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationPlan {
+    pub conversation_id: String,
+    pub markdown: String,
+    pub status: PlanStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProfile {
+    pub id: String,
+    /// Display name. Empty displays `id`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Collapsed model-list group. Empty is inferred from `id`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    /// Explicit capability set.
+    #[serde(default)]
+    pub capabilities: BTreeSet<ModelCapability>,
+    /// Reasoning return form. Always written explicitly: a record that omits it
+    /// is repaired on load by `resolve_reasoning_content`.
+    #[serde(default)]
+    pub reasoning_content: ReasoningContent,
+    /// Whether requests carry Claude Code's prompt-cache breakpoints. Claude
+    /// models only cache what the client marks, so this defaults on; a record
+    /// that omits it is repaired to `true` on load. Consumed by families where
+    /// `ProviderFamily::prompt_cache_takes_effect` holds; elsewhere the value
+    /// is stored but has no wire effect.
+    #[serde(default = "default_prompt_cache")]
+    pub prompt_cache: bool,
+    /// How many minutes after a request this model's prompt cache is taken to
+    /// still hold it. Only the renderer reads it: it decides how long the
+    /// conversation settings warn before rewriting that cache
+    /// (`src/lib/toolLock.ts`). `None` means the renderer's default. It is not
+    /// sent to any provider — the providers' own lifetimes are theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_minutes: Option<u32>,
+}
+
+fn default_prompt_cache() -> bool {
+    true
+}
+
+impl ModelProfile {
+    pub fn has(&self, capability: ModelCapability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+
+    pub fn set_capability(&mut self, capability: ModelCapability, on: bool) {
+        if on {
+            self.capabilities.insert(capability);
+        } else {
+            self.capabilities.remove(&capability);
+        }
+    }
+
+    pub fn supports_vision(&self) -> bool {
+        self.has(ModelCapability::ImageRecognition)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HookDefinition {
+    pub id: String,
+    pub name: String,
+    pub event: HookEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_windows: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    pub enabled: bool,
+    pub timeout_ms: u64,
+    /// Where a hook declared by a WSL or SSH workspace's `hooks.json` runs:
+    /// that machine. `None` runs it on this computer. Host-only, from
+    /// discovery; never accepted from the renderer.
+    #[serde(skip)]
+    pub on_machine: Option<crate::remote_capabilities::HookPlace>,
+    /// The workspace whose `hooks.json` declared it, by
+    /// [`crate::capabilities::workspace_key`]; `None` for a global hook.
+    /// Host-only, from discovery.
+    #[serde(skip)]
+    pub workspace_key: Option<String>,
+    /// The conversation's number for that workspace, set when a run places its
+    /// hooks. A workspace's hook runs for what happens in that workspace and
+    /// for the conversation's own events, never for another workspace's tool
+    /// calls. Host-only.
+    #[serde(skip)]
+    pub member: Option<u32>,
+    /// Where a hook a workspace on this computer declared runs: that
+    /// workspace's folder (the conversation's worktree of it when there is
+    /// one), with its variables. Host-only, set when a run places its hooks;
+    /// `None` for a global hook, which runs in the run's own folder.
+    #[serde(skip)]
+    pub local_place: Option<LocalHookPlace>,
+}
+
+/// The folder and variables of the workspace on this computer a hook belongs
+/// to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalHookPlace {
+    pub cwd: String,
+    pub env: Vec<(String, String)>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    SessionStart,
+    InstructionsLoaded,
+    UserPromptSubmit,
+    PreToolUse,
+    PermissionRequest,
+    PostToolUse,
+    Stop,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HookContextMetadata {
+    pub execution_id: String,
+    pub hook_id: String,
+    pub hook_name: String,
+    pub event: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub context_injected: bool,
+}
+
+/// Per-tool user text from a tool-description file. `description` replaces the
+/// tool's model-visible description; it does not change the parameter schema,
+/// permissions, or execution.
+///
+/// A tool has no separate guidance slot: an older file's `usageGuidance` key is
+/// an unknown key and is ignored on load. The field was once named
+/// `schemaNotes`, which is still read as an alias.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDescriptionEntry {
+    pub tool_name: String,
+    #[serde(default, alias = "schemaNotes")]
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationPreset {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// The one conversation template this preset opens with, empty for none.
+    ///
+    /// Bound by id, like a role's, because the body lives in the host's template
+    /// store: nothing the renderer writes here can become a tool result the model
+    /// believes really ran. The id may dangle, which reads as "no template" and
+    /// leaves the preset a working one.
+    ///
+    /// `serde(default)` is required: documents written before this field existed
+    /// must still load.
+    #[serde(default)]
+    pub template_id: String,
+    pub settings: ConversationPresetSettings,
+}
+
+/// Reusable settings owned by a conversation preset. Resource IDs are stored
+/// directly rather than through preset layers.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationPresetSettings {
+    pub enabled_tools: Vec<String>,
+    /// At most one selected description file. A missing file falls back to the
+    /// built-in descriptions.
+    #[serde(default)]
+    pub tool_description_file_id: Option<String>,
+    /// Subagent roles copied into a new conversation, by catalog id, in the
+    /// same shape as `skill_ids`: each names one `agents/*.json` file or a
+    /// built-in role (`agent_roles`). A dangling id is skipped.
+    #[serde(default)]
+    pub agent_ids: Vec<String>,
+    /// Roles as presets stored them before roles were files. Read only as the
+    /// input of `agent_roles::migrate_legacy_agent_definitions` and never
+    /// accepted from the renderer: every save keeps the committed list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_definitions: Vec<AgentDefinition>,
+    /// Template for allowing roleless subagents. A missing key means roles are
+    /// required.
+    #[serde(default)]
+    pub allow_roleless_subagents: bool,
+    /// Directly selected capability resource IDs.
+    #[serde(default)]
+    pub hook_ids: Vec<String>,
+    #[serde(default)]
+    pub skill_ids: Vec<String>,
+    #[serde(default)]
+    pub mcp_ids: Vec<String>,
+    /// Web-search behavior template copied into a new conversation.
+    #[serde(default)]
+    pub web_search: ConversationWebSearchSettings,
+    /// Web-access switch copied into a new conversation. An enabled preset
+    /// derives `web_search` and `web_fetch` by the conversation's own rule.
+    #[serde(default)]
+    pub web_search_enabled: bool,
+    /// Security-policy template copied into a new conversation.
+    #[serde(default)]
+    pub security_level: SecurityLevel,
+    /// Memory-tier switches copied into a new conversation. Each enabled tier
+    /// contributes its instructions, index, and tools.
+    #[serde(default)]
+    pub global_memory_enabled: bool,
+    #[serde(default)]
+    pub project_memory_enabled: bool,
+    /// On-demand skill-delivery template. A missing key delivers skill bodies
+    /// in the initial system prompt.
+    #[serde(default)]
+    pub skill_tool_enabled: bool,
+    /// MCP tool-discovery template. A missing key declares every MCP tool's
+    /// schema up front.
+    #[serde(default)]
+    pub mcp_tool_discovery_enabled: bool,
+    /// Host-message container template copied into a new conversation. A
+    /// missing key means `user`.
+    #[serde(default)]
+    pub host_message_container: HostMessageContainer,
+    // A sandbox template was copied into new conversations from here. The
+    // sandbox is a setting of each workspace now, so a preset has none; an
+    // old preset's key is read past and not written back.
+    // The five file write guards were preset templates here. They are
+    // unconditional in the host now, so there is nothing left to copy into a
+    // conversation. See [`FileGuard`].
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityCatalog {
+    #[serde(default)]
+    pub hooks: Vec<ResourceDescriptor>,
+    pub skills: Vec<ResourceDescriptor>,
+    pub mcps: Vec<ResourceDescriptor>,
+    /// Language servers discovered in `lsp.json` plus the built-in presets.
+    ///
+    /// Read-only: unlike skills and MCP servers, a conversation never selects
+    /// one of these. Which server answers a file is decided by its extension,
+    /// so a per-conversation checkbox would express nothing. The rows exist so
+    /// a user can see what was found and why an entry is unavailable.
+    #[serde(default)]
+    pub lsps: Vec<ResourceDescriptor>,
+    /// Read-only tool-description files discovered on disk. The app applies the
+    /// selected file's content but never edits these resources.
+    #[serde(default)]
+    pub tool_description_files: Vec<ResourceDescriptor>,
+    /// Subagent roles: the built-in ones first, then the `agents/*.json`
+    /// files of every level. An unreadable or invalid file is a row with
+    /// `available: false` and the reason as its description.
+    ///
+    /// Carried to the renderer but never persisted: the anchor keeps this
+    /// list empty (`storage::save_unchecked`), since it is a scan of the
+    /// files the renderer repeats at every start.
+    #[serde(default)]
+    pub agents: Vec<crate::agent_roles::AgentRoleDescriptor>,
+    /// Workspaces on another machine whose `.mewrk` the scan could not read,
+    /// with why: their rows are missing because the machine did not answer,
+    /// not because they were deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_levels: Vec<UnreadableLevel>,
+}
+
+/// A workspace level a scan could not read.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnreadableLevel {
+    /// The workspace, by [`crate::capabilities::workspace_key`].
+    pub workspace_key: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceDescriptor {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub location: String,
+    pub source: ResourceSource,
+    pub available: bool,
+    /// The workspace whose `.mewrk` directory this entry was read from, by
+    /// its location ([`crate::capabilities::workspace_key`]: the machine and
+    /// the registered directory); `None` for global (`~/.mewrk`) and
+    /// built-in entries. A conversation may select the entries of every one
+    /// of its workspaces, so the renderer groups and narrows on this and the
+    /// host resolves a run against the same set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_key: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceSource {
+    Builtin,
+    User,
+    Workspace,
+}
+
+/// A sidebar **project** (项目): the entity that owns conversations.
+///
+/// The type keeps its historical name because the document, the store and every
+/// IPC coordinate (`workspaceId`) are keyed on it; only the product term moved.
+/// A project has one or more *workspaces*, each a directory on some machine:
+/// `path` + `machine` are workspace 1 — the one isolated worktrees, the files
+/// pane and the default Git review act on — and `additional_workspaces` are
+/// workspaces 2..k. A conversation's own attached workspaces are numbered after
+/// all of those.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Workspace {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub kind: WorkspaceKind,
+    /// Workspace 1's directory. Empty for the temporary project.
+    pub path: String,
+    /// Machine this workspace's directory lives on. `None` is the host machine,
+    /// which is what every workspace registered before machines existed is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<RunTarget>,
+    /// The project's further workspaces, 2..k in order, each on the machine it
+    /// names. Every conversation in the project can address them, numbered
+    /// right after workspace 1 and before the conversation's own attached ones.
+    ///
+    /// Only a directory project has them; the temporary project's list must be
+    /// empty. Each entry passed through a host directory picker, which
+    /// `storage::validate_workspace_authorizations` re-checks on every save just
+    /// as it does for `path`. Worktrees never apply to these: an isolated
+    /// worktree is a checkout of workspace 1 only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_workspaces: Vec<AttachedWorkspace>,
+    pub created_at: String,
+    /// Preset forced for workspace-created conversations. Empty or dangling IDs
+    /// use `last_conversation_settings`.
+    #[serde(default)]
+    pub default_conversation_preset_id: String,
+    /// Most recent conversation settings snapshot for this workspace. The
+    /// renderer writes it; the host only persists and validates it.
+    #[serde(default)]
+    pub last_conversation_settings: Option<ConversationSettings>,
+    /// The project's unsent new task's own settings. Every project has at most
+    /// one draft. The renderer writes it; the host only persists and validates
+    /// it, as it does `last_conversation_settings`. Its roles are canonicalized
+    /// when the draft becomes a conversation, not here: nothing runs from a draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_conversation: Option<DraftConversationSnapshot>,
+    pub conversations: Vec<Conversation>,
+}
+
+impl Workspace {
+    /// The project's workspaces after workspace 1, as the conversation workspace
+    /// list numbers them. Only a directory project has any: a temporary project
+    /// is one scratch directory per conversation, and an entry recorded on one
+    /// anyway (validation refuses it) must not widen what its conversations
+    /// can reach.
+    pub fn member_workspaces(&self) -> &[AttachedWorkspace] {
+        match self.kind {
+            WorkspaceKind::Directory => &self.additional_workspaces,
+            WorkspaceKind::Temporary | WorkspaceKind::Unsupported => &[],
+        }
+    }
+
+    /// Every workspace a conversation in this project addresses after its
+    /// primary: the project's members (2..k), then the conversation's own
+    /// attached workspaces (k+1..). This is the one place that order is decided;
+    /// the model run, the manual tool-card policy and the terminal all resolve
+    /// through it, so workspace 3 means the same directory to each of them.
+    pub fn conversation_workspaces_after_primary(
+        &self,
+        conversation: &Conversation,
+    ) -> Vec<AttachedWorkspace> {
+        self.member_workspaces()
+            .iter()
+            .cloned()
+            .chain(conversation.effective_attached_workspaces())
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceKind {
+    #[default]
+    Directory,
+    #[serde(alias = "none")]
+    Temporary,
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserAbortedTaskMetrics {
+    pub child_count: Option<u64>,
+    pub tokens: Option<u64>,
+    pub tool_count: Option<u64>,
+    pub elapsed_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserAbortedTaskRecord {
+    pub id: String,
+    pub source_kind: String,
+    pub source_identity: String,
+    pub label: String,
+    pub detail: String,
+    pub metrics: UserAbortedTaskMetrics,
+    pub started_at: String,
+    pub ended_at: String,
+    pub reason: String,
+}
+
+/// Which conversation a timeline fork was taken from, and which of its forks it
+/// is. Forks of a fork name the same origin, so one conversation's forks share
+/// one numbering.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationForkOrigin {
+    pub conversation_id: String,
+    pub number: u32,
+}
+
+/// Which conversation an auto-compact continuation carries on, and which of its
+/// continuations it is: the host titles it `<origin title>-handover-<number>`
+/// (`handoff.rs`). A continuation of a continuation names the same origin, so a
+/// chain of handoffs shares one numbering. A fork's shape, not a fork: its title
+/// is fixed when it opens and follows nothing afterwards.
+pub type ConversationHandoffOrigin = ConversationForkOrigin;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Conversation {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub settings: ConversationSettings,
+    pub contexts: Vec<ContextItem>,
+    /// Follow-up messages submitted while a model turn is running. They are
+    /// persisted before execution so cancellation or reload never drops them.
+    #[serde(default)]
+    pub queued_messages: Vec<QueuedMessage>,
+    #[serde(default)]
+    pub branches: Vec<ConversationBranch>,
+    #[serde(default)]
+    pub user_aborted_tasks: Vec<UserAbortedTaskRecord>,
+    /// Whether the user's Stop paused the queue: `queued_messages` wait for the
+    /// user's next send instead of going out one round at a time. Saved with
+    /// the conversation, so a restart does not send what the user held back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queue_paused: bool,
+    /// Isolated Git worktrees for this conversation, at most one per project
+    /// workspace: each stands in for the workspace it was checked out from
+    /// (see [`Conversation::worktree_for`]). They belong on the conversation
+    /// because copying settings must not copy a worktree path.
+    ///
+    /// Also read from the pre-multi-workspace `worktree` key, which held one
+    /// record for workspace 1 (see [`deserialize_worktrees`]).
+    #[serde(
+        default,
+        alias = "worktree",
+        deserialize_with = "deserialize_worktrees"
+    )]
+    pub worktrees: Vec<ConversationWorktree>,
+    /// Shell execution location. `None` means local execution. It belongs on the
+    /// conversation because settings copies must not copy an SSH machine binding.
+    ///
+    /// Retained for compatibility only: the host no longer resolves it. A run's
+    /// shell environment is its workspace 1's machine, and every other machine
+    /// is reached through the numbered workspace list. The composer's picker that
+    /// set it is gone, so a stale value here (a deleted SSH machine, say) must
+    /// not be able to fail a run the user has no way left to repair.
+    #[serde(default)]
+    pub run_target: Option<RunTarget>,
+    /// The conversation this one was forked from. `None` is a top-level
+    /// conversation. Nesting is a renderer concept: the child's permissions
+    /// come from its own `settings`. Lives on the conversation, not in
+    /// `settings`, for the same reason as `worktrees`: settings are copied
+    /// wholesale by presets and workspace snapshots.
+    #[serde(default)]
+    pub parent_conversation_id: Option<String>,
+    /// Set on a conversation forked from the timeline's context menu while its
+    /// title is still the one named after its origin; the renderer names and
+    /// renames it (`lib/conversationForks.ts`) and clears this when the user
+    /// renames the fork. A trace like `preset_id`: it may dangle once the origin
+    /// is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<ConversationForkOrigin>,
+    /// Set on a continuation the `handoff` tool opened; only the next handoff
+    /// reads it, to number its own continuation. A trace like `fork_of`: it may
+    /// dangle once the origin is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_of: Option<ConversationHandoffOrigin>,
+    /// Conversation preset most recently applied. Empty means an unnamed draft.
+    /// A trace, not a link: it is never validated against the catalog, never
+    /// disables a field, and may dangle after its preset is deleted.
+    #[serde(default)]
+    pub preset_id: String,
+    /// Conversation template most recently applied. Empty means none. A trace on
+    /// the same terms as `preset_id`: never validated, never disabling, and free
+    /// to dangle once its template is deleted. It exists so the settings picker
+    /// can tell "this timeline is that template's message queue" from "this
+    /// timeline is the user's own work", which is what decides whether switching
+    /// templates has to ask first.
+    #[serde(default)]
+    pub template_id: String,
+    /// Directories outside the primary workspace this conversation may also work
+    /// in, each on the machine it names. Together with the primary workspace they
+    /// form the numbered list the model addresses: the primary is workspace 1 and
+    /// these follow in order.
+    ///
+    /// On the conversation rather than in `settings` for the same reason as
+    /// `worktrees`: presets and workspace snapshots copy settings wholesale, and a
+    /// path that one conversation was granted is not a path another may have.
+    /// Each entry passed through the host's directory picker — native for the
+    /// host machine, the remote browser for a WSL or SSH machine — which is what
+    /// `storage::validate_workspace_authorizations` re-checks on every save, so
+    /// the renderer cannot widen a conversation's reach by writing a path into
+    /// the document.
+    #[serde(default)]
+    pub attached_workspaces: Vec<AttachedWorkspace>,
+    /// Superseded by `attached_workspaces`, which carries a machine alongside
+    /// each path. Read from archives written before workspaces could be remote
+    /// and folded into host-machine entries by
+    /// [`Conversation::adopt_legacy_additional_directories`]; never written back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<String>,
+}
+
+impl Conversation {
+    /// The isolated worktree standing in for the project workspace at 1-based
+    /// position `member`, whose registered location is `registered`.
+    ///
+    /// A record names the workspace it was checked out from by machine and
+    /// path, not by position, so a project whose workspaces are reordered or
+    /// removed never hands one workspace's worktree to another: a record whose
+    /// workspace is gone simply stands in for nothing. A record from before
+    /// every workspace could have one names no workspace and is workspace 1's.
+    pub fn worktree_for(
+        &self,
+        member: usize,
+        registered: &AttachedWorkspace,
+    ) -> Option<&ConversationWorktree> {
+        self.worktrees.iter().find(|worktree| match &worktree.workspace {
+            Some(source) => source.same_location(registered),
+            None => member == 1,
+        })
+    }
+
+    /// The attached workspaces, with pre-multi-machine grants folded in.
+    ///
+    /// An archive written before workspaces carried a machine names host-machine
+    /// directories, so every legacy entry reads as an entry with no machine. The
+    /// fold is a read rather than a migration on load: the legacy field is the
+    /// only record those grants have until the conversation is next saved, and a
+    /// reader that skipped it would silently narrow what the conversation could
+    /// reach.
+    ///
+    /// The legacy field is ignored once `attached_workspaces` holds anything —
+    /// that document has been through the new path, and a stale legacy entry must
+    /// not resurrect a grant the user has since removed.
+    pub fn effective_attached_workspaces(&self) -> Vec<AttachedWorkspace> {
+        if !self.attached_workspaces.is_empty() || self.additional_directories.is_empty() {
+            return self.attached_workspaces.clone();
+        }
+        self.additional_directories
+            .iter()
+            .map(|path| AttachedWorkspace {
+                machine: None,
+                path: path.clone(),
+            })
+            .collect()
+    }
+}
+
+/// Shell execution location selected by a conversation. SSH stores only a stable
+/// catalog ID; connection settings are resolved at dispatch time.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RunTarget {
+    /// Execute in a WSL distribution addressed by its current name.
+    #[serde(rename_all = "camelCase")]
+    Wsl { distro: String },
+    /// Execute on a user-configured SSH machine.
+    #[serde(rename_all = "camelCase")]
+    Ssh { machine_id: String },
+}
+
+/// One directory a conversation may work in, together with the machine it is on.
+///
+/// `machine` absent is the host machine, matching [`RunTarget`]'s own "local is
+/// the absent variant" convention. The model never sees these paths as its own
+/// addressing scheme: it names a workspace by its 1-based position in the
+/// conversation's workspace list, which is what the `workspace` parameter on
+/// every path-taking tool carries.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachedWorkspace {
+    /// Machine this directory lives on. `None` is the host machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<RunTarget>,
+    /// Absolute path on that machine. A remote path is POSIX and may begin `~`.
+    pub path: String,
+}
+
+impl AttachedWorkspace {
+    /// Whether two records name the same directory on the same machine.
+    ///
+    /// Paths are compared as recorded, less trailing separators: both came
+    /// back from a directory picker, which spells a directory one way.
+    pub fn same_location(&self, other: &AttachedWorkspace) -> bool {
+        crate::run_environment::env_key(self.machine.as_ref())
+            == crate::run_environment::env_key(other.machine.as_ref())
+            && self.path.trim_end_matches(['/', '\\']) == other.path.trim_end_matches(['/', '\\'])
+    }
+}
+
+/// Isolated conversation worktree. Branch and baseline are both required for
+/// safe release and extra-commit detection.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationWorktree {
+    /// Root of the checkout, on the machine of the workspace it came from.
+    pub path: String,
+    pub branch: String,
+    pub base_oid: String,
+    /// The branch the worktree was forked from, which the review shows it
+    /// against. `None` for a detached HEAD, and on records written before it
+    /// was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// The project workspace this worktree was checked out from — its machine
+    /// and registered root — which it stands in for. `None` on records written
+    /// when only workspace 1 could have a worktree: those are workspace 1's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<AttachedWorkspace>,
+}
+
+/// Reads [`Conversation::worktrees`] from either shape it has been written
+/// in: the list, or — under the legacy `worktree` key — one record or `null`.
+pub fn deserialize_worktrees<'de, D>(deserializer: D) -> Result<Vec<ConversationWorktree>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Shape {
+        Many(Vec<ConversationWorktree>),
+        One(ConversationWorktree),
+    }
+    Ok(match Option::<Shape>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(Shape::One(worktree)) => vec![worktree],
+        Some(Shape::Many(worktrees)) => worktrees,
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedMessage {
+    pub id: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileAttachment>,
+    pub created_at: String,
+}
+
+/// One suffix choice after a user-message fork point. The active slot is an
+/// empty marker; its live suffix remains in `Conversation::contexts`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationBranch {
+    pub id: String,
+    pub fork_context_id: String,
+    pub active: bool,
+    #[serde(default)]
+    pub contexts: Vec<ContextItem>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// What the messages the host hands the model between rounds come in: a
+/// background task's result nobody waited for, a hook's context, a skill added
+/// later, a file that changed, an instruction with no system message to ride
+/// (`wire_history::host_delivery`). A conversation setting, which its
+/// subagents and workflow steps follow.
+///
+/// Either way the timeline holds one card per message, and the card converts
+/// to the other form, so switching replays the whole transcript in the new
+/// one. A background task's result on a model that takes asynchronous tool
+/// calls is the output of the call that started the task whichever is chosen
+/// (`async_tools.rs`).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostMessageContainer {
+    /// A user-role message, as Claude Code delivers its reminders and task
+    /// notifications: `<system-reminder>`, and a task's `<task-notification>`
+    /// behind the preamble that says it is not the user speaking.
+    #[default]
+    User,
+    /// The result of a call to `box`, a no-op tool every run declares, which
+    /// the host writes into the transcript itself: the call with its one empty
+    /// argument, and the message as its result.
+    Box,
+}
+
+/// How a conversation auto-compacts once its context crosses the threshold:
+/// one of the two, chosen per conversation. Each method's threshold is global
+/// ([`AutoCompactSettings`]).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMethod {
+    /// The model writes handoff notes and carries on in a new conversation
+    /// (`handoff.rs`).
+    #[default]
+    Handoff,
+    /// The provider compacts the context into one item and the work carries
+    /// on in a new conversation that opens on it (`native_compaction.rs`).
+    Native,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSettings {
+    pub enabled_tools: Vec<String>,
+    /// Directly selected capability resource IDs.
+    #[serde(default)]
+    pub hook_ids: Vec<String>,
+    #[serde(default)]
+    pub skill_ids: Vec<String>,
+    #[serde(default)]
+    pub mcp_ids: Vec<String>,
+    /// At most one selected description file; `None` uses built-in descriptions.
+    #[serde(default)]
+    pub tool_description_file_id: Option<String>,
+    /// The subagent roles this conversation offers, by catalog id: built-in
+    /// roles and the `agents/*.json` files of the global level and of this
+    /// conversation's workspaces. A selected id discovery cannot find is
+    /// skipped. Models select a role by its name only.
+    #[serde(default)]
+    pub agent_ids: Vec<String>,
+    /// Roles as conversations stored them before roles were files: the input
+    /// of `agent_roles::migrate_legacy_agent_definitions`, and nothing else.
+    /// Host-owned: every save and update keeps the committed list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_definitions: Vec<AgentDefinition>,
+    /// Whether subagents may omit a named role.
+    ///
+    /// When disabled, `agent_spawn` and workflow steps require a role. When no
+    /// role is available, the host treats this as enabled: requiring an impossible
+    /// value would make every call fail. A missing key means disabled.
+    #[serde(default)]
+    pub allow_roleless_subagents: bool,
+    /// Conversation search behavior, initially copied from its preset template.
+    #[serde(default)]
+    pub web_search: ConversationWebSearchSettings,
+    /// Whether this conversation can reach the web at all.
+    ///
+    /// The feature switch for both web tools, in the same shape as the two
+    /// memory tiers: when on, the host derives `web_search` unless the search
+    /// provider is Off and `web_fetch` unless the fetch provider is Off (or is
+    /// Native on a family without a fetch tool), whether or not the chosen
+    /// provider works right now (`web_search::apply_web_tools`); when off,
+    /// neither name is granted and [`Self::web_search`] describes a backend
+    /// nothing calls. Neither tool is ever taken from the persisted enabled-tool
+    /// list, so the renderer cannot grant web access by writing a tool name.
+    ///
+    /// A missing key means OFF, because reaching the network is the kind of
+    /// capability a conversation should be given deliberately. The shipped
+    /// presets, not a serde fallback, are where "on" is decided.
+    #[serde(default)]
+    pub web_search_enabled: bool,
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
+    #[serde(default)]
+    pub security_level: SecurityLevel,
+    /// Whether this conversation is in plan mode (`plan_mode.rs`): the switch
+    /// under the composer. Independent of the security level — the model
+    /// writes a plan and asks for approval, and the level decides what its
+    /// calls need either way. The host turns it off when the user approves a
+    /// plan. A missing key means off.
+    #[serde(default)]
+    pub plan_mode_enabled: bool,
+    /// Whether this conversation loads the global memory tier (`~/.mewrk`).
+    ///
+    /// When true, that tier's `MEWRK.md` instructions and `MEMORY.md` index
+    /// are concatenated into the context and its three tools
+    /// (`read`/`create`/`edit_global_memory`) are exposed. When false, the tier
+    /// is not read, nothing is injected, and those three tools are withheld —
+    /// so the conversation cannot observe or modify global memory at all.
+    ///
+    /// A missing key means OFF. Memory reads and writes files the user may not
+    /// expect a fresh conversation to touch, so the built-in engineering
+    /// defaults preset — not a serde fallback — is where "on" is decided.
+    #[serde(default)]
+    pub global_memory_enabled: bool,
+    /// Whether this conversation loads the project memory tier
+    /// (`<workspace>/.mewrk`). Independent of [`Self::global_memory_enabled`]
+    /// in both directions: either, both or neither may be on.
+    #[serde(default)]
+    pub project_memory_enabled: bool,
+    /// Skill delivery mode for this conversation. When disabled, all skill bodies
+    /// enter the system prompt at turn start; when enabled, the `skill` tool
+    /// supplies bodies on demand. Both modes use the same `skill_ids`.
+    #[serde(default)]
+    pub skill_tool_enabled: bool,
+    /// MCP tool delivery mode for this conversation. When disabled, every
+    /// discovered MCP tool is declared with its full schema on every request.
+    /// When enabled, the schemas are withheld, the names are announced, and the
+    /// `tool_search` tool hands out a schema when the model asks for it. Both
+    /// modes dial the same `mcp_ids`.
+    ///
+    /// A missing key means OFF: withholding schemas changes what the model can
+    /// call without looking, which is a decision a conversation should make on
+    /// purpose.
+    #[serde(default)]
+    pub mcp_tool_discovery_enabled: bool,
+    /// What the messages the host hands the model between rounds come in
+    /// ([`HostMessageContainer`]). A missing key means `user`.
+    #[serde(default)]
+    pub host_message_container: HostMessageContainer,
+    /// How this conversation auto-compacts ([`CompactionMethod`]). `None` on a
+    /// conversation from before the choice existed, which hands off as it
+    /// always did, and on the new-task draft, which has not chosen yet: the
+    /// renderer settles it by the model when the draft becomes a conversation
+    /// — native where the model compacts natively, the handoff elsewhere. Not
+    /// a preset template, so every new conversation chooses by its model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_method: Option<CompactionMethod>,
+    /// The sandbox this conversation's commands ran in when the sandbox was a
+    /// setting of each conversation. It is a setting of each workspace now
+    /// ([`ExecutionEnvironmentAssets::sandboxes`]), so this is read and never
+    /// written: loading hands one that was on to the workspaces the
+    /// conversation works in (`storage::lift_conversation_sandboxes`), and
+    /// nothing else reads it.
+    #[serde(default, rename = "sandbox", skip_serializing)]
+    pub legacy_sandbox: SandboxSettings,
+    /// What this conversation's last request put in front of the model, and
+    /// which model sent it when.
+    ///
+    /// `None` until the first run. The host does not decide the contents — the
+    /// renderer records each request's surface — but the field must exist here
+    /// so a settings round trip through the store does not drop it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_lock: Option<ConversationToolLock>,
+}
+
+/// The file guard a run executes under: the read-record scope it consults.
+/// Host-only; never crosses IPC.
+///
+/// There is no policy beside it any more. The five mechanisms ported from
+/// Claude Code's `readFileState` — read-before-write, the stale-write refusal,
+/// external-change notices, hook re-sync and the formatter hint — used to be
+/// five per-conversation switches. They are unconditional now: every run of
+/// every conversation, and every child of one, enforces all five, so the only
+/// thing left to resolve per run is WHICH record it reads.
+///
+/// The scope is a key into [`crate::file_read_state::FileReadRegistry`]. A
+/// top-level run's scope is its conversation. A child agent gets a scope of its
+/// own, seeded from its parent's record the first time it is touched — Claude
+/// Code hands a subagent a clone of `readFileState`, and a child's later reads
+/// and writes must not count as the parent's: the parent never saw them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileGuard {
+    /// Empty means "the conversation id".
+    pub scope: String,
+    /// The scope to seed this one from on first use.
+    pub parent_scope: Option<String>,
+}
+
+/// The tool surface a conversation's last request went out with, and which
+/// model sent it when. The renderer owns it (`src/lib/toolLock.ts`): while that
+/// model's cache is warm it draws the settings that would rewrite the cached
+/// prompt — on a model that cannot take a tool mid-conversation, the whole
+/// surface. The host only round-trips it, apart from `prompt_skill_ids`.
+///
+/// The three optional selection fields are pins: each holds one answer a run
+/// has already acted on, where a second answer would contradict the transcript
+/// rather than extend it. The two backend pins only ever hold native: a
+/// host-run backend is part of the surface (`search_backend`/`fetch_backend`).
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationToolLock {
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub mcp_ids: Vec<String>,
+    #[serde(default)]
+    pub global_memory: bool,
+    #[serde(default)]
+    pub project_memory: bool,
+    #[serde(default)]
+    pub skill_tool: bool,
+    /// Whether the last request withheld MCP tool schemas behind `tool_search`.
+    #[serde(default)]
+    pub mcp_tool_discovery: bool,
+    /// Whether the last request granted web access. One bit for the feature,
+    /// not one per tool name: which of `web_search` / `web_fetch` a run grants
+    /// follows the two backend selections, the same way which memory tools a
+    /// tier grants follows the tier.
+    #[serde(default)]
+    pub web_search: bool,
+    /// Whether the last request offered the plan-mode pair.
+    #[serde(default)]
+    pub plan_mode: bool,
+    /// Skills selected at the last request, by catalog id.
+    #[serde(default)]
+    pub skill_ids: Vec<String>,
+    /// The skills this conversation's system prompt was assembled from, fixed
+    /// by its first run. `None` on a conversation that predates the pin or has
+    /// not run yet, which [`crate::capabilities::runtime_context`] reads as
+    /// "every selected skill belongs to the prompt" — the behaviour before
+    /// later additions had a second route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_skill_ids: Option<Vec<String>>,
+    /// The search backend the last request's settings named, `None` when it
+    /// had no web access. Round-tripped only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_backend: Option<SearchProviderSelection>,
+    /// The fetch backend the last request's settings named, on the same terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_backend: Option<FetchProviderSelection>,
+    /// Whether the last request granted `web_fetch`.
+    #[serde(default)]
+    pub web_fetch: bool,
+    /// Native search, once a native search has actually run (its report is in
+    /// the transcript). Host-read only for round tripping; the renderer owns
+    /// the decision to pin it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_provider: Option<SearchProviderSelection>,
+    /// Native fetch, once a run has been granted `web_fetch` with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_provider: Option<FetchProviderSelection>,
+    /// The model the last request used, and when it went out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_request: Option<ToolLockRequest>,
+    /// Every model's latest request in this conversation, one entry per model,
+    /// for the composer's model menu to mark the ones whose cache is still warm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_requests: Vec<ToolLockRequest>,
+    /// Hooks selected at the last request, which the system prompt lists.
+    /// `None` on a lock written before it was recorded. Round-tripped only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_ids: Option<Vec<String>>,
+    /// The prompt profile the last request was worded with (the built-in's id
+    /// for none), on the same terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_profile: Option<String>,
+    /// The host-message container the last request projected its host
+    /// messages in, on the same terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_message_container: Option<HostMessageContainer>,
+}
+
+/// Which model a conversation's last request used, and when (RFC 3339).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolLockRequest {
+    pub provider_id: String,
+    pub model_id: String,
+    pub at: String,
+}
+
+/// Hand-written so a lock pinned by a build that still had the `auto` fetch
+/// selection keeps opening, with the pin naming the backend that run actually
+/// fetched with.
+///
+/// A pin is the record of a decision a past run acted on, so it cannot be read
+/// out of context the way the conversation's own selector can: the search leg
+/// the resolution consults is the one pinned beside it, which is why this
+/// cannot live on `FetchProviderSelection`'s `Deserialize` either. A `None`
+/// search pin makes `auto` resolve to `Native`, the same answer that reading
+/// gives a conversation whose search leg is native. The renderer's
+/// `normalizeToolLockValue` performs the same resolution on its side.
+impl<'de> Deserialize<'de> for ConversationToolLock {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "camelCase")]
+        enum StoredFetchProvider {
+            Auto,
+            Native,
+            Explicit {
+                #[serde(rename = "providerKind")]
+                provider_kind: SearchProviderKind,
+            },
+            Disabled,
+            Unavailable,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            #[serde(default)]
+            tools: Vec<String>,
+            #[serde(default)]
+            mcp_ids: Vec<String>,
+            #[serde(default)]
+            global_memory: bool,
+            #[serde(default)]
+            project_memory: bool,
+            #[serde(default)]
+            skill_tool: bool,
+            #[serde(default)]
+            mcp_tool_discovery: bool,
+            #[serde(default)]
+            web_search: bool,
+            #[serde(default)]
+            plan_mode: bool,
+            #[serde(default)]
+            skill_ids: Vec<String>,
+            #[serde(default)]
+            prompt_skill_ids: Option<Vec<String>>,
+            #[serde(default)]
+            search_backend: Option<SearchProviderSelection>,
+            #[serde(default)]
+            fetch_backend: Option<FetchProviderSelection>,
+            #[serde(default)]
+            web_fetch: bool,
+            #[serde(default)]
+            search_provider: Option<SearchProviderSelection>,
+            #[serde(default)]
+            fetch_provider: Option<StoredFetchProvider>,
+            #[serde(default)]
+            last_request: Option<ToolLockRequest>,
+            #[serde(default)]
+            model_requests: Vec<ToolLockRequest>,
+            #[serde(default)]
+            hook_ids: Option<Vec<String>>,
+            #[serde(default)]
+            prompt_profile: Option<String>,
+            #[serde(default)]
+            host_message_container: Option<HostMessageContainer>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let fetch_provider = raw.fetch_provider.map(|stored| match stored {
+            StoredFetchProvider::Auto => {
+                match raw.search_provider {
+                    Some(SearchProviderSelection::Explicit { provider_kind })
+                        if provider_kind.supports(SearchCapability::FetchUrls) =>
+                    {
+                        FetchProviderSelection::Explicit { provider_kind }
+                    }
+                    _ => FetchProviderSelection::Native,
+                }
+            }
+            StoredFetchProvider::Native => FetchProviderSelection::Native,
+            StoredFetchProvider::Explicit { provider_kind } => {
+                FetchProviderSelection::Explicit { provider_kind }
+            }
+            StoredFetchProvider::Disabled => FetchProviderSelection::Disabled,
+            StoredFetchProvider::Unavailable => FetchProviderSelection::Unavailable,
+        });
+        Ok(Self {
+            tools: raw.tools,
+            mcp_ids: raw.mcp_ids,
+            global_memory: raw.global_memory,
+            project_memory: raw.project_memory,
+            skill_tool: raw.skill_tool,
+            mcp_tool_discovery: raw.mcp_tool_discovery,
+            web_search: raw.web_search,
+            plan_mode: raw.plan_mode,
+            skill_ids: raw.skill_ids,
+            prompt_skill_ids: raw.prompt_skill_ids,
+            search_backend: raw.search_backend,
+            fetch_backend: raw.fetch_backend,
+            web_fetch: raw.web_fetch,
+            search_provider: raw.search_provider,
+            fetch_provider,
+            last_request: raw.last_request,
+            model_requests: raw.model_requests,
+            hook_ids: raw.hook_ids,
+            prompt_profile: raw.prompt_profile,
+            host_message_container: raw.host_message_container,
+        })
+    }
+}
+
+/// Skill resolved from disk during trusted request construction. The model sees
+/// only its name and trigger; body and directory remain host-only until use.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResolvedSkill {
+    /// Name used by the model and displayed in the catalog.
+    pub name: String,
+    /// Trigger text explaining when to use the skill.
+    pub trigger: String,
+    /// `SKILL.md` body with front matter removed.
+    pub body: String,
+    /// Absolute skill directory for resolving relative body references.
+    pub directory: String,
+}
+
+/// One skill that reaches the model as a host notice rather than through the
+/// opening prompt, already rendered in the conversation's prompt profile and
+/// its delivery mode.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddedSkill {
+    /// Catalog resource id. The context id is derived from it, which is what
+    /// keeps a second round from delivering the same skill again.
+    pub resource_id: String,
+    /// The skill's name, for the notice's summary line.
+    pub name: String,
+    pub content: String,
+}
+
+/// One message the host has for the model, waiting for the round loop to hand
+/// it over in the run's host-message container — a `<system-reminder>` user
+/// message, or a `box` result (`api::deliver_host_notices`).
+///
+/// Producers only queue: most of them run where no card can be placed yet — a
+/// hook in the middle of a tool batch, a diagnostics scan before the round's
+/// exchange exists — and the loop is the one place that knows whether the
+/// notice rides this round's tool results or takes its own timeline spot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostNotice {
+    /// The notice's name on its card (`wire_history::notice_kind`). The
+    /// renderer titles the row by it; it never reaches the wire.
+    pub kind: &'static str,
+    /// What the message says: the reminder's text, or the `box` result.
+    pub body: String,
+    /// The card id for a notice a conversation receives at most once (a skill
+    /// added mid-conversation); `None` mints a fresh one.
+    pub id: Option<String>,
+}
+
+/// One MCP tool whose schema this run withheld from the wire.
+///
+/// Only the name is announced, grouped under the server that declared it. The
+/// descriptor itself stays in `RunModelRequest::tools` throughout — it is what
+/// the executor dispatches against, what `tool_search` searches, and what it
+/// hands back — so this is a record of what is currently hidden rather than a
+/// second copy of the tool.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeferredTool {
+    /// Model-facing tool name, as `RunModelRequest::tools` carries it.
+    pub name: String,
+    /// The server that declared it, for grouping the announcement.
+    pub server_name: String,
+}
+
+/// One provider-cited web source on an assistant round (server-side search /
+/// grounding). Wire and store shape are identical; the renderer shows these as
+/// citation chips under the prose.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ContextSource {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// What a native compaction left behind (`native_compaction.rs`): the
+/// provider's compaction item, and the recent messages kept verbatim ahead of
+/// it, the way Codex rebuilds a compacted history — plus what the continuation
+/// that opens on it needs to send the request the compacted conversation would
+/// have sent: the tools it had appended, whether it had the plan pair, and the
+/// prompt cache key its requests went out under.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeCompaction {
+    /// The provider entry whose account produced the item. The item is
+    /// encrypted for that account, so only a request to the same provider
+    /// carries it.
+    pub provider_id: String,
+    /// The model that compacted. A note: any model of the same provider that
+    /// takes native compaction reads the item.
+    pub model: String,
+    /// What the model is called on screen, for the card's title.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model_name: String,
+    /// The compaction item as the AI SDK's assistant content parts, in the
+    /// order the provider returned them. Opaque to the host.
+    pub parts: Vec<Value>,
+    /// The messages kept ahead of the item, oldest first: the latest user
+    /// messages within the budget, the oldest of them possibly cut in the
+    /// middle, and every system prompt that applied from its place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained: Vec<RetainedMessage>,
+    /// The context as measured when it compacted.
+    pub tokens_before: u64,
+    /// What the card is estimated to weigh on a request: the kept messages
+    /// plus the item as the provider counted it.
+    pub tokens_after: u64,
+    /// Tools the compacted conversation had appended mid-way
+    /// (`tool_append.rs`) rather than declared. The card hands them over again
+    /// ahead of the item, so the continuation declares exactly what the
+    /// compacted conversation declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub appended_tools: Vec<String>,
+    /// The compacted conversation had been offered the plan pair, which stays
+    /// once offered (`plan_mode::transcript_offered_tools`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub plan_tools: bool,
+    /// The prompt cache key the compacted conversation's requests went out
+    /// under, which the continuation's keep (`native_compaction::cache_key`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_key: String,
+}
+
+/// One message a native compaction kept ahead of its item.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainedMessage {
+    pub role: RetainedRole,
+    /// The card it was copied from, which may since have been edited or deleted.
+    pub source_id: String,
+    pub content: String,
+    /// Cut in the middle to fit the budget.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RetainedRole {
+    User,
+    /// A system prompt that applied from its place (`system_append.rs`).
+    System,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ContextItem {
+    System {
+        id: String,
+        content: String,
+        /// Local lifecycle diagnostics that must never be promoted into model input.
+        #[serde(rename = "localOnly", default, skip_serializing_if = "is_false")]
+        local_only: bool,
+        #[serde(
+            rename = "hookExecution",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        hook_execution: Option<HookContextMetadata>,
+        /// Tools that joined the conversation at this point (`tool_append.rs`).
+        /// A host record, always `local_only`: its text never reaches the
+        /// model. What it does reach is each protocol's own append interface,
+        /// which hands the tools over here, at the end of the transcript as it
+        /// stood, instead of rewriting the tool list every request declares.
+        #[serde(rename = "toolsAdded", default, skip_serializing_if = "Vec::is_empty")]
+        tools_added: Vec<String>,
+        /// The conversation opens on a native compaction
+        /// (`native_compaction.rs`). A host record, always `local_only`, whose
+        /// text is empty: what the card says on screen is read from these
+        /// fields, and none of it reaches the model. On a request the
+        /// compaction applies to, the card stands for the compacted
+        /// conversation — the messages it kept, the tools it had appended,
+        /// then the provider's compaction item; on any other request only
+        /// the kept messages.
+        #[serde(
+            rename = "nativeCompaction",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        native_compaction: Option<Box<NativeCompaction>>,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+    User {
+        id: String,
+        content: String,
+        /// Provider-neutral references into the external image attachment store.
+        /// Raw bytes/base64 never enter the conversation document.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageAttachment>,
+        /// Non-image attachments, by reference into the file attachment store
+        /// on the same terms as `images`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<FileAttachment>,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+    Assistant {
+        id: String,
+        content: String,
+        /// One-based model request round. Manual and legacy assistant contexts omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        round: Option<usize>,
+        /// Stable local association for every canonical item emitted by this model round.
+        #[serde(
+            rename = "modelTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        model_turn_id: Option<String>,
+        /// A locally retained fragment from an interrupted stream. It remains visible but is
+        /// never projected back into provider history.
+        #[serde(default, skip_serializing_if = "is_false")]
+        interrupted: bool,
+        /// Web sources the provider cited for this round (server-side search /
+        /// grounding). Empty for providers that don't cite; never projected
+        /// back into model input — citations are a UI fact, not history.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<ContextSource>,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+    Reasoning {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        /// Form of this reasoning card. It is resolved from the producing
+        /// model's `ReasoningContent`, not inferred from empty content, because
+        /// a plaintext model may produce no reasoning text.
+        ///
+        /// Absence identifies cards written before this field and uses the legacy
+        /// empty-content heuristic. The old `encrypted` boolean is intentionally
+        /// ignored rather than reused because it had incompatible semantics.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form: Option<ReasoningForm>,
+        /// One-based model request round. Manual and legacy reasoning contexts omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        round: Option<usize>,
+        /// Stable local association for every canonical item emitted by this model round.
+        #[serde(
+            rename = "modelTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        model_turn_id: Option<String>,
+        /// A locally retained fragment from an interrupted stream. It remains visible but is
+        /// never projected back into provider history.
+        #[serde(default, skip_serializing_if = "is_false")]
+        interrupted: bool,
+        /// Wall-clock milliseconds the provider spent inside this round's
+        /// reasoning items, measured by the sidecar.
+        ///
+        /// Present even when `content` is absent: a Responses round that only
+        /// returns `encrypted_content` emits no summary text at all, and this
+        /// field plus `tokens` is the entire visible trace of it.
+        #[serde(
+            rename = "durationMs",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        duration_ms: Option<u64>,
+        /// Provider-reported reasoning tokens for this round. A subset of the
+        /// round's output tokens; see [`ModelUsage::reasoning_tokens`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens: Option<u64>,
+        /// Signed or encrypted provider payload replayed on later turns. See
+        /// [`ReasoningReplay`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay: Option<ReasoningReplay>,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+    Tool {
+        id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        /// One-based model request round. Manual and legacy tool contexts omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        round: Option<usize>,
+        /// Stable local association for every canonical item emitted by this model round.
+        #[serde(
+            rename = "modelTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        model_turn_id: Option<String>,
+        /// The provider's own id for this tool call, kept so replay can send back
+        /// the very id the model issued instead of minting a fresh one.
+        ///
+        /// [`crate::api::tool_context_id`] hashes this id into the card's local
+        /// id and is therefore not reversible, so without this field replay has
+        /// nothing to send but a digest — and every tool call in a turn changes
+        /// id the moment the next turn replays it from the timeline. The wire
+        /// protocols treat the id as an opaque key that only has to pair a call
+        /// with its result, so replaying the original is always valid.
+        ///
+        /// Absent on manually inserted cards, on host-fabricated exchanges, and
+        /// on cards written before this field existed; those still mint a digest.
+        /// Unattested on purpose, like `round` and `modelTurnId`: the call and
+        /// its result read the same field, so a rewritten value still pairs, and
+        /// [`crate::wire_history::replayable_provider_call_id`] rejects anything
+        /// that is not a plausible, non-reserved provider id.
+        #[serde(
+            rename = "providerCallId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        provider_call_id: Option<String>,
+        /// Model-requested arguments before hooks changed the executed arguments.
+        #[serde(
+            rename = "requestedInput",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        requested_input: Option<JsonObject>,
+        input: JsonObject,
+        result: ToolResult,
+        /// Full child transcript and progress updates for a `subagent` call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent: Option<SubagentRunRecord>,
+        /// Which host message a `box` delivery card carries
+        /// (`wire_history::notice_kind`), so the renderer can title the row and
+        /// the host can find its own notices again. Absent on a delivered
+        /// background result and on every other card.
+        ///
+        /// Host bookkeeping, never model input: the card's `input` is the empty
+        /// argument the fabricated call carries and its result is the whole
+        /// message, both exactly as the model reads them. Unattested on purpose,
+        /// like `round`: it changes no byte the model sees.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
+        /// Host proof that this card's result came from this application's own
+        /// execution rather than from the renderer.
+        ///
+        /// Issued when the card is built and carried by the renderer like any
+        /// other field. It replaces a process-local map of executed payloads,
+        /// which could not survive a restart and could not hold more than a few
+        /// hundred entries — both of which left ordinary cards permanently
+        /// unsaveable. Absent on cards the host does not attest (a manually
+        /// inserted card, or one written before this field existed), which are
+        /// quarantined at save time rather than trusted.
+        #[serde(
+            rename = "attestation",
+            default,
+            skip_serializing_if = "String::is_empty"
+        )]
+        attestation: String,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentRunStatus {
+    Completed,
+    /// Legacy catch-all, still written when the host cancels an agent at turn
+    /// end and nothing more specific is known. Documents predating the split
+    /// carry only this and `Completed`.
+    Interrupted,
+    /// The child's provider call errored. Retryable in principle.
+    Failed,
+    /// Deliberately halted — an explicit `agent_stop`, a hook stop, or a
+    /// revoked definition. Retrying reproduces the stop.
+    Stopped,
+    /// Truncated by a host round/tool ceiling rather than finishing. The output
+    /// is partial but valid, which is why it must not read as a failure.
+    // `rename_all = "lowercase"` inserts no separator, so the wire value would
+    // be "roundlimit"; the renderer union spells it camelCase like every other
+    // multi-word wire string.
+    #[serde(rename = "roundLimit")]
+    RoundLimit,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubagentRunKind {
+    #[default]
+    General,
+    /// One step of a `workflow` run. The synthesized parent record carries one
+    /// `workflow_step` tool context per step; the step itself is an ordinary
+    /// child run inside the workflow's private pool.
+    WorkflowStep,
+    /// A `bash`/`powershell` command the model explicitly backgrounded
+    /// (`run_in_background`). The pool entry is lifecycle
+    /// plumbing only — the worker polls the OS process instead of running a
+    /// model, the model addresses the task as `shell:<id>`, and no subagent
+    /// record is backfilled (the shell-task registry row and the folded result
+    /// notification are the durable surfaces).
+    ShellCommand,
+    /// **Retired:** `web_search` is an ordinary concurrent async tool whose
+    /// result comes back as its own tool result. Nothing constructs this variant.
+    ///
+    /// The variant remains because persisted `SubagentRunRecord`s from previously
+    /// saved conversations may carry `"webSearch"` on disk. Deleting it would make
+    /// those documents unreadable; retired mechanisms must not brick archives.
+    WebSearch,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentUpdate {
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRunRecord {
+    /// Host-selected role. Web research is never selectable through the
+    /// generic agent_spawn arguments and uses a narrower capability profile.
+    #[serde(default)]
+    pub kind: SubagentRunKind,
+    /// Stable per-conversation agent name addressed by `task_wait`.
+    /// Absent on legacy `subagent` records, which are not continuable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The model-visible task address of a managed run (`workflow:<runId>`),
+    /// or a workflow step's display label. Pool names (`aN`/`wsN`) are host
+    /// pipeline internals; this is what `task_list` prints for the run after
+    /// its turn ended. Absent on ordinary subagents — their address IS `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// `agent_spawn context:"conversation"` is a fork: it receives the
+    /// parent's host-generated auto-memory block and lease. Ordinary named
+    /// agents remain isolated. Persisting this bit lets a continued fork
+    /// reacquire the current parent snapshot after reload without serializing
+    /// the host-only lease itself.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inherits_model_memory: bool,
+    /// Exact trusted provider/model and keyed auto-memory snapshot receipt for
+    /// a conversation fork. New fork records have this field together with
+    /// `inherits_model_memory`; ordinary and named agents never have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_model_binding: Option<ForkModelBinding>,
+    /// Exact trusted named-agent definition/model binding. Ordinary agents
+    /// have neither this field nor inherited memory; conversation forks use
+    /// `inherits_model_memory` and never this binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_definition: Option<AgentDefinitionBinding>,
+    /// Keyed receipt over the owning conversation, exact addressable name,
+    /// ordinary/fork/named execution mode and its trusted binding. Records
+    /// without a valid receipt remain visible as legacy history but cannot be
+    /// continued.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub execution_mode_receipt: String,
+    pub task: String,
+    pub status: SubagentRunStatus,
+    pub contexts: Vec<ContextItem>,
+    pub updates: Vec<SubagentUpdate>,
+    /// The latest value this agent returned through `structured_output`.
+    /// `#[serde(default)]` is mandatory: `task`/`status`/`contexts`/`updates`
+    /// above carry no serde attributes and are required keys, so every existing
+    /// conversation document would fail to load without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<Value>,
+    /// The spawn-time `output_schema` document of a schema-bound run.
+    ///
+    /// `RunModelRequest.output_schema` is `#[serde(skip)]` and the live
+    /// `AgentPool` is turn-scoped, so without this field a continuation in a
+    /// later turn rehydrates schema-less and quietly finishes with prose —
+    /// exactly what the schema existed to prevent. The raw document (not a
+    /// compiled form) is persisted because the record is renderer-writable:
+    /// rehydration re-runs `orchestration::compile_output_schema`, bounding a
+    /// forged value like a fresh spawn's, and refuses the continuation when the
+    /// precheck fails. Deleting the key instead of forging it unbinds the
+    /// continuation without a signal — that is deliberate scope, not an
+    /// oversight: record content is unattested by design (a schema constrains
+    /// output and grants nothing), so removal is exactly as powerful as any
+    /// other edit of the record's contexts. Absent on runs spawned without a
+    /// schema and on schema-bound records that predate this field; those records
+    /// stay continuable but — unrecoverably — schema-less.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    /// Tokens this agent alone consumed across every one of its turns.
+    ///
+    /// The parent's own `usage` is a turn total that already absorbed these
+    /// numbers through `take_usage`, so this is a separate never-taken copy
+    /// rather than a view of the same counter — the task sidebar needs the
+    /// per-agent figure to survive both the drain and a reload. Defaulted
+    /// because records that predate this field lack it.
+    #[serde(default, skip_serializing_if = "is_empty_usage")]
+    pub usage: ModelUsage,
+}
+
+fn is_empty_usage(usage: &ModelUsage) -> bool {
+    usage == &ModelUsage::default()
+}
+
+/// Frozen v1 projection of [`ForkModelBinding`] for the execution-mode receipt.
+///
+/// The receipt payload must never widen implicitly. Serialising the live struct
+/// put every future field into the signed bytes, and a changed payload does not
+/// merely drop a record to view-only — `reserve_subagent_execution_mode_receipt`
+/// has no update path and hard-errors `subagent name is permanently reserved to
+/// another execution mode`, permanently burning that (conversation, name) pair.
+///
+/// Field list and order are byte-frozen. NEVER add, reorder or rename a field
+/// here: extend the payload with a v2 projection plus a recorded version instead.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkModelBindingV1<'a> {
+    provider_id: &'a str,
+    model_id: &'a str,
+    memory_language: ResolvedLanguage,
+    memory_tool_names: &'a [String],
+    system_prompt_snapshot: &'a str,
+    system_prompt_receipt: &'a str,
+    /// Omitted entirely — not `null` — when absent, reproducing the original
+    /// `skip_serializing_if = "Option::is_none"` on the live struct.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_snapshot_receipt: Option<&'a str>,
+    binding_receipt: &'a str,
+}
+
+impl<'a> From<&'a ForkModelBinding> for ForkModelBindingV1<'a> {
+    fn from(binding: &'a ForkModelBinding) -> Self {
+        Self {
+            provider_id: binding.provider_id.as_str(),
+            model_id: binding.model_id.as_str(),
+            memory_language: binding.memory_language,
+            memory_tool_names: binding.memory_tool_names.as_slice(),
+            system_prompt_snapshot: binding.system_prompt_snapshot.as_str(),
+            system_prompt_receipt: binding.system_prompt_receipt.as_str(),
+            memory_snapshot_receipt: binding.memory_snapshot_receipt.as_deref(),
+            binding_receipt: binding.binding_receipt.as_str(),
+        }
+    }
+}
+
+/// Frozen v1 projection of [`AgentDefinitionBinding`]. See
+/// [`ForkModelBindingV1`] for why this exists and why it must not grow.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentDefinitionBindingV1<'a> {
+    source: AgentDefinitionSource,
+    source_key: &'a str,
+    name: &'a str,
+    revision: u64,
+    memory_epoch: u64,
+    provider_id: &'a str,
+    model_id: &'a str,
+    memory: AgentDefinitionMemory,
+    scope_key: &'a str,
+    configuration_receipt: &'a str,
+}
+
+impl<'a> From<&'a AgentDefinitionBinding> for AgentDefinitionBindingV1<'a> {
+    fn from(binding: &'a AgentDefinitionBinding) -> Self {
+        Self {
+            source: binding.source,
+            source_key: binding.source_key.as_str(),
+            name: binding.name.as_str(),
+            revision: binding.revision,
+            memory_epoch: binding.memory_epoch,
+            provider_id: binding.provider_id.as_str(),
+            model_id: binding.model_id.as_str(),
+            memory: binding.memory,
+            scope_key: binding.scope_key.as_str(),
+            configuration_receipt: binding.configuration_receipt.as_str(),
+        }
+    }
+}
+
+/// Canonical host-only identity for one addressable child execution mode.
+/// The public agent name and owning conversation are part of the payload, as
+/// are the complete trusted fork/named bindings. Model arguments never supply
+/// this value.
+///
+/// The bindings are projected through frozen v1 views rather than serialised
+/// directly, so adding a field to `ForkModelBinding` or `AgentDefinitionBinding`
+/// cannot change these bytes. The output stays a six-element JSON array whose
+/// binding elements are camelCase objects.
+///
+/// # There is no v2 — and a frozen field SET is not frozen BYTES
+///
+/// A binding's `receipt_version` selects which payload
+/// `api::fork_model_binding_receipt_payload` /
+/// `api::agent_definition_receipt_payload` sign, and it must never be
+/// enumerated here. There is no v2 of this payload and there must not be one:
+/// `MemoryStore::reserve_subagent_execution_mode_receipt` has only insert /
+/// identical-no-op / hard-error branches, no UPDATE and no production DELETE.
+/// A move in these bytes therefore burns any `(conversation_id, name)` pair that
+/// already holds a row under the old bytes, with `subagent name is permanently
+/// reserved to another execution mode`. It is not unconditional: a name with no
+/// row yet is simply reserved at the new bytes, and the overwhelmingly common
+/// case — a name whose run persisted — is re-spawned under a FRESH name by the
+/// dedupe gate. What the burn needs is the orphan window described below.
+///
+/// That closes the SHAPE route only. The projections freeze a field SET over
+/// PER-SPAWN VALUES, so the property that actually has to hold is: two spawn
+/// attempts at the same `(conversation_id, name)` must project identical
+/// VALUES. Every projected value is a route into these bytes.
+///
+/// Stable by construction — this is what bounds the blast radius.
+/// `conversation_id` and `name` ARE the reservation key. `kind` is fixed per
+/// call site (`api::run_agent_spawn` always passes `General`). And both binding
+/// elements are `None` for an ordinary non-fork spawn (`api::agent_child_template`
+/// sets `inherits_parent_model_memory`, `fork_model_binding` and
+/// `agent_definition_binding` off, and only the `context: "conversation"` /
+/// `agent_type` arms fill them in) and for every web-search worker
+/// (`api::web_research_executor_template`, same three fields), leaving the
+/// binding-free `[conv, name, kind, false, null, null]`. The search stack
+/// re-reserves `rx1` in turn after turn and survives only because of that.
+///
+/// Volatile between two attempts at the same name, every one of them an
+/// ordinary user or model action: `inherits_model_memory` (fork vs plain spawn
+/// is a per-call model choice); a fork's `providerId`/`modelId` (the parent's
+/// CURRENT provider/model); `memoryLanguage` and `memoryToolNames`
+/// (`api::request_memory_language`, `api::enabled_memory_tool_names`);
+/// `systemPromptSnapshot`/`systemPromptReceipt` (the parent's assembled prompt
+/// plus `subagent_prompt::render(PromptVersion::current(..), ..)`); a named
+/// binding's `source`/`sourceKey`/`name` (WHICH definition the model resolved,
+/// not just its content) together with `revision`, `memoryEpoch`,
+/// provider/model, `memory` and `scopeKey` (any definition edit); and
+/// `bindingReceipt`/`configurationReceipt`, whose values are HMACs over a
+/// version-DISPATCHED payload — which makes bumping
+/// `api::CURRENT_FORK_BINDING_RECEIPT_VERSION` or
+/// `api::CURRENT_DEFINITION_RECEIPT_VERSION` ONE instance of this rule, not the
+/// rule. `configurationReceipt` additionally carries a transitive CONTENT route:
+/// its payload covers `system_prompt`, `enabled`, `deleted` and `model_selection`,
+/// none of which appear in the projection, so editing a definition's prompt moves
+/// these bytes without moving any field you can see here.
+///
+/// `memorySnapshotReceipt` is the one projected field that is `Option` with
+/// `skip_serializing_if`, so it does not merely change VALUE between attempts —
+/// its presence or absence adds or removes a key and changes the payload SHAPE.
+/// A fork of a parent carrying an auto-memory snapshot and one without therefore
+/// cannot share a name, independently of every value route above.
+///
+/// # Why a value change USED to be fatal: the reserve-before-persist window
+///
+/// `api::sign_subagent_execution_mode` writes the reservation row BEFORE
+/// `AgentPool::register` and before the turn's tool result is persisted. A turn
+/// that dies in between leaves the name held by a row that the spawn dedupe
+/// gate's other sources — persisted records, the branch-wide
+/// `subagent_reserved_names` assembled in `lib.rs`, the live pool — cannot see,
+/// while `AgentPool::auto_name` restarts deterministically at `a1`. The row has
+/// no UPDATE and no production DELETE, so the next spawn landing on that name
+/// either matched byte-for-byte (silent no-op) or errored FOREVER — and since
+/// auto-naming kept choosing it, the conversation lost `agent_spawn` outright
+/// rather than losing one name.
+///
+/// Every volatile input above can change while the durable reservation remains
+/// invisible, so the spawn gate must account for that reservation.
+///
+/// **The spawn gate closes this window (S7):**
+/// `api::run_agent_spawn` reads
+/// `memory::MemoryStore::reserved_subagent_execution_mode_names` and feeds it to
+/// both the explicit-name check and `auto_name`. Every route into these bytes is
+/// covered at once, because the fix is about the NAME being invisible, not about
+/// any particular value moving. Resume never re-issues anyway (it re-verifies the
+/// STORED receipt). The deliberate exception is `api::web_research_executor_name`,
+/// which must keep naming from the live pool alone — a search group re-reserves
+/// `rx1` turn after turn by design and lives on the identical-no-op branch.
+///
+/// Guards. `tests::the_execution_mode_payload_depends_on_the_binding_receipt_value`
+/// pins the receipt-value route so the receipts cannot later be dropped from
+/// the payload as inert.
+/// `tests::a_new_binding_field_cannot_reach_the_frozen_payload` proves FIELD-SET
+/// immunity and nothing more: it varies `receipt_version`, which the projections
+/// exclude, so it stays green through every value route above. The issuance
+/// versions are checked against their dispatchers by
+/// `api::tests::receipt_payload_dispatchers_support_exactly_their_issued_versions`,
+/// the prompt version by
+/// `subagent_prompt::tests::the_current_prompt_version_is_pinned_by_the_fork_reservation`,
+/// and the window closure itself by
+/// `api::tests::orphan_reservation_rows_are_visible_to_the_spawn_dedupe_gate` —
+/// which is the one to look at first if a burn is ever observed again.
+pub(crate) fn canonical_subagent_execution_mode_payload(
+    conversation_id: &str,
+    name: &str,
+    kind: SubagentRunKind,
+    inherits_model_memory: bool,
+    fork_model_binding: Option<&ForkModelBinding>,
+    agent_definition: Option<&AgentDefinitionBinding>,
+) -> Result<String, String> {
+    if inherits_model_memory != fork_model_binding.is_some()
+        || (agent_definition.is_some() && (inherits_model_memory || fork_model_binding.is_some()))
+    {
+        return Err("子代理执行模式字段互相冲突，无法签发宿主回执".into());
+    }
+    serde_json::to_string(&(
+        conversation_id,
+        name,
+        kind,
+        inherits_model_memory,
+        fork_model_binding.map(ForkModelBindingV1::from),
+        agent_definition.map(AgentDefinitionBindingV1::from),
+    ))
+    .map_err(|error| format!("无法编码子代理执行模式回执: {error}"))
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_background() -> String {
+    "solid".into()
+}
+
+/// Appearance, with documents from before the background library carried forward: their
+/// `customBackground` turned the picture and the glass on together, and `backgroundImage`
+/// was remembered even while it was off.
+fn deserialize_appearance<'de, D>(deserializer: D) -> Result<AppearancePreferences, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut value = Value::deserialize(deserializer)?;
+    if let Value::Object(fields) = &mut value {
+        let legacy_on = fields.remove("customBackground").and_then(|value| value.as_bool());
+        let legacy_image = fields.remove("backgroundImage");
+        if !fields.contains_key("background") {
+            if let (Some(true), Some(Value::String(image))) = (legacy_on, legacy_image) {
+                if !image.is_empty() {
+                    fields.insert("background".into(), Value::String(image));
+                    fields.insert("liquidGlass".into(), Value::Bool(true));
+                }
+            }
+        }
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+fn default_agent_definition_epoch() -> u64 {
+    1
+}
+
+impl ContextItem {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::System { id, .. }
+            | Self::User { id, .. }
+            | Self::Assistant { id, .. }
+            | Self::Reasoning { id, .. }
+            | Self::Tool { id, .. } => id,
+        }
+    }
+
+    /// Serde `kind` tag value, stored separately so persistence can identify a
+    /// row without parsing JSON.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::System { .. } => "system",
+            Self::User { .. } => "user",
+            Self::Assistant { .. } => "assistant",
+            Self::Reasoning { .. } => "reasoning",
+            Self::Tool { .. } => "tool",
+        }
+    }
+
+    pub fn round(&self) -> Option<usize> {
+        match self {
+            Self::Assistant { round, .. }
+            | Self::Reasoning { round, .. }
+            | Self::Tool { round, .. } => *round,
+            Self::System { .. } | Self::User { .. } => None,
+        }
+    }
+
+    pub fn model_turn_id(&self) -> Option<&str> {
+        match self {
+            Self::Assistant { model_turn_id, .. }
+            | Self::Reasoning { model_turn_id, .. }
+            | Self::Tool { model_turn_id, .. } => model_turn_id.as_deref(),
+            Self::System { .. } | Self::User { .. } => None,
+        }
+    }
+
+    pub fn created_at(&self) -> &str {
+        match self {
+            Self::System { created_at, .. }
+            | Self::User { created_at, .. }
+            | Self::Assistant { created_at, .. }
+            | Self::Reasoning { created_at, .. }
+            | Self::Tool { created_at, .. } => created_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAttachment {
+    /// Full lowercase SHA-256 digest of the image bytes.
+    pub id: String,
+    pub name: String,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u64,
+    /// Conversation-local number the model cites as `[Image #N]` and passes to
+    /// `preview_upload_image`. Numbers are allocated by scanning the transcript
+    /// for the current maximum and are never reused within a conversation, so
+    /// an instance keeps its number even after other images are removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<u32>,
+}
+
+/// How the model reads a [`FileAttachment`]. Both end up as text in the user
+/// message; the format decides where that text comes from.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FileAttachmentFormat {
+    /// A UTF-8 text file; the stored original is what the model reads.
+    Text,
+    /// A PDF; the model reads the text layer the renderer extracted at upload,
+    /// stored beside the original because the host has no PDF parser.
+    Pdf,
+}
+
+/// Reference to a non-image file attached to a user message.
+///
+/// Like [`ImageAttachment`], conversation JSON carries only this metadata; the
+/// bytes live in the content-addressed `file_attachments` store and are read
+/// back, verified, and inlined as text only when a model request is built.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileAttachment {
+    /// Full lowercase SHA-256 digest of the stored original bytes.
+    pub id: String,
+    pub name: String,
+    pub format: FileAttachmentFormat,
+    /// Byte size of the stored original.
+    pub bytes: u64,
+    /// Estimated tokens of the model-visible text.
+    pub tokens: u64,
+    /// PDF page count; `None` for text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolResult {
+    pub success: bool,
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    pub executed_at: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDescriptor {
+    pub name: String,
+    pub label: String,
+    pub description: String,
+    pub category: ToolCategory,
+    pub dangerous: bool,
+    pub parameters: Vec<ToolParameter>,
+    /// Raw JSON Schema for dynamically discovered tools such as MCP. Built-in tools continue to
+    /// derive their schemas from the typed parameter list below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<Value>,
+    /// This particular approval must be answered by a human, whatever the
+    /// classifier says about the tool.
+    ///
+    /// Host-set and `#[serde(skip)]`, exactly like `subagent_name`: the renderer
+    /// supplies `tools` on a run request, so a field it could set would be a
+    /// hole rather than a guard. Only the run loop turns it on, and only on the
+    /// **clone** it hands to one approval call.
+    ///
+    /// It exists because a Hook `permissionDecision: ask` forces a confirmation
+    /// at the call site, while the approval closure recomputes "is this
+    /// mandatory" from the ordinary classifier alone. Without the bit, a
+    /// A standing allow decision for a tool must not bypass a hook-forced
+    /// confirmation.
+    #[serde(skip)]
+    pub force_confirmation: bool,
+    /// A line the approval card shows under the tool's name for this one call:
+    /// which hook asked for the confirmation, or what a takeover would hand
+    /// over. Host-set on the clone handed to one approval call, like
+    /// `force_confirmation`, and worded in the app language. It is not part of
+    /// the label because the card names the tool in the app language itself
+    /// (`tool_prompt::card_label`), whatever language the label was minted in.
+    #[serde(skip)]
+    pub approval_note: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCategory {
+    Filesystem,
+    Shell,
+    /// Everything that reaches the network: `web_search` (dispatched by the
+    /// trusted model loop so renderer input can never select the search
+    /// provider, its credentials, or its endpoint) and the preview tools.
+    Web,
+    /// Host-owned coordination: the subagent tools, `workflow`, and
+    /// `ask_user`. Every member is executed by the model run loop itself,
+    /// never by the manual tool executor.
+    Orchestration,
+    /// Model-owned long-term memory. The model identity and workspace scope are
+    /// injected by the trusted host request and are never accepted as tool
+    /// arguments.
+    Memory,
+    /// Tools discovered from an enabled MCP server. They are executable only inside the trusted
+    /// model loop and use a dedicated approval path.
+    Mcp,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolParameter {
+    pub name: String,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub parameter_type: ToolParameterType,
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub help: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolParameterType {
+    String,
+    Number,
+    Boolean,
+    Multiline,
+    Json,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionRequest {
+    pub conversation_id: String,
+    pub workspace_path: String,
+    pub tool_name: String,
+    pub input: JsonObject,
+}
+
+pub type ToolExecutionResponse = ToolResult;
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunModelRequest {
+    pub provider: ApiProvider,
+    /// Backend-owned web-search configuration. Renderer IPC is never allowed
+    /// to choose an external endpoint, credential binding or browser policy.
+    #[serde(skip)]
+    pub web_search: WebSearchSettings,
+    /// Shared main/child session counter. Renderer input is discarded.
+    /// True only for the host-minted one-shot request that `web_search`
+    /// dispatches. It is the sole gate that attaches the provider-native
+    /// `web_search` server tool to a wire request — the one tool in the
+    /// codebase that reaches the wire without a `ToolDescriptor`. Renderer IPC
+    /// and model arguments cannot set it; only the host template does.
+    #[serde(skip)]
+    pub native_search_call: bool,
+    /// Fetch budget for the host's one-shot native `web_fetch` request, or
+    /// `None` on every other request. The count is the number of URLs the model
+    /// asked for, so the executor cannot wander past the pages it was given.
+    /// Like `native_search_call`, renderer IPC and model arguments cannot set it.
+    #[serde(skip)]
+    pub native_fetch_call: Option<u32>,
+    /// Trusted copy of this conversation's web-access switch, hydrated from the
+    /// persisted document at turn start. Renderer IPC cannot assert it and the
+    /// model cannot pass it as a tool argument, so a conversation the user left
+    /// offline can neither be handed a web tool nor reach one by asking.
+    #[serde(skip)]
+    pub web_search_enabled: bool,
+    /// Trusted copy of this conversation's two memory-tier switches, hydrated
+    /// from the persisted document at turn start. Renderer IPC cannot assert
+    /// them and the model cannot pass them as tool arguments, so a tier the
+    /// user left off can neither be handed to the model as a snapshot nor
+    /// reached through a tool call.
+    #[serde(skip)]
+    pub global_memory_enabled: bool,
+    #[serde(skip)]
+    pub project_memory_enabled: bool,
+    /// Trusted skill bodies exposed to this run through the `skill` tool,
+    /// resolved from the persisted conversation's `skill_ids` at turn start.
+    ///
+    /// Host-only for the same reason the two memory switches are: the renderer
+    /// must not be able to hand a run a body it never selected, and the model
+    /// must not be able to name a path instead of a skill. Empty whenever the
+    /// conversation left `skill_tool_enabled` off — those bodies went into the
+    /// system prompt instead, and carrying them here too would send them twice.
+    #[serde(skip)]
+    pub skills: Vec<ResolvedSkill>,
+    /// Skills selected after this conversation's system prompt was opened.
+    ///
+    /// They cannot go where the others went: the prompt the earlier rounds were
+    /// sent with is already in the transcript, and rewriting it would change
+    /// what those rounds were answering. So each arrives as its own system
+    /// message, written once at the round it was added and carried by the
+    /// history from then on. Host-only for the same reason [`Self::skills`] is.
+    #[serde(skip)]
+    pub added_skills: Vec<AddedSkill>,
+    /// Whether this run withholds MCP tool schemas behind `tool_search`.
+    ///
+    /// Host-only, like the two memory switches: it decides what the model is
+    /// allowed to call without asking first, so the renderer must not be able
+    /// to assert it on a request. `trusted_run_request` reads it from the
+    /// conversation's own setting, floored by its tool lock.
+    #[serde(skip)]
+    pub mcp_tool_discovery: bool,
+    /// What this run's host messages come in: the conversation's setting,
+    /// which its children inherit. Host-only like the switches around it —
+    /// it decides whether `box` is declared — so `trusted_run_request` reads it
+    /// from the conversation's own settings.
+    #[serde(skip)]
+    pub host_message_container: HostMessageContainer,
+    /// The file write guards this run enforces and the read-record scope they
+    /// consult. Host-only like the switches above: `trusted_run_request` reads
+    /// the policy from the conversation's own settings, and the scope is a
+    /// process-local key the renderer has no business naming.
+    #[serde(skip)]
+    pub file_guard: FileGuard,
+    /// The MCP tools whose schemas this run withheld, in discovery order.
+    ///
+    /// Filled by `api::attach_mcp_tools` once the servers answer, which is the
+    /// first moment their tool names exist. Fixed for the run: the announcement
+    /// built from it sits at the head of every step, so a list that moved
+    /// between steps would evict the whole prompt cache each round.
+    #[serde(skip)]
+    pub deferred_tools: Vec<DeferredTool>,
+    /// Forced result shape for this run, resolved from the spawning
+    /// `agent_spawn` call. `#[serde(skip)]` following the host-only pattern
+    /// above: the renderer must not be able to assert a schema on a run, since
+    /// the schema decides whether the run is allowed to finish at all.
+    ///
+    /// It carries a [`crate::subagent_schema::Schema`], not a raw `Value`, so
+    /// every consumer knows the validity precheck already ran.
+    #[serde(skip)]
+    pub output_schema: Option<crate::subagent_schema::Schema>,
+    pub model: ModelProfile,
+    #[serde(default, alias = "thinkingEffort")]
+    pub reasoning_effort: ReasoningEffort,
+    pub conversation_id: String,
+    /// Stable current workspace identity resolved from the persisted document.
+    /// This is host-only policy: renderer input and model tool arguments can
+    /// never select another project's memory namespace.
+    #[serde(skip)]
+    pub workspace_id: String,
+    /// Exact host-created ephemeral context carrying the two-tier Markdown
+    /// memory block. Refresh removes only the context it previously created,
+    /// so marker text in unrelated instructions is never mistaken for it.
+    #[serde(skip)]
+    pub memory_context_id: Option<String>,
+    /// Exact host-created startup context carrying trusted project/user
+    /// instructions. It is distinct from the long-term memory block and lets
+    /// refresh remove only the context it previously created.
+    #[serde(skip)]
+    pub project_memory_context_id: Option<String>,
+    /// Exact trusted named-agent definition selected for this child. It is
+    /// persisted on the subagent record, but never accepted through renderer
+    /// IPC or exposed to model tool arguments.
+    #[serde(skip)]
+    pub agent_definition_binding: Option<AgentDefinitionBinding>,
+    /// Explicit fork identity. Never infer this from either main-model or
+    /// named-agent memory leases: all three child modes are distinct.
+    #[serde(skip)]
+    pub inherits_parent_model_memory: bool,
+    /// Host-only exact provider/model and auto-memory snapshot receipt selected
+    /// for a conversation fork. Renderer IPC and model arguments cannot
+    /// manufacture or replace this persisted binding.
+    #[serde(skip)]
+    pub fork_model_binding: Option<ForkModelBinding>,
+    /// Host-only receipt copied into persisted addressable subagent records.
+    /// It is generated after the exact ordinary/fork/named child mode has
+    /// been selected and is never accepted from renderer IPC.
+    #[serde(skip)]
+    pub subagent_execution_mode_receipt: Option<String>,
+    /// Complete host-derived set of addressable subagent names already used
+    /// anywhere in this conversation's active or inactive branch tree.
+    /// Names are permanently reserved so a receipt from one branch cannot be
+    /// replayed to downgrade another branch's fork/named execution mode.
+    #[serde(skip)]
+    pub subagent_reserved_names: Vec<String>,
+    /// Host-generated top-level run identifier used only for content-free
+    /// memory audit correlation. It is never accepted from renderer IPC or
+    /// exposed to model tool schemas.
+    #[serde(skip)]
+    pub memory_run_id: Option<String>,
+    /// Host-resolved addressable child name used only by the context-load
+    /// manifest. Main runs keep this empty. It is never accepted from IPC.
+    #[serde(skip)]
+    pub context_load_actor_name: Option<String>,
+    pub workspace_path: String,
+    /// Directories outside `workspace_path` that this conversation's filesystem
+    /// tools may also reach, copied from the persisted conversation by the
+    /// trusted request builder.
+    ///
+    /// Serde-skipped like every other trusted field: it widens a security
+    /// boundary, so renderer IPC must not be able to assert it. Child agents
+    /// inherit it from their parent request.
+    #[serde(skip)]
+    pub additional_directories: Vec<String>,
+    /// Host-rendered stable prompt, never accepted from or serialized to IPC.
+    #[serde(skip)]
+    pub assembled_system_prompt: String,
+    pub enabled_tools: Vec<String>,
+    pub contexts: Vec<ContextItem>,
+    /// Per-run low-priority context assembled by the trusted host (for
+    /// example project instructions and the long-term memory index). It is projected
+    /// as user context before conversation history and is never persisted.
+    #[serde(skip)]
+    pub ephemeral_contexts: Vec<ContextItem>,
+    /// Host notices queued for the next delivery point of the round loop. Every
+    /// message the host appends to a conversation goes through here and reaches
+    /// the model as a `box` result, so it lands at the end of the transcript
+    /// rather than in the system prompt or ahead of the history.
+    #[serde(skip)]
+    pub host_notices: Vec<HostNotice>,
+    pub tools: Vec<ToolDescriptor>,
+    /// Resolved from the persisted conversation by Rust. Renderer-provided values are replaced.
+    #[serde(default)]
+    pub active_hooks: Vec<HookDefinition>,
+    /// Trusted execution policy injected from the persisted document by Rust.
+    /// This is the level the run started with; read `effective_security_level`
+    /// for the level in force right now.
+    #[serde(default)]
+    pub security_level: SecurityLevel,
+    /// Shared with every descendant of this run so a mid-turn switch (the user
+    /// picking another level while the turn streams) reaches them. Absent
+    /// outside a registered run, and never on the wire — the renderer must not
+    /// be able to name a level.
+    #[serde(skip)]
+    pub live_security_level: Option<std::sync::Arc<LiveSecurityLevel>>,
+    /// Whether this run offers the `plan` / `exit_plan_mode` pair: plan mode
+    /// is on, or was on earlier in this conversation — once offered, the pair
+    /// stays, so turning plan mode on again never appends it twice. Host-only,
+    /// like the level: the renderer cannot grant the tools by asserting it.
+    #[serde(skip)]
+    pub plan_tools: bool,
+    /// The conversation's plan-mode switch as it stands now (`LivePlanMode`).
+    /// Absent outside a registered top-level run, which is never in plan mode.
+    #[serde(skip)]
+    pub live_plan_mode: Option<std::sync::Arc<LivePlanMode>>,
+    /// Trusted Tauri application-data root injected by Rust. Renderer input is ignored.
+    #[serde(default)]
+    pub app_data_path: String,
+    /// Trusted shell environment of workspace 1's machine, taken from
+    /// `workspaces` (the persisted `Conversation::run_target` is no longer read).
+    /// It is host-only, so neither the renderer nor tool arguments can select a
+    /// machine or inject variables. Child agents inherit it unchanged.
+    #[serde(skip)]
+    pub run_environment: crate::run_environment::ShellRunner,
+    /// The numbered workspaces this run may act in, resolved from the persisted
+    /// conversation. Host-only for the same reason as `run_environment`, and for
+    /// a stronger one: it names both the directories and the machines a call can
+    /// reach, so a renderer able to assert it could widen either. Child agents
+    /// inherit the parent's set unchanged.
+    #[serde(skip)]
+    pub workspaces: crate::workspace_set::WorkspaceSet,
+    /// The prompt profile this run renders every host-authored text with:
+    /// tool-description overrides plus the wording of every fixed injection
+    /// point. Resolved by `trusted_run_request` from the conversation's
+    /// selection (a built-in or a discovered `~/.mewrk/tool-descriptions` file)
+    /// and inherited unchanged by child agents. Host-only for the same reason
+    /// as the fields above: neither the renderer nor the model may hand a run a
+    /// text the user never selected.
+    #[serde(skip)]
+    pub prompt_profile: std::sync::Arc<crate::prompt_profile::PromptProfile>,
+    /// MCP transports dialed for this run. Host-owned; never accepted from renderer IPC.
+    /// Filled by `trusted_run_request` from the document's enabled MCP servers that this
+    /// conversation actually selected.
+    #[serde(skip)]
+    pub mcp_servers: Vec<crate::mcp::RuntimeMcpServer>,
+    /// Where `assembled_system_prompt` lists those servers, so a server that
+    /// fails to connect this turn can be taken out of the list again
+    /// (`api::attach_mcp_tools`). Host-owned like the servers themselves.
+    #[serde(skip)]
+    pub mcp_prompt_section: crate::capabilities::McpPromptSection,
+    /// Tool bindings discovered from trusted server transports for this run. Child agents inherit
+    /// them, while renderer IPC can never provide or replace them.
+    #[serde(skip)]
+    pub mcp_bindings: Vec<crate::mcp::McpToolBinding>,
+    /// What a role spawned from this run resolves its own skills, MCP servers
+    /// and hooks against (`capabilities::RoleBasis`): the run's environment
+    /// block, the conversation's selections the run took, and the role hooks
+    /// the turn's hook confirmation listed. Set by `trusted_run_request`;
+    /// children inherit it. Host-only.
+    #[serde(skip)]
+    pub role_basis: std::sync::Arc<crate::capabilities::RoleBasis>,
+    /// Orchestration nesting depth. Never read from IPC input; `run_model` sets it
+    /// when spawning a subagent so nested spawns can be refused deterministically.
+    #[serde(skip)]
+    pub subagent_depth: usize,
+    /// The conversation's handoff notebook and whether the run is armed to
+    /// hand off (`handoff.rs`). Host-only: resolved when the run starts and
+    /// moved only by the run loop, so neither the renderer nor the model can
+    /// grant itself the tools it decides.
+    #[serde(skip)]
+    pub handoff: crate::handoff::HandoffRun,
+    /// The user pressed "compact now": the run's first boundary compacts the
+    /// context natively whatever the threshold, opens the continuation and
+    /// ends, without a turn of its own (`native_compaction.rs`). Host-only:
+    /// `run_model` sets it from its own argument.
+    #[serde(skip)]
+    pub compact_now: bool,
+    /// The turn this request belongs to, as the host knows it.
+    ///
+    /// Hydrated in `trusted_run_request` from `run_model`'s own argument, never
+    /// from the request body — the renderer already passes `requestId` as a
+    /// separate parameter, and letting the body assert one would let a caller
+    /// claim a turn it does not own. Empty for child agents, which have no
+    /// registered run of their own.
+    #[serde(skip)]
+    pub request_id: String,
+    /// Addressable name of the agent this request runs as, or `None` for the
+    /// main session. Host-set alongside `subagent_depth`; never from IPC.
+    ///
+    /// Its only consumer is the dangerous-tool confirmation dialog: with up to
+    /// `MAX_RUNNING_SUBAGENTS` children running concurrently, a prompt that does not
+    /// say who is asking is not an informed decision.
+    #[serde(skip)]
+    pub subagent_name: Option<String>,
+    /// Parent-timeline call id of the child turn this request runs as, or
+    /// `None` for the main session. Host-set by the task workers alongside
+    /// `subagent_name`; never from IPC.
+    ///
+    /// Same single consumer as `subagent_name` — the dangerous-tool
+    /// confirmation card — but machine-facing: the renderer's streaming view of
+    /// a workflow step is keyed by this call id, not by the pool name the card
+    /// displays, so this is what lets the card open the requester's own page.
+    #[serde(skip)]
+    pub subagent_call_id: Option<String>,
+    /// The owner this run's history entries are filed under when `subagent_name`
+    /// alone would not name one owner per agent. A workflow step's pool name
+    /// restarts at `ws1` for every run, so two runs' first steps would share an
+    /// owner and read as one agent; the step's driver sets this to
+    /// `<run>/<name>` instead, which the step shell also publishes so the
+    /// renderer can ask for exactly those entries. `None` — every other request —
+    /// derives the owner from `subagent_name` and `subagent_depth`. Host-set;
+    /// never from IPC.
+    #[serde(skip)]
+    pub history_owner: Option<String>,
+    /// User steer inbox attached only by the trusted `run_model` command.
+    /// Queue cards remain persisted until the loop emits `UserInputReceived`.
+    #[serde(skip)]
+    pub steer_mailbox: crate::agents::AgentMailboxHandle,
+    /// Cancellation signal for the owning task, attached by workers for child
+    /// rounds. It must reach synchronously blocking work. A nonempty task signal
+    /// is the sole cancellation source for a task round; a top-level round uses
+    /// its own signal. Renderer IPC and model arguments cannot supply either.
+    #[serde(skip)]
+    pub task_cancel: crate::cancel::CancelSignal,
+    /// Cancellation signal for this run, minted by `begin_model_run`. All
+    /// cancellation checks use [`Self::round_cancellation`] to select the signal
+    /// by ownership rather than looking up another conversation's current run.
+    #[serde(skip)]
+    pub run_cancel: crate::cancel::CancelSignal,
+}
+
+impl RunModelRequest {
+    /// Which memory tiers this run may read and write.
+    ///
+    /// The single source of truth for tier gating: context assembly, tool
+    /// granting and tool execution all derive from this rather than from the
+    /// two booleans directly, so they cannot drift apart.
+    pub fn memory_tier_access(&self) -> crate::mewrk_memory::MemoryTierAccess {
+        crate::mewrk_memory::MemoryTierAccess {
+            global: self.global_memory_enabled,
+            project: self.project_memory_enabled,
+        }
+    }
+
+    /// True when at least one tier is on. For the coarse questions — is there
+    /// any memory block at all, is any memory tool reachable — where the tier
+    /// does not matter.
+    pub fn memory_enabled(&self) -> bool {
+        self.global_memory_enabled || self.project_memory_enabled
+    }
+
+    /// The read-record scope this run's file guards consult: the child scope a
+    /// spawner minted, or the conversation itself.
+    pub fn file_guard_scope(&self) -> &str {
+        if self.file_guard.scope.is_empty() {
+            &self.conversation_id
+        } else {
+            &self.file_guard.scope
+        }
+    }
+
+    /// The security level in force for the next decision.
+    ///
+    /// The user may switch the level in the middle of a turn, so every gate
+    /// evaluated during a run reads this rather than `security_level`, which is
+    /// only the value the run started with.
+    /// Whether this run is in plan mode right now. Only the conversation the
+    /// user is talking to plans; a child never is, whatever the switch says.
+    pub fn plan_mode_active(&self) -> bool {
+        self.subagent_depth == 0
+            && self
+                .live_plan_mode
+                .as_ref()
+                .is_some_and(|cell| cell.get())
+    }
+
+    pub fn effective_security_level(&self) -> SecurityLevel {
+        match &self.live_security_level {
+            Some(cell) => cell.get(),
+            None => self.security_level,
+        }
+    }
+
+    /// Select the cancellation signal by round ownership.
+    ///
+    /// * Task rounds use only `task_cancel`.
+    /// * Top-level rounds use only `run_cancel`.
+    /// * Empty signals used by direct IPC or tests never cancel.
+    ///
+    /// All cancellable work observes this one value to prevent divergent stop
+    /// semantics or unsafe current-run lookups.
+    pub fn round_cancellation(&self) -> crate::cancel::CancelSignal {
+        if !self.task_cancel.is_empty() {
+            return self.task_cancel.clone();
+        }
+        self.run_cancel.clone()
+    }
+}
+
+impl std::fmt::Debug for RunModelRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mcp_tool_names = self
+            .mcp_bindings
+            .iter()
+            .map(|binding| binding.exposed_name.as_str())
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("RunModelRequest")
+            .field("provider_id", &self.provider.id)
+            .field("model_id", &self.model.id)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("conversation_id", &self.conversation_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("has_memory_context", &self.memory_context_id.is_some())
+            .field(
+                "has_project_memory_context",
+                &self.project_memory_context_id.is_some(),
+            )
+            .field(
+                "has_agent_definition_binding",
+                &self.agent_definition_binding.is_some(),
+            )
+            .field(
+                "inherits_parent_model_memory",
+                &self.inherits_parent_model_memory,
+            )
+            .field("has_fork_model_binding", &self.fork_model_binding.is_some())
+            .field(
+                "has_subagent_execution_mode_receipt",
+                &self.subagent_execution_mode_receipt.is_some(),
+            )
+            .field(
+                "subagent_reserved_name_count",
+                &self.subagent_reserved_names.len(),
+            )
+            .field("has_memory_run_id", &self.memory_run_id.is_some())
+            .field(
+                "has_context_load_actor_name",
+                &self.context_load_actor_name.is_some(),
+            )
+            .field("enabled_tools", &self.enabled_tools)
+            .field("context_count", &self.contexts.len())
+            .field("ephemeral_context_count", &self.ephemeral_contexts.len())
+            .field("tool_count", &self.tools.len())
+            .field("active_hook_count", &self.active_hooks.len())
+            .field("security_level", &self.security_level)
+            .field("effective_security_level", &self.effective_security_level())
+            .field("mcp_server_count", &self.mcp_servers.len())
+            .field("mcp_tools", &mcp_tool_names)
+            .field("subagent_depth", &self.subagent_depth)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    /// Reasoning tokens the provider billed for this request.
+    ///
+    /// **A subset of `output_tokens`, never an addend.** Same discipline as
+    /// `cached_input_tokens`: it exists so the timeline can say how much
+    /// thinking a round actually cost, and adding it to any total would bill
+    /// the same tokens twice. OpenAI Responses reports `0` rather than
+    /// omitting the field when a round did no reasoning at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunModelResponse {
+    pub contexts: Vec<ContextItem>,
+    pub usage: ModelUsage,
+    pub model: String,
+    pub provider_name: String,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Terminal request failure of the turn (`stop_reason == "error"`). Kept
+    /// out of `contexts` on purpose: the renderer shows it as a dismissable
+    /// notice instead of persisting error text into the timeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ModelRunError>,
+    /// The value this turn handed back through `structured_output`, already
+    /// validated against the run's `output_schema`.
+    ///
+    /// It has to travel on the response rather than be recovered from the
+    /// contexts, because `agent_worker_loop` never sees tool calls — it builds a
+    /// child request, recurses into `run_model` and inspects only what comes
+    /// back here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<Value>,
+}
+
+/// Structured description of the API failure that ended a model turn after
+/// automatic retries were exhausted (or a permanent failure was detected).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRunError {
+    pub message: String,
+    /// Tool round the failing request belonged to (1-based).
+    pub round: usize,
+    /// Total requests attempted for that round, including the first one.
+    pub attempts: u32,
+}
+
+/// Normalized incremental output sent over the per-invocation Tauri channel.
+/// Provider-specific protocol events, signatures, and encrypted payloads deliberately
+/// never cross the IPC boundary. Only provider-designated visible reasoning is emitted.
+// `Eq` stops at `ToolContextSettled` because its `ContextItem` card can contain
+// a subagent record with fields that implement only `PartialEq`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelStreamEvent {
+    #[cfg(debug_assertions)]
+    DebugRequestBody {
+        round: usize,
+        body: Value,
+    },
+    TextDelta {
+        round: usize,
+        delta: String,
+    },
+    /// The provider opened a reasoning item.
+    ///
+    /// Deliberately *not* implied by the first [`Self::ReasoningDelta`]: a
+    /// Responses round that only returns `encrypted_content` never emits a
+    /// single delta, and this is then the one signal that the model is
+    /// thinking at all. The renderer starts its live clock here.
+    ReasoningStart {
+        round: usize,
+        /// Zero-based ordinal of this reasoning item inside the round. The
+        /// sidecar only numbers items that survive its evidence gate, so the
+        /// ordinal is dense. The renderer keys one live reasoning row per
+        /// ordinal — without it, interleaved reasoning items collapse into a
+        /// single card while settlement splits them into several.
+        #[serde(default)]
+        item: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form: Option<ReasoningForm>,
+    },
+    ReasoningDelta {
+        round: usize,
+        #[serde(default)]
+        item: usize,
+        delta: String,
+    },
+    ReasoningDone {
+        round: usize,
+        #[serde(default)]
+        item: usize,
+        /// Wall-clock milliseconds this step has spent reasoning so far,
+        /// measured by the sidecar. Cumulative across the step's reasoning
+        /// items, so repeated `ReasoningDone` events carry the same figure
+        /// and applying them is idempotent.
+        ///
+        /// Explicitly renamed: this enum's `rename_all` only touches variant
+        /// names, so `duration_ms` would otherwise reach the renderer as
+        /// `duration_ms` while every other field there is camelCase.
+        #[serde(
+            rename = "durationMs",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        duration_ms: Option<u64>,
+    },
+    /// Live estimate of the tokens an open reasoning item has thought without
+    /// streaming them as text (omitted thinking), cumulative for the item.
+    /// Display only — it feeds the indicator beside the cat and is never
+    /// usage, which stays the provider's figure.
+    ReasoningProgress {
+        round: usize,
+        #[serde(default)]
+        item: usize,
+        #[serde(rename = "estimatedTokens")]
+        estimated_tokens: u64,
+    },
+    /// Provider-reported cumulative usage for the current API round. A retry
+    /// reuses `round`, so renderers replace the previous attempt's snapshot
+    /// instead of adding it.
+    UsageUpdated {
+        round: usize,
+        usage: ModelUsage,
+    },
+    /// A persisted queue item has crossed the backend boundary and joined the
+    /// current model turn as a real user context.
+    UserInputReceived {
+        round: usize,
+        id: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageAttachment>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<FileAttachment>,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+    /// A context the host itself added to the transcript between two of the
+    /// model's requests: a `box` delivery (a background result, a restart
+    /// notice, a host notice such as auto-compact arming), an appended system
+    /// prompt, a tool-addition marker, a Stop hook's continuation message.
+    ///
+    /// Nothing else announces these. The card is already in the run's
+    /// persisted contexts; this lets the renderer show it in the live turn
+    /// rather than only once the turn settles. `round` is the round it joins
+    /// ahead of, and the host sends these and `UserInputReceived` in the
+    /// order the transcript holds them.
+    HostContextAdded {
+        round: usize,
+        context: Box<ContextItem>,
+    },
+    ToolCallAnnounced {
+        round: usize,
+        #[serde(rename = "callId")]
+        call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        /// The timeline id this call's card will carry once it is persisted.
+        ///
+        /// The renderer has to give the streaming row an id the moment a call
+        /// is announced, long before the host builds the card. Sending the
+        /// host's id here is what keeps the two from inventing separate ones
+        /// and then disagreeing about which is real at save time — a
+        /// disagreement that used to strand a card's attestation permanently.
+        #[serde(rename = "contextId")]
+        context_id: String,
+    },
+    ToolCallArgumentsReady {
+        round: usize,
+        #[serde(rename = "callId")]
+        call_id: String,
+        input: JsonObject,
+    },
+    /// A tool call is waiting on the user. The renderer shows an approval card
+    /// above the composer and answers with `resolve_tool_prompt`; the worker
+    /// thread that raised it is blocked until then. Superseded by
+    /// `ToolApprovalResolved` the moment any answer lands, including a denial
+    /// the host produced itself (run cancelled, prompt timed out).
+    ///
+    /// Carries no round or call id: approval is raised from the tool executor,
+    /// which is handed the execution request and the descriptor but not the
+    /// surrounding turn. A card is identified by its prompt id alone, so
+    /// inventing a round here would only be plausible-looking noise.
+    ToolApprovalRequested {
+        #[serde(rename = "promptId")]
+        prompt_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        /// Which card the renderer draws: an ordinary tool approval, or one of
+        /// the two plan-mode cards, which offer feedback instead of "always".
+        #[serde(default)]
+        kind: crate::tool_prompt::PromptKind,
+        /// Human-facing tool label, already localized by the catalog.
+        label: String,
+        /// A short description of what the model is asking to do, derived from
+        /// the call's own redacted arguments and truncated for display.
+        summary: String,
+        #[serde(rename = "riskLevel")]
+        risk_level: String,
+        reason: String,
+        /// The requesting subagent's name, or absent for the main session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        requester: Option<String>,
+        /// Machine-readable requester address, unlike `requester` which is
+        /// display-escaped text: the child's addressable name plus the
+        /// parent-timeline call id of its turn. Both absent for the main
+        /// session's own calls. The renderer uses them to open the requesting
+        /// child's page when the card arrives.
+        #[serde(rename = "sourceAgent", skip_serializing_if = "Option::is_none")]
+        source_agent: Option<String>,
+        #[serde(rename = "sourceCallId", skip_serializing_if = "Option::is_none")]
+        source_call_id: Option<String>,
+        /// False for shell and MCP tools, and for any decision the classifier
+        /// marked mandatory: those must be answered one call at a time.
+        #[serde(rename = "allowAlwaysOffered")]
+        allow_always_offered: bool,
+        /// Whether this card appears whatever the conversation's security level
+        /// is. The renderer says so on the card, so full access showing a prompt
+        /// reads as the deliberate exception it is rather than a malfunction.
+        #[serde(default)]
+        mandatory: bool,
+        /// The questions a `question` card asks (the `ask_user` input's
+        /// `questions` array). Absent on every other kind.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        questions: Option<serde_json::Value>,
+    },
+    /// The pending approval card for `promptId` is over. `approved` reports
+    /// what the host concluded, which is not always what the user clicked —
+    /// a cancelled run resolves outstanding cards as denied.
+    ToolApprovalResolved {
+        #[serde(rename = "promptId")]
+        prompt_id: String,
+        approved: bool,
+    },
+    ToolExecutionStarted {
+        round: usize,
+        #[serde(rename = "callId")]
+        call_id: String,
+    },
+    /// A normalized child model event, attributed to the parent agent tool
+    /// call. Keeping the event shape intact lets the frontend feed both parent
+    /// and child streams through the same context projection and renderer.
+    SubagentEvent {
+        round: usize,
+        #[serde(rename = "callId")]
+        call_id: String,
+        event: Box<ModelStreamEvent>,
+    },
+    /// Parent-facing child lifecycle and explicit progress updates. Raw model
+    /// content and tool events use `SubagentEvent` instead.
+    SubagentDelta {
+        round: usize,
+        #[serde(rename = "callId")]
+        call_id: String,
+        channel: SubagentChannel,
+        delta: String,
+    },
+    /// One transition of a running workflow's progress ledger, attributed to
+    /// the `workflow` tool call that owns the run.
+    ///
+    /// Per-step transcripts keep riding `SubagentEvent`'s double nesting, so
+    /// this carries only what the progress card draws. A renderer that ignores
+    /// it loses the card, not the transcripts — which is why the card was not
+    /// folded into `SubagentChannel` as a sixth channel: a status delta is a
+    /// string, and squeezing a mergeable row through it would force the
+    /// renderer to parse its own wire format back out.
+    WorkflowProgress {
+        round: usize,
+        #[serde(rename = "callId")]
+        call_id: String,
+        /// The run this transition belongs to. The card's Skip/Retry commands
+        /// address a step by (request_id, run_id, step_index), and the run id is
+        /// minted host-side per run — including on resume, where it is reused —
+        /// so the renderer can only learn it from the stream.
+        #[serde(rename = "runId")]
+        run_id: String,
+        entry: Box<workflow_core::progress::ProgressRow>,
+    },
+    ToolExecutionCompleted {
+        round: usize,
+        #[serde(rename = "callId")]
+        call_id: String,
+        result: ToolResult,
+    },
+    /// The settled, host-attested form of an already-emitted tool card —
+    /// today that means an agent/workflow card whose terminal child record was
+    /// just backfilled at a round boundary, while the parent run keeps going.
+    ///
+    /// The renderer replaces its persisted copy of the card by id and lets the
+    /// ordinary debounced save make the record durable immediately, instead of
+    /// waiting for the request to settle: a process that dies mid-run used to
+    /// take every finished child transcript with it. The card carries a fresh
+    /// attestation token covering the record, so the replacement passes save
+    /// validation on its own even after a restart.
+    ToolContextSettled {
+        round: usize,
+        context: Box<ContextItem>,
+    },
+    HookExecutionStarted {
+        round: usize,
+        #[serde(rename = "executionId")]
+        execution_id: String,
+        #[serde(rename = "hookId")]
+        hook_id: String,
+        #[serde(rename = "hookName")]
+        hook_name: String,
+        event: String,
+        #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
+        status_message: Option<String>,
+    },
+    HookExecutionCompleted {
+        round: usize,
+        #[serde(rename = "executionId")]
+        execution_id: String,
+        #[serde(rename = "hookId")]
+        hook_id: String,
+        #[serde(rename = "hookName")]
+        hook_name: String,
+        event: String,
+        result: ToolResult,
+        blocked: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(rename = "contextInjected")]
+        context_injected: bool,
+    },
+    /// A transient model-request failure is about to be retried. The renderer
+    /// discards the failed attempt's partial content for `round` and shows a
+    /// temporary retry notice; the error text is never a timeline context.
+    StreamRetryScheduled {
+        round: usize,
+        /// 1-based retry attempt about to run.
+        attempt: u32,
+        #[serde(rename = "maxAttempts")]
+        max_attempts: u32,
+        #[serde(rename = "delayMs")]
+        delay_ms: u64,
+        message: String,
+    },
+    /// Cancellation probe emitted while no provider data is flowing (retry
+    /// backoff waits, keep-alive gaps). Carries no payload; renderers ignore it.
+    Ping,
+    /// The turn behind this conversation's run has settled host-side and its
+    /// outcome is waiting in the run-stream hub. Renderers that own the
+    /// original `run_model` invocation ignore it (their invoke promise carries
+    /// the same settlement); renderers that adopted the run via
+    /// `attach_model_run` respond by calling `take_run_settlement`.
+    RunConcluded {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+}
+
+/// Which stream of the nested run a `SubagentDelta` fragment belongs to.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentChannel {
+    Text,
+    Reasoning,
+    Activity,
+    Update,
+    /// Lifecycle transitions of a background agent (every value of
+    /// `AgentLiveStatus::wire`). An empty delta is a liveness heartbeat emitted
+    /// while `task_wait` blocks; renderers must ignore it.
+    Status,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn conversation_json(worktree_key: &str, worktree: Value) -> Value {
+        let base = crate::catalog::default_document().workspaces[0].conversations[0].clone();
+        let mut value = serde_json::to_value(base).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("worktrees");
+        object.insert(worktree_key.to_owned(), worktree);
+        value
+    }
+
+    /// Worktrees read from every shape they were ever written in: the list,
+    /// the legacy single record for workspace 1, and nothing at all.
+    #[test]
+    fn worktrees_read_from_the_list_and_from_the_legacy_single_record() {
+        let record = json!({ "path": "/w/a", "branch": "mewrk/conv/a", "baseOid": "abc" });
+        let legacy: Conversation =
+            serde_json::from_value(conversation_json("worktree", record.clone())).unwrap();
+        assert_eq!(legacy.worktrees.len(), 1);
+        assert_eq!(legacy.worktrees[0].workspace, None);
+        let none: Conversation =
+            serde_json::from_value(conversation_json("worktree", Value::Null)).unwrap();
+        assert!(none.worktrees.is_empty());
+        let listed: Conversation =
+            serde_json::from_value(conversation_json("worktrees", json!([record]))).unwrap();
+        assert_eq!(listed.worktrees, legacy.worktrees);
+        let written = serde_json::to_value(&listed).unwrap();
+        assert!(written.get("worktree").is_none());
+        assert_eq!(written["worktrees"][0]["path"], "/w/a");
+    }
+
+    /// A worktree stands in for the workspace it was checked out from, by
+    /// machine and path — never by position — and a legacy record only for
+    /// workspace 1.
+    #[test]
+    fn a_worktree_stands_in_only_for_the_workspace_it_came_from() {
+        let ssh = |path: &str| AttachedWorkspace {
+            machine: Some(RunTarget::Ssh { machine_id: "m1".into() }),
+            path: path.into(),
+        };
+        let local = |path: &str| AttachedWorkspace { machine: None, path: path.into() };
+        let worktree = |path: &str, workspace: Option<AttachedWorkspace>| ConversationWorktree {
+            path: path.into(),
+            branch: "mewrk/conv/x".into(),
+            base_oid: "abc".into(),
+            base_branch: Some("main".into()),
+            workspace,
+        };
+        let mut conversation: Conversation =
+            serde_json::from_value(conversation_json("worktrees", json!([]))).unwrap();
+        conversation.worktrees = vec![
+            worktree("/w/legacy", None),
+            worktree("C:/w/remote", Some(ssh("C:/repo/"))),
+        ];
+        assert_eq!(
+            conversation.worktree_for(1, &local("/repo")).map(|w| w.path.as_str()),
+            Some("/w/legacy")
+        );
+        assert_eq!(
+            conversation.worktree_for(3, &ssh("C:/repo")).map(|w| w.path.as_str()),
+            Some("C:/w/remote")
+        );
+        // Same path, other machine: not the same workspace.
+        assert!(conversation.worktree_for(2, &local("C:/repo")).is_none());
+    }
+
+    /// Catalogs cover each variant exactly once and every slug round-trips. The
+    /// TypeScript vocabulary guard reads this file as text, so this test is its
+    /// Rust-side compiled reader.
+    #[test]
+    fn endpoint_and_capability_vocabularies_are_self_consistent() {
+        let endpoint_slugs: BTreeSet<&str> = EndpointType::CATALOG
+            .iter()
+            .map(|entry| entry.slug())
+            .collect();
+        assert_eq!(
+            endpoint_slugs.len(),
+            EndpointType::CATALOG.len(),
+            "两个端点共用一个 slug 会让跨语言比对沉默地通过"
+        );
+        for endpoint in EndpointType::CATALOG {
+            assert_eq!(EndpointType::from_slug(endpoint.slug()), Some(*endpoint));
+        }
+        // `openai_chat` is a ProviderFamily slug, not an endpoint slug.
+        // Mixing the vocabularies silently invalidates endpoint coverage.
+        assert_eq!(EndpointType::from_slug("openai_chat"), None);
+
+        let capability_slugs: BTreeSet<&str> = ModelCapability::CATALOG
+            .iter()
+            .map(|entry| entry.slug())
+            .collect();
+        assert_eq!(capability_slugs.len(), ModelCapability::CATALOG.len());
+        for capability in ModelCapability::CATALOG {
+            assert_eq!(
+                ModelCapability::from_slug(capability.slug()),
+                Some(*capability)
+            );
+        }
+        assert_eq!(ModelCapability::from_slug("vision"), None);
+        // Retired capability slugs must not resolve: a stale archive that still
+        // carries them is read as "no capability", not as a live variant.
+        for retired in [
+            "function_call",
+            "reasoning",
+            "image_generation",
+            "audio_generation",
+            "audio_transcript",
+            "embedding",
+            "rerank",
+        ] {
+            assert_eq!(ModelCapability::from_slug(retired), None, "{retired}");
+        }
+
+        let reasoning_slugs: BTreeSet<&str> = ReasoningContent::CATALOG
+            .iter()
+            .map(|entry| entry.slug())
+            .collect();
+        assert_eq!(reasoning_slugs.len(), ReasoningContent::CATALOG.len());
+        for form in ReasoningContent::CATALOG {
+            assert_eq!(ReasoningContent::from_slug(form.slug()), Some(*form));
+        }
+        // `auto` was retired in favour of an explicit value written at load time.
+        assert_eq!(ReasoningContent::from_slug("auto"), None);
+    }
+
+    /// `supports_vision` projects the capability set rather than an independent
+    /// boolean.
+    #[test]
+    fn vision_support_projects_from_the_capability_set() {
+        let mut model = ModelProfile {
+            id: "m".into(),
+            name: String::new(),
+            group: String::new(),
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: BTreeSet::new(),
+            reasoning_content: Default::default(),
+            prompt_cache: true,
+            cache_ttl_minutes: None,
+        };
+        assert!(!model.supports_vision());
+
+        model.set_capability(ModelCapability::ImageRecognition, true);
+        assert!(model.supports_vision());
+
+        model.set_capability(ModelCapability::ImageRecognition, false);
+        assert!(!model.supports_vision());
+    }
+
+    /// `prompt_cache` is a concrete, always-written attribute that defaults on:
+    /// a profile written before the key existed loads as enabled, an explicit
+    /// `false` survives the round trip, and the key is never omitted on save.
+    #[test]
+    fn prompt_cache_defaults_on_and_round_trips_false() {
+        let legacy: ModelProfile = serde_json::from_value(serde_json::json!({
+            "id": "m",
+            "capabilities": [],
+            "reasoningContent": "plaintext"
+        }))
+        .unwrap();
+        assert!(legacy.prompt_cache);
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap()["promptCache"],
+            serde_json::json!(true)
+        );
+
+        let disabled: ModelProfile = serde_json::from_value(serde_json::json!({
+            "id": "m",
+            "capabilities": [],
+            "reasoningContent": "plaintext",
+            "promptCache": false
+        }))
+        .unwrap();
+        assert!(!disabled.prompt_cache);
+        assert_eq!(
+            serde_json::to_value(&disabled).unwrap()["promptCache"],
+            serde_json::json!(false)
+        );
+    }
+
+    /// Only the Messages protocol consumes the attribute; every other family
+    /// stores it without a wire effect.
+    #[test]
+    fn prompt_cache_takes_effect_only_on_the_messages_protocol() {
+        for family in ProviderFamily::CATALOG {
+            assert_eq!(
+                family.prompt_cache_takes_effect(),
+                matches!(family, ProviderFamily::Anthropic),
+                "{family:?}"
+            );
+        }
+    }
+
+    /// Every literal a provider or the renderer can put in a tool payload,
+    /// paired with what one trip through JavaScript turns it into. The right
+    /// column is not hand-written: it was produced by actually running
+    /// `JSON.stringify(JSON.parse(x))` in node.
+    const JAVASCRIPT_ROUND_TRIP: &[(&str, &str)] = &[
+        // Integral floats lose the fractional part.
+        ("1.0", "1"),
+        ("-1.0", "-1"),
+        ("1.0e2", "100"),
+        ("123456789.0", "123456789"),
+        // Negative zero is not representable in JSON output.
+        ("-0.0", "0"),
+        // Integers past 2^53 round to the nearest representable f64.
+        ("9007199254740993", "9007199254740992"),
+        ("-9007199254740993", "-9007199254740992"),
+        // Ordinary values are untouched.
+        ("0", "0"),
+        ("3", "3"),
+        ("-5", "-5"),
+        ("2.5", "2.5"),
+        ("0.1", "0.1"),
+        ("-0.5", "-0.5"),
+        ("0.30000000000000004", "0.30000000000000004"),
+        ("3.0e-7", "3e-7"),
+        ("1.5e-10", "1.5e-10"),
+        ("9007199254740992", "9007199254740992"),
+    ];
+
+    /// Canonicalizing what a payload becomes after the round trip must give
+    /// the same answer as canonicalizing what it started as, or a tool card
+    /// stops matching its own attestation and the document becomes unsaveable.
+    #[test]
+    fn the_canonical_number_form_is_what_a_javascript_round_trip_produces() {
+        for (input, javascript) in JAVASCRIPT_ROUND_TRIP {
+            let mut original =
+                serde_json::from_str::<Value>(&format!("{{\"d\":{input}}}")).unwrap();
+            canonicalize_json_numbers(&mut original);
+            assert_eq!(
+                serde_json::to_string(&original).unwrap(),
+                format!("{{\"d\":{javascript}}}"),
+                "{input} should canonicalize to the value JavaScript hands back"
+            );
+        }
+    }
+
+    /// The property persistence actually depends on: canonicalizing a payload
+    /// that already made the trip changes nothing, so the bytes attested at
+    /// execution equal the bytes presented at save.
+    #[test]
+    fn canonicalizing_a_value_that_already_crossed_the_renderer_is_a_no_op() {
+        for (_, javascript) in JAVASCRIPT_ROUND_TRIP {
+            let document = format!("{{\"d\":{javascript}}}");
+            let mut once = serde_json::from_str::<Value>(&document).unwrap();
+            canonicalize_json_numbers(&mut once);
+            let mut twice = once.clone();
+            canonicalize_json_numbers(&mut twice);
+            assert_eq!(once, twice, "{javascript} should be a fixed point");
+            assert_eq!(serde_json::to_string(&once).unwrap(), document);
+        }
+    }
+
+    /// A card is attested when it is executed and re-checked when it is saved,
+    /// with a full JSON trip through the renderer in between. Every literal a
+    /// provider can write has to survive that trip byte for byte, because the
+    /// comparison at the far end is exact.
+    #[test]
+    fn a_tool_payload_survives_the_round_trip_that_attestation_spans() {
+        // Every value here is one the renderer hands back verbatim; the
+        // simulation below is what the host does to both ends.
+        for (input, _) in JAVASCRIPT_ROUND_TRIP {
+            let executed = format!("{{\"argument\":{input}}}");
+            let mut attested = serde_json::from_str::<Value>(&executed).unwrap();
+            canonicalize_json_numbers(&mut attested);
+            let attested_bytes = serde_json::to_string(&attested).unwrap();
+
+            // The renderer parses those bytes and hands them back, and the
+            // host re-canonicalizes what arrives before comparing.
+            let mut returned = serde_json::from_str::<Value>(&attested_bytes).unwrap();
+            canonicalize_json_numbers(&mut returned);
+
+            assert_eq!(
+                serde_json::to_string(&returned).unwrap(),
+                attested_bytes,
+                "{input} must present the same bytes at save that it attested at execution"
+            );
+        }
+    }
+
+    /// Numbers inside strings are data, not values. Tool output is the field
+    /// most likely to contain JSON-looking text, and rewriting it would both
+    /// corrupt the output and break the card it belongs to.
+    #[test]
+    fn number_shaped_text_inside_strings_and_keys_is_left_alone() {
+        for document in [
+            r#"{"output":"cost 1.0 and -0.0 and 9007199254740993"}"#,
+            r#"{"1.0":"key stays"}"#,
+            r#"{"output":"escaped \" then 1.0"}"#,
+        ] {
+            let original = serde_json::from_str::<Value>(document).unwrap();
+            let mut canonical = original.clone();
+            canonicalize_json_numbers(&mut canonical);
+            assert_eq!(
+                canonical, original,
+                "{document} must not be rewritten inside strings or keys"
+            );
+        }
+    }
+
+    /// Nested payloads are the common shape for tool arguments.
+    #[test]
+    fn canonicalization_reaches_nested_objects_and_arrays() {
+        let mut value = serde_json::from_str::<Value>(r#"{"a":[1.0,{"b":[-0.0,2.0]}]}"#).unwrap();
+        canonicalize_json_numbers(&mut value);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"{"a":[1,{"b":[0,2]}]}"#
+        );
+
+        let mut object = serde_json::from_str::<JsonObject>(r#"{"a":[1.0],"b":2.0}"#).unwrap();
+        canonicalize_object_numbers(&mut object);
+        assert_eq!(
+            serde_json::to_string(&object).unwrap(),
+            r#"{"a":[1],"b":2}"#
+        );
+    }
+
+    /// The four literals below freeze the *shape* of the execution-mode
+    /// payload: field order, nesting, and which fields are omitted when unset.
+    /// A shape change silently re-points an addressable name at a different
+    /// execution mode mid-conversation, which is exactly what
+    /// `AppState::reserve_subagent_execution_mode` exists to refuse.
+    ///
+    /// If this test fails, the payload shape moved. Do not re-capture the
+    /// literals — revert the shape change and extend via a v2 projection.
+    ///
+    /// The one exception is a rename of an enum the payload embeds: the
+    /// reservation registry is an in-process map rebuilt every launch, and
+    /// incompatible persisted documents are rejected, so no stored value can
+    /// disagree with the current name.
+    #[test]
+    fn execution_mode_payload_v1_is_frozen() {
+        let fork_without_snapshot_receipt = ForkModelBinding {
+            provider_id: "anthropic".into(),
+            model_id: "claude-opus-5".into(),
+            memory_language: ResolvedLanguage::ZhCn,
+            memory_tool_names: vec!["memory_read".into(), "memory_write".into()],
+            system_prompt_snapshot: "快照提示词".into(),
+            system_prompt_receipt: "spr-1".into(),
+            memory_snapshot_receipt: None,
+            binding_receipt: "br-1".into(),
+            receipt_version: 1,
+        };
+        let mut fork_with_snapshot_receipt = fork_without_snapshot_receipt.clone();
+        fork_with_snapshot_receipt.memory_snapshot_receipt = Some("msr-1".into());
+
+        let definition = AgentDefinitionBinding {
+            source: AgentDefinitionSource::Project,
+            source_key: "workspace-key".into(),
+            name: "reviewer".into(),
+            revision: 7,
+            memory_epoch: 3,
+            provider_id: "anthropic".into(),
+            model_id: "claude-sonnet-5".into(),
+            memory: AgentDefinitionMemory::Project,
+            scope_key: "scope-key".into(),
+            configuration_receipt: "cr-1".into(),
+            receipt_version: 1,
+        };
+
+        let fixtures = [
+            (
+                "no_bindings",
+                canonical_subagent_execution_mode_payload(
+                    "conv-1",
+                    "helper",
+                    SubagentRunKind::General,
+                    false,
+                    None,
+                    None,
+                ),
+            ),
+            (
+                "fork_without_snapshot_receipt",
+                canonical_subagent_execution_mode_payload(
+                    "conv-1",
+                    "helper",
+                    SubagentRunKind::General,
+                    true,
+                    Some(&fork_without_snapshot_receipt),
+                    None,
+                ),
+            ),
+            (
+                "fork_with_snapshot_receipt",
+                canonical_subagent_execution_mode_payload(
+                    "conv-1",
+                    "helper",
+                    SubagentRunKind::WorkflowStep,
+                    true,
+                    Some(&fork_with_snapshot_receipt),
+                    None,
+                ),
+            ),
+            (
+                "definition_binding",
+                canonical_subagent_execution_mode_payload(
+                    "conv-1",
+                    "reviewer",
+                    SubagentRunKind::General,
+                    false,
+                    None,
+                    Some(&definition),
+                ),
+            ),
+        ];
+
+        let expected = [
+            r#"["conv-1","helper","general",false,null,null]"#,
+            concat!(
+                r#"["conv-1","helper","general",true,{"providerId":"anthropic","#,
+                r#""modelId":"claude-opus-5","memoryLanguage":"zh-CN","#,
+                r#""memoryToolNames":["memory_read","memory_write"],"#,
+                r#""systemPromptSnapshot":"快照提示词","systemPromptReceipt":"spr-1","#,
+                r#""bindingReceipt":"br-1"},null]"#
+            ),
+            concat!(
+                r#"["conv-1","helper","workflowStep",true,{"providerId":"anthropic","#,
+                r#""modelId":"claude-opus-5","memoryLanguage":"zh-CN","#,
+                r#""memoryToolNames":["memory_read","memory_write"],"#,
+                r#""systemPromptSnapshot":"快照提示词","systemPromptReceipt":"spr-1","#,
+                r#""memorySnapshotReceipt":"msr-1","bindingReceipt":"br-1"},null]"#
+            ),
+            concat!(
+                r#"["conv-1","reviewer","general",false,null,{"source":"project","#,
+                r#""sourceKey":"workspace-key","name":"reviewer","revision":7,"#,
+                r#""memoryEpoch":3,"providerId":"anthropic","modelId":"claude-sonnet-5","#,
+                r#""memory":"project","scopeKey":"scope-key","configurationReceipt":"cr-1"}]"#
+            ),
+        ];
+
+        for ((label, payload), want) in fixtures.iter().zip(expected) {
+            assert_eq!(
+                payload.as_deref(),
+                Ok(want),
+                "execution-mode payload drifted for fixture `{label}`"
+            );
+        }
+    }
+
+    /// Adding `receipt_version` to the live binding structs is exactly the
+    /// change S1's projections exist to absorb. If this ever fails, a struct
+    /// field leaked into the signed payload and every persisted
+    /// (conversation, name) pair is about to be permanently burned.
+    ///
+    /// SCOPE: this is a FIELD-SET assertion. It varies `receipt_version`, which
+    /// the projections exclude, so it stays green when a bumped issuance version
+    /// moves the payload through the receipt VALUES it does project — see
+    /// `the_execution_mode_payload_depends_on_the_binding_receipt_value`. Do not
+    /// cite this test as proof that a version bump is safe.
+    #[test]
+    fn a_new_binding_field_cannot_reach_the_frozen_payload() {
+        let fork = ForkModelBinding {
+            provider_id: "anthropic".into(),
+            model_id: "claude-opus-5".into(),
+            memory_language: ResolvedLanguage::ZhCn,
+            memory_tool_names: Vec::new(),
+            system_prompt_snapshot: String::new(),
+            system_prompt_receipt: String::new(),
+            memory_snapshot_receipt: None,
+            binding_receipt: String::new(),
+            receipt_version: 1,
+        };
+        let mut bumped = fork.clone();
+        bumped.receipt_version = 7;
+
+        let payload_of = |binding: &ForkModelBinding| {
+            canonical_subagent_execution_mode_payload(
+                "c",
+                "n",
+                SubagentRunKind::General,
+                true,
+                Some(binding),
+                None,
+            )
+            .expect("payload builds")
+        };
+        assert_eq!(payload_of(&fork), payload_of(&bumped));
+        assert!(!payload_of(&fork).contains("receiptVersion"));
+    }
+
+    /// The projections are what make later fields non-breaking, so their key
+    /// sets are asserted directly. Adding a field to `ForkModelBinding` or
+    /// `AgentDefinitionBinding` must leave these untouched; adding one to a
+    /// `*V1` projection trips this test.
+    ///
+    /// Key ORDER is pinned byte-exactly by `execution_mode_payload_v1_is_frozen`;
+    /// it cannot be re-checked here because `serde_json` is built without
+    /// `preserve_order`, so parsing back into a `Value` sorts the keys.
+    #[test]
+    fn execution_mode_payload_projects_only_the_frozen_field_set() {
+        let fork = ForkModelBinding {
+            provider_id: "p".into(),
+            model_id: "m".into(),
+            memory_language: ResolvedLanguage::ZhCn,
+            memory_tool_names: Vec::new(),
+            system_prompt_snapshot: String::new(),
+            system_prompt_receipt: String::new(),
+            memory_snapshot_receipt: Some("msr".into()),
+            binding_receipt: String::new(),
+            receipt_version: 1,
+        };
+        let definition = AgentDefinitionBinding {
+            source: AgentDefinitionSource::User,
+            source_key: String::new(),
+            name: "n".into(),
+            revision: 1,
+            memory_epoch: 1,
+            provider_id: "p".into(),
+            model_id: "m".into(),
+            memory: AgentDefinitionMemory::None,
+            scope_key: String::new(),
+            configuration_receipt: String::new(),
+            receipt_version: 1,
+        };
+
+        let keys = |payload: &str, element: usize| -> Vec<String> {
+            let parsed: serde_json::Value =
+                serde_json::from_str(payload).expect("payload is valid JSON");
+            let mut names: Vec<String> = parsed[element]
+                .as_object()
+                .expect("binding element is an object")
+                .keys()
+                .cloned()
+                .collect();
+            names.sort();
+            names
+        };
+        let sorted = |names: &[&str]| {
+            let mut owned: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+            owned.sort();
+            owned
+        };
+
+        let fork_payload = canonical_subagent_execution_mode_payload(
+            "c",
+            "n",
+            SubagentRunKind::General,
+            true,
+            Some(&fork),
+            None,
+        )
+        .expect("payload builds");
+        assert_eq!(
+            keys(&fork_payload, 4),
+            sorted(&[
+                "providerId",
+                "modelId",
+                "memoryLanguage",
+                "memoryToolNames",
+                "systemPromptSnapshot",
+                "systemPromptReceipt",
+                "memorySnapshotReceipt",
+                "bindingReceipt",
+            ])
+        );
+
+        let definition_payload = canonical_subagent_execution_mode_payload(
+            "c",
+            "n",
+            SubagentRunKind::General,
+            false,
+            None,
+            Some(&definition),
+        )
+        .expect("payload builds");
+        assert_eq!(
+            keys(&definition_payload, 5),
+            sorted(&[
+                "source",
+                "sourceKey",
+                "name",
+                "revision",
+                "memoryEpoch",
+                "providerId",
+                "modelId",
+                "memory",
+                "scopeKey",
+                "configurationReceipt",
+            ])
+        );
+    }
+
+    /// The transitive burn route, asserted instead of described. The frozen
+    /// projections carry `bindingReceipt` / `configurationReceipt`, whose VALUES
+    /// are HMACs over a version-dispatched payload — so anything that changes
+    /// how a binding receipt is computed, an issuance-version bump included,
+    /// moves the execution-mode bytes and burns reservations. Two consequences,
+    /// both pinned here: the receipts must stay IN the payload (they are what
+    /// binds an execution mode to the exact binding it was reserved for, so no
+    /// later "these look inert" cleanup may drop them), and no one may claim a
+    /// version bump cannot reach these bytes.
+    #[test]
+    fn the_execution_mode_payload_depends_on_the_binding_receipt_value() {
+        let fork = ForkModelBinding {
+            provider_id: "anthropic".into(),
+            model_id: "claude-opus-5".into(),
+            memory_language: ResolvedLanguage::ZhCn,
+            memory_tool_names: Vec::new(),
+            system_prompt_snapshot: "快照".into(),
+            system_prompt_receipt: "spr".into(),
+            memory_snapshot_receipt: None,
+            binding_receipt: "signed-at-v1".into(),
+            receipt_version: 1,
+        };
+        // Everything a v2 issuance changes about the record reaching this
+        // function: the receipt value, and only the receipt value.
+        let mut reissued_fork = fork.clone();
+        reissued_fork.binding_receipt = "signed-at-v2".into();
+
+        let fork_payload = |binding: &ForkModelBinding| {
+            canonical_subagent_execution_mode_payload(
+                "conv-1",
+                "helper",
+                SubagentRunKind::General,
+                true,
+                Some(binding),
+                None,
+            )
+            .expect("payload builds")
+        };
+        assert!(fork_payload(&fork).contains("signed-at-v1"));
+        assert_ne!(
+            fork_payload(&fork),
+            fork_payload(&reissued_fork),
+            "a re-issued fork binding_receipt must move the execution-mode bytes; \
+             if it no longer does, the receipt was dropped from the frozen projection"
+        );
+
+        let definition = AgentDefinitionBinding {
+            source: AgentDefinitionSource::Project,
+            source_key: "workspace-key".into(),
+            name: "reviewer".into(),
+            revision: 7,
+            memory_epoch: 3,
+            provider_id: "anthropic".into(),
+            model_id: "claude-sonnet-5".into(),
+            memory: AgentDefinitionMemory::Project,
+            scope_key: "scope-key".into(),
+            configuration_receipt: "signed-at-v1".into(),
+            receipt_version: 1,
+        };
+        let mut reissued_definition = definition.clone();
+        reissued_definition.configuration_receipt = "signed-at-v2".into();
+
+        let definition_payload = |binding: &AgentDefinitionBinding| {
+            canonical_subagent_execution_mode_payload(
+                "conv-1",
+                "reviewer",
+                SubagentRunKind::General,
+                false,
+                None,
+                Some(binding),
+            )
+            .expect("payload builds")
+        };
+        assert!(definition_payload(&definition).contains("signed-at-v1"));
+        assert_ne!(
+            definition_payload(&definition),
+            definition_payload(&reissued_definition),
+            "a re-issued configuration_receipt must move the execution-mode bytes; \
+             if it no longer does, the receipt was dropped from the frozen projection"
+        );
+    }
+
+    #[test]
+    fn the_effective_view_resolves_a_backend_or_refuses_without_falling_back() {
+        let mut assets = WebSearchAssets {
+            providers: SearchProviderKind::CATALOG
+                .iter()
+                .copied()
+                .map(SearchProviderConfig::new)
+                .collect(),
+            ..Default::default()
+        };
+
+        // Native ignores assets and always resolves; protocol support is checked
+        // when the conversation model calls it.
+        let native = ConversationWebSearchSettings::default();
+        assert_eq!(
+            WebSearchSettings::effective(&native, &assets, false).backend,
+            Some(SearchBackend::Native)
+        );
+
+        // Disabled explicit choices remain absent; do not silently fall back to
+        // another provider or Native.
+        let explicit_disabled = ConversationWebSearchSettings {
+            provider: SearchProviderSelection::Explicit {
+                provider_kind: SearchProviderKind::Tavily,
+            },
+            ..Default::default()
+        };
+        assert!(
+            WebSearchSettings::effective(&explicit_disabled, &assets, false)
+                .backend
+                .is_none()
+        );
+
+        // User overrides take precedence over catalog defaults.
+        let tavily = assets
+            .providers
+            .iter_mut()
+            .find(|entry| entry.kind == SearchProviderKind::Tavily)
+            .expect("目录里有 tavily");
+        tavily.enabled = true;
+        tavily.search_api_host = " https://gateway.example/tavily ".into();
+        let Some(SearchBackend::Provider(overridden)) =
+            WebSearchSettings::effective(&explicit_disabled, &assets, false).backend
+        else {
+            panic!("启用后可解析");
+        };
+        assert_eq!(overridden.kind, SearchProviderKind::Tavily);
+        assert_eq!(overridden.api_host, "https://gateway.example/tavily");
+
+        // Unavailable is explicit and does not fall back.
+        let unavailable = ConversationWebSearchSettings {
+            provider: SearchProviderSelection::Unavailable,
+            ..Default::default()
+        };
+        assert!(WebSearchSettings::effective(&unavailable, &assets, false)
+            .backend
+            .is_none());
+    }
+
+    #[test]
+    fn a_search_only_provider_can_never_resolve_as_the_fetch_backend() {
+        let mut assets = WebSearchAssets {
+            providers: SearchProviderKind::CATALOG
+                .iter()
+                .copied()
+                .map(SearchProviderConfig::enabled)
+                .collect(),
+        };
+        let with_fetch = |kind| ConversationWebSearchSettings {
+            fetch_provider: FetchProviderSelection::Explicit {
+                provider_kind: kind,
+            },
+            ..Default::default()
+        };
+
+        // Selecting a search-only provider for fetch leaves no backend, so
+        // `web_fetch` returns a recoverable error rather than targeting it.
+        assert!(WebSearchSettings::effective(
+            &with_fetch(SearchProviderKind::Tavily),
+            &assets,
+            false
+        )
+        .fetch
+        .is_none());
+
+        // Jina supports both capabilities and fetch must resolve its distinct
+        // `r.jina.ai` endpoint rather than search's `s.jina.ai`.
+        let resolved =
+            WebSearchSettings::effective(&with_fetch(SearchProviderKind::Jina), &assets, false)
+                .fetch
+                .expect("jina 支持 fetchUrls");
+        let SearchFetchBackend::Provider(resolved) = resolved else {
+            panic!("目录提供商的 fetch 解析必须是 Provider 后端");
+        };
+        assert_eq!(resolved.kind, SearchProviderKind::Jina);
+        assert_eq!(resolved.api_host, "https://r.jina.ai");
+
+        // A disabled provider is equivalent to no selection.
+        let jina = assets
+            .providers
+            .iter_mut()
+            .find(|entry| entry.kind == SearchProviderKind::Jina)
+            .expect("目录里有 jina");
+        jina.enabled = false;
+        assert!(WebSearchSettings::effective(
+            &with_fetch(SearchProviderKind::Jina),
+            &assets,
+            false
+        )
+        .fetch
+        .is_none());
+    }
+
+    /// `Disabled` and `Unavailable` both leave no backend, and the difference
+    /// between them is the whole of what `search_withheld` carries.
+    #[test]
+    fn a_disabled_search_selection_withholds_the_tool_while_a_broken_one_keeps_it() {
+        let assets = WebSearchAssets {
+            providers: SearchProviderKind::CATALOG
+                .iter()
+                .copied()
+                .map(SearchProviderConfig::enabled)
+                .collect(),
+        };
+        let with_provider = |provider| ConversationWebSearchSettings {
+            provider,
+            ..Default::default()
+        };
+
+        let disabled = WebSearchSettings::effective(
+            &with_provider(SearchProviderSelection::Disabled),
+            &assets,
+            true,
+        );
+        assert!(disabled.backend.is_none());
+        assert!(disabled.search_withheld);
+
+        let unavailable = WebSearchSettings::effective(
+            &with_provider(SearchProviderSelection::Unavailable),
+            &assets,
+            true,
+        );
+        assert!(unavailable.backend.is_none());
+        assert!(
+            !unavailable.search_withheld,
+            "a broken binding keeps the tool so the failure can be reported and fixed"
+        );
+
+        // The two legs are independent: a conversation that does not search may
+        // still fetch a page it was given the address of.
+        let fetch_only = ConversationWebSearchSettings {
+            provider: SearchProviderSelection::Disabled,
+            fetch_provider: FetchProviderSelection::Native,
+            ..Default::default()
+        };
+        let resolved = WebSearchSettings::effective(&fetch_only, &assets, true);
+        assert!(resolved.search_withheld);
+        assert_eq!(resolved.fetch, Some(SearchFetchBackend::Native));
+    }
+
+    /// The fetch leg follows the search leg's rule: Off withholds `web_fetch`,
+    /// while a provider that is switched off, unknown or unable to fetch keeps
+    /// the tool and leaves the backend absent for a repairable error. Whether a
+    /// provider is switched on in global settings never decides presence.
+    #[test]
+    fn a_disabled_fetch_selection_withholds_the_tool_while_a_broken_one_keeps_it() {
+        let switched_off = WebSearchAssets {
+            providers: SearchProviderKind::CATALOG
+                .iter()
+                .copied()
+                .map(SearchProviderConfig::new)
+                .collect(),
+        };
+        let switched_on = WebSearchAssets {
+            providers: SearchProviderKind::CATALOG
+                .iter()
+                .copied()
+                .map(SearchProviderConfig::enabled)
+                .collect(),
+        };
+        let with_fetch = |fetch_provider| ConversationWebSearchSettings {
+            fetch_provider,
+            ..Default::default()
+        };
+
+        let disabled = WebSearchSettings::effective(
+            &with_fetch(FetchProviderSelection::Disabled),
+            &switched_on,
+            true,
+        );
+        assert!(disabled.fetch.is_none());
+        assert!(disabled.fetch_withheld);
+
+        for broken in [
+            FetchProviderSelection::Unavailable,
+            // A search-only provider can never fetch.
+            FetchProviderSelection::Explicit {
+                provider_kind: SearchProviderKind::Tavily,
+            },
+        ] {
+            let resolved = WebSearchSettings::effective(&with_fetch(broken), &switched_on, true);
+            assert!(resolved.fetch.is_none());
+            assert!(!resolved.fetch_withheld, "a broken binding keeps the tool");
+        }
+
+        // Switching the provider off in global settings changes what resolves,
+        // never whether the tool is offered.
+        let jina = with_fetch(FetchProviderSelection::Explicit {
+            provider_kind: SearchProviderKind::Jina,
+        });
+        let on = WebSearchSettings::effective(&jina, &switched_on, false);
+        let off = WebSearchSettings::effective(&jina, &switched_off, false);
+        assert!(on.fetch.is_some());
+        assert!(off.fetch.is_none());
+        assert!(!on.fetch_withheld && !off.fetch_withheld);
+
+        // Native fetch is a second web tool only where the family splits it out.
+        let native = with_fetch(FetchProviderSelection::Native);
+        assert!(!WebSearchSettings::effective(&native, &switched_off, true).fetch_withheld);
+        assert!(WebSearchSettings::effective(&native, &switched_off, false).fetch_withheld);
+    }
+
+    /// The renderer writes an unknown fetch provider as `unavailable`, in a
+    /// conversation and in a lock pin alike, and both must open as such.
+    #[test]
+    fn an_unavailable_fetch_selection_round_trips() {
+        let conversation = serde_json::from_value::<ConversationWebSearchSettings>(
+            serde_json::json!({ "fetchProvider": { "kind": "unavailable" } }),
+        )
+        .expect("an unavailable fetch selection opens");
+        assert_eq!(conversation.fetch_provider, FetchProviderSelection::Unavailable);
+        assert_eq!(
+            serde_json::to_value(&conversation).expect("serializable")["fetchProvider"],
+            serde_json::json!({ "kind": "unavailable" })
+        );
+        let lock = serde_json::from_value::<ConversationToolLock>(serde_json::json!({
+            "fetchBackend": { "kind": "unavailable" },
+            "fetchProvider": { "kind": "unavailable" }
+        }))
+        .expect("a lock naming an unavailable fetch backend opens");
+        assert_eq!(lock.fetch_backend, Some(FetchProviderSelection::Unavailable));
+        assert_eq!(lock.fetch_provider, Some(FetchProviderSelection::Unavailable));
+    }
+
+    /// A document written before the fetch selector became exhaustive carries
+    /// `auto`, which named no backend of its own. It must open on the backend it
+    /// was actually fetching with, and the renderer's
+    /// `normalizeFetchProviderSelection` has to agree key for key.
+    #[test]
+    fn a_persisted_auto_fetch_selection_resolves_against_the_search_leg_it_read() {
+        let stored = |provider: serde_json::Value| {
+            serde_json::from_value::<ConversationWebSearchSettings>(serde_json::json!({
+                "provider": provider,
+                "fetchProvider": { "kind": "auto" }
+            }))
+            .expect("a stored auto selection still opens")
+            .fetch_provider
+        };
+
+        // A search provider that can fetch is what `auto` used, so it is named
+        // outright rather than the conversation being moved onto a default.
+        assert_eq!(
+            stored(serde_json::json!({ "kind": "explicit", "providerKind": "jina" })),
+            FetchProviderSelection::Explicit {
+                provider_kind: SearchProviderKind::Jina
+            }
+        );
+        // A search-only provider could never have satisfied `auto`'s first
+        // choice, and the global default it fell back to is gone.
+        assert_eq!(
+            stored(serde_json::json!({ "kind": "explicit", "providerKind": "tavily" })),
+            FetchProviderSelection::Native
+        );
+        assert_eq!(
+            stored(serde_json::json!({ "kind": "native" })),
+            FetchProviderSelection::Native
+        );
+
+        // Nothing writes `auto` again.
+        let wire =
+            serde_json::to_value(ConversationWebSearchSettings::default()).expect("serializable");
+        assert_eq!(
+            wire["fetchProvider"],
+            serde_json::json!({ "kind": "native" })
+        );
+    }
+
+    /// A lock carries the same retired `auto` spelling in its pin, resolved
+    /// against the search leg pinned beside it — the leg that run actually
+    /// searched with, which is the only context a pin has.
+    #[test]
+    fn a_pinned_auto_fetch_selection_resolves_against_the_pinned_search_leg() {
+        let locked = |search: serde_json::Value| {
+            serde_json::from_value::<ConversationToolLock>(serde_json::json!({
+                "searchProvider": search,
+                "fetchProvider": { "kind": "auto" }
+            }))
+            .expect("a lock pinned under the old spelling still opens")
+            .fetch_provider
+        };
+        assert_eq!(
+            locked(serde_json::json!({ "kind": "explicit", "providerKind": "jina" })),
+            Some(FetchProviderSelection::Explicit {
+                provider_kind: SearchProviderKind::Jina
+            })
+        );
+        assert_eq!(
+            locked(serde_json::json!({ "kind": "native" })),
+            Some(FetchProviderSelection::Native)
+        );
+        // No search pin at all reads like a native search leg: `auto` fell
+        // back to fetching with the conversation's own provider then, too.
+        assert_eq!(
+            serde_json::from_value::<ConversationToolLock>(serde_json::json!({
+                "fetchProvider": { "kind": "auto" }
+            }))
+            .expect("a search-less lock still opens")
+            .fetch_provider,
+            Some(FetchProviderSelection::Native)
+        );
+    }
+
+    /// The host only round-trips the lock, so every field the renderer writes
+    /// must survive a save — a dropped one would take the cache marks and the
+    /// backend tones with it.
+    #[test]
+    fn the_lock_surface_backends_and_model_requests_round_trip() {
+        let wire = serde_json::json!({
+            "tools": ["read"],
+            "mcpIds": [],
+            "globalMemory": false,
+            "projectMemory": false,
+            "skillTool": false,
+            "mcpToolDiscovery": false,
+            "webSearch": true,
+            "planMode": false,
+            "skillIds": [],
+            "searchBackend": { "kind": "explicit", "providerKind": "tavily" },
+            "fetchBackend": { "kind": "explicit", "providerKind": "jina" },
+            "webFetch": true,
+            "searchProvider": { "kind": "native" },
+            "lastRequest": { "providerId": "p", "modelId": "b", "at": "2026-09-30T10:05:00Z" },
+            "modelRequests": [
+                { "providerId": "p", "modelId": "a", "at": "2026-09-30T10:00:00Z" },
+                { "providerId": "p", "modelId": "b", "at": "2026-09-30T10:05:00Z" }
+            ]
+        });
+        let lock = serde_json::from_value::<ConversationToolLock>(wire.clone())
+            .expect("a lock with every field opens");
+        assert_eq!(
+            lock.fetch_backend,
+            Some(FetchProviderSelection::Explicit {
+                provider_kind: SearchProviderKind::Jina
+            })
+        );
+        assert!(lock.web_fetch);
+        assert_eq!(lock.model_requests.len(), 2);
+        assert_eq!(serde_json::to_value(&lock).expect("serializable"), wire);
+    }
+
+    /// The shaping defaults are the ones a conversation persisted before these
+    /// keys existed must open on: it asked for the ordinary shaping, not for
+    /// everything.
+    #[test]
+    fn absent_result_shaping_reads_as_the_shared_default_rather_than_as_no_limit() {
+        let restored =
+            serde_json::from_value::<ConversationWebSearchSettings>(serde_json::json!({}))
+                .expect("an empty block is a legal conversation");
+        assert_eq!(restored.max_results, DEFAULT_SEARCH_MAX_RESULTS);
+        assert_eq!(restored.compression_cutoff, DEFAULT_SEARCH_CUTOFF_LIMIT);
+        assert_eq!(
+            restored.fetch_compression_cutoff,
+            DEFAULT_SEARCH_CUTOFF_LIMIT
+        );
+        assert_eq!(restored.domain_filter, SearchDomainFilterMode::Off);
+
+        // 0 is a value, not an absence: it round trips as the "no limit" answer.
+        let unlimited =
+            serde_json::from_value::<ConversationWebSearchSettings>(serde_json::json!({
+                "maxResults": 0,
+                "compressionCutoff": 0,
+                "fetchCompressionCutoff": 0
+            }))
+            .expect("0 is a legal answer on all three");
+        assert_eq!(unlimited.max_results, 0);
+        assert_eq!(unlimited.compression_cutoff, 0);
+        assert_eq!(unlimited.fetch_compression_cutoff, 0);
+    }
+
+    /// One knob used to cover both legs. A document written then has no fetch
+    /// cap of its own and must read the value its single knob held — above all
+    /// 0, the user's "unlimited", which must not turn back into the default
+    /// 2000 on the fetch leg. The renderer's normalizer answers the same way.
+    #[test]
+    fn a_document_without_a_fetch_cap_reads_the_old_single_cap_on_the_fetch_leg() {
+        let read = |wire: serde_json::Value| {
+            serde_json::from_value::<ConversationWebSearchSettings>(wire)
+                .expect("a document from before the split still opens")
+        };
+        let unlimited = read(serde_json::json!({ "compressionCutoff": 0 }));
+        assert_eq!(unlimited.compression_cutoff, 0);
+        assert_eq!(unlimited.fetch_compression_cutoff, 0);
+
+        let tightened = read(serde_json::json!({ "compressionCutoff": 9_000 }));
+        assert_eq!(tightened.fetch_compression_cutoff, 9_000);
+
+        // Once the key exists it is its own answer, whatever the search cap says.
+        let split = read(serde_json::json!({
+            "compressionCutoff": 9_000,
+            "fetchCompressionCutoff": 700
+        }));
+        assert_eq!(split.compression_cutoff, 9_000);
+        assert_eq!(split.fetch_compression_cutoff, 700);
+
+        let wire = serde_json::to_value(&split).expect("serializable");
+        assert_eq!(wire["fetchCompressionCutoff"], 700);
+    }
+
+    /// A role persisted before the fetch cap existed asked for ordinary
+    /// shaping, so its absent fetch key is the shared default — not 0, and not
+    /// a copy of its own search cap.
+    #[test]
+    fn a_role_without_a_fetch_cap_reads_the_shared_default() {
+        let role = serde_json::from_value::<AgentDefinition>(serde_json::json!({
+            "name": "scout",
+            "source": "user",
+            "sourceKey": "preset",
+            "revision": 1,
+            "compressionCutoff": 0
+        }))
+        .expect("a role from before the fetch cap still opens");
+        assert_eq!(role.compression_cutoff, 0);
+        assert_eq!(role.fetch_compression_cutoff, DEFAULT_SEARCH_CUTOFF_LIMIT);
+    }
+
+    /// The execution view is what the request builders read, so it carries the
+    /// fetch cap and bounds it with the same ceiling as the search cap.
+    #[test]
+    fn the_execution_view_carries_and_bounds_the_fetch_cap() {
+        let settings = ConversationWebSearchSettings {
+            fetch_compression_cutoff: MAX_SEARCH_CUTOFF_LIMIT * 2,
+            max_results: MAX_SEARCH_MAX_RESULTS + 1,
+            ..Default::default()
+        };
+        let execution = settings.execution();
+        assert_eq!(execution.fetch_compression_cutoff, MAX_SEARCH_CUTOFF_LIMIT);
+        assert_eq!(execution.max_results, MAX_SEARCH_MAX_RESULTS);
+        assert_eq!(
+            ConversationWebSearchSettings::default()
+                .execution()
+                .fetch_compression_cutoff,
+            DEFAULT_SEARCH_CUTOFF_LIMIT
+        );
+    }
+
+    /// The catalog's per-backend numbers are the product table: which backend
+    /// takes a result count and up to how many, and which takes a per-result
+    /// token cap and from how few. The renderer's mirror is held to this table
+    /// line by line, so a change here is a change to what the settings page
+    /// draws.
+    #[test]
+    fn the_catalog_declares_each_backends_own_count_ceiling_and_content_floor() {
+        use SearchCapability::{FetchUrls, SearchKeywords};
+        use SearchProviderKind::*;
+        let numbers = |kind: SearchProviderKind, capability| {
+            kind.capability(capability)
+                .map(|spec| (spec.max_results, spec.min_content_tokens))
+        };
+        let expected_search = [
+            (Zhipu, (Some(50), None)),
+            (Tavily, (Some(20), None)),
+            (Searxng, (Some(50), Some(1))),
+            (Exa, (Some(100), Some(1))),
+            (ExaMcp, (Some(100), None)),
+            (Bocha, (Some(50), None)),
+            (Querit, (Some(100), None)),
+            (Jina, (Some(20), Some(500))),
+            (Firecrawl, (Some(100), None)),
+        ];
+        for (kind, numbers_expected) in expected_search {
+            assert_eq!(
+                numbers(kind, SearchKeywords),
+                Some(numbers_expected),
+                "{kind:?} search"
+            );
+        }
+        assert_eq!(numbers(Fetch, SearchKeywords), None);
+
+        // A fetch never has a result count; only these three take a content cap.
+        let expected_fetch = [
+            (Querit, None),
+            (Fetch, Some(1)),
+            (Jina, Some(500)),
+            (Firecrawl, None),
+        ];
+        for (kind, floor) in expected_fetch {
+            assert_eq!(
+                numbers(kind, FetchUrls),
+                Some((None, floor)),
+                "{kind:?} fetch"
+            );
+        }
+        for kind in SearchProviderKind::CATALOG {
+            assert!(
+                kind.capability(FetchUrls)
+                    .map_or(true, |spec| spec.max_results.is_none()),
+                "{kind:?} fetch must not declare a result count"
+            );
+        }
+
+        // The storage ceiling admits every backend's own ceiling.
+        let largest = SearchProviderKind::CATALOG
+            .iter()
+            .filter_map(|kind| kind.capability(SearchKeywords))
+            .filter_map(|spec| spec.max_results)
+            .max();
+        assert_eq!(largest, Some(MAX_SEARCH_MAX_RESULTS));
+    }
+
+    /// Naming the conversation's own provider as the fetch backend is legal on
+    /// every family; what differs is how many web tools that leaves.
+    #[test]
+    fn a_native_fetch_selection_resolves_only_where_the_family_splits_fetch_out() {
+        let assets = WebSearchAssets {
+            providers: SearchProviderKind::CATALOG
+                .iter()
+                .copied()
+                .map(SearchProviderConfig::enabled)
+                .collect(),
+        };
+        // Searching is deliberately a catalog provider here: the two legs are
+        // independent, so native fetch does not require native search.
+        let conversation = ConversationWebSearchSettings {
+            provider: SearchProviderSelection::Explicit {
+                provider_kind: SearchProviderKind::Tavily,
+            },
+            fetch_provider: FetchProviderSelection::Native,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            WebSearchSettings::effective(&conversation, &assets, true).fetch,
+            Some(SearchFetchBackend::Native)
+        );
+        // A family that fetches inside its one search tool gets exactly that
+        // one tool, which is its own shape rather than a missing capability.
+        assert!(WebSearchSettings::effective(&conversation, &assets, false)
+            .fetch
+            .is_none());
+
+        // The renderer writes this selection as `{"kind":"native"}`; a document
+        // that round trips it into anything else would silently un-pick it.
+        let wire = serde_json::to_value(&conversation).expect("serializable");
+        assert_eq!(
+            wire["fetchProvider"],
+            serde_json::json!({ "kind": "native" })
+        );
+        assert_eq!(
+            serde_json::from_value::<ConversationWebSearchSettings>(wire).expect("round trip"),
+            conversation
+        );
+    }
+
+    #[test]
+    fn the_catalog_mirrors_cherry_studio_row_for_row() {
+        // Each kind has exactly one row in catalog order.
+        assert_eq!(SEARCH_PROVIDER_CATALOG.len(), 10);
+        assert_eq!(
+            SearchProviderKind::CATALOG
+                .iter()
+                .map(|kind| kind.slug())
+                .collect::<Vec<_>>(),
+            SEARCH_PROVIDER_CATALOG
+                .iter()
+                .map(|entry| entry.slug)
+                .collect::<Vec<_>>()
+        );
+        // The serde name must exactly match the catalog slug because documents
+        // and the credential store use the same key.
+        for kind in SearchProviderKind::CATALOG.iter().copied() {
+            let wire = serde_json::to_string(&kind).expect("kind 可序列化");
+            assert_eq!(wire, format!("\"{}\"", kind.slug()));
+            assert_eq!(SearchProviderKind::from_slug(kind.slug()), Some(kind));
+        }
+
+        // Every catalog entry must expose at least one capability.
+        for entry in SEARCH_PROVIDER_CATALOG {
+            assert!(
+                entry.search.is_some() || entry.fetch.is_some(),
+                "{} 至少要声明一条能力",
+                entry.slug
+            );
+        }
+
+        // Only local `fetch` needs no third-party endpoint.
+        let hostless = SEARCH_PROVIDER_CATALOG
+            .iter()
+            .filter(|entry| {
+                [entry.search.as_ref(), entry.fetch.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|spec| !spec.requires_api_host())
+            })
+            .map(|entry| entry.slug)
+            .collect::<Vec<_>>();
+        assert_eq!(hostless, vec!["fetch"]);
+    }
+
+    #[test]
+    fn legacy_global_preference_defaults_preserve_chinese_day_mode() {
+        assert_eq!(AppLanguage::default(), AppLanguage::ZhCn);
+        assert_eq!(ResolvedLanguage::default(), ResolvedLanguage::ZhCn);
+        assert_eq!(ThemePreference::default(), ThemePreference::Day);
+    }
+
+    #[test]
+    fn a_custom_background_from_before_the_library_becomes_glass_over_its_picture() {
+        #[derive(Deserialize)]
+        struct Settings {
+            #[serde(deserialize_with = "super::deserialize_appearance")]
+            appearance: AppearancePreferences,
+        }
+        let read = |appearance: Value| {
+            serde_json::from_value::<Settings>(serde_json::json!({ "appearance": appearance }))
+                .unwrap()
+                .appearance
+        };
+        let picture = "a".repeat(64);
+
+        let on = read(serde_json::json!({ "customBackground": true, "backgroundImage": picture }));
+        assert!(on.liquid_glass);
+        assert_eq!(on.background, picture);
+
+        // Off, the remembered picture was not on screen; the plain theme was.
+        let off = read(serde_json::json!({ "customBackground": false, "backgroundImage": picture }));
+        assert!(!off.liquid_glass);
+        assert_eq!(off.background, "solid");
+
+        let fresh = read(serde_json::json!({}));
+        assert_eq!((fresh.liquid_glass, fresh.background.as_str()), (false, "solid"));
+
+        let current = read(serde_json::json!({ "liquidGlass": true, "background": "builtin:desk" }));
+        assert_eq!((current.liquid_glass, current.background.as_str()), (true, "builtin:desk"));
+        let saved = serde_json::to_value(&current).unwrap();
+        assert!(saved.get("customBackground").is_none());
+        assert!(saved.get("backgroundImage").is_none());
+    }
+
+    #[test]
+    fn subagent_stream_events_serialize_with_camel_case_call_id() {
+        let nested = ModelStreamEvent::SubagentEvent {
+            round: 3,
+            call_id: "call_9".into(),
+            event: Box::new(ModelStreamEvent::ToolCallAnnounced {
+                round: 2,
+                call_id: "child_call_1".into(),
+                tool_name: "read".into(),
+                context_id: "ctx_tool_child".into(),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(nested).unwrap(),
+            json!({
+                "type": "subagent_event",
+                "round": 3,
+                "callId": "call_9",
+                "event": {
+                    "type": "tool_call_announced",
+                    "round": 2,
+                    "callId": "child_call_1",
+                    "toolName": "read",
+                    "contextId": "ctx_tool_child"
+                }
+            })
+        );
+
+        let event = ModelStreamEvent::SubagentDelta {
+            round: 3,
+            call_id: "call_9".into(),
+            channel: SubagentChannel::Activity,
+            delta: "→ read".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "type": "subagent_delta",
+                "round": 3,
+                "callId": "call_9",
+                "channel": "activity",
+                "delta": "→ read"
+            })
+        );
+
+        let update = ModelStreamEvent::SubagentDelta {
+            round: 3,
+            call_id: "call_9".into(),
+            channel: SubagentChannel::Update,
+            delta: "已完成接口审查".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(update).unwrap(),
+            json!({
+                "type": "subagent_delta",
+                "round": 3,
+                "callId": "call_9",
+                "channel": "update",
+                "delta": "已完成接口审查"
+            })
+        );
+    }
+
+    #[test]
+    fn retry_events_and_run_error_use_camel_case_wire_shapes() {
+        let usage = ModelStreamEvent::UsageUpdated {
+            round: 2,
+            usage: ModelUsage {
+                input_tokens: Some(120),
+                cached_input_tokens: Some(80),
+                output_tokens: Some(7),
+                total_tokens: Some(127),
+                reasoning_tokens: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(usage).unwrap(),
+            json!({
+                "type": "usage_updated",
+                "round": 2,
+                "usage": {
+                    "inputTokens": 120,
+                    "cachedInputTokens": 80,
+                    "outputTokens": 7,
+                    "totalTokens": 127
+                }
+            })
+        );
+
+        let retry = ModelStreamEvent::StreamRetryScheduled {
+            round: 2,
+            attempt: 1,
+            max_attempts: 5,
+            delay_ms: 400,
+            message: "模型 API 请求失败".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(retry).unwrap(),
+            json!({
+                "type": "stream_retry_scheduled",
+                "round": 2,
+                "attempt": 1,
+                "maxAttempts": 5,
+                "delayMs": 400,
+                "message": "模型 API 请求失败"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ModelStreamEvent::Ping).unwrap(),
+            json!({"type": "ping"})
+        );
+        let error = ModelRunError {
+            message: "模型 API 请求失败：HTTP 503".into(),
+            round: 1,
+            attempts: 6,
+        };
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            json!({
+                "message": "模型 API 请求失败：HTTP 503",
+                "round": 1,
+                "attempts": 6
+            })
+        );
+    }
+
+    #[test]
+    fn tool_context_serializes_canonical_model_turn_and_subagent_record() {
+        let context = ContextItem::Tool {
+            id: "ctx_parent_tool".into(),
+            tool_name: "subagent".into(),
+            round: Some(2),
+            model_turn_id: Some("turn_parent_2".into()),
+            provider_call_id: None,
+            requested_input: Some(Map::from_iter([("task".into(), json!("原始任务"))])),
+            input: Map::from_iter([("task".into(), json!("审查 API"))]),
+            result: ToolResult {
+                success: true,
+                output: "审查完成".into(),
+                images: Vec::new(),
+                diff: None,
+                executed_at: "2026-07-14T00:00:03Z".into(),
+                duration_ms: 20,
+            },
+            subagent: Some(SubagentRunRecord {
+                kind: SubagentRunKind::General,
+                name: Some("a1".into()),
+                label: None,
+                inherits_model_memory: false,
+                fork_model_binding: None,
+                agent_definition: None,
+                execution_mode_receipt: String::new(),
+                task: "审查 API".into(),
+                status: SubagentRunStatus::Completed,
+                contexts: vec![ContextItem::Assistant {
+                    id: "ctx_child_answer".into(),
+                    content: "审查完成".into(),
+                    round: None,
+                    model_turn_id: None,
+                    interrupted: false,
+                    sources: Vec::new(),
+                    created_at: "2026-07-14T00:00:02Z".into(),
+                }],
+                updates: vec![SubagentUpdate {
+                    content: "已完成接口审查".into(),
+                    created_at: "2026-07-14T00:00:01Z".into(),
+                }],
+                structured_output: None,
+                output_schema: None,
+                usage: ModelUsage::default(),
+            }),
+            notice: None,
+            attestation: String::new(),
+            created_at: "2026-07-14T00:00:03Z".into(),
+        };
+        let value = serde_json::to_value(&context).unwrap();
+        assert_eq!(value["kind"], "tool");
+        assert_eq!(value["modelTurnId"], "turn_parent_2");
+        assert_eq!(value["requestedInput"]["task"], "原始任务");
+        assert!(value.get("callId").is_none());
+        assert_eq!(value["subagent"]["task"], "审查 API");
+        assert_eq!(value["subagent"]["status"], "completed");
+        assert_eq!(value["subagent"]["contexts"][0]["kind"], "assistant");
+        // A schema-less record must not serialize the key: records that predate
+        // it lack the key, and rehydration treats absence as "not schema-bound".
+        assert!(value["subagent"].get("outputSchema").is_none());
+        assert_eq!(
+            value["subagent"]["updates"][0],
+            json!({
+                "content": "已完成接口审查",
+                "createdAt": "2026-07-14T00:00:01Z"
+            })
+        );
+
+        let legacy: ContextItem = serde_json::from_value(json!({
+            "kind": "tool",
+            "id": "ctx_legacy",
+            "toolName": "read",
+            "callId": "provider-call-id",
+            "input": {"path": "README.md"},
+            "result": {
+                "success": true,
+                "output": "ok",
+                "executedAt": "2026-07-14T00:00:00Z",
+                "durationMs": 1
+            },
+            "createdAt": "2026-07-14T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(matches!(
+            &legacy,
+            ContextItem::Tool {
+                model_turn_id: None,
+                requested_input: None,
+                subagent: None,
+                ..
+            }
+        ));
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("callId")
+            .is_none());
+
+        let assistant: ContextItem = serde_json::from_value(json!({
+            "kind": "assistant",
+            "id": "ctx_legacy_assistant",
+            "content": "answer",
+            "openAiChat": {"providerId":"p","modelId":"m","message":{"role":"assistant"}},
+            "createdAt": "2026-07-14T00:00:00Z"
+        }))
+        .unwrap();
+        let reasoning: ContextItem = serde_json::from_value(json!({
+            "kind": "reasoning",
+            "id": "ctx_legacy_reasoning",
+            "encrypted": true,
+            "encryptedPayload": "opaque-provider-payload",
+            "createdAt": "2026-07-14T00:00:00Z"
+        }))
+        .unwrap();
+        let canonical = serde_json::to_value([assistant, reasoning]).unwrap();
+        assert!(!canonical.to_string().contains("openAiChat"));
+        assert!(!canonical.to_string().contains("encryptedPayload"));
+    }
+
+    /// The reasoning form is an independent optional key that never inherits the
+    /// legacy `encrypted` flag. Explicit forms serialize as the TypeScript
+    /// `ReasoningForm` literals; absence preserves legacy-card identification.
+    #[test]
+    fn reasoning_form_round_trips_and_never_inherits_the_legacy_encrypted_flag() {
+        let card = |form: Option<ReasoningForm>| ContextItem::Reasoning {
+            id: "ctx_reasoning".into(),
+            content: None,
+            form,
+            round: Some(1),
+            model_turn_id: None,
+            interrupted: false,
+            duration_ms: Some(1_200),
+            tokens: Some(64),
+            replay: None,
+            created_at: "2026-08-30T00:00:00Z".into(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(card(Some(ReasoningForm::Encrypted))).unwrap()["form"],
+            json!("encrypted")
+        );
+        assert_eq!(
+            serde_json::to_value(card(Some(ReasoningForm::Plaintext))).unwrap()["form"],
+            json!("plaintext")
+        );
+        assert!(serde_json::to_value(card(None))
+            .unwrap()
+            .get("form")
+            .is_none());
+
+        let round_tripped: ContextItem = serde_json::from_value(
+            serde_json::to_value(card(Some(ReasoningForm::Plaintext))).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            round_tripped,
+            ContextItem::Reasoning {
+                form: Some(ReasoningForm::Plaintext),
+                ..
+            }
+        ));
+
+        let legacy: ContextItem = serde_json::from_value(json!({
+            "kind": "reasoning",
+            "id": "ctx_legacy_reasoning",
+            "encrypted": true,
+            "createdAt": "2026-07-14T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(matches!(legacy, ContextItem::Reasoning { form: None, .. }));
+    }
+
+    /// The replay payload is opaque provider data: it round-trips byte for byte,
+    /// is absent from the wire when there is nothing to replay, and a record
+    /// written before the field existed still loads without it.
+    #[test]
+    fn reasoning_replay_round_trips_and_is_absent_when_none() {
+        let card = |replay: Option<ReasoningReplay>| ContextItem::Reasoning {
+            id: "ctx_reasoning".into(),
+            content: Some("thought".into()),
+            form: Some(ReasoningForm::Plaintext),
+            round: Some(1),
+            model_turn_id: None,
+            interrupted: false,
+            duration_ms: None,
+            tokens: None,
+            replay,
+            created_at: "2026-09-03T00:00:00Z".into(),
+        };
+        let replay = ReasoningReplay {
+            model: "claude-opus-5".into(),
+            parts: vec![json!({
+                "text": "thought",
+                "providerOptions": { "anthropic": { "signature": "sig-bytes" } }
+            })],
+        };
+        let encoded = serde_json::to_value(card(Some(replay.clone()))).unwrap();
+        assert_eq!(encoded["replay"]["model"], json!("claude-opus-5"));
+        assert_eq!(
+            encoded["replay"]["parts"][0]["providerOptions"]["anthropic"]["signature"],
+            json!("sig-bytes")
+        );
+        let round_tripped: ContextItem = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(
+            round_tripped,
+            ContextItem::Reasoning { replay: Some(ref stored), .. } if *stored == replay
+        ));
+
+        assert!(serde_json::to_value(card(None))
+            .unwrap()
+            .get("replay")
+            .is_none());
+        let legacy: ContextItem = serde_json::from_value(json!({
+            "kind": "reasoning",
+            "id": "ctx_legacy_reasoning",
+            "content": "old thought",
+            "createdAt": "2026-07-14T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            ContextItem::Reasoning { replay: None, .. }
+        ));
+    }
+
+    #[test]
+    fn retired_reasoning_effort_spellings_migrate() {
+        for (legacy, level, written) in [
+            ("minimal", ReasoningEffort::Low, "low"),
+            ("disabled", ReasoningEffort::Low, "low"),
+            ("xhigh", ReasoningEffort::Extra, "extra"),
+        ] {
+            let effort: ReasoningEffort = serde_json::from_value(json!(legacy)).unwrap();
+            assert_eq!(effort, level, "{legacy}");
+            assert_eq!(serde_json::to_value(effort).unwrap(), json!(written));
+        }
+        assert_eq!(
+            serde_json::to_value(ReasoningEffort::Max).unwrap(),
+            json!("max")
+        );
+        assert_eq!(ReasoningEffort::default(), ReasoningEffort::Medium);
+    }
+
+    /// A record's `outputSchema` document round-trips under its camelCase wire
+    /// name, and a record without the key still loads — it rehydrates schema-less.
+    #[test]
+    fn subagent_record_output_schema_round_trips_and_legacy_records_load() {
+        let schema_document = json!({
+            "type": "object",
+            "properties": {"verdict": {"type": "string"}},
+            "required": ["verdict"]
+        });
+        let record = SubagentRunRecord {
+            kind: SubagentRunKind::General,
+            name: Some("a1".into()),
+            label: None,
+            inherits_model_memory: false,
+            fork_model_binding: None,
+            agent_definition: None,
+            execution_mode_receipt: String::new(),
+            task: "审查 API".into(),
+            status: SubagentRunStatus::Completed,
+            contexts: Vec::new(),
+            updates: Vec::new(),
+            structured_output: None,
+            output_schema: Some(schema_document.clone()),
+            usage: ModelUsage::default(),
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["outputSchema"], schema_document);
+        let restored: SubagentRunRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.output_schema, Some(schema_document));
+
+        let legacy: SubagentRunRecord = serde_json::from_value(json!({
+            "task": "历史任务",
+            "status": "completed",
+            "contexts": [],
+            "updates": []
+        }))
+        .unwrap();
+        assert_eq!(legacy.output_schema, None);
+    }
+
+    #[test]
+    fn tool_stream_events_use_stable_camel_case_payload_fields() {
+        let event = ModelStreamEvent::ToolCallArgumentsReady {
+            round: 2,
+            call_id: "call_7".into(),
+            input: Map::from_iter([("path".into(), json!("README.md"))]),
+        };
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "type": "tool_call_arguments_ready",
+                "round": 2,
+                "callId": "call_7",
+                "input": {"path": "README.md"}
+            })
+        );
+
+        let completed = ModelStreamEvent::ToolExecutionCompleted {
+            round: 2,
+            call_id: "call_7".into(),
+            result: ToolResult {
+                success: true,
+                output: "ok".into(),
+                images: Vec::new(),
+                diff: None,
+                executed_at: "2026-07-12T00:00:00Z".into(),
+                duration_ms: 4,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(completed).unwrap()["callId"],
+            json!("call_7")
+        );
+    }
+
+    /// The renderer reads the estimate as `estimatedTokens`; `rename_all` on the
+    /// enum only renames the variant.
+    #[test]
+    fn reasoning_progress_reaches_the_renderer_in_its_wire_shape() {
+        let progress = ModelStreamEvent::ReasoningProgress {
+            round: 3,
+            item: 1,
+            estimated_tokens: 1536,
+        };
+        assert_eq!(
+            serde_json::to_value(progress).unwrap(),
+            json!({"type": "reasoning_progress", "round": 3, "item": 1, "estimatedTokens": 1536})
+        );
+    }
+
+    #[test]
+    fn tool_result_diff_is_optional_and_omitted_for_legacy_results() {
+        let legacy: ToolResult = serde_json::from_value(json!({
+            "success": true,
+            "output": "ok",
+            "executedAt": "2026-07-12T00:00:00Z",
+            "durationMs": 4
+        }))
+        .unwrap();
+        assert_eq!(legacy.diff, None);
+        assert!(serde_json::to_value(&legacy).unwrap().get("diff").is_none());
+
+        let with_diff = ToolResult {
+            diff: Some("--- old\n+++ new\n".into()),
+            ..legacy
+        };
+        assert_eq!(
+            serde_json::to_value(with_diff).unwrap()["diff"],
+            json!("--- old\n+++ new\n")
+        );
+    }
+
+    /// The wire names are read by the renderer, by stored documents and by the
+    /// hook `permission_mode`, so a rename is a data migration rather than a
+    /// refactor. `ALL` is asserted to be complete here because nothing else can.
+    #[test]
+    fn security_level_wire_names_are_stable() {
+        let names: Vec<Value> = SecurityLevel::ALL
+            .iter()
+            .map(|level| serde_json::to_value(level).unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                json!("request_approval"),
+                json!("allow_edits"),
+                json!("full_access"),
+            ]
+        );
+        for level in SecurityLevel::ALL {
+            let name = serde_json::to_value(level).unwrap();
+            assert_eq!(
+                serde_json::from_value::<SecurityLevel>(name).unwrap(),
+                level
+            );
+        }
+        // A document written before plan mode carries no level at all, and must
+        // keep landing on the prompting level rather than the new one.
+        assert_eq!(SecurityLevel::default(), SecurityLevel::RequestApproval);
+    }
+
+    /// The user moves the level in the middle of a turn, so the cell has to
+    /// survive a round trip through the byte it stores for every level.
+    #[test]
+    fn the_live_cell_round_trips_every_level() {
+        let cell = LiveSecurityLevel::new(SecurityLevel::FullAccess);
+        assert_eq!(cell.get(), SecurityLevel::FullAccess);
+        for level in SecurityLevel::ALL {
+            cell.set(level);
+            assert_eq!(cell.get(), level);
+        }
+    }
+
+    #[test]
+    fn settings_from_the_tool_family_picker_load_and_drop_its_remembered_rows() {
+        // The picker no longer gathers tools into families, so the rows it kept
+        // for a switched-off family are read past and not written back.
+        let settings: ConversationSettings = serde_json::from_value(json!({
+            "enabledTools": [],
+            "rememberedToolFamilies": { "preview": ["preview_start", "preview_click"] }
+        }))
+        .expect("settings with remembered families");
+        let serialized = serde_json::to_value(&settings).unwrap();
+        assert!(serialized.get("rememberedToolFamilies").is_none());
+        // An unstated sandbox is the default one, and none is written out.
+        assert!(serialized.get("sandbox").is_none());
+        assert_eq!(settings.legacy_sandbox, SandboxSettings::default());
+    }
+}

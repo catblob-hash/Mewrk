@@ -1,0 +1,507 @@
+//! The Bash session snapshot, the mechanism that makes Claude Code's
+//! one-process-per-call shell feel continuous.
+//!
+//! Claude Code spawns a brand new `bash` for every tool call — there is no
+//! long-lived shell — so nothing a command defines survives on its own. What
+//! survives is replayed: once per session it runs the user's shell rc file in a
+//! login shell, serializes the resulting `shopt` flags, functions, `set -o`
+//! options, aliases, and `PATH` into a script, and every later shell `source`s
+//! that script as its first clause. A shell started this way therefore knows the
+//! user's aliases and functions without being a login shell, which is why the
+//! spawn argv drops `-l` whenever a snapshot exists.
+//!
+//! The snapshot is generated, not written by hand, and it is generated from the
+//! user's own rc file. That makes it untrusted input in the sense that matters:
+//! its contents are whatever the user's dotfiles produce. It is never parsed
+//! here — it is handed to `source` — so there is nothing to sanitize, but it is
+//! also the reason the shell tool no longer clears `BASH_ENV` and friends. A
+//! shell that deliberately replays the user's functions cannot also claim to be
+//! a sterile environment, and pretending otherwise was the more misleading of
+//! the two options.
+//!
+//! One thing Claude Code puts in its snapshot is deliberately not copied: shims
+//! that re-`exec` its own binary as `rg` and guard `pkill` against killing the
+//! CLI. Mewrk bundles no ripgrep and has no such process to protect, so those
+//! clauses would be inert at best.
+
+use crate::host_platform::host_platform;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// How long the generator may take. It runs the user's rc file, which can do
+/// arbitrary work; a dotfile that blocks must not hang the first shell call.
+const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Directory holding generated snapshots, under the app-data root.
+pub(crate) fn snapshot_directory(app_data: &Path) -> PathBuf {
+    app_data.join("shell-snapshots")
+}
+
+/// The rc file a shell of this flavour reads, chosen the way Claude Code chooses
+/// it: by what the interpreter path is called, not by what is installed.
+fn rc_file_for(shell_path: &str) -> Option<PathBuf> {
+    let home = dirs_home()?;
+    let lowered = shell_path.to_ascii_lowercase();
+    let name = if lowered.contains("zsh") {
+        ".zshrc"
+    } else if lowered.contains("bash") {
+        ".bashrc"
+    } else {
+        ".profile"
+    };
+    Some(home.join(name))
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    for variable in ["HOME", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(variable) {
+            if !value.is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+    None
+}
+
+/// The flavour word that goes in the file name, matching Claude Code's
+/// `snapshot-<flavour>-<millis>-<random>.sh`.
+fn flavour_of(shell_path: &str) -> &'static str {
+    let lowered = shell_path.to_ascii_lowercase();
+    if lowered.contains("zsh") {
+        "zsh"
+    } else if lowered.contains("bash") {
+        "bash"
+    } else {
+        "sh"
+    }
+}
+
+/// Six lowercase base-36 characters, as Claude Code's
+/// `Math.random().toString(36).substring(2, 8)` produces.
+fn random_suffix() -> String {
+    // Two unrelated clocks are mixed so two snapshots minted in the same
+    // millisecond still differ; the value only has to be unique, not secret.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let mut state = nanos
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(std::process::id() as u64)
+        .wrapping_add(1_442_695_040_888_963_407);
+    const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    (0..6)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ALPHABET[(state % ALPHABET.len() as u64) as usize] as char
+        })
+        .collect()
+}
+
+/// The variable a login shell is handed the application's `PATH` in, for
+/// [`in_application_path_order`] to restore after the profile has run.
+pub(crate) const APPLICATION_PATH_ENVIRONMENT_NAME: &str = "MEWRK_APPLICATION_PATH";
+
+/// Puts `PATH` back in the application's order after a login shell's profile has
+/// run, then forgets the handoff so the command never sees it.
+///
+/// macOS's `/etc/profile` and `/etc/zprofile` run `path_helper`, which moves the
+/// system directories to the front of `PATH`: `/usr/bin/git`, `/usr/bin/python3`,
+/// the `java` stub and `/bin/bash` would then shadow the Homebrew, nvm and pyenv
+/// builds the user runs in their own terminal. The application's `PATH` already
+/// has the login shell's order (`child_environment::adopt_login_shell_path`), so
+/// it leads, and only what the profile added follows.
+///
+/// One line of plain POSIX, because the same clause runs in `bash` (3.2
+/// included), `zsh` and `sh`: zsh does not split an unquoted `$PATH` on `IFS`,
+/// so the entries are peeled off with `%%`/`#` instead. An empty entry would put
+/// the working directory on `PATH` and is dropped.
+const RESTORE_APPLICATION_PATH_ORDER: &str = concat!(
+    r#"if [ -n "${MEWRK_APPLICATION_PATH-}" ]; then "#,
+    r#"__mewrk_path="$MEWRK_APPLICATION_PATH"; __mewrk_rest="$PATH:"; "#,
+    r#"while [ -n "$__mewrk_rest" ]; do "#,
+    r#"__mewrk_entry="${__mewrk_rest%%:*}"; __mewrk_rest="${__mewrk_rest#*:}"; "#,
+    r#"case ":$__mewrk_path:" in *":$__mewrk_entry:"*) ;; "#,
+    r#"*) [ -z "$__mewrk_entry" ] || __mewrk_path="$__mewrk_path:$__mewrk_entry" ;; "#,
+    r#"esac; done; PATH="$__mewrk_path"; export PATH; fi; "#,
+    "unset MEWRK_APPLICATION_PATH __mewrk_path __mewrk_rest __mewrk_entry;",
+);
+
+/// `script` for a login shell (`-l`) on this host, preceded by the clause that
+/// repairs `PATH` after `path_helper` where login shells run it (macOS), or
+/// `None` where they do not and the script needs nothing.
+///
+/// The caller hands the shell the `PATH` it starts it with under
+/// [`APPLICATION_PATH_ENVIRONMENT_NAME`]; without it the clause does nothing.
+/// The clause shares the script's first line, so a syntax error the shell
+/// reports in the caller's own command keeps its line number.
+pub(crate) fn in_application_path_order(script: &str) -> Option<String> {
+    host_platform()
+        .is_macos()
+        .then(|| format!("{RESTORE_APPLICATION_PATH_ORDER} {script}"))
+}
+
+/// Quotes a path for a POSIX single-quoted shell word.
+fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Rewrites a Windows path into the `/c/...` form Git Bash understands.
+pub(crate) fn bash_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && (bytes[0] as char).is_ascii_alphabetic() {
+        let drive = (bytes[0] as char).to_ascii_lowercase();
+        return format!("/{drive}{}", &text[2..]);
+    }
+    text
+}
+
+/// The generator script, run once per session by a login shell.
+///
+/// The emitted snapshot matches Claude Code's clause for clause: unalias
+/// everything first so an alias cannot be frozen inside a function definition,
+/// then `shopt`, then one `eval` per function, then `set -o`, then
+/// `expand_aliases`, then the aliases, then `PATH`.
+///
+/// Two details are load-bearing. Functions are emitted one `eval` per function
+/// with `printf %q` so a body that no longer parses drops only itself instead of
+/// aborting the whole `source`, and `%q` needs no command substitution at source
+/// time. Aliases defined as `winpty` wrappers are dropped under MSYS/Cygwin
+/// because `winpty` cannot attach to a pipe and every command wrapped in one
+/// would fail.
+fn generator_script(snapshot_file: &Path, rc_file: Option<&Path>) -> String {
+    let target = quote(&bash_path(snapshot_file));
+    // The generator is a login shell, so on macOS `path_helper` has reordered
+    // `PATH` by the time it is written down; see `in_application_path_order`.
+    let restore_path_order = if host_platform().is_macos() {
+        format!("\n{RESTORE_APPLICATION_PATH_ORDER}")
+    } else {
+        String::new()
+    };
+    let source_rc = match rc_file {
+        Some(rc) => format!("source {} < /dev/null", quote(&bash_path(rc))),
+        None => "# No user config file to source".to_owned(),
+    };
+    format!(
+        r##"SNAPSHOT_FILE={target}
+{source_rc}
+
+# First, create/clear the snapshot file
+echo "# Snapshot file" >| "$SNAPSHOT_FILE"
+
+# When this file is sourced, we first unalias to avoid conflicts with functions.
+# Aliases get "frozen" inside function definitions at definition time, which can
+# cause unexpected behavior when functions use commands that conflict with aliases.
+echo "# Unset all aliases to avoid conflicts with functions" >> "$SNAPSHOT_FILE"
+echo "unalias -a 2>/dev/null || true" >> "$SNAPSHOT_FILE"
+
+echo "# Shopt" >> "$SNAPSHOT_FILE"
+shopt -p | head -n 1000 >> "$SNAPSHOT_FILE"
+
+echo "# Functions" >> "$SNAPSHOT_FILE"
+# One eval per function so a body that no longer parses (rc=2, not fatal in
+# non-POSIX bash) drops only itself. The %q literal needs no fork at source time,
+# unlike a base64 command substitution.
+declare -F | cut -d' ' -f3 | grep -vE '^_[^_]' | while read -r func; do
+  printf 'eval %q > /dev/null 2>&1\n' "$(declare -f "$func")" >> "$SNAPSHOT_FILE"
+done
+
+echo "# Shell Options" >> "$SNAPSHOT_FILE"
+# Match the state column, not the line: `grep on` also matches `monitor off` and
+# `onecmd off`. `monitor` is never replayed even when on: job control gives each
+# command its own process group, and stopping a command kills exactly one group.
+set -o | awk '$2 == "on" && $1 != "monitor" && $1 != "onecmd" {{print "set -o " $1}}' | head -n 1000 >> "$SNAPSHOT_FILE"
+echo "shopt -s expand_aliases" >> "$SNAPSHOT_FILE"
+
+echo "# Aliases" >> "$SNAPSHOT_FILE"
+if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
+  alias | grep -v "='winpty " | sed 's/^alias //g' | sed 's/^/alias -- /' | head -n 1000 >> "$SNAPSHOT_FILE"
+else
+  alias | sed 's/^alias //g' | sed 's/^/alias -- /' | head -n 1000 >> "$SNAPSHOT_FILE"
+fi
+
+echo "# Path" >> "$SNAPSHOT_FILE"{restore_path_order}
+echo "export PATH='$PATH'" >> "$SNAPSHOT_FILE"
+
+# Exit silently on success, only report errors
+if [ ! -f "$SNAPSHOT_FILE" ]; then
+  echo "Error: Snapshot file was not created at $SNAPSHOT_FILE" >&2
+  exit 1
+fi
+"##
+    )
+}
+
+/// Builds one snapshot and returns its path. `None` means the shell must fall
+/// back to a login shell (`-l`), which is what Claude Code does when its own
+/// snapshot is missing: strictly worse, because a login shell re-runs the
+/// profile on every call, but never wrong.
+///
+/// Failure is deliberately quiet. A user whose `.bashrc` exits non-zero should
+/// still be able to run commands, so a generator that fails leaves the caller
+/// with the fallback rather than an error the model has to interpret.
+pub(crate) fn build(app_data: &Path, shell_path: &str) -> Option<PathBuf> {
+    let directory = snapshot_directory(app_data);
+    if std::fs::create_dir_all(&directory).is_err() {
+        return None;
+    }
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    let file = directory.join(format!(
+        "snapshot-{}-{millis}-{}.sh",
+        flavour_of(shell_path),
+        random_suffix()
+    ));
+    let rc = rc_file_for(shell_path).filter(|path| path.is_file());
+    let script = generator_script(&file, rc.as_deref());
+
+    let mut command = Command::new(shell_path);
+    command
+        .args(["-c", "-l", script.as_str()])
+        // The generator runs the user's rc file, which may inspect these.
+        .env("SHELL", shell_path)
+        .env("GIT_EDITOR", "true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if host_platform().is_macos() {
+        command.env(
+            APPLICATION_PATH_ENVIRONMENT_NAME,
+            std::env::var_os("PATH").unwrap_or_default(),
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().ok()?;
+    // The rc file is arbitrary user code, so the wait is bounded and a snapshot
+    // that has not appeared by the deadline is abandoned along with its process.
+    let deadline = std::time::Instant::now() + SNAPSHOT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+    // The exit status is not the criterion: an rc file that ends non-zero still
+    // produces a usable snapshot, and Claude Code likewise only checks the file.
+    file.is_file().then_some(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_paths_become_git_bash_paths() {
+        assert_eq!(bash_path(Path::new(r"C:\Users\a\b.sh")), "/c/Users/a/b.sh");
+        assert_eq!(bash_path(Path::new("/already/posix")), "/already/posix");
+        // A relative path has no drive letter to rewrite.
+        assert_eq!(bash_path(Path::new(r"rel\path")), "rel/path");
+    }
+
+    #[test]
+    fn a_quoted_path_survives_an_apostrophe() {
+        assert_eq!(quote("it's"), r#"'it'"'"'s'"#);
+    }
+
+    /// The suffix only has to distinguish two snapshots minted back to back.
+    #[test]
+    fn random_suffixes_are_six_base36_characters_and_differ() {
+        let first = random_suffix();
+        let second = random_suffix();
+        assert_eq!(first.len(), 6);
+        assert!(first
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_rc_file_is_chosen_by_interpreter_name() {
+        let home = dirs_home().expect("a home directory");
+        assert_eq!(rc_file_for("/usr/bin/zsh"), Some(home.join(".zshrc")));
+        assert_eq!(
+            rc_file_for(r"C:\Program Files\Git\bin\bash.exe"),
+            Some(home.join(".bashrc"))
+        );
+        assert_eq!(rc_file_for("/bin/dash"), Some(home.join(".profile")));
+    }
+
+    /// The emitted snapshot has to unalias before it defines functions, or an
+    /// alias is frozen into a function body at definition time.
+    #[test]
+    fn the_generator_unaliases_before_it_replays_functions() {
+        let script = generator_script(Path::new("/tmp/s.sh"), None);
+        let unalias = script.find("unalias -a").expect("unalias clause");
+        let functions = script.find("# Functions").expect("functions clause");
+        assert!(unalias < functions);
+        assert!(script.contains("# No user config file to source"));
+    }
+
+    /// A `winpty` alias cannot attach to a pipe, so replaying one would break
+    /// every command it wraps.
+    #[test]
+    fn winpty_aliases_are_dropped_under_msys() {
+        let script = generator_script(Path::new("/tmp/s.sh"), Some(Path::new("/home/u/.bashrc")));
+        assert!(script.contains(r#"grep -v "='winpty ""#));
+        assert!(script.contains("source '/home/u/.bashrc' < /dev/null"));
+    }
+
+    /// Only options that are on are replayed, and never job control. Matching
+    /// `on` anywhere in the line picked up `monitor off`, so every later command
+    /// ran in a process group of its own that a stop could not reach.
+    #[cfg(not(windows))]
+    #[test]
+    fn replayed_options_exclude_off_options_and_job_control() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("snapshot.sh");
+        let rc = directory.path().join("rc.sh");
+        std::fs::write(&rc, "set -o monitor\nset -o noclobber\n").unwrap();
+        let status = Command::new("bash")
+            .args(["-c", generator_script(&file, Some(&rc)).as_str()])
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let body = std::fs::read_to_string(&file).unwrap();
+        let replayed: Vec<&str> = body
+            .lines()
+            .filter(|line| line.starts_with("set -o "))
+            .collect();
+        assert!(replayed.contains(&"set -o noclobber"), "{body}");
+        assert!(replayed.contains(&"set -o hashall"), "{body}");
+        for absent in ["set -o monitor", "set -o onecmd", "set -o errexit"] {
+            assert!(!replayed.contains(&absent), "{absent} replayed: {body}");
+        }
+    }
+
+    /// A login bash on macOS reorders `PATH` through `path_helper`; the snapshot
+    /// keeps the application's order in front and appends what the profile added.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_snapshot_keeps_the_application_path_order_on_macos() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("snapshot.sh");
+        let status = Command::new("/bin/bash")
+            .args(["-c", generator_script(&file, None).as_str()])
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/profile/added")
+            .env("MEWRK_APPLICATION_PATH", "/opt/homebrew/bin:/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            body.contains("export PATH='/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/profile/added'"),
+            "{body}"
+        );
+    }
+
+    /// Runs the repair clause in each POSIX shell this host has: zsh does not
+    /// split `$PATH` the way bash and sh do, so the clause must not rely on it.
+    #[cfg(unix)]
+    #[test]
+    fn the_path_repair_works_in_every_posix_shell() {
+        assert!(RESTORE_APPLICATION_PATH_ORDER.contains(APPLICATION_PATH_ENVIRONMENT_NAME));
+        assert!(!RESTORE_APPLICATION_PATH_ORDER.contains('\n'));
+        let report = r#"printf '%s|%s\n' "$PATH" "${MEWRK_APPLICATION_PATH-unset}""#;
+        // Even `zsh -c` reads `~/.zshenv`, which may add to `PATH` on its own.
+        let home = tempfile::tempdir().unwrap();
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh", "/usr/bin/zsh"] {
+            if !Path::new(shell).is_file() {
+                continue;
+            }
+            let run = |application_path: Option<&str>| {
+                let mut command = Command::new(shell);
+                command
+                    .args(["-c", &format!("{RESTORE_APPLICATION_PATH_ORDER} {report}")])
+                    .env("PATH", "/usr/bin:/bin:/usr/sbin::/profile/added:/usr/bin")
+                    .env("HOME", home.path())
+                    .env("ZDOTDIR", home.path())
+                    .env_remove(APPLICATION_PATH_ENVIRONMENT_NAME)
+                    .stdin(Stdio::null());
+                if let Some(path) = application_path {
+                    command.env(APPLICATION_PATH_ENVIRONMENT_NAME, path);
+                }
+                let output = command.output().unwrap();
+                assert!(output.status.success(), "{shell}: {output:?}");
+                String::from_utf8(output.stdout).unwrap()
+            };
+            assert_eq!(
+                run(Some("/opt/homebrew/bin:/usr/bin:/bin")),
+                "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/profile/added|unset\n",
+                "{shell}"
+            );
+            // No handoff, nothing to restore: PATH is left exactly as it was.
+            assert_eq!(
+                run(None),
+                "/usr/bin:/bin:/usr/sbin::/profile/added:/usr/bin|unset\n",
+                "{shell}"
+            );
+        }
+    }
+
+    /// The real thing: a login zsh and a login bash run `/etc/zprofile` and
+    /// `/etc/profile`, whose `path_helper` puts the system directories first.
+    /// The user's own startup files are kept out with an empty home.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_shells_keep_the_application_path_order_on_macos() {
+        let home = tempfile::tempdir().unwrap();
+        let application_path = "/mewrk-test/first:/usr/bin:/bin";
+        let report = r#"printf '%s\n' "$PATH""#;
+        for shell in ["/bin/zsh", "/bin/bash"] {
+            let run = |script: String| {
+                let output = Command::new(shell)
+                    .args(["-l", "-c", &script])
+                    .env("PATH", application_path)
+                    .env(APPLICATION_PATH_ENVIRONMENT_NAME, application_path)
+                    .env("HOME", home.path())
+                    .env("ZDOTDIR", home.path())
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{shell}: {output:?}");
+                String::from_utf8(output.stdout).unwrap()
+            };
+            if Path::new("/usr/libexec/path_helper").is_file() {
+                let reordered = run(report.to_owned());
+                assert!(
+                    !reordered.starts_with(application_path),
+                    "{shell}: path_helper no longer reorders PATH: {reordered}"
+                );
+            }
+            let repaired = run(in_application_path_order(report).expect("macOS repairs PATH"));
+            assert!(
+                repaired.starts_with(&format!("{application_path}:")),
+                "{shell}: {repaired}"
+            );
+        }
+    }
+
+    /// One `eval` per function: a body that stopped parsing must not take the
+    /// rest of the snapshot down with it.
+    #[test]
+    fn functions_are_replayed_one_eval_at_a_time() {
+        let script = generator_script(Path::new("/tmp/s.sh"), None);
+        assert!(script.contains("printf 'eval %q > /dev/null 2>&1\\n'"));
+    }
+}

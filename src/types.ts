@@ -1,0 +1,2382 @@
+export type ContextKind = "system" | "user" | "reasoning" | "tool" | "assistant";
+export type InsertableContextKind = ContextKind;
+
+export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+export type JsonObject = Record<string, JsonValue>;
+
+/** Lightweight reference to image bytes kept outside the main document payload. */
+export interface ImageAttachment {
+  id: string;
+  name: string;
+  mime: string;
+  width: number;
+  height: number;
+  bytes: number;
+  /** Conversation-scoped number backing `[Image #N]` placeholders and `preview_upload_image` references. */
+  shortId?: number;
+}
+
+/** How the model reads an attached file: its own text, or the text layer of a PDF. */
+export type FileAttachmentFormat = "text" | "pdf";
+
+/**
+ * Lightweight reference to a non-image file attached to a user message.
+ *
+ * Mirrors Rust `model::FileAttachment`. The host keeps the bytes (and, for a
+ * PDF, the text read out of it) in its content-addressed attachment store; the
+ * model reads the text, inlined into the message when the request is built.
+ */
+export interface FileAttachment {
+  /** Full lowercase SHA-256 of the stored original bytes. */
+  id: string;
+  name: string;
+  format: FileAttachmentFormat;
+  /** Size of the stored original. */
+  bytes: number;
+  /** Estimated tokens of the text the model reads for this file. */
+  tokens: number;
+  /** Page count of a PDF. */
+  pages?: number;
+}
+
+interface TextContextBase {
+  id: string;
+  content: string;
+  /** Marks content that is still streaming; completed or interrupted fragments may be persisted. */
+  streaming?: boolean;
+  createdAt: string;
+}
+
+export interface SystemContext extends TextContextBase {
+  kind: "system";
+  /** Lifecycle diagnostics kept in the local timeline and excluded from every model request. */
+  localOnly?: boolean;
+  /** Present on lifecycle diagnostics and model-visible context produced by a hook. */
+  hookExecution?: HookExecutionMetadata;
+  /**
+   * Tools that joined the conversation at this point (Rust `tool_append.rs`).
+   * Always local-only: the wire hands the tools over here through the
+   * protocol's own append interface, and the timeline draws no row for it.
+   */
+  toolsAdded?: string[];
+  /**
+   * The conversation opens on a native compaction (Rust `native_compaction.rs`):
+   * the continuation of a conversation that was compacted. Always local-only,
+   * with empty text — what the card says is read from these fields. On a
+   * request the compaction applies to — same provider, a model that takes
+   * native compaction — the card stands for the compacted conversation: the
+   * messages it kept, the tools it had appended, then the item; elsewhere only
+   * the kept messages.
+   */
+  nativeCompaction?: NativeCompaction;
+}
+
+/** What a native compaction left behind. Mirrors Rust `model.rs::NativeCompaction`. */
+export interface NativeCompaction {
+  /** The provider entry whose account the item is encrypted for. */
+  providerId: string;
+  /** The model that compacted. */
+  model: string;
+  /** What that model is called on screen, for the card's title. */
+  modelName?: string;
+  /** The provider's compaction item as AI SDK content parts. Opaque. */
+  parts: JsonValue[];
+  /** The messages kept ahead of the item, oldest first. */
+  retained?: RetainedMessage[];
+  /** The context as measured when it compacted. */
+  tokensBefore: number;
+  /** What the card weighs on a request: the kept messages plus the item. */
+  tokensAfter: number;
+  /** Tools the compacted conversation had appended, handed over again ahead of the item. */
+  appendedTools?: string[];
+  /** The compacted conversation had been offered the plan pair. */
+  planTools?: boolean;
+  /** The prompt cache key the continuation's requests keep. */
+  cacheKey?: string;
+}
+
+export interface RetainedMessage {
+  role: "user" | "system";
+  /** The card it was copied from. */
+  sourceId: string;
+  content: string;
+  /** Cut in the middle to fit the budget. */
+  truncated?: boolean;
+}
+
+export interface UserContext extends TextContextBase {
+  kind: "user";
+  images?: ImageAttachment[];
+  files?: FileAttachment[];
+}
+
+/** One provider-cited web source on an assistant round (server-side search /
+ * grounding). Mirrors the host's `ContextSource`; rendered as citation chips
+ * under the prose and never projected back into model input. */
+export interface ContextSource {
+  id: string;
+  url?: string;
+  title?: string;
+}
+
+export interface AssistantContext extends TextContextBase {
+  kind: "assistant";
+  /** One-based model request round for model-generated assistant output. */
+  round?: number;
+  /** Local association shared by every canonical item emitted by one model round. */
+  modelTurnId?: string;
+  /** Visible local fragment from an interrupted stream; excluded from every model request. */
+  interrupted?: boolean;
+  /** Provider-cited web sources for this round; absent when the provider cited none. */
+  sources?: ContextSource[];
+}
+
+export type TextContext = SystemContext | UserContext | AssistantContext;
+
+export interface HookExecutionMetadata {
+  executionId: string;
+  hookId: string;
+  hookName: string;
+  event: string;
+  status: "running" | "succeeded" | "failed" | "blocked";
+  contextInjected: boolean;
+}
+
+export interface ReasoningContext {
+  id: string;
+  kind: "reasoning";
+  content?: string;
+  /**
+   * Whether the reasoning is readable plaintext or an encrypted trace.
+   * Mirrors Rust `model.rs::ReasoningForm`.
+   *
+   * Resolve this when creating the card from
+   * `ModelProfile.reasoningContent`, not from whether prose is empty. An
+   * absent value is a pre-field record and must use `isEncryptedReasoning`.
+   */
+  form?: ReasoningForm;
+  /** Marks reasoning that is still arriving from the model. */
+  streaming?: boolean;
+  /** One-based model request round for model-generated reasoning. */
+  round?: number;
+  /** Local association shared by every canonical item emitted by one model round. */
+  modelTurnId?: string;
+  /** Visible local fragment from an interrupted stream; excluded from every model request. */
+  interrupted?: boolean;
+  /**
+   * Wall-clock milliseconds the provider spent reasoning in this round,
+   * measured by the sidecar.
+   *
+   * Present even when `content` is absent: a Responses round that only returns
+   * `encrypted_content` emits no summary text at all, and this plus `tokens`
+   * is the entire visible trace of it.
+   */
+  durationMs?: number;
+  /** Provider-reported reasoning tokens for this round. A subset of the round's output tokens. */
+  tokens?: number;
+  /**
+   * The provider's own signed reasoning parts, replayed verbatim on later turns
+   * (an Anthropic signature, a Responses item id plus ciphertext). Owned by the
+   * host — `ContextItem::Reasoning.replay` — and opaque to the renderer, which
+   * never reads inside it. `content` above is the presentation copy.
+   */
+  replay?: { model: string; parts: unknown[] };
+  /**
+   * When the live stream saw this round's reasoning open. UI-only and never
+   * persisted — the host's `ContextItem::Reasoning` has no such field, so serde
+   * drops it on the way to disk. It exists so the card can tick a live clock
+   * before `durationMs` arrives.
+   */
+  startedAt?: string;
+  createdAt: string;
+}
+
+export interface ToolResult {
+  success: boolean;
+  output: string;
+  images?: ImageAttachment[];
+  /** Optional unified diff for file-mutating tools. Kept separate from model-visible output. */
+  diff?: string;
+  executedAt: string;
+  durationMs: number;
+}
+
+export type SubagentRunStatus =
+  | "completed"
+  | "interrupted"
+  | "failed"
+  | "stopped"
+  | "roundLimit";
+
+/** Live lifecycle values streamed on the `status` subagent channel. */
+export type SubagentLiveStatus =
+  | "running"
+  | "idle"
+  | "interrupted"
+  | "failed"
+  | "stopped"
+  | "roundLimit";
+
+export interface SubagentUpdate {
+  content: string;
+  createdAt: string;
+}
+
+/** Host-persisted exact resolution for a trusted named-agent definition. */
+export interface AgentDefinitionBinding {
+  source: AgentDefinitionSource;
+  sourceKey: string;
+  name: string;
+  revision: number;
+  /** Host-owned identity epoch; delete/re-add must advance it. */
+  memoryEpoch: number;
+  providerId: string;
+  /** Exact raw, case-sensitive model ID; never a hash or synthetic owner. */
+  modelId: string;
+  memory: AgentDefinitionMemory;
+  scopeKey: string;
+  /** Keyed host receipt over the complete trusted definition/model binding. */
+  configurationReceipt: string;
+  /** Payload shape the receipt was signed over; absent on pre-versioning records. */
+  receiptVersion?: number;
+}
+
+/** Host-persisted exact model and parent-memory snapshot selected for a fork. */
+export interface ForkModelBinding {
+  providerId: string;
+  /** Exact raw, case-sensitive model ID; never a hash or synthetic owner. */
+  modelId: string;
+  memoryLanguage: ResolvedAppLanguage;
+  /** Exact sorted parent memory-tool subset retained across reload. */
+  memoryToolNames: string[];
+  systemPromptSnapshot: string;
+  systemPromptReceipt: string;
+  memorySnapshotReceipt?: string;
+  /** Keyed host receipt over the full exact model, capability, and snapshot binding. */
+  bindingReceipt: string;
+  /** Payload shape the receipt was signed over; absent on pre-versioning records. */
+  receiptVersion?: number;
+}
+
+/**
+ * A cumulative child run snapshot persisted with the agent tool context that
+ * started the child (`agent_spawn`). Older saved conversations may carry it on
+ * a retired `send_message` or `followup_task` context instead, and legacy
+ * `subagent` contexts carry one too.
+ */
+export interface SubagentRunRecord {
+  /** Addressable agent name `task_wait` takes; absent on legacy records. */
+  name?: string;
+  /**
+   * Model-visible task address of a managed run (`workflow:<runId>`) or a
+   * workflow step's display label. Pool names are host internals; this is what
+   * `task_list` prints after the run's turn ended. Absent on ordinary agents.
+   */
+  label?: string;
+  /**
+   * Specialized child workspace kind; absent on ordinary agents. Workflow steps
+   * use `workflowStep` for their read-only child transcript.
+   * Wire values mirror model.rs `SubagentRunKind` under serde camelCase.
+   */
+  kind?: "general" | "workflowStep";
+  /** True only for conversation-context forks that inherit host-bound model auto-memory. */
+  inheritsModelMemory?: boolean;
+  /** Present only for conversation-context forks; mutually exclusive with agentDefinition. */
+  forkModelBinding?: ForkModelBinding;
+  /** Present only for a trusted named agent; mutually exclusive with inheritsModelMemory. */
+  agentDefinition?: AgentDefinitionBinding;
+  /** Host-keyed receipt over the conversation, name, and exact ordinary/fork/named continuation mode. */
+  executionModeReceipt?: string;
+  task: string;
+  status: SubagentRunStatus;
+  contexts: ContextItem[];
+  updates: SubagentUpdate[];
+  /**
+   * Result of this agent's latest turn when the spawn set an `output_schema`,
+   * already validated against it by the host. Absent on every other record.
+   */
+  structuredOutput?: unknown;
+  /**
+   * The spawn-time `output_schema` document of a schema-bound run, persisted so
+   * a continuation in a later turn stays schema-bound. The host re-compiles it
+   * under the spawn-time bounds at rehydration; the renderer never interprets
+   * it. Absent on runs spawned without a schema and records persisted before
+   * this field existed.
+   */
+  outputSchema?: unknown;
+  /**
+   * Tokens this agent alone consumed across all of its turns. Separate from the
+   * conversation's own usage, which is a turn total that already absorbed these
+   * numbers — the task sidebar shows the per-agent figure. Absent on records
+   * persisted before this field existed and on agents that never completed a turn.
+   */
+  usage?: ModelUsage;
+}
+
+export interface SubagentLiveState {
+  /** Failed projection survives backoff until this round starts replacing it. */
+  retryRound?: number;
+  /** Standard contexts projected from the child's nested model stream. */
+  contexts: ContextItem[];
+  /** Status updates explicitly reported by the child to its parent. */
+  updates: SubagentUpdate[];
+  /** Latest lifecycle transition streamed on the status channel. */
+  status?: SubagentLiveStatus;
+  /**
+   * Provider-reported cumulative usage per child request round, streamed while
+   * the child runs. Keyed by round because each snapshot supersedes that
+   * round's previous one; summing the map is what gives the run's total. The
+   * persisted record wins once it exists — it is authoritative and spans every
+   * turn the agent ran — so this only ever fills the gap before settlement.
+   */
+  usageByRound?: Record<number, ModelUsage>;
+  /** UI-only provider-call correlation; never copied into a persisted child transcript. */
+  toolContextIds?: Record<string, string>;
+}
+
+export interface ToolContext {
+  id: string;
+  kind: "tool";
+  toolName: string;
+  /** One-based model request round. Absent for manual and legacy tool contexts. */
+  round?: number;
+  /** Local association shared by every canonical item emitted by one model round. */
+  modelTurnId?: string;
+  /**
+   * The provider's own id for this tool call, replayed verbatim on later turns
+   * so the exchange keeps one id for its whole life. Opaque to the renderer,
+   * which must carry it through untouched. Absent on manual, host-fabricated
+   * and legacy cards, which fall back to a host-minted digest.
+   */
+  providerCallId?: string;
+  /** Model-requested arguments before hooks changed the arguments that were executed. */
+  requestedInput?: JsonObject;
+  input: JsonObject;
+  result: ToolResult;
+  /** UI-only tool call that is still moving through the model execution pipeline. */
+  streaming?: boolean;
+  /** Transient phase used only while a model run is active. */
+  streamStatus?: "announced" | "ready" | "running" | "completed";
+  /** UI-only live activity of a running subagent call; never persisted. */
+  live?: SubagentLiveState;
+  /** Persisted child transcript and terminal state for a `subagent` call. */
+  subagent?: SubagentRunRecord;
+  /**
+   * Which host message a `box` delivery card carries (Rust
+   * `wire_history::notice_kind`); absent on a delivered background result. Host
+   * bookkeeping that never reaches the model: the card's input is the empty
+   * argument and its result the whole message, as the model reads them.
+   */
+  notice?: string;
+  /**
+   * Host proof that this card's result came from the backend's own execution,
+   * issued when the card was built. The renderer treats it as opaque and must
+   * carry it through untouched: a card that arrives back without it cannot be
+   * verified and is quarantined instead of saved.
+   */
+  attestation?: string;
+  createdAt: string;
+}
+
+export type ContextItem = TextContext | ReasoningContext | ToolContext;
+
+export interface ConversationSettings {
+  enabledTools: string[];
+  /** Directly selected capability-catalog resource IDs. */
+  hookIds: string[];
+  skillIds: string[];
+  mcpIds: string[];
+  /** Selected tool-description resource ID; at most one. `null` enables all built-ins. */
+  toolDescriptionFileId: string | null;
+  /**
+   * The subagent roles this conversation offers the model, by catalog id
+   * (`CapabilityCatalog.agents`), exactly as `skillIds` selects skills. A role
+   * is a JSON file under `~/.mewrk/agents/` or a workspace's
+   * `.mewrk/agents/` (or one of the built-ins), never a record of the
+   * conversation's own, so editing one reaches every conversation that selects
+   * it. An id discovery cannot find is kept and skipped (dangling). A preset
+   * component, so applying a preset replaces the whole selection.
+   */
+  agentIds: string[];
+  /**
+   * Allows subagents without a named role. When disabled, `agent_spawn` and
+   * workflow steps must name a role. The host treats an empty role set as
+   * enabled because otherwise every call would be unsatisfiable.
+   */
+  allowRolelessSubagents: boolean;
+  /** Per-conversation web-search behavior; provider list and keys are global assets. */
+  webSearch: ConversationWebSearchSettings;
+  /**
+   * Whether this conversation can reach the web at all.
+   *
+   * The feature switch for both web tools, in the same shape as the two memory
+   * tiers: when enabled, the host derives `web_search` unless the search
+   * provider is off, and `web_fetch` unless the fetch provider is off (or is
+   * native on a family without a fetch tool), whether or not the chosen
+   * provider currently works. Neither name is ever taken from `enabledTools`,
+   * so they are not rows in the tool picker.
+   * When disabled, `webSearch` below describes a backend nothing calls.
+   */
+  webSearchEnabled: boolean;
+  reasoningEffort: ReasoningEffort;
+  securityLevel: SecurityLevel;
+  /**
+   * Whether this conversation is in plan mode: the switch under the composer.
+   * Independent of the security level — the model writes a plan and asks for
+   * approval, and the level decides what its calls need either way. Not part
+   * of a preset; a new conversation starts with it off, and the host turns it
+   * off when the user approves a plan.
+   */
+  planModeEnabled?: boolean;
+  /**
+   * Whether this conversation loads the global memory tier (`~/.mewrk`). When
+   * enabled, that tier's `MEWRK.md` instructions and `MEMORY.md` index are
+   * concatenated into the context and its three tools
+   * (`read`/`create`/`edit_global_memory`) become available. When disabled,
+   * nothing is read, nothing is injected, and those three are withheld.
+   */
+  globalMemoryEnabled: boolean;
+  /**
+   * The same for the project tier (`<workspace>/.mewrk`). The two tiers are
+   * independent: either, both or neither may be on.
+   */
+  projectMemoryEnabled: boolean;
+  /**
+   * Controls how conversation skills reach the model.
+   *
+   * When disabled, full skill bodies are added to the system prompt before each
+   * round. When enabled, the `skill` tool loads bodies on demand. Both paths
+   * use `skillIds` to choose the available skills.
+   */
+  skillToolEnabled: boolean;
+  /**
+   * Controls how this conversation's MCP tools reach the model.
+   *
+   * When disabled, every discovered MCP tool is declared with its full schema
+   * on every request. When enabled, the schemas are withheld, the names are
+   * announced in the run's own context, and the `tool_search` tool hands out a
+   * schema when the model asks for one. Both paths dial the same `mcpIds`.
+   */
+  mcpToolDiscoveryEnabled: boolean;
+  /**
+   * What the messages the host hands the model between rounds come in — a
+   * background result nobody waited for, a hook's context, a skill added
+   * later, an instruction with no system message to ride. Absent means
+   * `"user"`. Mirrors Rust `model.rs::HostMessageContainer`.
+   */
+  hostMessageContainer?: HostMessageContainer;
+  /**
+   * How this conversation auto-compacts: one of the two, each with its global
+   * threshold (`AutoCompactSettings`). Absent on a conversation from before the
+   * choice, which hands off, and on the new-task draft until it becomes a
+   * conversation, when it is settled by the model — native where the model
+   * compacts natively, the handoff elsewhere (`defaultCompactionMethod`). Not
+   * a preset template. Mirrors Rust `ConversationSettings::compaction_method`.
+   */
+  compactionMethod?: CompactionMethod;
+  /* The sandbox used to be a setting here. It belongs to each workspace now
+   * (`ExecutionEnvironmentAssets.sandboxes`); the host hands an old
+   * conversation's to its workspaces when it loads and never sends it here. */
+  /* The five file write guards used to be switches here. They are now
+   * unconditional in the host — every conversation, and every child of one,
+   * runs with read-before-write, the stale-write refusal, external-change
+   * notices, hook re-sync and the formatter hint — so there is nothing left for
+   * a conversation to carry about them. See `FileGuard` on the Rust side. */
+  /**
+   * What this conversation's last request put in front of the model, and which
+   * model sent it when. Absent until the first run. Per-conversation runtime
+   * state, not a preset component: it records history and must never be copied
+   * into one.
+   */
+  toolLock?: ConversationToolLock;
+}
+
+/**
+ * The tool surface the conversation's last request went out with, and which
+ * model sent it when (`src/lib/toolLock.ts`).
+ *
+ * The prompt cache belongs to that model and that surface. While the selected
+ * model is the same one and its cache is warm, a change that would rewrite the
+ * cached prefix is drawn orange and asks first — on a model that cannot take a
+ * tool mid-conversation, that is every part of the surface, either way.
+ * Picking another model lifts it, and picking this one again puts it back.
+ *
+ * Three fields are pins rather than parts of the surface: what they hold is one
+ * answer the transcript already carries, fixed by the first run that gave it.
+ *
+ * A fork of the conversation carries the lock as it stands, timestamps and all:
+ * the cache the fork's history rides on is the same one, and it runs out at the
+ * same moment for both.
+ */
+export interface ConversationToolLock {
+  tools: string[];
+  mcpIds: string[];
+  globalMemory: boolean;
+  projectMemory: boolean;
+  skillTool: boolean;
+  /** Whether the last request withheld MCP tool schemas behind `tool_search`. */
+  mcpToolDiscovery: boolean;
+  /**
+   * Whether the last request granted web access. One bit for the feature, not
+   * one per tool name: which of `web_search` / `web_fetch` a run grants follows
+   * the two backend selections below.
+   */
+  webSearch: boolean;
+  /**
+   * Whether a request has offered the plan-mode pair. Sticky: once plan mode
+   * has been on, the pair stays on every later request.
+   */
+  planMode: boolean;
+  /** Skills the conversation had selected at the last request, by catalog id. */
+  skillIds: string[];
+  /**
+   * The skills the system prompt was assembled from, fixed by this
+   * conversation's first run and `null` before it. Skills selected afterwards
+   * arrive as host notices instead, so the prompt the earlier rounds were
+   * cached against never changes under them.
+   */
+  promptSkillIds: string[] | null;
+  /**
+   * The search backend the last request's settings named, or `null` when that
+   * request had no web access. Part of the surface: a host-run search leaves
+   * ordinary tool results any backend can follow, so another one may take over
+   * — it only throws the warm cache away.
+   */
+  searchBackend: SearchProviderSelection | null;
+  /** The fetch backend the last request's settings named, on the same terms. */
+  fetchBackend: FetchProviderSelection | null;
+  /** Whether the last request granted `web_fetch`: native fetch is a second tool only on some families. */
+  webFetch: boolean;
+  /**
+   * Native search, once a native search has actually run here — its report is
+   * in the transcript — and for as long as it stays there. Pinned because a
+   * native search leaves provider-sealed blocks in the transcript that only
+   * that provider's models can read back. Merely offering `web_search` with
+   * Native pins nothing: on a family without native search every call fails.
+   * Only ever `{ kind: "native" }`: a host-run backend is part of the surface
+   * above instead.
+   */
+  searchProvider: SearchProviderSelection | null;
+  /** Native fetch, once a run has been granted `web_fetch` with it, pinned for the same reason. */
+  fetchProvider: FetchProviderSelection | null;
+  /** The model the last request used, and when it went out. `null` before the first. */
+  lastRequest: ToolLockRequest | null;
+  /**
+   * Every model's latest request in this conversation, one entry per model.
+   * The surface belongs to the last request alone, but each of these models
+   * still holds a cache of its own until its lifetime runs out — which is what
+   * the composer's model menu marks.
+   */
+  modelRequests: ToolLockRequest[];
+  /**
+   * Hooks selected at the last request, which its system prompt listed.
+   * `null` on a lock written before they were recorded, which tones nothing.
+   */
+  hookIds: string[] | null;
+  /**
+   * The prompt profile the last request was worded with — the built-in's id
+   * when none was selected — or `null` on an older lock.
+   */
+  promptProfile: string | null;
+  /** The host-message container the last request used, or `null` on an older lock. */
+  hostMessageContainer: HostMessageContainer | null;
+}
+
+/** Which model a conversation's last request used, and when. */
+export interface ToolLockRequest {
+  providerId: string;
+  modelId: string;
+  /** RFC 3339. */
+  at: string;
+}
+
+/** The reusable subset of conversation settings owned by a conversation preset. */
+export interface ConversationPresetSettings {
+  enabledTools: string[];
+  /** Selected tool-description resource ID; at most one. `null` enables all built-ins. */
+  toolDescriptionFileId: string | null;
+  /** The roles this preset selects, by catalog id; dangling ids are retained. */
+  agentIds: string[];
+  /** Template for `allowRolelessSubagents`, copied into a conversation when applying the preset. */
+  allowRolelessSubagents: boolean;
+  /** Directly selected capability-catalog resource IDs; dangling IDs are retained. */
+  hookIds: string[];
+  skillIds: string[];
+  mcpIds: string[];
+  /** Web-search behavior template, copied into new conversations when applying the preset. */
+  webSearch: ConversationWebSearchSettings;
+  /**
+   * Web-access template copied into conversations. An enabled preset derives
+   * `web_search` and `web_fetch` by the same rule as a conversation.
+   */
+  webSearchEnabled: boolean;
+  /** Security-policy template copied into conversations; in-conversation changes use the composer selector. */
+  securityLevel: SecurityLevel;
+  /** Memory-tier templates copied into conversations; enabled tiers inject context and expose their tools. */
+  globalMemoryEnabled: boolean;
+  projectMemoryEnabled: boolean;
+  /** On-demand skill-loading template copied into conversations. */
+  skillToolEnabled: boolean;
+  /** MCP tool-discovery template copied into conversations. */
+  mcpToolDiscoveryEnabled: boolean;
+  /** Host-message container template copied into conversations; absent means `"user"`. */
+  hostMessageContainer?: HostMessageContainer;
+}
+
+/**
+ * One alternative suffix after a user-message fork point.
+ *
+ * The common prefix stays in `Conversation.contexts`. Exactly one slot for a
+ * given `forkContextId` is active and therefore keeps an empty `contexts`
+ * array; its live suffix is the portion of `Conversation.contexts` after the
+ * fork message. Inactive slots own their suffix snapshots. This keeps context
+ * ids unique and avoids copying potentially large tool history.
+ */
+export interface ConversationBranch {
+  id: string;
+  forkContextId: string;
+  active: boolean;
+  contexts: ContextItem[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * The conversation a timeline fork was taken from, and which of its forks this is.
+ *
+ * A fork is titled `<origin title>-fork-<number>` and keeps following the
+ * origin's title (see `lib/conversationForks.ts`). A fork of a fork names the
+ * same origin, so all forks of one conversation share one numbering — keyed by
+ * the origin's id, never its title, so two conversations with the same title
+ * count separately.
+ */
+export interface ConversationForkOrigin {
+  conversationId: string;
+  number: number;
+}
+
+/**
+ * The conversation an auto-compact continuation carries on, and which of its
+ * continuations this is. The host titles it `<origin title>-handover-<number>`
+ * when it opens (`src-tauri/src/handoff.rs`); a continuation of a continuation
+ * names the same origin, so a chain of handoffs shares one numbering. A fork's
+ * shape, not a fork: the title follows nothing afterwards.
+ */
+export type ConversationHandoffOrigin = ConversationForkOrigin;
+
+/** Retained solely to deserialize persisted `webSearch` abort records. */
+export type UserAbortedTaskKind = "subagent" | "workflow" | "terminal" | "shell" | "webSearch" | "browser";
+
+export interface UserAbortedTaskRecord {
+  id: string;
+  sourceKind: UserAbortedTaskKind;
+  sourceIdentity: string;
+  label: string;
+  detail: string;
+  metrics: {
+    childCount: number | null;
+    tokens: number | null;
+    toolCount: number | null;
+    elapsedMs: number | null;
+  };
+  startedAt: string;
+  endedAt: string;
+  reason: "userAborted";
+}
+
+/**
+ * An isolated Git worktree used by this conversation in place of one of its
+ * project's workspaces.
+ *
+ * The host runs this conversation's tools against `path` wherever they name
+ * that workspace, isolating it from the project's other conversations. It
+ * belongs to the conversation instance, not `ConversationSettings`, because
+ * settings are copied by presets.
+ */
+export interface ConversationWorktree {
+  /** Absolute worktree root path, on the machine of the workspace it came from. */
+  path: string;
+  /** Branch created for this worktree. */
+  branch: string;
+  /** Baseline commit used at release to determine whether extra commits exist. */
+  baseOid: string;
+  /** The branch the worktree was forked from; absent for a detached HEAD or an older record. */
+  baseBranch?: string | null;
+  /**
+   * The project workspace this worktree was checked out from — its machine and registered
+   * directory — which it stands in for. Absent on records from before every workspace could
+   * have one: those are workspace 1's.
+   */
+  workspace?: AttachedWorkspace | null;
+}
+
+/**
+ * Execution target for this conversation's shell commands. `null` is local;
+ * local execution is represented by the absence of a remote target.
+ *
+ * This belongs to the conversation instance because presets and workspace
+ * snapshots copy `ConversationSettings`. SSH records store only stable machine
+ * IDs; the host resolves endpoint details from {@link ExecutionEnvironmentAssets}.
+ */
+export type RunTarget =
+  | { kind: "wsl"; distro: string }
+  | { kind: "ssh"; machineId: string };
+
+/**
+ * One directory a conversation may work in, together with the machine it is on.
+ *
+ * `machine` absent (or `null`) is the host machine, matching {@link RunTarget}'s
+ * "local is the absent variant" convention. The model never addresses these by
+ * path: it names a workspace by its 1-based position in the conversation's list,
+ * which is what the `workspace` parameter on every path-taking tool carries.
+ */
+export interface AttachedWorkspace {
+  machine?: RunTarget | null;
+  /** Absolute path on that machine. A remote path is POSIX and may begin `~`. */
+  path: string;
+}
+
+export interface Conversation {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  settings: ConversationSettings;
+  contexts: ContextItem[];
+  queuedMessages: QueuedMessage[];
+  branches: ConversationBranch[];
+  userAbortedTasks: UserAbortedTaskRecord[];
+  /**
+   * Whether the user's Stop paused the queue: queued messages wait for the next
+   * send instead of going out one round at a time. Mirrors Rust
+   * `Conversation::queue_paused`; absent means not paused.
+   */
+  queuePaused?: boolean;
+  /**
+   * Isolated worktrees, at most one per project workspace; a workspace without one runs at its
+   * registered directory. See {@link ConversationWorktree} and `worktreeFor`.
+   */
+  worktrees: ConversationWorktree[];
+  /** Execution target, or `null` for local execution. See {@link RunTarget}. */
+  runTarget: RunTarget | null;
+  /**
+   * Directories outside the primary workspace that this conversation may also
+   * work in, each on the machine it names — the composer's workspace chips.
+   * Together with the primary workspace they form the numbered list the model
+   * addresses: the primary is workspace 1 and these follow in order.
+   *
+   * On the conversation rather than in {@link ConversationSettings} for the same
+   * reason as `worktrees`: presets and workspace snapshots copy settings
+   * wholesale, and one conversation's granted path is not another's. Each entry
+   * came back from a host directory picker — native for the host machine, the
+   * remote browser for a WSL or SSH machine — which is the only thing that
+   * authorizes it; writing a path here that no picker returned makes the
+   * document unsavable.
+   */
+  attachedWorkspaces: AttachedWorkspace[];
+  /**
+   * Superseded by {@link Conversation.attachedWorkspaces}, which carries a
+   * machine alongside each path. Present only on documents written before
+   * workspaces could be remote; the host folds it into host-machine entries and
+   * never writes it back.
+   */
+  additionalDirectories?: string[];
+  /**
+   * The conversation this one was forked from, or `null` for a top-level
+   * conversation. Nesting is a renderer concept only: a child has exactly the
+   * permissions its own `settings` grant. A parent that no longer exists
+   * renders the child at top level.
+   */
+  parentConversationId: string | null;
+  /**
+   * Set on a conversation forked from the timeline's context menu while its
+   * title is still the one named after its origin. Renaming the fork clears
+   * it: a name the user chose no longer follows anything.
+   */
+  forkOf?: ConversationForkOrigin | null;
+  /**
+   * Set by the host on a continuation the `handoff` tool opened. Only the host
+   * reads it, to number the next handoff; the renderer carries it through so
+   * a write does not drop it. Renaming keeps it.
+   */
+  handoffOf?: ConversationHandoffOrigin | null;
+  /**
+   * Conversation preset most recently applied. Empty means an unnamed draft:
+   * either nothing was ever applied, or a preset-owned field has since changed.
+   * A trace, not a link — it never validates, never disables a field, and may
+   * dangle once its preset is deleted.
+   */
+  presetId: string;
+  /**
+   * Conversation template most recently applied, or empty for none. A trace on
+   * the same terms as `presetId`: never validated, never disabling, free to
+   * dangle. It is what lets the owner tell "this timeline is that template's
+   * message queue" from "this timeline is the user's own work" — which is the
+   * difference between a preset quietly replacing the timeline and asking first.
+   */
+  templateId: string;
+  /**
+   * Renderer-only: this conversation's body — `contexts` and every branch's —
+   * is not in memory. Bodies are pooled data (`lib/conversationBodies.ts`): the
+   * host loads a document without them, and the renderer unloads the least
+   * recently opened once its pool is full. The conversation is not empty; its
+   * body is fetched again when it is opened. Never written back.
+   */
+  bodyUnloaded?: boolean;
+}
+
+export interface QueuedMessage {
+  id: string;
+  content: string;
+  images?: ImageAttachment[];
+  files?: FileAttachment[];
+  createdAt: string;
+}
+
+export type WorkspaceKind = "directory" | "temporary";
+
+export interface Workspace {
+  id: string;
+  name: string;
+  kind: WorkspaceKind;
+  path: string;
+  /**
+   * Machine this workspace's directory lives on. Absent (or `null`) is the host
+   * machine, which is what every workspace registered before machines existed is.
+   */
+  machine?: RunTarget | null;
+  /**
+   * The project's workspaces after the first. The sidebar entry is a project: one
+   * or more directories, each on its own machine. `path` and `machine` above are
+   * the first — workspace 1, the one the Git chip shows by default — and these
+   * follow it as workspaces 2, 3, … in every conversation
+   * of the project, ahead of the conversation's own attached workspaces.
+   *
+   * Absent on projects registered with a single directory. Each entry came back
+   * from a host directory picker, on the same terms as an attached workspace.
+   */
+  additionalWorkspaces?: AttachedWorkspace[];
+  createdAt: string;
+  /**
+   * Preset the project's new task — its draft — starts from. An empty or dangling
+   * ID falls back to `lastConversationSettings` ("Last used" in the project menu).
+   */
+  defaultConversationPresetId: string;
+  /** Latest conversation-settings snapshot. It survives deletion of the source conversation. */
+  lastConversationSettings: ConversationSettings | null;
+  /**
+   * The project's unsent new task, absent when it has none. The draft copies
+   * its settings once, when it is opened, and from then on owns them like any
+   * conversation; keeping them here is what lets it survive a restart instead
+   * of being rebuilt from the preset.
+   */
+  draftConversation?: DraftConversationSnapshot | null;
+  conversations: Conversation[];
+}
+
+export interface ConversationPreset {
+  id: string;
+  name: string;
+  description: string;
+  /**
+   * The one conversation template this preset opens with, or empty for none.
+   *
+   * Bound by id on the same terms as a role's: the body lives in the host's
+   * template store, so nothing the renderer writes here can become a tool result
+   * the model believes really ran. May dangle — a template that is gone opens
+   * nothing.
+   */
+  templateId: string;
+  settings: ConversationPresetSettings;
+}
+
+/**
+ * A stored message queue, as the renderer sees it without its body. Bodies are
+ * never sent here: the host owns them, because a template carries tool cards and
+ * applying one re-issues host receipts. The renderer only ever names a template.
+ *
+ * Nothing draws `name` any more — a template is titled by whatever owns it, a
+ * preset or a role — but the host still keeps the column, so it is still read.
+ */
+export interface ConversationTemplateSummary {
+  id: string;
+  name: string;
+  messageCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ResourceDescriptor {
+  id: string;
+  name: string;
+  description: string;
+  location: string;
+  source: "builtin" | "user" | "workspace";
+  available: boolean;
+  /**
+   * The workspace this entry was read from (`<workspace>/.mewrk`), by its
+   * location — machine and registered directory, `capabilityWorkspaceKey` in
+   * `lib/workspaces.ts`. Absent for global (`~/.mewrk`) and built-in entries,
+   * which every conversation may select. A conversation may select the
+   * entries of every one of its workspaces; the host resolves its runs
+   * against exactly that set.
+   */
+  workspaceKey?: string;
+}
+
+/** Provider protocol adaptation family. Mirrors Rust `model.rs::ProviderFamily`. */
+export type ProviderFamily =
+  | "openai_responses"
+  | "openai_codex"
+  | "openai_chat"
+  | "anthropic"
+  | "claude_agent"
+  | "google"
+  | "xai"
+  | "azure"
+  | "bedrock"
+  | "vertex"
+  | "openai_compatible";
+
+/** Family-specific identity field. Mirrors Rust `model.rs::FamilySetting`. */
+export type FamilySetting = "region" | "project" | "location" | "api_version";
+
+/**
+ * Endpoint shape supported by a provider. Mirrors Rust `model.rs::EndpointType`.
+ * Identity is per endpoint rather than vendor because most providers expose
+ * OpenAI-compatible image and audio endpoint shapes. The first six members are
+ * callable conversation endpoints; the remaining four are configuration-only.
+ */
+export type EndpointType =
+  | "openai_chat_completions"
+  | "openai_responses"
+  | "anthropic_messages"
+  | "google_generative"
+  | "azure_openai"
+  | "bedrock_converse"
+  | "openai_image_generation"
+  | "openai_image_edit"
+  | "openai_text_to_speech"
+  | "openai_audio_transcription";
+
+/**
+ * Explicit model capabilities. Mirrors Rust `model.rs::ModelCapability`.
+ * Unknown models infer capabilities from their ID once, then persist them.
+ */
+export type ModelCapability =
+  | "image_recognition"
+  /** Takes a tool appended mid-conversation through its protocol's interface. */
+  | "tool_append"
+  /** Takes a system message in the middle of the conversation. */
+  | "system_append"
+  /** Takes a tool call whose result arrives later, on the call itself. */
+  | "async_tools"
+  /** Compacts its own context through its protocol's native compaction. */
+  | "native_compaction";
+
+/**
+ * What a conversation's host messages come in (Rust `model.rs::HostMessageContainer`):
+ * a user-role message in Claude Code's form, or the result of a `box` call the host
+ * writes into the transcript itself.
+ */
+export type HostMessageContainer = "user" | "box";
+
+/** Mirrors Rust `model.rs::ReasoningEffort`; the ladder and legacy spellings live in `lib/reasoningEffort.ts`. */
+export type ReasoningEffort = "low" | "medium" | "high" | "extra" | "max";
+
+/**
+ * Form in which this model returns reasoning. Mirrors Rust
+ * `model.rs::ReasoningContent`. This is independent of the `reasoning`
+ * capability because providers on the same protocol may return either
+ * plaintext or encrypted content. Discovery writes the protocol default
+ * explicitly, so there is no "follow the protocol" variant to resolve later.
+ */
+export type ReasoningContent = "plaintext" | "encrypted";
+
+/**
+ * Form of one produced reasoning card after resolving {@link ReasoningContent}.
+ * Plaintext cards are editable while encrypted cards can only be deleted.
+ */
+export type ReasoningForm = "plaintext" | "encrypted";
+
+export type SecurityLevel = "request_approval" | "allow_edits" | "full_access";
+
+/**
+ * The one plan document a conversation owns while it is in plan mode.
+ * Mirrors `ConversationPlan` in the host. There is at most one per
+ * conversation: writing a plan replaces the previous body.
+ */
+export interface ConversationPlan {
+  conversationId: string;
+  markdown: string;
+  status: "draft" | "approved" | "rejected";
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ModelProfile {
+  id: string;
+  /** Display name; empty uses `id`. */
+  name: string;
+  /** Collapsed group in the model list; empty derives from `id`. */
+  group: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  /** Explicit capabilities, deduplicated and sorted by {@link MODEL_CAPABILITIES}. */
+  capabilities: ModelCapability[];
+  /** Reasoning return form. Always concrete: discovery resolves the protocol default. */
+  reasoningContent: ReasoningContent;
+  /**
+   * Whether requests carry Claude Code's prompt-cache breakpoints. Always
+   * concrete and on by default; only families where `promptCacheTakesEffect`
+   * holds put it on the wire.
+   */
+  promptCache: boolean;
+  /**
+   * Minutes after a request this model's prompt cache is taken to still hold
+   * it; absent means 30. Only the conversation settings read it, to decide how
+   * long a change that would rewrite that cache is drawn orange. It is not sent
+   * to any provider.
+   */
+  cacheTtlMinutes?: number;
+}
+
+/** Account facts the host extracted from the Codex OAuth tokens; no token material. */
+export interface CodexOauthAccount {
+  accountId: string;
+  email?: string;
+  planType?: string;
+}
+
+/** Login state of the built-in OpenAI Codex provider, owned by the host. */
+export interface CodexOauthStatus {
+  signedIn: boolean;
+  signingIn: boolean;
+  account: CodexOauthAccount | null;
+}
+
+/**
+ * Login state of the local Claude Code CLI, read by the host from
+ * `claude auth status --json`. Mewrk never holds this credential: the CLI owns
+ * its own login and this is only a report of it.
+ */
+export interface ClaudeAgentLoginStatus {
+  signedIn: boolean;
+  /** `claude.ai` | `console` | `none`, or whatever else the CLI reports. */
+  authMethod: string;
+  email: string | null;
+  orgName: string | null;
+  subscriptionType: string | null;
+  /** Path the host resolved the executable to. */
+  executable: string;
+  /** Configuration directory actually in effect (`CLAUDE_CONFIG_DIR` or `~/.claude`). */
+  configDir: string;
+  /**
+   * The sign-in as a terminal command: the bundled executable by its absolute
+   * path, quoted for this platform's shell. What Copy command copies.
+   */
+  loginCommand: string;
+}
+
+/**
+ * The Claude Agent SDK and the Claude Code CLI Mewrk drives, installed from npm
+ * under the app's data directory (the installer does not ship them). The host
+ * reads this for the Claude Agent provider page.
+ */
+export interface ClaudeAgentComponentStatus {
+  /** What is installed (or, in a development build, the source tree's copy); `null` when nothing is. */
+  installed: {
+    sdkVersion: string;
+    claudeCodeVersion: string | null;
+    source: "installed" | "development";
+    installedAt: string | null;
+    /**
+     * Within `compatible`. An installed copy outside it (the AI SDK component that
+     * drives it was updated past it) is refused by every Claude Agent step until it
+     * is updated.
+     */
+    compatible: boolean;
+  } | null;
+  /** The semver range this Mewrk build can drive, e.g. `^0.3.284`. */
+  compatible: string;
+  /** Newest compatible version on npm; `null` when it was not checked or the check failed. */
+  latest: { sdkVersion: string; claudeCodeVersion: string | null } | null;
+  /** Why the npm check failed, already localized by the host. */
+  latestError: string | null;
+  /** A newer version outside `compatible` (e.g. `0.4.0`): it needs a newer Mewrk. */
+  newerIncompatible: string | null;
+  updateAvailable: boolean;
+  /** The install or update running now. */
+  task: {
+    action: "install" | "update";
+    sdkVersion: string;
+    phase: "resolving" | "downloading" | "verifying" | "installing";
+    receivedBytes: number;
+    /** `null` while the size is not known yet. */
+    totalBytes: number | null;
+  } | null;
+  /** The last install's failure; cleared when a new one starts. */
+  lastError: string | null;
+}
+
+/** The AI SDK sidecar Mewrk fetches from its own download channel at startup. */
+export interface AisdkComponentStatus {
+  state: "development" | "installed" | "checking" | "downloading" | "failed" | "missing";
+  protocol: number;
+  version: string | null;
+  builtAt: string | null;
+  receivedBytes: number | null;
+  totalBytes: number | null;
+  error: string | null;
+}
+
+/** The components Mewrk updates by itself, shown on the Updates page. */
+export interface AppComponentsStatus {
+  aisdk: AisdkComponentStatus;
+}
+
+export interface ApiProvider {
+  id: string;
+  name: string;
+  enabled: boolean;
+  family: ProviderFamily;
+  baseUrl: string;
+  /** Family-specific identity fields. Mirrors Rust `ApiProvider::family_settings`. */
+  familySettings: Partial<Record<FamilySetting, string>>;
+  notes: string;
+  models: ModelProfile[];
+  /** The model selected for this provider. Each provider remembers its own selection. */
+  activeModelId: string | null;
+}
+
+/**
+ * Search-provider catalog kinds. Mirrors `SearchProviderKind` in `model.rs`;
+ * `searchProviders.test.ts` compares the two tables row for row.
+ */
+export type SearchProviderKind =
+  | "zhipu"
+  | "tavily"
+  | "searxng"
+  | "exa"
+  | "exa-mcp"
+  | "bocha"
+  | "querit"
+  | "fetch"
+  | "jina"
+  | "firecrawl";
+
+/** What the host can ask a search provider to do. */
+export type SearchCapability = "searchKeywords" | "fetchUrls";
+
+/**
+ * `native` = the conversation's own model performs the search with its own
+ * server-side tool. Its encrypted payload can be consumed only by that
+ * provider's models. The catalog entries are a different backend entirely: the
+ * host runs those searches itself.
+ */
+export type SearchProviderSelection =
+  | { kind: "native" }
+  | { kind: "explicit"; providerKind: SearchProviderKind }
+  /**
+   * No backend searches for this conversation. Distinct from turning web access
+   * off: the fetch leg keeps whatever backend it names, so a conversation may
+   * retrieve a page it was given the address of without being able to go
+   * looking for one.
+   */
+  | { kind: "disabled" }
+  | { kind: "unavailable" };
+
+/**
+ * Which backend retrieves a named page for `web_fetch`.
+ *
+ * Separate from `SearchProviderSelection` because fetching and searching are
+ * different upstream capabilities and a backend may have one without the other:
+ * DeepSeek and OpenAI expose only a server-side search tool and keep page
+ * retrieval internal to it, while Anthropic exposes search and fetch as two
+ * distinct server tools. `native` names the conversation's own upstream,
+ * independently of who searches: on Anthropic that grants a second web tool, and
+ * on a family that folds retrieval into its search tool it grants none, which is
+ * exactly that family's own shape.
+ *
+ * Every variant names a backend outright. There is deliberately no "automatic":
+ * a selector that resolved to something else — the search backend, or a global
+ * default — reads as a choice while being an alias for one, and the thing it
+ * aliased could be changed from another screen without this one saying so.
+ */
+export type FetchProviderSelection =
+  | { kind: "native" }
+  | { kind: "explicit"; providerKind: SearchProviderKind }
+  | { kind: "disabled" }
+  /**
+   * A named provider this build cannot resolve, kept without its old id. Like
+   * the search leg's `unavailable` it keeps `web_fetch` offered and reads
+   * "Repair fetch provider", rather than passing for a deliberate "off".
+   */
+  | { kind: "unavailable" };
+
+/**
+ * Which version of the Anthropic Messages server-side `web_search` tool the
+ * native leg attaches, as the `type` that goes on the wire.
+ *
+ * This is the one native-backend choice that is a protocol detail rather than a
+ * backend: every version names the same tool and returns the same block shapes,
+ * and only Messages spells the version into the request. Families on another
+ * protocol have no `type` to pick, so they ignore the selection and send their
+ * own native tool instead — the selection is kept rather than rewritten, so
+ * returning to a Messages model returns to the version that was chosen.
+ *
+ * The list is exactly what this build can emit, bounded by the AI SDK's
+ * Anthropic provider rather than by the API: a version the SDK cannot map is
+ * dropped from the request with a warning, so offering it would take web search
+ * away without saying so. Mirrors Rust `model::NativeSearchTool`.
+ */
+export type NativeSearchTool = "web_search_20250305" | "web_search_20260209";
+
+/** The same, on the other web tool. Mirrors Rust `model::NativeFetchTool`. */
+export type NativeFetchTool = "web_fetch_20250910" | "web_fetch_20260209";
+
+/** Offered search versions, in the order the menu lists them; the first is the default. */
+export const NATIVE_SEARCH_TOOLS: readonly NativeSearchTool[] = [
+  "web_search_20250305",
+  "web_search_20260209"
+];
+
+/** Offered fetch versions; the first is the default. */
+export const NATIVE_FETCH_TOOLS: readonly NativeFetchTool[] = [
+  "web_fetch_20250910",
+  "web_fetch_20260209"
+];
+
+/**
+ * Which domain list, if either, filters a conversation's search results.
+ * Mirrors Rust `model::SearchDomainFilterMode`.
+ */
+export type SearchDomainFilterMode = "off" | "exclude" | "include";
+
+/** Per-conversation web-search behavior and backend selection. */
+export interface ConversationWebSearchSettings {
+  /**
+   * Native searches allowed inside one `web_search` call. 0 = unlimited.
+   * Only the native backend reads it; a catalog provider returns `maxResults`
+   * results for the one search it was asked to run.
+   */
+  maxSearchesPerCall: number;
+  provider: SearchProviderSelection;
+  /** Fetch backend for this conversation. */
+  fetchProvider: FetchProviderSelection;
+  /**
+   * Which Messages `web_search` version the native search leg sends.
+   *
+   * It sits beside the backend selection rather than inside the `native`
+   * variant so that leaving native — for a catalog provider, or for a model
+   * whose family has no version to pick — only stops it from being used, never
+   * erases it. Coming back to a Messages model finds the same version still
+   * selected.
+   */
+  nativeSearchTool: NativeSearchTool;
+  /** The same, for the native fetch leg. */
+  nativeFetchTool: NativeFetchTool;
+  /**
+   * How many results one search asks the selected backend for, sent under that
+   * backend's own count field. 0 = send nothing and leave the backend's own
+   * default (for SearXNG, which has no such field, read every result page).
+   * Only a backend that has a count parameter reads it: a native backend decides
+   * its own search depth and ignores this.
+   */
+  maxResults: number;
+  /**
+   * Per-result token cap for the SEARCH leg: the most tokens of body text kept
+   * from each result, not a budget for the whole call. 0 = no cap. Only a backend
+   * with a length parameter of its own (Exa, Jina) or one whose pages mewrk
+   * reads and truncates itself (SearXNG) uses it; every other backend returns
+   * what it returns, and a native search has no such parameter at all.
+   */
+  compressionCutoff: number;
+  /**
+   * Per-page token cap for the FETCH leg, in the same unit as `compressionCutoff`
+   * and with the same `0 = no cap` reading, but its own answer: the two legs run
+   * on different backends and a page is not a snippet. Read by Jina Reader, the
+   * local `fetch`, and a native fetch on the Anthropic family.
+   */
+  fetchCompressionCutoff: number;
+  /**
+   * Which of the two domain lists filters this conversation's results, if
+   * either. They are a choice rather than a pair of switches because a result
+   * admitted by one and refused by the other has no obvious answer, and a
+   * selector that can only be in one state never asks that question.
+   *
+   * `off` keeps both lists — turning filtering off is not the same as throwing
+   * away what was written, and coming back finds it still there.
+   */
+  domainFilter: SearchDomainFilterMode;
+  /**
+   * Result allowlist, in effect while `domainFilter` is `include`: a result is
+   * kept only if it matches one of these rules, so an empty list while the mode
+   * is on admits nothing.
+   *
+   * Syntax for both lists: `<all_urls>`, a `scheme://host/path` match pattern
+   * (`*` wildcards, `*.` matches subdomains), or `/regex/`.
+   */
+  includeDomains: string[];
+  /** Result blocklist, in effect while `domainFilter` is `exclude`: a result is
+   * dropped if it matches one of these rules. */
+  excludeDomains: string[];
+}
+
+/** Global provider catalog configuration; secrets remain in OS credentials. */
+export interface SearchProviderConfig {
+  kind: SearchProviderKind;
+  enabled: boolean;
+  /** Empty = the catalog default endpoint for `searchKeywords`. */
+  searchApiHost: string;
+  /** Empty = the catalog default endpoint for `fetchUrls`. */
+  fetchApiHost: string;
+  /** Searxng only; empty = pick the instance's general web engines from /config. */
+  engines: string[];
+  /** Searxng only. The password lives in the OS credential store, never here. */
+  basicAuthUsername: string;
+}
+
+/**
+ * The global search assets: the provider catalog and nothing else.
+ *
+ * Everything about how a search BEHAVES — how many results, how hard they are
+ * compressed, which domains are admitted — belongs to the conversation that
+ * runs it, and to the subagent role when a role runs its own. What is left here
+ * is what genuinely has one value per installation: which providers exist,
+ * where they point, and whether they are switched on.
+ */
+export interface WebSearchAssets {
+  providers: SearchProviderConfig[];
+}
+
+export type AppLanguage = "auto" | "zh-CN" | "en-US";
+export type ResolvedAppLanguage = Exclude<AppLanguage, "auto">;
+export type ThemePreference = "day" | "night" | "system";
+
+export type AgentDefinitionSource = "user" | "project" | "plugin" | "managed";
+export type AgentDefinitionMemory = "none" | "user" | "project" | "local";
+export type AgentModelSelection =
+  | { kind: "inherit" }
+  | { kind: "explicit"; providerId: string; modelId: string }
+  /**
+   * No model to bind: an older build wrote this in place of a dead binding,
+   * keeping none of the old identifiers, and the host lists a built-in role
+   * whose provider family is missing this way. A role in this state is hidden
+   * from the model and fails with its own wording if named anyway.
+   */
+  | { kind: "unavailable" };
+
+/** The kinds of discovered asset the conversation-settings catalog pages list. */
+export type CapabilityResourceKind = "skills" | "mcp" | "hooks" | "agents";
+
+/**
+ * The body of one subagent role file — `~/.mewrk/agents/<file>.json`, a
+ * workspace's `.mewrk/agents/<file>.json`, or a built-in the host computes.
+ * Mirrors Rust `agent_roles::AgentRoleFile`.
+ *
+ * A role answers which model it runs on, which tools, skills, MCP servers and
+ * hooks it may use, how its searches and fetches go, and what it tells the model
+ * it is for. Every tool-like answer is the role's OWN: nothing here follows the
+ * calling conversation's tools, selections or web backends. Only the model
+ * (`modelSelection.kind = "inherit"`) and the reasoning effort (`effort: null`)
+ * may still ride the caller at run time. The caller's web-access switch stays
+ * the ceiling: a role can never put an offline conversation online.
+ *
+ * It carries no system prompt of its own: a named child renders the
+ * conversation's prompt through the subagent addendum, exactly like an ordinary
+ * child.
+ */
+export interface AgentRole {
+  /** Model-visible role name; the host falls back to the file stem when blank. */
+  name: string;
+  /**
+   * What this role is for, in the user's own words. The host renders it into
+   * the model-facing description of whichever of `agent_spawn` / `workflow`
+   * carries the role block; empty means the role contributes no line at all.
+   * Free text — multi-line, no length cap, written through verbatim.
+   */
+  description: string;
+  modelSelection: AgentModelSelection;
+  /** `null` rides the caller's reasoning effort. */
+  effort: ReasoningEffort | null;
+  /**
+   * The tools this role may call, selected out of the trusted catalogue rather
+   * than intersected with the caller's enabled set. Always a concrete list on
+   * the wire: the host materialises a file without the key to every tool a role
+   * can hold. `[]` is a real "none".
+   */
+  tools: string[];
+  /** Subtracted from `tools`; the host's own subagent floor is below both. */
+  disallowedTools: string[];
+  /** This role's own skills, MCP servers and hooks, by catalog id. */
+  skillIds: string[];
+  mcpIds: string[];
+  hookIds: string[];
+  /** This role's whole search/fetch configuration, in a conversation's shape. */
+  webSearch: ConversationWebSearchSettings;
+  /**
+   * Conversation template seeded as this role's opening history, or `null` for a
+   * child that starts from the task alone. Only ever an id: the body lives in
+   * the host's template store. May dangle; a deleted template seeds nothing.
+   */
+  templateId: string | null;
+}
+
+/**
+ * One discovered role, as the catalog lists it. `description` is the role's own
+ * description, or — when the file could not be used — the reason, and `role` is
+ * then `null`. Mirrors Rust `AgentRoleDescriptor`.
+ */
+export interface AgentRoleResource extends ResourceDescriptor {
+  role: AgentRole | null;
+}
+
+/**
+ * Token in a key combination. Modifiers use `Control`, `Alt`, `Shift`, or
+ * `Meta`; all other tokens are `KeyboardEvent.code` values so bindings are
+ * keyboard-layout independent.
+ */
+export type KeyToken = string;
+
+/** Persisted shortcut preference; command labels, groups, and defaults are code constants. */
+export interface ShortcutPreference {
+  /** Empty means unbound. Unbound commands never dispatch and cannot be enabled. */
+  binding: KeyToken[];
+  enabled: boolean;
+}
+
+/**
+ * Bindable shortcut command. The command table is owned by
+ * `src/lib/shortcuts.ts`; documents store only bindings and enabled states.
+ */
+export type ShortcutCommandId =
+  | "app.settings.open"
+  | "app.conversation_settings.open"
+  | "app.zoom.in"
+  | "app.zoom.out"
+  | "app.zoom.reset"
+  | "conversation.create"
+  | "conversation.next"
+  | "conversation.previous"
+  | "conversation.stop"
+  | "message.copy_last"
+  | "message.edit_last_user"
+  | "panel.browser.toggle"
+  | "panel.close";
+
+/** Only preferences that the Mewrk renderer can apply. */
+export interface AppearancePreferences {
+  /** Uppercase `#RRGGBB` accent color; empty uses the palette accent. */
+  themeColor: string;
+  /** Page zoom multiplier, 0.5-2.0 in 0.1 increments. */
+  zoom: number;
+  /** UI font family; empty uses the system default. */
+  uiFontFamily: string;
+  /** Monospace font family; empty uses the system default. */
+  monoFontFamily: string;
+  /** Message text size, 12-22. */
+  messageFontSize: number;
+  /** Use a serif font for message prose. */
+  serifMessages: boolean;
+  /** Use the wide message layout; inverse of `chat.narrow_mode`. */
+  wideMessages: boolean;
+  /** Key combination for sending messages; mutually exclusive with {@link newlineShortcut}. */
+  sendShortcut: KeyToken[];
+  /** Key combination for inserting a newline; mutually exclusive with {@link sendShortcut}. */
+  newlineShortcut: KeyToken[];
+  /** Enable composer spell checking. */
+  spellCheck: boolean;
+  /** Render user-authored messages as Markdown. */
+  renderUserMarkdown: boolean;
+  /** Confirm before deleting a timeline item. Defaults to false because deletion is undoable. */
+  confirmMessageDelete: boolean;
+  /** Collapse reasoning chains by default. */
+  collapseReasoning: boolean;
+  /** Allow long code blocks to collapse. */
+  codeBlockCollapsible: boolean;
+  /** Wrap code blocks instead of horizontally scrolling. */
+  codeBlockWrappable: boolean;
+  /** Enable inline `$...$` math; disabled mode recognizes only `$$...$$`. */
+  singleDollarMath: boolean;
+  /** User-defined CSS applied through a constructable stylesheet, not a `<style>` element. */
+  customCss: string;
+  /** Panes of glass over {@link background}; light or dark glass follows {@link GlobalSettings.theme}. */
+  liquidGlass: boolean;
+  /**
+   * The window's background (`lib/background.ts`): `solid`, the theme's own ground, which
+   * follows the theme; `solid:day` / `solid:night`, one theme's ground picked while the other
+   * was on screen, until the theme changes; `builtin:<name>`; or an imported picture's host id.
+   */
+  background: string;
+  /** The local helper model's uses and prompts (Appearance → Local model). */
+  localModel: LocalModelPreferences;
+}
+
+/** Mirror of Rust `model::LocalModelPreferences`. Empty prompts mean the built-in ones. */
+export interface LocalModelPreferences {
+  /** Name conversations from their first message. */
+  titles: boolean;
+  /** Describe each shell command in one line on its card. */
+  shellExplanations: boolean;
+  /** Say in a few words why a failed tool call or shell command failed, on its card's title. */
+  errorExplanations: boolean;
+  /**
+   * The uses above reach subagents and workflow steps too (each step also gets a title); their
+   * requests wait behind the conversation's own.
+   */
+  subagents: boolean;
+  titlePrompt: string;
+  shellPrompt: string;
+  errorPrompt: string;
+}
+
+/** What the local helper model is asked to do, each with its own prompt (Rust `prompts::Task`). */
+export type LocalModelTask = "title" | "shell" | "error";
+
+/** Mirror of Rust `helper_model::DefaultPrompts`: the built-in prompt of each task. */
+export type LocalModelDefaultPrompts = Record<LocalModelTask, string>;
+
+/** Mirror of Rust `helper_model::Phase` (serde tag `phase`). */
+/** Mirror of Rust `helper_model::VariantId`: one build of the model per inference backend. */
+export type LocalModelVariantId = "ane" | "mlx" | "llama";
+
+/** Mirror of Rust `helper_model::Unavailable`: why a build cannot run on this machine. */
+export type LocalModelUnavailable =
+  | "needsAppleSilicon"
+  | "noNeuralEngine"
+  | "needsMacos14"
+  | "needsMacos15"
+  | "notInThisBuild";
+
+export type LocalModelPhase =
+  | { phase: "missing" }
+  | { phase: "unsupported"; reason: LocalModelUnavailable }
+  | { phase: "downloading"; received: number; total: number; source: "huggingFace" | "hfMirror" | "mirror" | "release" }
+  | { phase: "preparing"; step: "compile" | "verify" | "unpack"; done: number; total: number }
+  | { phase: "ready" }
+  | { phase: "failed"; message: string };
+
+/** Mirror of Rust `helper_model::VariantStatus`. */
+export type LocalModelVariantStatus = LocalModelPhase & {
+  id: LocalModelVariantId;
+  downloadBytes: number;
+  diskBytes: number;
+};
+
+/** Mirror of Rust `helper_model::Machine`. */
+export interface LocalModelMachine {
+  chip: string | null;
+  model: string | null;
+  osVersion: string | null;
+  appleSilicon: boolean;
+  neuralEngineCores: number | null;
+}
+
+/** Mirror of Rust `helper_model::Status`. */
+export interface LocalModelStatus {
+  machine: LocalModelMachine;
+  /** Every build this app knows, best first. */
+  variants: LocalModelVariantStatus[];
+  active: LocalModelVariantId | null;
+  recommended: LocalModelVariantId | null;
+  /** The active build is loading and caching its prompts. */
+  warming: boolean;
+  /** The active build's weights are loading (warming, or a request after an idle unload). */
+  loading: boolean;
+  device: string | null;
+  loaded: boolean;
+  running: number;
+  queued: number;
+  slots: number;
+  context: number;
+  diskBytes: number;
+  lastError: string | null;
+}
+
+/** Mirror of Rust `helper_model::PromptReport`. */
+export interface LocalModelPromptReport {
+  tokens: number;
+  /** `null`: no cached state yet, and none was built. */
+  cacheBytes: number | null;
+  maxTokens: number;
+}
+
+/** A background picture the host has stored, as its largest tier. */
+export interface BackgroundImage {
+  id: string;
+  width: number;
+  height: number;
+}
+
+/** One tier of a background picture, ready to paint. */
+export interface BackgroundImageData {
+  dataUrl: string;
+  width: number;
+  height: number;
+  /** No larger tier exists. */
+  largest: boolean;
+}
+
+/** User-added executable to monitor on PATH; built-in definitions are code constants. */
+export interface EnvironmentToolDefinition {
+  name: string;
+  /** Executable name to locate on PATH, without an extension. */
+  executable: string;
+  /** Arguments for obtaining the version; empty uses `["--version"]`. */
+  versionArgs: string[];
+}
+
+/** Environment dependency check result. The host probes live and never persists it. */
+export interface EnvironmentToolSnapshot {
+  name: string;
+  executable: string;
+  /** Resolved absolute path; empty when not found. */
+  path: string;
+  /** Detected version; empty when parsing fails. */
+  version: string;
+  /** Probe failure reason; empty on success. */
+  error: string;
+  description: string;
+  repoUrl: string;
+  homepage: string;
+  /** Built-in presets cannot be deleted; user-added definitions can. */
+  builtin: boolean;
+}
+
+/** How this copy of Mewrk was installed. Mirrors Rust `app_update::InstallFlavor`. */
+/** This copy's edition. Mirrors Rust `app_update::InstallFlavor`. */
+export type AppInstallFlavor =
+  | "installer"
+  | "portable"
+  | "store_msix"
+  | "sideloaded_msix"
+  | "mac_app"
+  | "other";
+
+/** Running version and install shape. Mirrors Rust `app_update::AppVersionInfo`. */
+export interface AppVersionInfo {
+  version: string;
+  flavor: AppInstallFlavor;
+  /** A `cargo build` without `--release`; never shipped as a release asset. */
+  developmentBuild: boolean;
+  arch: string;
+  os: string;
+  repositoryUrl: string;
+  releasesUrl: string;
+  executableDir: string;
+}
+
+/** One downloadable file on a GitHub release. Mirrors Rust `app_update::ReleaseAsset`. */
+export interface AppReleaseAsset {
+  name: string;
+  downloadUrl: string;
+  size: number;
+}
+
+/** Result of asking GitHub for the latest release. Mirrors Rust `app_update::UpdateCheck`. */
+export interface AppUpdateCheck {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  release: {
+    tag: string;
+    name: string;
+    htmlUrl: string;
+    /** Release body as GitHub stores it: Markdown. */
+    notes: string;
+    /** ISO 8601; empty when GitHub omits it. */
+    publishedAt: string;
+  };
+  /** The asset for this machine's flavor and architecture, when the release has one. Always null when `inAppInstall` is false. */
+  asset: AppReleaseAsset | null;
+  /** `SHA256SUMS` when the release publishes one. */
+  checksumsAsset: AppReleaseAsset | null;
+  checkedAt: string;
+  /**
+   * Whether this host can download and install the update in-app. Only Windows can: every
+   * release asset is a Windows build, so other hosts are sent to the release page.
+   */
+  inAppInstall: boolean;
+}
+
+/** Streamed while an update downloads. Mirrors Rust `app_update::DownloadEvent`. */
+export type AppUpdateDownloadEvent =
+  | { type: "progress"; receivedBytes: number; totalBytes: number }
+  | { type: "verifying" };
+
+/** A finished download. Mirrors Rust `app_update::DownloadedUpdate`. */
+export interface AppUpdateDownload {
+  path: string;
+  fileName: string;
+  sizeBytes: number;
+  sha256: string;
+  /** `verified`: matched the release's SHA256SUMS; `unavailable`: the release publishes no SHA256SUMS at all. */
+  verification: "verified" | "unavailable";
+  flavor: AppInstallFlavor;
+}
+
+/** What `install_app_update` did. Mirrors Rust `app_update::InstallOutcome`. */
+export interface AppUpdateInstallOutcome {
+  action: "installer_launched" | "revealed";
+}
+
+/** MCP connectivity-probe result. Mirrors Rust `lib.rs::McpProbeReport`. */
+export interface McpProbeReport {
+  ok: boolean;
+  /** Negotiated MCP protocol version; empty on probe failure. */
+  protocolVersion: string;
+  /** Remote `serverInfo.name`; empty on probe failure. */
+  serverName: string;
+  /** Remote `serverInfo.version`; empty on probe failure. */
+  serverVersion: string;
+  tools: McpProbeTool[];
+  /** Nonempty only if the remote declares the prompts capability. */
+  prompts: McpProbePrompt[];
+  /** Nonempty only if the remote declares the resources capability. */
+  resources: McpProbeResource[];
+  /** stderr lines written during a stdio probe; always empty for HTTP servers. */
+  logs: string[];
+  error: string;
+}
+
+export interface McpProbeTool {
+  /** Remote tool name, not the model-facing prefixed name. */
+  name: string;
+  title: string;
+  description: string;
+  /** The remote declares that every call requires manual confirmation. */
+  requiresUserInteraction: boolean;
+  inputSchema: JsonValue;
+}
+
+/** One `prompts/list` entry. */
+export interface McpProbePrompt {
+  name: string;
+  title: string;
+  description: string;
+  arguments: McpProbePromptArgument[];
+}
+
+export interface McpProbePromptArgument {
+  name: string;
+  description: string;
+  required: boolean;
+}
+
+/** One `resources/list` entry. */
+export interface McpProbeResource {
+  uri: string;
+  name: string;
+  title: string;
+  description: string;
+  mimeType: string;
+  /** Byte count declared by the remote; `0` when undeclared. */
+  size: number;
+}
+
+/*
+ * Skills and MCP servers have no renderer-side record types. Both are files the
+ * user owns — `~/.mewrk/skills/<dir>/SKILL.md` and `<level>/mcp.json` — so the
+ * only renderer view of them is the `ResourceDescriptor` the host's
+ * `discover_capabilities` scan returns, and the only writes are the host's
+ * `delete_skill` / `delete_mcp_server` commands. The in-app registries
+ * (`assets.skills`, `assets.mcpServers`) and the online skill-registry search are
+ * retired; nothing here mirrors them.
+ */
+
+export interface GlobalSettings {
+  /** Application chrome language. `auto` resolves from the current OS/browser locale. */
+  appLanguage: AppLanguage;
+  /**
+   * What `appLanguage` currently resolves to, mirrored for the backend.
+   *
+   * This value carries both host-rendered UI text and the language a
+   * user-written tool-description file is treated as being in: such a file
+   * declares none of its own, and the built-in profile that fills the keys it
+   * omits follows from this. Selecting a built-in profile — or selecting
+   * nothing, which is the English built-in — pins the language to that profile
+   * instead. Only the renderer can resolve `auto`, so it writes the resolved
+   * value here for the backend to read.
+   */
+  resolvedAppLanguage: ResolvedAppLanguage;
+  /** Persisted appearance preference. `system` follows the current Windows theme. */
+  theme: ThemePreference;
+  conversationPresets: ConversationPreset[];
+  /** New conversations link to this preset. The host keeps the built-in preset in every document and points a default that no longer resolves at it. */
+  defaultConversationPresetId: string;
+  /** Default inherited by the next conversation; each conversation keeps its own value. */
+  lastReasoningEffort: ReasoningEffort;
+  apiProviders: ApiProvider[];
+  activeProviderId: string | null;
+  /** Web-search assets: external providers and the global selected provider. */
+  webSearch: WebSearchAssets;
+  /** Appearance preferences. */
+  appearance: AppearancePreferences;
+  /** Per-command bindings. Absent entries use code defaults; resetting a command removes its entry. */
+  shortcuts: Partial<Record<ShortcutCommandId, ShortcutPreference>>;
+  /** User-added environment dependencies; built-ins are code constants. */
+  environmentTools: EnvironmentToolDefinition[];
+  /** Execution-environment assets: SSH machine catalog and environment-keyed variables. */
+  executionEnvironments: ExecutionEnvironmentAssets;
+  /** When a conversation hands its work over to a forked continuation. */
+  autoCompact: AutoCompactSettings;
+}
+
+/**
+ * The composer's auto-compact settings, global: one switch for both methods and
+ * each method's threshold. Which method a conversation uses is its own
+ * (`ConversationSettings.compactionMethod`). The host reads them at every round
+ * boundary. The handoff: once the latest request's context reaches
+ * `thresholdPercent` of the model's window (rounded down to a token count), the
+ * conversation is armed to hand off — the model writes handoff notes and calls
+ * `handoff`, and the work continues in a new conversation,
+ * `<title>-handover-<n>`, that starts from those notes with none of this one's
+ * cache state (`src-tauri/src/handoff.rs`). Native compaction (`native`) has a
+ * threshold of its own.
+ */
+export interface AutoCompactSettings {
+  enabled: boolean;
+  /** The handoff's, 20–97. */
+  thresholdPercent: number;
+  native: NativeCompactSettings;
+}
+
+/** How a conversation auto-compacts. Mirrors Rust `model.rs::CompactionMethod`. */
+export type CompactionMethod = "handoff" | "native";
+
+/**
+ * Native compaction (`src-tauri/src/native_compaction.rs`): past
+ * `thresholdPercent` of the window the provider compacts the context into one
+ * opaque item, the latest user messages up to `retainedTokens` are kept
+ * verbatim ahead of it, and the conversation carries on in place.
+ */
+export interface NativeCompactSettings {
+  /** 20–97, independent of the handoff's; 90 to start with. */
+  thresholdPercent: number;
+  /** 0–128,000. */
+  retainedTokens: number;
+}
+
+/** What of a project's new-task draft outlives the process: its settings and their preset trace. */
+export interface DraftConversationSnapshot {
+  settings: ConversationSettings;
+  /** Same trace semantics as `Conversation.presetId`. */
+  presetId: string;
+}
+
+/**
+ * User-registered SSH execution machine. `host` accepts `user@hostname`, a
+ * hostname, or an `~/.ssh/config` host alias. Authentication material is not
+ * persisted; OpenSSH resolves it from identity files and the agent.
+ *
+ * The machine carries no working directory. A directory on it is a workspace
+ * like any other — picked through the remote directory browser and recorded on
+ * the conversation, where it gets the number the model addresses it by.
+ */
+export interface SshMachineConfig {
+  id: string;
+  name: string;
+  host: string;
+  /** `0` uses the default SSH port, 22. */
+  port: number;
+  /** Private key path; empty uses OpenSSH's default resolution. */
+  identityFile: string;
+  /**
+   * The shell the machine's agent runs Mewrk's own scripts in (the remote file
+   * tools and language servers). Absent until the machine is first probed, when
+   * the first backend of its OS's priority list that it has is recorded here.
+   */
+  agentShell?: ShellBackend;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * A shell Mewrk runs commands and its own scripts through. Mirrors the host's
+ * `shell_backend::ShellBackend`; which ones a machine has is found by probing it.
+ */
+export type ShellBackend = "bash" | "zsh" | "sh" | "powershell";
+
+/** A machine's operating system. WSL is one of them, not a kind of shell. */
+export type MachineOs = "windows" | "macos" | "linux" | "wsl";
+
+/** One backend a probe found, and where. */
+export interface DetectedShell {
+  backend: ShellBackend;
+  path: string;
+}
+
+/** What a probe learned about one machine. Mirrors `machine_shells::MachineShells`. */
+export interface MachineShells {
+  os: MachineOs;
+  shells: DetectedShell[];
+  probedAt: string;
+}
+
+/**
+ * Execution-environment assets. WSL distributions are machine state and are
+ * enumerated live by `list_wsl_distros`. Environment variables and sandboxes
+ * belong to workspaces, keyed by `workspaceEnvKey`: the machine's `local`,
+ * `wsl:<distro>` or `ssh:<machine id>`, then `|` and the directory.
+ */
+export interface ExecutionEnvironmentAssets {
+  sshMachines: SshMachineConfig[];
+  envVars: Record<string, Record<string, string>>;
+  /**
+   * Each workspace's sandbox. A workspace with no entry is off; one switched
+   * off keeps its entry, which records that answer.
+   */
+  sandboxes?: Record<string, SandboxSettings>;
+  /** Each WSL distribution's agent shell, by distribution name. */
+  wslAgentShells?: Record<string, ShellBackend>;
+}
+
+/** Which hosts a sandbox's processes may connect to. */
+export type SandboxNetworkMode = "off" | "allowlist" | "open";
+
+/**
+ * The sandbox a workspace's commands run in when it is on. Mirrors
+ * `model::SandboxSettings`: sandboxed agent processes on the workspace's
+ * machine, one per conversation working there, which can write the workspace
+ * (and nothing in it that runs outside the sandbox later), cannot read
+ * credentials, and reach the network only through a proxy that applies
+ * `network`. A setting of each workspace, like its variables.
+ */
+export interface SandboxSettings {
+  enabled: boolean;
+  network: {
+    mode: SandboxNetworkMode;
+    /** `example.com`, `*.example.com` (subdomains only), optionally `:port`. */
+    allow: string[];
+    deny: string[];
+  };
+  /** Further directories the workspace's sandbox may write: absolute or `~/…`. */
+  writable: string[];
+  /** Further paths the workspace's sandbox may not read, besides the built-in credential locations. */
+  denyRead: string[];
+}
+
+/** What a machine's agent reports about sandboxing there. Mirrors `protocol::SandboxSupport`. */
+export interface SandboxSupport {
+  /** `seatbelt`, `bubblewrap`, `srt-win`; empty when none. */
+  backend: string;
+  available: boolean;
+  detail: string;
+  /** Not available until the machine is set up for it once, with administrator rights (Windows). */
+  setup: boolean;
+}
+
+/** Installed WSL distribution enumerated live by `list_wsl_distros`. */
+export interface WslDistro {
+  name: string;
+  version: number;
+  isDefault: boolean;
+}
+
+export type ToolParameterType = "string" | "number" | "boolean" | "multiline" | "json";
+
+export interface ToolParameter {
+  name: string;
+  label: string;
+  type: ToolParameterType;
+  required: boolean;
+  placeholder?: string;
+  help?: string;
+  defaultValue?: JsonValue;
+}
+
+export interface ToolDescriptor {
+  name: string;
+  label: string;
+  /**
+   * Transport-only field not read or displayed by the frontend. Built-in seed
+   * descriptions are empty; nonempty values come only from dynamically
+   * discovered MCP tools, and the backend assembles effective descriptions.
+   */
+  description: string;
+  category: "filesystem" | "shell" | "web" | "orchestration" | "memory" | "mcp";
+  dangerous: boolean;
+  parameters: ToolParameter[];
+  inputSchema?: JsonValue;
+}
+
+/*
+ * Tool-description file contents are not modeled here. The app discovers and
+ * selects files but never reads, edits, or writes their bodies. Their format
+ * lives in the host: `capabilities.rs` parses the file, `prompt_profile.rs`
+ * owns the `prompts` registry and the document shape.
+ */
+
+export interface CapabilityCatalog {
+  hooks: ResourceDescriptor[];
+  skills: ResourceDescriptor[];
+  mcps: ResourceDescriptor[];
+  /** Tool-description JSON files discovered on disk, one descriptor per file. */
+  toolDescriptionFiles: ResourceDescriptor[];
+  /**
+   * Subagent roles: the built-ins first, then one entry per `agents/*.json`
+   * file at the global level and in each workspace.
+   */
+  agents: AgentRoleResource[];
+  /**
+   * Workspaces on WSL or an SSH machine whose `.mewrk` the scan could not read,
+   * with why: their rows are missing because the machine did not answer, not
+   * because they were deleted.
+   */
+  unreadableLevels?: Array<{ workspaceKey: string; message: string }>;
+}
+
+export interface AppDocument {
+  schemaVersion: number;
+  globalSettings: GlobalSettings;
+  workspaces: Workspace[];
+  tools: ToolDescriptor[];
+  capabilities: CapabilityCatalog;
+}
+
+export interface ToolExecutionRequest {
+  conversationId: string;
+  workspacePath: string;
+  toolName: string;
+  input: JsonObject;
+}
+
+export interface AttestEditedToolContextRequest {
+  conversationId: string;
+  contextId: string;
+  toolName: string;
+  input: JsonObject;
+  output: string;
+  images: ImageAttachment[];
+}
+
+export interface AttestEditedToolContextResponse {
+  input: JsonObject;
+  result: ToolResult;
+  attestation: string;
+}
+
+/** A call written out by hand rather than executed. The host owns every result
+ * field but the text, so none of them are sent. */
+export interface AttestInsertedToolContextRequest {
+  conversationId: string;
+  contextId: string;
+  toolName: string;
+  input: JsonObject;
+  output: string;
+}
+
+export interface ToolExecutionResponse extends ToolResult {}
+
+/** What the renderer needs to draw one approval card. Mirrors
+ * `PendingToolPrompt` in `src-tauri/src/tool_prompt.rs`, and matches the
+ * payload of a `tool_approval_requested` stream event field for field. */
+export interface PendingToolPrompt {
+  promptId: string;
+  toolName: string;
+  label: string;
+  /** A short description of the call, derived from its redacted arguments. */
+  summary: string;
+  riskLevel: string;
+  reason: string;
+  /** The requesting subagent's name, or absent for the main session. */
+  requester?: string;
+  /** Machine-readable requester address, unlike `requester` which is
+   * display-escaped text: the child's addressable name plus the
+   * parent-timeline call id of its turn. Used to open the requesting
+   * child's page when the card arrives. */
+  sourceAgent?: string;
+  sourceCallId?: string;
+  /** False for shell and MCP tools, and for anything the backend marked
+   * mandatory: those must be answered one call at a time. */
+  allowAlwaysOffered: boolean;
+  /** Whether this card appears whatever the conversation's security level is.
+   * `allowAlwaysOffered` cannot stand in for it: an ordinary shell or MCP call
+   * also declines blanket permission while still being an approval the level
+   * decides. Full access clears every prompt except these. */
+  mandatory?: boolean;
+  /**
+   * Which card this is. Plain tool approvals omit it. `plan_exit` asks whether
+   * to leave plan mode and start implementing; it is answered with the same
+   * decisions but draws different copy and collects feedback on a denial.
+   * `question` is an `ask_user` call blocked on the user's answers; it is
+   * answered with a {@link QuestionResponse} instead of a decision.
+   */
+  kind?: ToolPromptKind;
+  /** The questions a `question` card asks: the `ask_user` input's `questions`. */
+  questions?: JsonValue;
+}
+
+export type ToolPromptKind = "tool" | "plan_exit" | "question";
+
+/**
+ * How the user left a question card. `answers`, `previews`, and `notes` are
+ * index-aligned with the card's questions; `null` is an unanswered slot. A
+ * multi-select answer is the picked labels joined with `", "`. The host words
+ * the tool result from this, exactly as Claude Code does.
+ */
+export interface QuestionResponse {
+  /** `submit` hands the answers back; `close` closes the card unanswered;
+   * `chat` declines the questions so the user can talk them over, carrying
+   * whatever was answered so far. */
+  action: "submit" | "close" | "chat";
+  answers: Array<string | null>;
+  previews?: Array<string | null>;
+  notes?: Array<string | null>;
+}
+
+export type ToolPromptDecision = "deny" | "allow_once" | "allow_always";
+
+/**
+ * One pending `fork` request raised by the model. Mirrors
+ * `PendingForkRequest` in `src-tauri/src/fork_requests.rs` and the flattened
+ * payload of the `forkRequested` push event.
+ */
+export interface PendingForkRequest {
+  forkId: string;
+  workspaceId: string;
+  sourceConversationId: string;
+  /** Display-escaped title of the conversation that raised the request. */
+  sourceTitle: string;
+  /** The child's first user message, verbatim. */
+  prompt: string;
+  requestedAt: string;
+}
+
+/**
+ * How one `fork` request ended. Mirrors `ForkDecisionRecord` in
+ * `src-tauri/src/fork_requests.rs`.
+ *
+ * The record exists for the user alone: it is the task bar's only trace that a
+ * fork was ever asked for. The model is never told the outcome, so this never
+ * reaches `task_list` or any tool receipt.
+ */
+export interface ForkDecisionRecord {
+  forkId: string;
+  workspaceId: string;
+  sourceConversationId: string;
+  /** Display-escaped title derived from the prompt when the request was raised. */
+  title: string;
+  /** The child's first user message, verbatim. */
+  prompt: string;
+  requestedAt: string;
+  decidedAt: string;
+  approved: boolean;
+  /** Set exactly when a child conversation exists; null on a decline. */
+  childConversationId: string | null;
+}
+
+export interface ToolApprovalGrant {
+  /** Present only when the runtime required and received an explicit approval. */
+  nonce?: string;
+  expiresInMs: number;
+  /** Present when the call still needs the user's answer. Draw this card and
+   * call `resolveToolPrompt`; that is what mints the nonce. Neither field set
+   * means no approval was needed at all. */
+  prompt?: PendingToolPrompt;
+}
+
+export interface ApiKeyStatus {
+  configured: boolean;
+  /** Persisted by the frontend so the masked value can match the secret without retaining it. */
+  keyLength?: number;
+}
+
+export interface ModelRunRequest {
+  /** Host-minted first-run intent, consumed only when the run becomes adoptable. */
+  forkPromptContextId?: string;
+  /**
+   * The user's "compact now": the run compacts the context natively at its
+   * first boundary, opens the continuation and ends without a turn of its own.
+   */
+  compactNow?: boolean;
+  provider: ApiProvider;
+  model: ModelProfile;
+  reasoningEffort: ReasoningEffort;
+  /** Identifies the persisted conversation whose dynamic presets Rust must resolve. */
+  conversationId: string;
+  workspacePath: string;
+  enabledTools: string[];
+  contexts: ContextItem[];
+  tools: ToolDescriptor[];
+}
+
+export interface ModelUsage {
+  inputTokens?: number;
+  /** Cached reads included in `inputTokens`; cache writes are deliberately excluded. */
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  /**
+   * Reasoning tokens included in `outputTokens` — never an addend, same
+   * discipline as `cachedInputTokens`. OpenAI Responses reports `0` rather
+   * than omitting it when a round did no reasoning.
+   */
+  reasoningTokens?: number;
+}
+
+export interface ModelRunResponse {
+  contexts: ContextItem[];
+  /** Validated `structured_output` value of a schema-bound run; absent otherwise. */
+  structuredOutput?: unknown;
+  usage: ModelUsage;
+  model: string;
+  providerName: string;
+  durationMs: number;
+  stopReason?: string;
+  /** Size of the final request round, unlike cumulative `usage`. */
+  contextTokens?: number;
+  /**
+   * Terminal request failure of the turn (`stopReason === "error"`), after
+   * automatic retries. Rendered as a dismissable transient notice; never
+   * persisted into the timeline.
+   */
+  error?: ModelRunFailure;
+}
+
+export interface ModelRunFailure {
+  message: string;
+  /** Tool round the failing request belonged to (1-based). */
+  round: number;
+  /** Total requests attempted for that round, including the first one. */
+  attempts: number;
+}
+
+export type SubagentChannel = "text" | "reasoning" | "activity" | "update" | "status";
+
+/** Lifecycle state of one workflow step in the progress card. `error` also
+ * carries user skips; check `skipped` to tell them apart. */
+export type WorkflowStepState = "start" | "progress" | "done" | "error";
+
+/**
+ * One row of a workflow run's progress ledger, mirroring `ProgressRow` in
+ * `workflow-core/src/progress.rs`.
+ *
+ * `agent` rows merge by `index` for the step's whole lifetime; `log` rows carry
+ * a host-assigned monotonic index and only ever accumulate. Optional fields are
+ * omitted rather than sent as null, so absence and emptiness stay distinct.
+ */
+export interface WorkflowProgressEntry {
+  kind: "agent" | "log";
+  index: number;
+  state: WorkflowStepState;
+  label?: string;
+  phase?: string;
+  phaseIndex?: number;
+  preview?: string;
+  message?: string;
+  cached?: boolean;
+  blocked?: boolean;
+  skipped?: boolean;
+}
+
+export type ModelStreamEvent =
+  | { type: "text_delta"; round: number; delta: string }
+  /**
+   * The provider opened a reasoning item. Deliberately not implied by the
+   * first `reasoning_delta`: a Responses round that only returns
+   * `encrypted_content` never emits a delta, and this is then the one signal
+   * that the model is thinking. The renderer starts its live clock here.
+   *
+   * `item` is the zero-based ordinal of the reasoning item inside the round
+   * (dense — the sidecar only numbers items that survive its evidence gate).
+   * One live reasoning row is keyed per ordinal. Optional only for fixture
+   * ergonomics; the wire always carries it since protocol generation 5.
+   */
+  | { type: "reasoning_start"; round: number; item?: number; form?: ReasoningForm }
+  | { type: "reasoning_delta"; round: number; item?: number; delta: string }
+  /** `durationMs` is the sidecar's cumulative reasoning wall clock for the step. */
+  | { type: "reasoning_done"; round: number; item?: number; durationMs?: number }
+  /**
+   * Estimated tokens an open item has thought without streaming them as text
+   * (omitted thinking), cumulative for the item. Display only: it never
+   * becomes usage.
+   */
+  | { type: "reasoning_progress"; round: number; item?: number; estimatedTokens: number }
+  /** Provider-reported cumulative usage for this backend request round. */
+  | { type: "usage_updated"; round: number; usage: ModelUsage }
+  | { type: "user_input_received"; round: number; id: string; content: string; images?: ImageAttachment[]; files?: FileAttachment[]; createdAt: string }
+  /**
+   * A context the host added to the transcript ahead of `round` — a `box`
+   * delivery (background result, host notice such as auto-compact arming), an
+   * appended system prompt, a tool-addition marker, a Stop hook's
+   * continuation. Already persisted host-side; this puts it in the live turn.
+   * Sent in transcript order relative to `user_input_received`.
+   */
+  | { type: "host_context_added"; round: number; context: ContextItem }
+  | {
+      type: "tool_call_announced";
+      round: number;
+      callId: string;
+      toolName: string;
+      /** The timeline id the persisted card will carry. The streaming row must
+       * adopt it: when both sides minted their own id, the renderer's replaced
+       * the host's on the way to disk and any attestation bound to the host's
+       * id could never match again. */
+      contextId: string;
+    }
+  | { type: "tool_call_arguments_ready"; round: number; callId: string; input: JsonObject }
+  | { type: "tool_execution_started"; round: number; callId: string }
+  | { type: "tool_execution_completed"; round: number; callId: string; result: ToolResult }
+  /**
+   * Settled form of an announced tool card. At the round boundary it contains
+   * the terminal subagent record and a new signature. The renderer replaces
+   * the persisted card in place and saves it immediately.
+   */
+  | { type: "tool_context_settled"; round: number; context: ToolContext }
+  /** A tool call is waiting on the user. The renderer draws an approval card
+   * above the composer and answers with `resolveToolPrompt`; the backend worker
+   * that raised it stays blocked until then. Carries no round: approval is
+   * raised from the tool executor, which does not know the surrounding turn. */
+  | { type: "tool_approval_requested"; promptId: string; toolName: string; label: string; summary: string; riskLevel: string; reason: string; requester?: string; sourceAgent?: string; sourceCallId?: string; allowAlwaysOffered: boolean; mandatory?: boolean; kind?: ToolPromptKind; questions?: JsonValue }
+  /** The card for `promptId` is over. `approved` is what the host concluded,
+   * which is not always what the user clicked — a cancelled run resolves its
+   * outstanding cards as denied. */
+  | { type: "tool_approval_resolved"; promptId: string; approved: boolean }
+  | { type: "subagent_event"; round: number; callId: string; event: ModelStreamEvent }
+  | { type: "subagent_delta"; round: number; callId: string; channel: SubagentChannel; delta: string }
+  /** One transition of a running workflow's progress ledger. Per-step
+   * transcripts still ride `subagent_event`; this carries only the card's row
+   * state, so a renderer that ignores it loses the card, not the transcripts.
+   * `runId` is what the card's Skip/Retry commands address — the host mints it
+   * per run (reusing it on resume), so the stream is the only place to learn it. */
+  | { type: "workflow_progress"; round: number; callId: string; runId: string; entry: WorkflowProgressEntry }
+  | { type: "hook_execution_started"; round: number; executionId: string; hookId: string; hookName: string; event: string; statusMessage?: string }
+  | { type: "hook_execution_completed"; round: number; executionId: string; hookId: string; hookName: string; event: string; result: ToolResult; blocked: boolean; reason?: string; contextInjected: boolean }
+  /** A transient request failure is about to be retried: the renderer drops
+   * the failed attempt's partial content for `round` and shows a temporary
+   * notice. The message is never persisted as timeline context. */
+  | { type: "stream_retry_scheduled"; round: number; attempt: number; maxAttempts: number; delayMs: number; message: string }
+  /** Backend cancellation probe emitted while no data is flowing; ignored. */
+  | { type: "ping" }
+  /**
+   * The host has settled this run and placed the result in its settlement slot.
+   * The initiating invocation ignores this event; an `attachModelRun` adopter
+   * uses it to call `takeRunSettlement`.
+   */
+  | { type: "run_concluded"; requestId: string };
+
+/**
+ * Historical settings view IDs remain for persisted routes and are redirected
+ * by `GlobalSettings` to current views. `skills` and `mcp` are current pages.
+ */
+export type SettingsView =
+  | "general"
+  | "appearance"
+  | "providers"
+  | "search_providers"
+  | "mcp"
+  | "skills"
+  | "shortcuts"
+  | "usage"
+  | "execution_environments"
+  | "dependencies"
+  | "updates"
+  | "web_search"
+  | "memory"
+  | "agents"
+  | "hooks"
+  | "advanced"
+  | "conversation_presets"
+  | "capability_catalog";

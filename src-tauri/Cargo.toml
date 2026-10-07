@@ -1,0 +1,217 @@
+[workspace]
+members = [
+    # Agent kernel state machine: implementation projection of formal/tla/AgentKernel.tla.
+    # This pure-logic crate is driven by the host; workspace membership includes
+    # its guard tests and conformance exports in `cargo test --workspace`.
+    "agent-kernel",
+    "workflow-core",
+    # The rquickjs adapter is the workflow tool's only script-engine implementation;
+    # the host uses it through ScriptSpec/ScriptSource.
+    "workflow-script",
+    # The persistent agent Mewrk keeps on SSH machines, and the host's link to
+    # it. Cross-compiled for every machine Mewrk can reach, so its own
+    # dependencies stay minimal; the host links only its `client` half.
+    "remote-agent",
+    # Git reads and writes, linked by the host and by the remote agent, which
+    # runs the same operations on the machine a remote checkout is on.
+    "git-core",
+    # The local helper model (Qwen3.5-0.8B) that names conversations and explains
+    # shell commands: tokenizer, weight conversion, and the Core ML (Apple Neural
+    # Engine) and llama.cpp backends with their scheduler.
+    "local-model",
+]
+
+[package]
+name = "mewrk"
+version = "1.0.0"
+description = "Mewrk — Mew. Work."
+authors = ["Mewrk contributors"]
+license = "GPL-3.0-or-later"
+# `app_update` reads releases from this repository's GitHub API; it is a runtime contract.
+repository = "https://github.com/catblob-hash/Mewrk"
+edition = "2021"
+rust-version = "1.89"
+default-run = "mewrk"
+
+[lib]
+name = "mewrk_lib"
+crate-type = ["lib"]
+
+[[bin]]
+name = "mewrk"
+path = "src/main.rs"
+test = false
+bench = false
+
+# The built-in browser's Chromium subprocess on macOS, bundled as `Mewrk Helper*.app`
+# (see src/cef_host); an empty program elsewhere.
+[[bin]]
+name = "mewrk-cef-helper"
+path = "src/cef_helper_main.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "mewrk-browser-dev"
+path = "src/browser_dev_main.rs"
+required-features = ["browser-dev"]
+test = false
+bench = false
+
+[build-dependencies]
+embed-resource = "3.0.11"
+resvg = { version = "0.45.1", default-features = false }
+tauri-build = { version = "2.4", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chacha20poly1305 = "0.10"
+axum = { version = "0.8", features = ["ws"], optional = true }
+dirs = "6"
+# Components fetched after install (`src/components`): gzip for Mewrk's own
+# builds on R2, tar for the npm tarballs of the Claude Agent SDK and its CLI.
+flate2 = "1"
+fs2 = "0.4"
+futures-util = { version = "0.3", optional = true }
+globset = "0.4"
+# `.mewrk/launch.json` is JSONC: comments and trailing commas, which serde_json
+# cannot read. Default features only, so this pulls in no transitive crates.
+jsonc-parser = "0.33.1"
+# Engine-agnostic workflow decision layer. The host uses `workflow_core::`, and
+# `subagent_schema` is re-exported from its `schema` module.
+mewrk-workflow-core = { path = "workflow-core" }
+# rquickjs/QuickJS-NG script source for the workflow tool.
+mewrk-workflow-script = { path = "workflow-script" }
+mewrk-agent-kernel = { path = "agent-kernel" }
+# The host's link to the agent it keeps on SSH machines. Only the `client` half:
+# the agent's own process and terminal code runs on the remote machine, not here.
+mewrk-remote-agent = { path = "remote-agent", default-features = false, features = ["client"] }
+# Git status, diffs, review writes and worktrees. The remote agent links the
+# same crate to serve checkouts on other machines (`mewrk-remote git`).
+mewrk-git-core = { path = "git-core" }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# npm's registry signatures (ECDSA P-256) on the Claude Agent SDK and CLI
+# versions Mewrk installs (`components::claude_agent`). Already built for
+# rustls; this only names it.
+ring = "0.17.14"
+# Persists the conversation data plane. `bundled` compiles SQLite from source,
+# avoiding system-library and OpenSSL toolchain dependencies; keys remain only
+# in the operating-system credential store.
+rusqlite = { version = "0.31", features = ["bundled"] }
+# The Claude Agent SDK releases npm offers, matched against the sidecar's caret
+# range (`components::claude_agent`).
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hmac = "0.12"
+similar = "2.7"
+tar = "0.4"
+tauri = { version = "2.8", features = ["unstable", "devtools", "tray-icon"] }
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+wait-timeout = "0.2"
+portable-pty = "0.9"
+# `portable_pty::MasterPty` spells its errors as `anyhow::Error`; the terminal an
+# SSH machine's agent serves implements that trait, so it names the same type.
+anyhow = "1"
+base64 = "0.22.1"
+gif = "=0.13.3"
+image-webp = "=0.2.4"
+zune-jpeg = "=0.4.21"
+# Encoders for Claude Code's prompt-image pipeline (`image_attachments`): the
+# JPEG quality ladder and the palette PNG, which `gif` already pulls in.
+jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
+color_quant = "=1.1.0"
+zeroize = "1.8"
+png = "=0.17.16"
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+webview2-com = "0.38.2"
+windows-core = "0.61.2"
+# Deliberately minimal. Mewrk has no desktop-automation line at all, so the
+# shipped binary must not even be able to reach the APIs one would need: no
+# Graphics_Capture / WinRT Direct3D (Windows Graphics Capture), no
+# Win32_UI_Input_KeyboardAndMouse (`SendInput`), no Win32_Storage_Xps
+# (`PrintWindow`), no Win32_System_StationsAndDesktops (desktop switching), no
+# Win32_Security_WinTrust (host Authenticode), and no Win32_System_Registry
+# (the deleted VM backend probe was its only user). A source audit is weaker
+# than an import audit; keep the `windows-sys` feature list below closed (and
+# the `windows` crate out) so reintroducing host control requires visibly
+# re-adding a dependency or feature here.
+#
+# Win32_System_Com is COM *initialization* only (CoInitializeEx/CoUninitialize).
+# `external_open` needs it because ShellExecuteW may delegate to a Shell
+# extension, which is a COM object, so the calling thread must have an
+# apartment. It buys no host-control capability and must not grow into one.
+# Win32_UI_Shell_Common exists only for `ITEMIDLIST`, the shell's name for a
+# path, which `reveal_path` hands to SHOpenFolderAndSelectItems so a file is
+# selected without going through Explorer's command-line parsing.
+# Win32_Security exists only because `CreateEventW` (instance_activation) spells
+# its always-null first argument as `*const SECURITY_ATTRIBUTES`; Mewrk calls no
+# ACL, token or privilege API and must not start to.
+# Wdk_System_SystemServices and Win32_System_SystemInformation exist only for
+# `RtlGetVersion` and the `OSVERSIONINFOW` it fills, which the system prompt's
+# environment block reports. Reading the OS version grants nothing; the manifest-
+# independent NT call is used because `GetVersionEx` reports 6.2 to an
+# unmanifested process.
+windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_System_Com", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# The local helper model on llama.cpp (CPU, and a GPU where one is usable),
+# whose official release build is downloaded with the model and loaded at run
+# time; nothing of llama.cpp is compiled into the app.
+mewrk-local-model = { path = "local-model", features = ["llama"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The local helper model on the Neural Engine (Core ML) or the GPU (MLX, built
+# into a library the app loads at run time); no llama.cpp here.
+mewrk-local-model = { path = "local-model", features = ["mlx"] }
+# Holds exactly one login-keychain item, the master key of `src/credential_vault.rs`;
+# every other credential is sealed under it, so macOS asks about one item instead of
+# one per credential.
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+# The built-in browser's page engine on macOS: Chromium, embedded through CEF as a
+# child view of the main window and driven over the DevTools protocol in-process —
+# the arrangement WebView2 already gives Windows. WKWebView, which Tauri would
+# otherwise supply, has no DevTools protocol, cannot be stacked beneath the
+# trusted renderer, and shares one cookie store across tabs. Pinned exactly:
+# the wrapper compiles against this CEF API version, and the framework loaded at
+# run time must be the same build (see `src/cef_host`).
+cef = { version = "=154.0.0", default-features = false, features = ["sandbox"] }
+# A direct dependency only so build.rs receives `DEP_CEF_DLL_WRAPPER_CEF_DIR`, the
+# directory the framework was fetched into, for development runs and bundling.
+cef-dll-sys = { version = "=154.0.0", features = ["sandbox"] }
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSLocale", "NSThread", "NSTimer", "NSRunLoop", "NSValue", "NSObject", "NSGeometry", "NSString"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSEvent", "NSResponder", "NSView", "NSWindow", "NSGraphics", "NSImage"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+browser-dev = ["dep:axum", "dep:futures-util"]
+
+# The local helper model converts 1.5 GB of weights and runs its sampling and
+# state copies in tight loops; unoptimized, a dev build takes minutes for what
+# release does in seconds.
+[profile.dev.package.mewrk-local-model]
+opt-level = 3
+
+# Model downloads are checked with SHA-256 (1.5 GB files); unoptimized, that
+# takes a minute per file in a development build.
+[profile.dev.package.sha2]
+opt-level = 3

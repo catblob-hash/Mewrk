@@ -1,0 +1,113 @@
+# Builds the site — the home page at / and /zh/, the documentation at /en/ and
+# /zh-CN/ — and publishes it to this repository's GitHub Pages. The site's
+# source is the private repository catblob-hash/Mewrk-site, checked out with a
+# read-only deploy key whose private half is the SITE_DEPLOY_KEY secret; it reads
+# the tool catalog and prompt-profile baselines (docs/context-injections/), the
+# brand mark (src/components/brandMark.ts) and the version from this checkout.
+#
+# The site is served at https://mewrk.dev, the repository's custom domain with
+# HTTPS enforced; GitHub redirects catblob-hash.github.io/Mewrk/ there. Its
+# DNS on Cloudflare points the apex at GitHub Pages (A 185.199.108-111.153,
+# AAAA 2606:50c0:8000-8003::153) and www at catblob-hash.github.io, all "DNS
+# only", not proxied. If the domain is ever changed, re-run this workflow once
+# HTTPS is on, so 404.html is built for the new root.
+#
+# The download links are baked from the latest release at build time. The
+# release-mirror workflow dispatches this one once a release is on the mirror.
+# Mewrk-site cannot start a workflow here, so an hourly run picks up its
+# changes: it deploys only when Mewrk-site's main, the files the site reads
+# here (by their Git object ids), or the latest release differ from what the
+# live site was built from (its /build.json).
+name: Documentation site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/context-injections/prompt-profile*.json"
+      - "docs/context-injections/builtin-tool-*.json"
+      - "src/components/brandMark.ts"
+      - ".github/workflows/pages.yml"
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.check.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: app
+      - uses: actions/checkout@v4
+        with:
+          repository: catblob-hash/Mewrk-site
+          ssh-key: ${{ secrets.SITE_DEPLOY_KEY }}
+          path: site
+      - id: pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - id: check
+        name: Compare with what the live site was built from
+        env:
+          LIVE: ${{ steps.pages.outputs.base_url }}/build.json
+        run: |
+          site=$(git -C site rev-parse HEAD)
+          app=$(git -C app rev-parse HEAD:docs/context-injections HEAD:src/components/brandMark.ts | paste -sd " " -)
+          release=$(curl -fsS https://dl.mewrk.dev/latest.json | jq -r .tag_name) || release=unknown
+          jq -n --arg site "$site" --arg app "$app" --arg release "$release" '{site: $site, app: $app, release: $release}' > build.json
+          cat build.json
+          deploy=true
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && curl -fsS "$LIVE" -o live.json && jq -e --slurpfile now build.json '. == $now[0]' live.json > /dev/null; then
+            echo "The live site was built from these; nothing to deploy."
+            deploy=false
+          fi
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.deploy == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - name: Build
+        if: steps.check.outputs.deploy == 'true'
+        working-directory: site
+        run: |
+          npm ci --ignore-scripts
+          node scripts/build.mjs --out dist
+          cp ../build.json dist/build.json
+        env:
+          MEWRK_APP_DIR: ${{ github.workspace }}/app
+          GITHUB_TOKEN: ${{ github.token }}
+          # The site's absolute URL, for share images and canonical links.
+          SITE_URL: ${{ steps.pages.outputs.base_url }}
+          # "/Mewrk" at catblob-hash.github.io, "" at a custom domain: 404.html
+          # is served for any missing path, so its links start from the base.
+          SITE_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.check.outputs.deploy == 'true'
+        with:
+          path: site/dist
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
