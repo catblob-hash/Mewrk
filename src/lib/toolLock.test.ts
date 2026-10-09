@@ -7,6 +7,7 @@ import {
   BUILTIN_PROMPT_PROFILE_ID,
   DEFAULT_CACHE_TTL_MINUTES,
   EMPTY_TOOL_LOCK,
+  fileWriteGuardsTone,
   hostMessageContainerTone,
   lockTone,
   lockTouch,
@@ -301,7 +302,7 @@ describe("how a setting is drawn", () => {
   });
 
   it("draws the settings that rewrite the prefix either way orange whichever way they stand", () => {
-    for (const kind of ["mcp", "memory", "skillTool", "discovery"] as const) {
+    for (const kind of ["mcp", "memory", "skillTool", "discovery", "hostMessages", "fileWriteGuards"] as const) {
       expect(lockTone(warm, kind, false, false)).toBe("cache");
       expect(lockTone(warm, kind, true, true)).toBe("cache");
       expect(lockTone(warm, kind, false, true)).toBeNull();
@@ -327,7 +328,7 @@ describe("how a setting is drawn", () => {
     const current = settings({ toolLock: lock(HAIKU) });
     const cold = toolLockState(current, HAIKU, SENT + 31 * MINUTE);
     const elsewhere = toolLockState(current, OPUS, SENT);
-    const kinds = ["tool", "webSearch", "skill", "mcp", "memory", "skillTool", "discovery", "hook", "profile", "hostMessages"] as const;
+    const kinds = ["tool", "webSearch", "skill", "mcp", "memory", "skillTool", "discovery", "hook", "profile", "hostMessages", "fileWriteGuards"] as const;
     for (const state of [cold, elsewhere]) {
       for (const kind of kinds) {
         expect(lockTone(state, kind, false, false)).toBeNull();
@@ -773,6 +774,80 @@ describe("the host-message container", () => {
     const state = toolLockState(older, OPUS, SENT);
     expect(hostMessageContainerTone(state, older)).toBeNull();
     expect(lockTouch(state, older, { ...older, hostMessageContainer: "user" })).toBe(false);
+    expect(restoreLockedSettings(older, state)).toBe(older);
+  });
+});
+
+describe("the file write guards", () => {
+  const before = settings({
+    fileWriteGuardsEnabled: false,
+    toolLock: lock(OPUS, { fileWriteGuards: false })
+  });
+  const warm = toolLockState(before, OPUS, SENT);
+
+  it("records whether each request ran with the guards, absent meaning on", () => {
+    expect(toolLockOf(withRunToolLock(before, [], request(OPUS))).fileWriteGuards).toBe(false);
+    expect(toolLockOf(withRunToolLock(settings(), [], request(OPUS))).fileWriteGuards).toBe(true);
+    expect(toolLockOf(withRunToolLock(settings({ fileWriteGuardsEnabled: true }), [], request(OPUS))).fileWriteGuards)
+      .toBe(true);
+    // A lock that holds the same answer is not a change to write.
+    const sent = withRunToolLock(before, [], request(OPUS));
+    expect(withRunToolLock(sent, [], request(OPUS))).toBe(sent);
+    // The switch moving is: the next request leaves the other answer behind.
+    const flipped = withRunToolLock({ ...sent, fileWriteGuardsEnabled: true }, [], request(OPUS));
+    expect(flipped).not.toBe(sent);
+    expect(toolLockOf(flipped).fileWriteGuards).toBe(true);
+  });
+
+  it("reads a lock written before the switch as knowing nothing", () => {
+    expect(EMPTY_TOOL_LOCK.fileWriteGuards).toBeNull();
+    const { fileWriteGuards: _gone, ...legacy } = lock(OPUS);
+    expect(toolLockOf(settings({ toolLock: legacy as ConversationToolLock })).fileWriteGuards).toBeNull();
+    expect(toolLockOf(settings({ toolLock: lock(OPUS, { fileWriteGuards: true }) })).fileWriteGuards).toBe(true);
+  });
+
+  it("warns before it moves while the cache is warm, either way", () => {
+    expect(fileWriteGuardsTone(warm, before)).toBe("cache");
+    expect(lockTouch(warm, before, { ...before, fileWriteGuardsEnabled: true })).toBe(true);
+    // The other way too: guards on at the last request, switched off now.
+    const on = settings({ toolLock: lock(OPUS, { fileWriteGuards: true }) });
+    const onWarm = toolLockState(on, OPUS, SENT);
+    expect(fileWriteGuardsTone(onWarm, on)).toBe("cache");
+    expect(lockTouch(onWarm, on, { ...on, fileWriteGuardsEnabled: false })).toBe(true);
+    // Writing the value it already has is no move.
+    expect(lockTouch(onWarm, on, { ...on, fileWriteGuardsEnabled: true })).toBe(false);
+    // Moved away, the cache is already lost for it: plain again.
+    expect(fileWriteGuardsTone(warm, { ...before, fileWriteGuardsEnabled: true })).toBeNull();
+    const cold = toolLockState(before, OPUS, SENT + 31 * MINUTE);
+    expect(fileWriteGuardsTone(cold, before)).toBeNull();
+    expect(lockTouch(cold, before, { ...before, fileWriteGuardsEnabled: true })).toBe(false);
+  });
+
+  it("warns on a model that cannot append tools while the cache is warm, and holds nothing once it is cold", () => {
+    const wholeBefore = settings({ toolLock: lock(HAIKU, { fileWriteGuards: true }) });
+    const whole = toolLockState(wholeBefore, HAIKU, SENT);
+    expect(fileWriteGuardsTone(whole, wholeBefore)).toBe("cache");
+    expect(lockTouch(whole, wholeBefore, { ...wholeBefore, fileWriteGuardsEnabled: false })).toBe(true);
+    const moved = { ...wholeBefore, fileWriteGuardsEnabled: false };
+    expect(restoreLockedSettings(moved, toolLockState(moved, HAIKU, SENT)).fileWriteGuardsEnabled).toBe(true);
+
+    const cold = toolLockState(wholeBefore, HAIKU, SENT + 60 * MINUTE);
+    expect(fileWriteGuardsTone(cold, wholeBefore)).toBeNull();
+    expect(lockTouch(cold, wholeBefore, { ...wholeBefore, fileWriteGuardsEnabled: false })).toBe(false);
+    expect(restoreLockedSettings(moved, toolLockState(moved, HAIKU, SENT + 60 * MINUTE))).toBe(moved);
+  });
+
+  it("puts it back when the warm model is picked again, and tones nothing an older lock never saw", () => {
+    const moved = { ...before, fileWriteGuardsEnabled: true };
+    expect(restoreLockedSettings(moved, toolLockState(moved, OPUS, SENT)).fileWriteGuardsEnabled).toBe(false);
+    // Absent is on, so a lock holding on puts back nothing against an absent field.
+    const absent = settings({ toolLock: lock(OPUS, { fileWriteGuards: true }) });
+    expect(restoreLockedSettings(absent, toolLockState(absent, OPUS, SENT))).toBe(absent);
+
+    const older = settings({ fileWriteGuardsEnabled: false, toolLock: lock(OPUS) });
+    const state = toolLockState(older, OPUS, SENT);
+    expect(fileWriteGuardsTone(state, older)).toBeNull();
+    expect(lockTouch(state, older, { ...older, fileWriteGuardsEnabled: true })).toBe(false);
     expect(restoreLockedSettings(older, state)).toBe(older);
   });
 });

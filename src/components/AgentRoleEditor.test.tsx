@@ -183,6 +183,7 @@ function roleBody(overrides: Partial<AgentRole> = {}): AgentRole {
     hookIds: [],
     webSearch: defaultAgentRoleWebSearch(),
     templateId: null,
+    toolDescriptionFileId: null,
     ...overrides
   };
 }
@@ -204,13 +205,13 @@ function roleResource(
   };
 }
 
-const builtinOpus = roleResource("agent_builtin_opus", roleBody({
+const globalOpus = roleResource("agent_user_opus", roleBody({
   name: "Opus",
-  description: "内置角色的说明。",
+  description: "一个全局角色的说明。",
   modelSelection: { kind: "explicit", providerId: exactProviderId, modelId: exactModelId },
   effort: "medium",
   tools: ["read_file", "run_command"]
-}), { source: "builtin", location: "builtin:agents/opus.json" });
+}));
 
 const globalReviewer = roleResource("agent_user_reviewer", roleBody());
 
@@ -220,8 +221,8 @@ const workspaceRole = roleResource("agent_workspace_local", roleBody({ name: "�
   location: "/work/a/.mewrk/agents/local.json"
 });
 
-/** Global and workspace entries of every kind, and the three kinds of role. */
-function catalogWith(agents: AgentRoleResource[] = [builtinOpus, globalReviewer, workspaceRole]): CapabilityCatalog {
+/** Global and workspace entries of every kind, and the roles of both levels. */
+function catalogWith(agents: AgentRoleResource[] = [globalOpus, globalReviewer, workspaceRole]): CapabilityCatalog {
   const row = (id: string, name: string, workspaceKey?: string): ResourceDescriptor => ({
     id,
     name,
@@ -235,7 +236,12 @@ function catalogWith(agents: AgentRoleResource[] = [builtinOpus, globalReviewer,
     skills: [row("skill_a", "技能甲"), row("skill_ws", "工作区技能", WORKSPACE_KEY)],
     mcps: [row("mcp_docs", "文档服务器"), row("mcp_ws", "工作区服务器", WORKSPACE_KEY)],
     hooks: [row("hook_lint", "Lint 钩子"), row("hook_ws", "工作区钩子", WORKSPACE_KEY)],
-    toolDescriptionFiles: [],
+    // The host lists both compiled-in profiles first, then the user's files.
+    toolDescriptionFiles: [
+      { ...row("tooldesc_builtin_en_us", "Mewrk guided"), location: "builtin:en-US", source: "builtin" },
+      { ...row("tooldesc_builtin_concise_en_us", "Mewrk concise"), location: "builtin:en-US/concise", source: "builtin" },
+      row("tooldesc_user_main_0f0f0f0f", "main")
+    ],
     agents
   };
 }
@@ -258,7 +264,7 @@ function conversationSettings(overrides: Partial<ConversationSettings> = {}): Co
       domainFilter: "include",
       maxResults: 9
     },
-    agentIds: ["agent_builtin_opus", "agent_user_reviewer"],
+    agentIds: ["agent_user_opus", "agent_user_reviewer"],
     allowRolelessSubagents: false,
     ...overrides
   };
@@ -352,10 +358,9 @@ function railEntries(dialog: HTMLElement): Array<string | null> {
 
 async function openRole(
   user: ReturnType<typeof userEvent.setup>,
-  name: string,
-  builtin = false
+  name: string
 ): Promise<HTMLElement> {
-  await user.click(screen.getByRole("button", { name: `${builtin ? "设置内置角色" : "设置角色"} ${name}` }));
+  await user.click(screen.getByRole("button", { name: `设置角色 ${name}` }));
   return screen.getByRole("dialog", { name });
 }
 
@@ -375,7 +380,7 @@ function userMessage(id: string, content: string): ContextItem {
 afterEach(() => {
   cleanup();
   // The editor's drafts are module state on purpose; each case starts clean.
-  for (const id of ["new:global", `new:${WORKSPACE_KEY}`, builtinOpus.id, globalReviewer.id, workspaceRole.id]) {
+  for (const id of ["new:global", `new:${WORKSPACE_KEY}`, globalOpus.id, globalReviewer.id, workspaceRole.id]) {
     forgetAgentRoleDraft(id);
   }
   readTemplate.mockReset();
@@ -389,47 +394,27 @@ const toggleNames = (root: HTMLElement) =>
   [...root.querySelectorAll(".catalog-row__toggle")].map((row) => row.getAttribute("aria-label"));
 
 describe("AgentRolesPage", () => {
-  it("lists the roles as a catalog: built-ins and global files first, then each workspace", () => {
+  it("lists the roles as a catalog: global files first, then each workspace", () => {
     // Listed workspace-first on purpose: the page groups by level, it does not
     // follow the catalog's order across levels.
-    renderRoles({ onDelete: vi.fn(), catalog: catalogWith([workspaceRole, builtinOpus, globalReviewer]) });
+    renderRoles({ onDelete: vi.fn(), catalog: catalogWith([workspaceRole, globalOpus, globalReviewer]) });
     // The levels in reading order, the global one before the workspace.
     expect(screen.getAllByRole("region").map((region) => region.getAttribute("aria-label")))
       .toEqual(["全局", "/work/a"]);
     const global = screen.getByRole("region", { name: "全局" });
-    // Within a level, the catalog's own order: the built-in, then the global file.
+    // Within a level, the catalog's own order.
     expect(toggleNames(global))
-      .toEqual(["Opus（内置）", "reviewer"]);
-    expect(within(global).getByRole("button", { name: "Opus（内置）" })).toHaveAttribute("aria-pressed", "true");
+      .toEqual(["Opus", "reviewer"]);
+    expect(within(global).getByRole("button", { name: "Opus" })).toHaveAttribute("aria-pressed", "true");
     expect(within(global).getByRole("button", { name: "reviewer" })).toHaveAttribute("aria-pressed", "true");
     const workspace = screen.getByRole("region", { name: "/work/a" });
     expect(toggleNames(workspace))
       .toEqual(["本地审查"]);
     expect(within(workspace).getByRole("button", { name: "本地审查" })).toHaveAttribute("aria-pressed", "false");
-    // The one built-in says so; the files the user wrote do not.
-    expect(within(global).getAllByText("内置")).toHaveLength(1);
-    expect(within(workspace).queryByText("内置")).toBeNull();
-    // A built-in has no file of its own to remove; a user's file does.
-    expect(screen.queryByRole("button", { name: "删除 Opus" })).toBeNull();
+    // Every role is a file the user wrote, so none is badged and each can be removed.
+    expect(screen.queryByText("内置")).toBeNull();
+    expect(screen.getByRole("button", { name: "删除 Opus" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "删除 reviewer" })).toBeInTheDocument();
-  });
-
-  it("tells a built-in role from a global copy of it by a badge and by every control's name", () => {
-    // What the catalog lists once Opus has been saved as a global role.
-    const copy = roleResource("agent_user_opus", roleBody({ name: "Opus" }));
-    renderRoles({ catalog: catalogWith([builtinOpus, copy]), onDelete: vi.fn() });
-    const builtinRow = screen.getByRole("button", { name: "Opus（内置）" }).closest(".catalog-row") as HTMLElement;
-    const copyRow = screen.getByRole("button", { name: "Opus" }).closest(".catalog-row") as HTMLElement;
-    expect(builtinRow).not.toBe(copyRow);
-    expect(within(builtinRow).getByText("内置")).toBeInTheDocument();
-    expect(within(copyRow).queryByText("内置")).toBeNull();
-    // No two controls on the page share a name.
-    expect(within(builtinRow).getByRole("button", { name: "设置内置角色 Opus" })).toBeInTheDocument();
-    expect(within(copyRow).getByRole("button", { name: "设置角色 Opus" })).toBeInTheDocument();
-    expect(within(builtinRow).queryByRole("button", { name: /^删除/ })).toBeNull();
-    expect(within(copyRow).getByRole("button", { name: "删除 Opus" })).toBeInTheDocument();
-    const names = toggleNames(document.body);
-    expect(new Set(names).size).toBe(names.length);
   });
 
   it("selects a role by id, the way a skill is selected", async () => {
@@ -437,9 +422,9 @@ describe("AgentRolesPage", () => {
     const { onSettingsChange } = renderRoles();
     await user.click(screen.getByRole("button", { name: "本地审查" }));
     expect(onSettingsChange).toHaveBeenLastCalledWith({
-      agentIds: ["agent_builtin_opus", "agent_user_reviewer", "agent_workspace_local"]
+      agentIds: ["agent_user_opus", "agent_user_reviewer", "agent_workspace_local"]
     });
-    await user.click(screen.getByRole("button", { name: "Opus（内置）" }));
+    await user.click(screen.getByRole("button", { name: "Opus" }));
     expect(onSettingsChange).toHaveBeenLastCalledWith({
       agentIds: ["agent_user_reviewer", "agent_workspace_local"]
     });
@@ -459,7 +444,7 @@ describe("AgentRolesPage", () => {
 
     await user.click(toggle);
     expect(onSettingsChange).toHaveBeenLastCalledWith({
-      agentIds: ["agent_builtin_opus"]
+      agentIds: ["agent_user_opus"]
     });
     expect(screen.getByRole("button", { name: "reviewer" })).toHaveAttribute("aria-pressed", "false");
     expect(screen.getByRole("button", { name: "reviewer" }).closest(".catalog-row")).not.toHaveClass("catalog-row--on");
@@ -673,10 +658,11 @@ describe("AgentRoleEditor", () => {
       mcpIds: [],
       hookIds: [],
       webSearch: defaultAgentRoleWebSearch(),
-      templateId: null
+      templateId: null,
+      toolDescriptionFileId: null
     });
     await waitFor(() => expect(onSettingsChange).toHaveBeenLastCalledWith({
-      agentIds: ["agent_builtin_opus", "agent_user_reviewer", "agent_workspace_new"]
+      agentIds: ["agent_user_opus", "agent_user_reviewer", "agent_workspace_new"]
     }));
     expect(screen.queryByRole("dialog", { name: "新建角色" })).toBeNull();
   });
@@ -727,29 +713,122 @@ describe("AgentRoleEditor", () => {
     );
   });
 
-  it("saves a built-in as a global copy that takes the built-in's place here", async () => {
+  it("offers the tool-description file between the effort and the location, following the caller by default", async () => {
     const user = userEvent.setup();
-    const onSaveRole = saveRoleMock("agent_user_opus");
-    const { onSettingsChange } = renderRoles({ onSaveRole });
-    const dialog = await openRole(user, "Opus", true);
+    renderRoles();
+    const dialog = await openCreate(user);
 
-    expect(within(dialog).getByText(/内置角色随 Mewrk 版本更新，不能修改或删除/)).toBeInTheDocument();
-    expect(within(dialog).getByText("内置角色，随 Mewrk 版本更新")).toBeInTheDocument();
-    expect(within(dialog).queryByRole("button", { name: "保存角色" })).toBeNull();
-    await user.selectOptions(
-      within(dialog).getByRole("combobox", { name: "思考程度" }),
-      within(dialog).getByRole("option", { name: "high" })
-    );
-    await user.click(within(dialog).getByRole("button", { name: "另存为全局角色" }));
+    const select = within(dialog).getByRole("combobox", { name: "工具描述" });
+    // Follow the caller first, then the catalog's own order: both built-ins
+    // explicitly (for a role "guided" is not "follow"), then the user's file.
+    expect(within(select).getAllByRole("option").map((option) => option.textContent))
+      .toEqual(["跟随调用方", "Mewrk guided", "Mewrk concise", "main"]);
+    expect(select).toHaveValue("");
+    const effort = within(dialog).getByRole("combobox", { name: "思考程度" });
+    const location = within(dialog).getByRole("combobox", { name: "位置" });
+    expect(effort.compareDocumentPosition(select) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(select.compareDocumentPosition(location) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
 
-    expect(onSaveRole).toHaveBeenCalledWith(
-      { workspaceKey: null },
-      { ...builtinOpus.role!, effort: "high" }
+  it("saves the tool-description file the role picked, and null when it follows the caller again", async () => {
+    const user = userEvent.setup();
+    const onSaveRole = saveRoleMock("agent_user_reviewer");
+    renderRoles({ onSaveRole });
+    const dialog = await openRole(user, "reviewer");
+    const select = () => within(dialog).getByRole("combobox", { name: "工具描述" });
+    expect(select()).toHaveValue("");
+
+    await user.selectOptions(select(), within(select()).getByRole("option", { name: "Mewrk concise" }));
+    expect(select()).toHaveValue("tooldesc_builtin_concise_en_us");
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
+    expect(onSaveRole).toHaveBeenLastCalledWith(
+      { id: "agent_user_reviewer", workspaceKey: null },
+      roleBody({ toolDescriptionFileId: "tooldesc_builtin_concise_en_us" })
     );
-    // The copy takes the built-in's slot rather than being appended beside it.
-    await waitFor(() => expect(onSettingsChange).toHaveBeenLastCalledWith({
-      agentIds: ["agent_user_opus", "agent_user_reviewer"]
-    }));
+  });
+
+  it.each([
+    ["Mewrk guided", "tooldesc_builtin_en_us"],
+    ["main", "tooldesc_user_main_0f0f0f0f"]
+  ])("saves %s as the role's tool-description file by its id", async (name, id) => {
+    const user = userEvent.setup();
+    const onSaveRole = saveRoleMock("agent_user_reviewer");
+    renderRoles({ onSaveRole });
+    const dialog = await openRole(user, "reviewer");
+    const select = within(dialog).getByRole("combobox", { name: "工具描述" });
+    await user.selectOptions(select, within(select).getByRole("option", { name }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
+    expect(onSaveRole.mock.calls.at(-1)![1].toolDescriptionFileId).toBe(id);
+  });
+
+  it("sends null once a role that named a file is set back to following the caller", async () => {
+    const user = userEvent.setup();
+    const onSaveRole = saveRoleMock("agent_user_reviewer");
+    renderRoles({
+      onSaveRole,
+      catalog: catalogWith([roleResource("agent_user_reviewer", roleBody({
+        toolDescriptionFileId: "tooldesc_builtin_concise_en_us"
+      }))])
+    });
+    const dialog = await openRole(user, "reviewer");
+    const select = within(dialog).getByRole("combobox", { name: "工具描述" });
+    // An existing role opens on the file it named, not on "follow".
+    expect(select).toHaveValue("tooldesc_builtin_concise_en_us");
+
+    await user.selectOptions(select, within(select).getByRole("option", { name: "跟随调用方" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
+    expect(onSaveRole.mock.calls.at(-1)![1].toolDescriptionFileId).toBeNull();
+  });
+
+  it("keeps a tool-description file the catalog lost as an unavailable option, selected and saved as it was", async () => {
+    const user = userEvent.setup();
+    const onSaveRole = saveRoleMock("agent_user_reviewer");
+    renderRoles({
+      onSaveRole,
+      catalog: catalogWith([roleResource("agent_user_reviewer", roleBody({
+        toolDescriptionFileId: "tooldesc_user_gone_deadbeef"
+      }))])
+    });
+    const dialog = await openRole(user, "reviewer");
+    const select = within(dialog).getByRole("combobox", { name: "工具描述" });
+
+    // After the catalog's own rows, so a choice that dangles does not pass for one that exists.
+    expect(within(select).getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "跟随调用方", "Mewrk guided", "Mewrk concise", "main", "不可用：tooldesc_user_gone_deadbeef"
+    ]);
+    expect(select).toHaveValue("tooldesc_user_gone_deadbeef");
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
+    expect(onSaveRole.mock.calls.at(-1)![1].toolDescriptionFileId).toBe("tooldesc_user_gone_deadbeef");
+  });
+
+  it("draws no unavailable option for a file the catalog lists, built-in or not", async () => {
+    const user = userEvent.setup();
+    renderRoles({
+      catalog: catalogWith([roleResource("agent_user_reviewer", roleBody({
+        toolDescriptionFileId: "tooldesc_user_main_0f0f0f0f"
+      }))])
+    });
+    const dialog = await openRole(user, "reviewer");
+    const select = within(dialog).getByRole("combobox", { name: "工具描述" });
+    expect(select).toHaveValue("tooldesc_user_main_0f0f0f0f");
+    expect(within(select).getAllByRole("option")).toHaveLength(4);
+    expect(within(select).queryByRole("option", { name: /不可用/ })).toBeNull();
+  });
+
+  it("words the tool-description selector in English", async () => {
+    configureI18n("en-US");
+    const user = userEvent.setup();
+    renderRoles({
+      catalog: catalogWith([roleResource("agent_user_reviewer", roleBody({
+        toolDescriptionFileId: "tooldesc_user_gone_deadbeef"
+      }))])
+    });
+    await user.click(screen.getByRole("button", { name: "Configure role reviewer" }));
+    const dialog = screen.getByRole("dialog", { name: "reviewer" });
+    const select = within(dialog).getByRole("combobox", { name: "Tool descriptions" });
+    expect(within(select).getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "Follow the caller", "Mewrk guided", "Mewrk concise", "main", "Unavailable: tooldesc_user_gone_deadbeef"
+    ]);
   });
 
   it("refuses a name another role already has at the same level, and only there", async () => {
@@ -789,7 +868,7 @@ describe("AgentRoleEditor", () => {
     const rewritten = roleResource("agent_user_reviewer", roleBody({ description: "别处的改动" }));
     rerender(
       <RolesHarness
-        catalog={catalogWith([builtinOpus, rewritten, workspaceRole])}
+        catalog={catalogWith([globalOpus, rewritten, workspaceRole])}
         onSaveRole={onSaveRole}
         onSettingsChange={onSettingsChange}
         workspaces={WORKSPACE_A}
@@ -868,6 +947,9 @@ describe("AgentRoleEditor", () => {
     expect(within(dialog).queryByRole("switch", { name: /记忆/ })).toBeNull();
     expect(within(dialog).queryByRole("combobox", { name: "工具描述" })).toBeNull();
     expect(within(dialog).queryByRole("radiogroup", { name: "宿主消息容器" })).toBeNull();
+    // The file write guards are the calling conversation's too: a role's runs follow it.
+    expect(within(dialog).queryByRole("switch", { name: /文件防误写保护/ })).toBeNull();
+    expect(within(dialog).queryByText("启用文件防误写保护")).toBeNull();
     // The role's own answers — native on both legs, its own shaping and no
     // filter — not the conversation's Tavily, Jina, 9 results and allowlist.
     expect(within(dialog).getByRole("button", { name: "搜索提供商：原生" })).toBeInTheDocument();
@@ -1123,7 +1205,7 @@ describe("AgentRoleEditor", () => {
     // The file moved on elsewhere: the stale draft is dropped, the file wins.
     rerender(
       <RolesHarness catalog={catalogWith([
-        builtinOpus,
+        globalOpus,
         roleResource("agent_user_reviewer", roleBody({ description: "新的正文" })),
         workspaceRole
       ])} />

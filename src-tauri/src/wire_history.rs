@@ -424,7 +424,7 @@ const BACKGROUND_EVENT_HEADER_IN_HUMAN_TURN: &str = "[SYSTEM NOTIFICATION - NOT 
 const ESCAPED_REMINDER_CLOSER: &str = "&lt;/system-reminder&gt;";
 
 /// Claude Code's `c3n`: text inside a reminder cannot close it early.
-fn escape_reminder_closer(text: &str) -> String {
+pub(crate) fn escape_reminder_closer(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find('<') {

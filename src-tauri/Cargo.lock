@@ -2450,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2485,6 +2485,7 @@ dependencies = [
  "png 0.17.16",
  "portable-pty",
  "regex",
+ "regex-syntax",
  "reqwest 0.12.28",
  "resvg",
  "ring",

@@ -988,37 +988,3 @@ fn a_model_installed_with_the_budget_suffix_still_validates() {
     // keep accepting brackets.
     crate::model::validate_model_id("claude-opus-5[1m]").unwrap();
 }
-
-#[test]
-fn the_seed_rows_carry_their_table_limits_and_vision() {
-    let models = claude_agent_seed_models(&provider(ProviderFamily::ClaudeAgent, String::new()));
-    let limits = |id: &str| {
-        let model = models
-            .iter()
-            .find(|model| model.id == id)
-            .unwrap_or_else(|| panic!("种子缺少 {id}"));
-        (model.context_window, model.max_output_tokens)
-    };
-
-    assert_eq!(models.len(), CLAUDE_AGENT_SEED_MODELS.len());
-    assert_eq!(models[0].id, "claude-fable-5-1");
-    assert_eq!(models[0].name, "Claude Fable 5.1");
-    // The built-in preset's Opus and Sonnet roles are bound to these, so they have to ship.
-    assert_eq!(limits("claude-opus-5-5"), (Some(1_000_000), Some(128_000)));
-    assert_eq!(limits("claude-sonnet-5-5"), (Some(1_000_000), Some(128_000)));
-    // The catalog lists a 1M window for `claude-opus-5`; the table says 200k and wins.
-    assert_eq!(limits("claude-opus-5"), (Some(200_000), Some(128_000)));
-    assert_eq!(limits("claude-sonnet-5"), (Some(1_000_000), Some(128_000)));
-    assert_eq!(limits("claude-opus-4-1"), (Some(200_000), Some(32_000)));
-    for model in &models {
-        assert!(!model.id.contains("[1m]"), "{} 带了预算后缀", model.id);
-        assert!(
-            model
-                .capabilities
-                .contains(&ModelCapability::ImageRecognition),
-            "{} 缺少视觉输入",
-            model.id
-        );
-        assert_eq!(model.group, "claude", "{} 的分组应由 id 推出", model.id);
-    }
-}

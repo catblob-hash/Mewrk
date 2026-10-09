@@ -76,13 +76,18 @@ impl FileGuardContext<'_> {
     }
 }
 
-/// The file a successful `read`, `write` or `edit` touched, by canonical path,
-/// so the run loop can commit the read record once the result is final and
-/// re-check the file after PostToolUse hooks.
-pub(crate) struct FileGuardTouch {
+/// The file a successful `read`, `write` or `edit` touched, by canonical path
+/// (a remote file by its machine-qualified key).
+///
+/// Reported whether or not the call runs under a file guard: nested project
+/// instructions and the language servers find a remote file by it. Under a
+/// guard the run loop also commits the read record once the result is final
+/// and re-checks the file after PostToolUse hooks; without one it commits
+/// nothing.
+pub(crate) struct FileTouch {
     pub path: PathBuf,
     /// What a `read` saw; `None` for the two writers, which recorded their own
-    /// result before returning.
+    /// result before returning, and for a read made without a guard.
     pub read: Option<FileReadRecord>,
 }
 
@@ -92,7 +97,7 @@ pub(crate) struct Outcome {
     images: Vec<ImageAttachment>,
     diff: Option<String>,
     opened_file: Option<PathBuf>,
-    file_touch: Option<FileGuardTouch>,
+    file_touch: Option<FileTouch>,
 }
 
 impl Outcome {
@@ -134,7 +139,7 @@ impl Outcome {
         self
     }
 
-    fn with_file_touch(mut self, touch: Option<FileGuardTouch>) -> Self {
+    fn with_file_touch(mut self, touch: Option<FileTouch>) -> Self {
         self.file_touch = touch;
         self
     }
@@ -155,7 +160,7 @@ pub(crate) struct VerifiedToolExecutionResponse {
     pub opened_file: Option<VerifiedOpenedFile>,
     /// The file a guarded `read`/`write`/`edit` touched. Host-only, like the
     /// identity above; `None` whenever the call ran without a guard.
-    pub file_touch: Option<FileGuardTouch>,
+    pub file_touch: Option<FileTouch>,
 }
 
 /// Workspace-only execution, for tests.
@@ -2125,16 +2130,16 @@ fn run_read(
         .with_opened_file(file_path))
 }
 
-/// What a `read` hands back for the run loop to commit once the result is
-/// final, or nothing when the call runs without a guard.
+/// What a `read` hands back for the run loop: the file it read, and — under a
+/// guard — the record to commit once the result is final.
 fn read_touch(
     file_guard: Option<FileGuardContext<'_>>,
     path: &Path,
     record: FileReadRecord,
-) -> Option<FileGuardTouch> {
-    file_guard.map(|_| FileGuardTouch {
+) -> Option<FileTouch> {
+    Some(FileTouch {
         path: path.to_path_buf(),
-        read: Some(record),
+        read: file_guard.map(|_| record),
     })
 }
 
@@ -2245,7 +2250,7 @@ fn run_write(
             .map_err(|error| format!("Failed to create parent directory: {error}"))?;
     }
     write_tool_file(&file_path, content.as_bytes(), sandbox)?;
-    let touch = file_guard.map(|guard| {
+    if let Some(guard) = file_guard {
         // The model wrote every byte, so its copy is the current one.
         guard.record(
             file_path.clone(),
@@ -2255,10 +2260,10 @@ fn run_write(
                 true,
             ),
         );
-        FileGuardTouch {
-            path: file_path.clone(),
-            read: None,
-        }
+    }
+    let touch = Some(FileTouch {
+        path: file_path.clone(),
+        read: None,
     });
     let diff = before.and_then(|(before, created)| unified_diff(&path, &before, &content, created));
     Ok(Outcome::success_with_diff(
@@ -2323,7 +2328,7 @@ fn run_edit(
     let diff = unified_diff(&path, &content, &next, false);
     write_tool_file(&file_path, next.as_bytes(), sandbox)?;
     let mut note = String::new();
-    let touch = file_guard.map(|guard| {
+    if let Some(guard) = file_guard {
         // After an edit the model knows the file only if it knew it before:
         // a full read it has seen, and no other changes applied on top. A
         // stale-recovered edit or a file never read leaves it holding a copy
@@ -2341,10 +2346,10 @@ fn run_edit(
             ),
         );
         note = write_receipt_note(profile, stale_recovered);
-        FileGuardTouch {
-            path: file_path.clone(),
-            read: None,
-        }
+    }
+    let touch = Some(FileTouch {
+        path: file_path.clone(),
+        read: None,
     });
     Ok(Outcome::success_with_diff(
         format!(
@@ -3708,7 +3713,9 @@ fn shell_launch_plan(
                 ));
             }
             let candidates: Vec<String> = match kind {
-                ShellKind::PowerShell => run_environment::local_powershell_candidates(),
+                ShellKind::Pwsh | ShellKind::WindowsPowerShell => {
+                    run_environment::local_powershell_candidates(kind)
+                }
                 // Resolved to an absolute path instead of named: a bare `bash`
                 // on Windows is either the WSL launcher or nothing at all. See
                 // `run_environment::local_bash_candidates`.
@@ -3720,7 +3727,8 @@ fn shell_launch_plan(
             if candidates.is_empty() {
                 return Err(match kind {
                     ShellKind::Bash => "No native Bash was found locally. Install Git for Windows or MSYS2, or change this conversation's run environment to WSL. The System32 WSL launcher is not used as local Bash because it executes commands in another machine's filesystem and network.".into(),
-                    ShellKind::PowerShell => "No PowerShell was found locally. Install PowerShell 7 (https://aka.ms/powershell), or use the bash tool instead.".to_owned(),
+                    ShellKind::Pwsh => "No PowerShell 7 (pwsh) was found locally. Install it (https://aka.ms/powershell), or use the powershell tool, which runs Windows PowerShell 5.1.".to_owned(),
+                    ShellKind::WindowsPowerShell => "No Windows PowerShell (powershell.exe) was found locally; use another shell tool instead.".to_owned(),
                     ShellKind::Zsh | ShellKind::Sh => format!(
                         "No {} was found on this machine's PATH; use another shell tool instead",
                         kind.display_name()
@@ -3730,7 +3738,7 @@ fn shell_launch_plan(
             let mut plan_env: Vec<(String, String)> =
                 env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             let args: Vec<String> = match kind {
-                ShellKind::PowerShell => vec![
+                ShellKind::Pwsh | ShellKind::WindowsPowerShell => vec![
                     "-NoProfile".into(),
                     "-NonInteractive".into(),
                     // The execution policy gates `.ps1` files, not `-Command`, so
@@ -3827,7 +3835,7 @@ fn shell_launch_plan(
                             crate::remote_shell::ps_single_quote(workspace_root)
                         )
                     };
-                    args.push(crate::remote_shell::powershell_line(&format!(
+                    args.push(crate::remote_shell::powershell_line_in(kind, &format!(
                         "{}{enter}{}",
                         run_environment::powershell_env_prologue(env),
                         crate::shell_backend::remote_powershell_session_command(
@@ -3975,7 +3983,7 @@ pub(crate) fn spawn_shell_process(
                 // anywhere suppresses the `NO_COLOR` default rather than fighting
                 // it. `SHELL` is explicitly cleared: a POSIX shell path confuses
                 // tools that find it in a PowerShell session.
-                ShellKind::PowerShell => {
+                ShellKind::Pwsh | ShellKind::WindowsPowerShell => {
                     for (key, value) in
                         child_text_defaults(&plan.env, |name| std::env::var_os(name).is_some())
                     {
@@ -4094,7 +4102,7 @@ fn spawn_sandboxed_shell(
                 .map(|name| name.to_string_lossy().into_owned())
                 .collect();
             match kind {
-                ShellKind::PowerShell => {
+                ShellKind::Pwsh | ShellKind::WindowsPowerShell => {
                     for (key, value) in child_text_defaults(&plan.env, |name| std::env::var_os(name).is_some()) {
                         env.insert(key.into(), value.into());
                     }
@@ -4130,7 +4138,7 @@ fn spawn_sandboxed_shell(
             }
             let mut argv = vec![executable];
             match kind {
-                ShellKind::PowerShell if host_platform().is_windows() => {
+                ShellKind::Pwsh | ShellKind::WindowsPowerShell if host_platform().is_windows() => {
                     let root = canonical_workspace(Path::new(workspace_root))?;
                     let mut args = plan.args;
                     if let Some(script) = args.last_mut() {
@@ -6830,7 +6838,7 @@ mod tests {
             );
             assert!(!refused.success, "{}", refused.output);
             assert!(
-                refused.output.contains("has no PowerShell"),
+                refused.output.contains("has no Windows PowerShell"),
                 "{}",
                 refused.output
             );
@@ -7121,9 +7129,10 @@ mod tests {
             }
         }
 
+        for edition in [ShellKind::Pwsh, ShellKind::WindowsPowerShell] {
         match shell_launch_plan(
             &workspace.path().to_string_lossy(),
-            ShellKind::PowerShell,
+            edition,
             None,
             "echo hi",
             &runner,
@@ -7144,20 +7153,27 @@ mod tests {
                 );
                 assert_eq!(ps.args[5], powershell_tool_script("echo hi", &cwd_file));
                 assert_eq!(ps.args.len(), 6);
-                // PowerShell 7 is preferred and Windows PowerShell 5.1 is last:
-                // 5.1 is the one that reads BOM-less UTF-8 files as ANSI.
-                let first = ps
-                    .candidates
-                    .first()
-                    .expect("a candidate")
-                    .to_ascii_lowercase();
-                assert!(
-                    first.contains("pwsh") || ps.candidates.len() == 1,
-                    "{first}"
-                );
+                // Each edition runs only its own program: a `pwsh` call
+                // never falls back to 5.1, nor a `powershell` call to 7.
+                for candidate in &ps.candidates {
+                    let name = candidate
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap()
+                        .to_ascii_lowercase();
+                    let expected = match edition {
+                        ShellKind::Pwsh => ["pwsh", "pwsh.exe"],
+                        _ => ["powershell", "powershell.exe"],
+                    };
+                    assert!(expected.contains(&name.as_str()), "{edition:?}: {candidate}");
+                }
             }
             Err(error) if host_platform().is_windows() => {
-                assert!(error.contains("No PowerShell was found"), "{error}");
+                assert!(error.contains("was found locally"), "{error}");
+                match edition {
+                    ShellKind::Pwsh => assert!(error.contains("PowerShell 7"), "{error}"),
+                    _ => assert!(error.contains("Windows PowerShell"), "{error}"),
+                }
             }
             Err(error) => {
                 // A Mac or Linux host is a POSIX workspace: the refusal names
@@ -7168,6 +7184,7 @@ mod tests {
                     "{error}"
                 );
             }
+        }
         }
     }
 
@@ -7294,7 +7311,7 @@ mod tests {
         assert!(!refused.success);
         assert_eq!(
             refused.output,
-            "Line 1 alone is 70 KB, more than one read can return. Use grep to find the part you need."
+            "Line 1 alone is 70 KB, more than one read can return. Search the file for the part you need instead."
         );
     }
 
@@ -7714,16 +7731,18 @@ mod tests {
         assert_eq!(plan.env, vec![("WSL_UTF8".to_owned(), "1".to_owned())]);
         assert!(!plan.local_hardening);
 
-        let error = shell_launch_plan(
-            &workspace.path().to_string_lossy(),
-            ShellKind::PowerShell,
-            None,
-            "echo hi",
-            &runner,
-            bare,
-        )
-        .unwrap_err();
-        assert!(error.contains("powershell") && error.contains("WSL"), "{error}");
+        for edition in [ShellKind::Pwsh, ShellKind::WindowsPowerShell] {
+            let error = shell_launch_plan(
+                &workspace.path().to_string_lossy(),
+                edition,
+                None,
+                "echo hi",
+                &runner,
+                bare,
+            )
+            .unwrap_err();
+            assert!(error.contains(edition.tool_name()) && error.contains("WSL"), "{error}");
+        }
 
         // zsh and sh reach the distribution the same way, each with its own
         // no-startup-files flags.
@@ -7930,19 +7949,25 @@ mod tests {
         );
 
         // A Windows machine's PowerShell travels base64-encoded, which its
-        // login shell — cmd.exe or PowerShell — passes through untouched.
-        let plan = shell_launch_plan(
-            &workspace.path().to_string_lossy(),
-            ShellKind::PowerShell,
-            None,
-            "Get-Location",
-            &runner,
-            bare,
-        )
-        .unwrap();
-        let line = plan.args.last().unwrap();
-        assert!(line.starts_with("powershell -NoLogo"), "{line}");
-        assert!(line.contains("-EncodedCommand "), "{line}");
+        // login shell — cmd.exe or PowerShell — passes through untouched, and
+        // runs in the edition the tool names.
+        for (edition, program) in [
+            (ShellKind::Pwsh, "pwsh"),
+            (ShellKind::WindowsPowerShell, "powershell"),
+        ] {
+            let plan = shell_launch_plan(
+                &workspace.path().to_string_lossy(),
+                edition,
+                None,
+                "Get-Location",
+                &runner,
+                bare,
+            )
+            .unwrap();
+            let line = plan.args.last().unwrap();
+            assert!(line.starts_with(&format!("{program} -NoLogo")), "{line}");
+            assert!(line.contains("-EncodedCommand "), "{line}");
+        }
     }
 
     /// Configured variables must reach local commands. What the host no longer
@@ -9513,11 +9538,18 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(read.file_touch.is_none());
+        // The touch still names the file — nested instructions and language
+        // servers go by it — but there is no record for it to land in.
+        let touch = read.file_touch.expect("the read names the file it read");
+        assert!(touch.read.is_none());
+        let canonical = touch.path;
         let edit = object(json!({ "path": "a.txt", "find": "alpha", "replace": "beta" }));
         let edited = run_edit(directory.path(), &edit, &scope, &profile, None, None).unwrap();
+        // No read-first gate, and no guard note on the receipt.
         assert_eq!(edited.output, "ok");
-        assert!(edited.file_touch.is_none());
+        let touch = edited.file_touch.expect("the edit names the file it wrote");
+        assert_eq!(touch.path, canonical);
+        assert!(touch.read.is_none());
     }
 
     #[test]
@@ -9582,7 +9614,7 @@ mod tests {
         assert!(hint.starts_with("[This command modified 7 file(s)"), "{hint}");
         assert!(hint.contains("a.txt, b.txt, c.txt, d.txt, e.txt and 2 more"), "{hint}");
         assert!(!hint.contains("untouched"), "{hint}");
-        assert!(hint.ends_with("Call read before editing.]"), "{hint}");
+        assert!(hint.ends_with("Read them again before editing.]"), "{hint}");
         assert!(
             stale_read_hint(Some(guard), workspace, "cargo test", started, &profile).is_none(),
             "only formatter-looking commands hint"

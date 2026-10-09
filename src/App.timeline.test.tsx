@@ -75,7 +75,7 @@ describe("App model run flow — timeline", () => {
       enabledTools: document.tools.map((tool) => tool.name)
     }));
     expect(request.tools.map((tool) => tool.name)).toEqual(document.tools.map((tool) => tool.name));
-    expect(request.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(["ls", "powershell", "bash"]));
+    expect(request.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(["ls", "pwsh", "powershell", "bash"]));
     expect(request.tools.find((tool) => tool.name === "ls")?.parameters[0].defaultValue).toBe(".");
     // The renderer never produces tool descriptions. Assert an empty string rather than equality with the seed, which could make matching defects pass.
     expect(request.tools.find((tool) => tool.name === "ls")?.description).toBe("");

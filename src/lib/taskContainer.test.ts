@@ -691,19 +691,22 @@ describe("deriveTaskItems", () => {
       terminals: [],
       shellTasks: [
         shellTask(),
-        shellTask({ shellTaskId: "shell-2", toolName: "powershell", command: "Get-Process" })
+        shellTask({ shellTaskId: "shell-2", toolName: "powershell", command: "Get-Process" }),
+        shellTask({ shellTaskId: "shell-3", toolName: "pwsh", command: "Get-Process" })
       ],
       now: NOW
     }, messages);
 
-    expect(items.map((item) => item.kind)).toEqual(["shell", "shell"]);
-    expect(items.map((item) => item.id)).toEqual(["shell-1", "shell-2"]);
+    expect(items.map((item) => item.kind)).toEqual(["shell", "shell", "shell"]);
+    expect(items.map((item) => item.id)).toEqual(["shell-1", "shell-2", "shell-3"]);
     // The row says which tool and which command without the user opening it.
     expect(items[0]!.label).toBe("bash");
     expect(items[0]!.detail).toBe("npm install");
+    // The two PowerShell editions are told apart by their tool name.
     expect(items[1]!.label).toBe("powershell");
+    expect(items[2]!.label).toBe("pwsh");
     expect(items.every((item) => item.state === "running")).toBe(true);
-    expect(runningTaskItems(items)).toHaveLength(2);
+    expect(runningTaskItems(items)).toHaveLength(3);
     expect(finishedTaskItems(items)).toHaveLength(0);
   });
 
@@ -936,18 +939,21 @@ describe("deriveTaskItems", () => {
       // A row recorded before the host kept its directory falls back to the workspace root.
       shellTask({ shellTaskId: "shell-2", toolName: "powershell", workspaceRoot: "C:\\src\\api" }),
       // And one recorded before either has only its shell.
-      shellTask({ shellTaskId: "shell-3", workspaceRoot: null })
+      shellTask({ shellTaskId: "shell-3", workspaceRoot: null }),
+      shellTask({ shellTaskId: "shell-4", toolName: "pwsh", workspaceRoot: "C:\\src\\web" })
     ];
     const items = deriveTaskItems({ agents: [], terminals: [], shellTasks, now: NOW }, messages);
     expect(items.map((item) => item.label)).toEqual([
       "bash:/Users/me/web/src",
       "powershell:C:\\src\\api",
-      "bash"
+      "bash",
+      "pwsh:C:\\src\\web"
     ]);
     expect(items.map((item) => item.kind === "shell" && shellTaskTitle(item.shell))).toEqual([
       "bash:/Users/me/web/src",
       "powershell:C:\\src\\api",
-      "bash"
+      "bash",
+      "pwsh:C:\\src\\web"
     ]);
     // The command stays the detail.
     expect(items[0]!.detail).toBe("npm install");

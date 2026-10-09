@@ -8,6 +8,7 @@ import type {
   SearchProviderSelection,
   ToolLockRequest
 } from "../types";
+import { fileWriteGuardsEnabledOf } from "./fileWriteGuards";
 import { hostMessageContainerOf } from "./hostMessages";
 import { appendsTools } from "./modelCapabilities";
 import { familySupportsNativeFetch } from "./webSearch";
@@ -68,11 +69,18 @@ export const EMPTY_TOOL_LOCK: ConversationToolLock = {
   modelRequests: [],
   hookIds: null,
   promptProfile: null,
-  hostMessageContainer: null
+  hostMessageContainer: null,
+  fileWriteGuards: null
 };
 
 /** The built-in prompt profile's id; a conversation that selects none uses it. */
 export const BUILTIN_PROMPT_PROFILE_ID = "tooldesc_builtin_en_us";
+
+/**
+ * The built-in concise prompt profile's id, the one the built-in preset selects.
+ * Mirrors `prompt_profile::BUILTIN_CONCISE_EN_US_ID` in `src-tauri`.
+ */
+export const BUILTIN_CONCISE_PROMPT_PROFILE_ID = "tooldesc_builtin_concise_en_us";
 
 /** The prompt profile these settings word their requests with. */
 function promptProfileOf(settings: ConversationSettings): string {
@@ -151,7 +159,8 @@ export function toolLockOf(settings: ConversationSettings): ConversationToolLock
       : lastRequest ? [lastRequest] : [],
     hookIds: lock.hookIds ?? null,
     promptProfile: lock.promptProfile ?? null,
-    hostMessageContainer: lock.hostMessageContainer ?? null
+    hostMessageContainer: lock.hostMessageContainer ?? null,
+    fileWriteGuards: typeof lock.fileWriteGuards === "boolean" ? lock.fileWriteGuards : null
   };
 }
 
@@ -202,7 +211,10 @@ function toolExposureOf(
     promptProfile: promptProfileOf(settings),
     /* Not a tool, but `box` is declared only for it, and every host message
        the transcript holds is projected in it. */
-    hostMessageContainer: hostMessageContainerOf(settings)
+    hostMessageContainer: hostMessageContainerOf(settings),
+    /* Not a tool either, but the `edit` and `write` descriptions carry the guard
+       rules only while it is on, and those sit in the cached prefix. */
+    fileWriteGuards: fileWriteGuardsEnabledOf(settings)
   };
 }
 
@@ -240,7 +252,8 @@ function nextToolLock(
     modelRequests: withModelRequest(lock.modelRequests, lastRequest),
     hookIds: [...new Set(exposure.hookIds ?? [])],
     promptProfile: exposure.promptProfile,
-    hostMessageContainer: exposure.hostMessageContainer
+    hostMessageContainer: exposure.hostMessageContainer,
+    fileWriteGuards: exposure.fileWriteGuards
   };
 }
 
@@ -323,7 +336,8 @@ function sameToolLock(left: ConversationToolLock, right: ConversationToolLock): 
     && left.modelRequests.every((item) => right.modelRequests.some((other) => sameRequest(item, other)))
     && sameIdList(left.hookIds, right.hookIds)
     && left.promptProfile === right.promptProfile
-    && left.hostMessageContainer === right.hostMessageContainer;
+    && left.hostMessageContainer === right.hostMessageContainer
+    && left.fileWriteGuards === right.fileWriteGuards;
 }
 
 function sameRequest(left: ToolLockRequest | null, right: ToolLockRequest | null): boolean {
@@ -466,6 +480,8 @@ export function modelCacheWarmUntil(
  * - `hostMessages`: either way rewrites the prefix — every host message the
  *   transcript holds is projected again in the other container, and `box` is
  *   declared or dropped with it.
+ * - `fileWriteGuards`: either way rewrites the prefix — the `edit` and `write`
+ *   descriptions gain or lose the guard rules with the switch.
  */
 export type LockedSettingKind =
   | "tool"
@@ -477,7 +493,8 @@ export type LockedSettingKind =
   | "discovery"
   | "hook"
   | "profile"
-  | "hostMessages";
+  | "hostMessages"
+  | "fileWriteGuards";
 
 /**
  * The one tone the lock draws: orange, a warning that the change throws a warm
@@ -494,7 +511,8 @@ const EITHER_WAY: ReadonlySet<LockedSettingKind> = new Set([
   "discovery",
   "hook",
   "profile",
-  "hostMessages"
+  "hostMessages",
+  "fileWriteGuards"
 ]);
 
 /** The kinds that are no part of the tool surface, whose additions no model folds into the declared list. */
@@ -541,6 +559,21 @@ export function hostMessageContainerTone(state: ToolLockState, settings: Convers
     state,
     "hostMessages",
     state.lock.hostMessageContainer === hostMessageContainerOf(settings),
+    true
+  );
+}
+
+/**
+ * How the file-write-guards switch is drawn: orange while the cache is warm and
+ * it still stands where the last request had it. A lock from before the switch
+ * was recorded knows nothing to protect.
+ */
+export function fileWriteGuardsTone(state: ToolLockState, settings: ConversationSettings): LockTone | null {
+  if (state.lock.fileWriteGuards === null) return null;
+  return lockTone(
+    state,
+    "fileWriteGuards",
+    state.lock.fileWriteGuards === fileWriteGuardsEnabledOf(settings),
     true
   );
 }
@@ -667,9 +700,16 @@ export function restoreLockedSettings(
     && lock.hostMessageContainer !== hostMessageContainerOf(settings)
     ? { hostMessageContainer: lock.hostMessageContainer }
     : {};
+  /* The guards go back the same way: their rules sit in the cached `edit` and
+     `write` descriptions, so the lock holds them whenever it recorded a value. */
+  const guards: Partial<ConversationSettings> = lock.fileWriteGuards !== null
+    && lock.fileWriteGuards !== fileWriteGuardsEnabledOf(settings)
+    ? { fileWriteGuardsEnabled: lock.fileWriteGuards }
+    : {};
   const next: ConversationSettings = {
     ...settings,
     ...container,
+    ...guards,
     enabledTools: whole ? [...lock.tools] : union(settings.enabledTools, lock.tools),
     mcpIds: [...lock.mcpIds],
     globalMemoryEnabled: lock.globalMemory,
@@ -709,7 +749,8 @@ function sameSurface(left: ConversationSettings, right: ConversationSettings): b
     && left.webSearch === right.webSearch
     && sameIdSet(left.hookIds, right.hookIds)
     && promptProfileOf(left) === promptProfileOf(right)
-    && hostMessageContainerOf(left) === hostMessageContainerOf(right);
+    && hostMessageContainerOf(left) === hostMessageContainerOf(right)
+    && fileWriteGuardsEnabledOf(left) === fileWriteGuardsEnabledOf(right);
 }
 
 /** The selection lists a dangling row can belong to. */
@@ -813,6 +854,9 @@ export function lockTouch(
   }
   if (hostMessageContainerOf(before) !== hostMessageContainerOf(after)) {
     note(hostMessageContainerTone(state, before));
+  }
+  if (fileWriteGuardsEnabledOf(before) !== fileWriteGuardsEnabledOf(after)) {
+    note(fileWriteGuardsTone(state, before));
   }
   const legs: Array<[WebBackendLeg, SearchProviderSelection | FetchProviderSelection, SearchProviderSelection | FetchProviderSelection]> = [
     ["search", before.webSearch.provider, after.webSearch.provider],

@@ -859,7 +859,7 @@ mod tests {
             .unwrap();
         assert_eq!(setup.status, Some(0), "{}", setup.stderr);
         let root = String::from_utf8_lossy(&setup.stdout).trim().to_owned();
-        let powershell = runner(AgentShell::new(ShellBackend::PowerShell, "powershell.exe"));
+        let powershell = runner(AgentShell::new(ShellBackend::WindowsPowerShell, "powershell.exe"));
 
         let through_bash = workspace_snapshot(&bash, "ssh:e2e", &root)
             .unwrap()
@@ -1050,7 +1050,7 @@ mod tests {
         let host =
             std::env::var("MEWRK_E2E_SSH_WINDOWS_HOST").expect("MEWRK_E2E_SSH_WINDOWS_HOST");
         let powershell = ShellRunner::Ssh {
-            agent_shell: AgentShell::new(ShellBackend::PowerShell, "powershell.exe"),
+            agent_shell: AgentShell::new(ShellBackend::WindowsPowerShell, "powershell.exe"),
             host,
             port: std::env::var("MEWRK_E2E_SSH_PORT")
                 .ok()

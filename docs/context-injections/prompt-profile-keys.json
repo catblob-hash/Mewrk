@@ -1,5 +1,5 @@
 {
-  "keyCount": 282,
+  "keyCount": 421,
   "keys": [
     {
       "description": "Frame of the environment block at the head of the host system prompt: the heading and the sentence introducing the fact list. `{facts}` is the list, one ` - ` item per `system.environment.*` line. Emptying this key removes the whole block, facts included.",
@@ -160,6 +160,13 @@
       ]
     },
     {
+      "description": "`system.skill_added_trigger` for a skill whose `SKILL.md` gives no description to use as its trigger: the skill is still announced, since the `skill` tool serves it, but with no trigger to fill a `{trigger}` slot.",
+      "id": "system.skill_added_untriggered",
+      "placeholders": [
+        "name"
+      ]
+    },
+    {
       "description": "One row of the MCP-server or hook list in the system prompt.",
       "id": "system.capability_row",
       "placeholders": [
@@ -230,8 +237,43 @@
       "placeholders": []
     },
     {
+      "description": "Description of `ls`'s `path` parameter.",
+      "id": "tool.ls.param.path",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ls`'s `depth` parameter.",
+      "id": "tool.ls.param.depth",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `grep` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `grep` overrides this key.",
       "id": "tool.grep.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `grep`'s `pattern` parameter.",
+      "id": "tool.grep.param.pattern",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `grep`'s `path` parameter.",
+      "id": "tool.grep.param.path",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `grep`'s `case_sensitive` parameter.",
+      "id": "tool.grep.param.case_sensitive",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `grep`'s `limit` parameter.",
+      "id": "tool.grep.param.limit",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `grep`'s `offset` parameter.",
+      "id": "tool.grep.param.offset",
       "placeholders": []
     },
     {
@@ -240,8 +282,48 @@
       "placeholders": []
     },
     {
-      "description": "Root description of the `read` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `read` overrides this key.",
+      "description": "Description of `find`'s `query` parameter.",
+      "id": "tool.find.param.query",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `find`'s `path` parameter.",
+      "id": "tool.find.param.path",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `read` schema for a model that takes images: it reads text files and shows images, the standard variant (see `tool_surface`). A profile's `tools[].description` for `read` overrides this key.",
       "id": "tool.read.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `read`'s `path` parameter.",
+      "id": "tool.read.param.path",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `read`'s `start_line` parameter.",
+      "id": "tool.read.param.start_line",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `read`'s `end_line` parameter.",
+      "id": "tool.read.param.end_line",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `read` schema in its `text_only` variant (see `tool_surface`): offered to a model that does not take images, so it reads text files and refuses an image. A profile's `tools[].description` for `read` with `variant: \"text_only\"` overrides this key.",
+      "id": "tool.read.text_only.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `read`'s `start_line` parameter in the `text_only` variant.",
+      "id": "tool.read.text_only.param.start_line",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `read`'s `end_line` parameter in the `text_only` variant.",
+      "id": "tool.read.text_only.param.end_line",
       "placeholders": []
     },
     {
@@ -250,53 +332,191 @@
       "placeholders": []
     },
     {
-      "description": "Root description of the `write` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `write` overrides this key.",
+      "description": "Description of `lsp`'s `operation` parameter.",
+      "id": "tool.lsp.param.operation",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `lsp`'s `filePath` parameter.",
+      "id": "tool.lsp.param.file_path",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `lsp`'s `line` parameter.",
+      "id": "tool.lsp.param.line",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `lsp`'s `character` parameter.",
+      "id": "tool.lsp.param.character",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `lsp`'s `query` parameter.",
+      "id": "tool.lsp.param.query",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `write` schema while the conversation's file write guards are on: an existing file has to have been read in this conversation first, the standard variant (see `tool_surface`). A profile's `tools[].description` for `write` overrides this key.",
       "id": "tool.write.description",
       "placeholders": []
     },
     {
-      "description": "Root description of the `edit` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `edit` overrides this key.",
+      "description": "Root description of the `write` schema in its `unguarded` variant (see `tool_surface`): offered while the conversation's file write guards are off, so nothing has to have been read first and nothing is refused as stale. A profile's `tools[].description` for `write` with `variant: \"unguarded\"` overrides this key.",
+      "id": "tool.write.unguarded.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `write`'s `path` parameter.",
+      "id": "tool.write.param.path",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `write`'s `content` parameter.",
+      "id": "tool.write.param.content",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `edit` schema while the conversation's file write guards are on: the file has to have been read in this conversation first, the standard variant (see `tool_surface`). A profile's `tools[].description` for `edit` overrides this key.",
       "id": "tool.edit.description",
       "placeholders": []
     },
     {
-      "description": "Sentence appended to the `edit` description while the read-before-write guard is on: the file must have been `read` in this conversation first.",
-      "id": "tool.edit.read_first",
+      "description": "Root description of the `edit` schema in its `unguarded` variant (see `tool_surface`): offered while the conversation's file write guards are off, so nothing has to have been read first and nothing is refused as stale. A profile's `tools[].description` for `edit` with `variant: \"unguarded\"` overrides this key.",
+      "id": "tool.edit.unguarded.description",
       "placeholders": []
     },
     {
-      "description": "Sentence appended to the `write` description while the read-before-write guard is on: an existing file must have been `read` in this conversation first.",
-      "id": "tool.write.read_first",
+      "description": "Description of `edit`'s `path` parameter.",
+      "id": "tool.edit.param.path",
       "placeholders": []
     },
     {
-      "description": "Sentence appended to the `agent_spawn` and `workflow` descriptions on a model that takes asynchronous tool calls, where both are declared asynchronous: the call returns nothing at first, and the task's result arrives later as the call's own output.",
-      "id": "tool.async_result",
+      "description": "Description of `edit`'s `find` parameter.",
+      "id": "tool.edit.param.find",
       "placeholders": []
     },
     {
-      "description": "Root description of the `powershell` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `powershell` overrides this key.",
+      "description": "Description of `edit`'s `replace` parameter.",
+      "id": "tool.edit.param.replace",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `edit`'s `replace_all` parameter.",
+      "id": "tool.edit.param.replace_all",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `pwsh` schema (PowerShell 7) in a top-level run: a background command outlives the turn and wakes an idle conversation, the standard variant (see `tool_surface`). A profile's `tools[].description` for `pwsh` overrides this key.",
+      "id": "tool.pwsh.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `pwsh` schema (PowerShell 7) in its `child` variant (see `tool_surface`): offered to a child agent, whose background commands are stopped when it gives its final reply. A profile's `tools[].description` for `pwsh` with `variant: \"child\"` overrides this key.",
+      "id": "tool.pwsh.child.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `pwsh`'s `command` parameter.",
+      "id": "tool.pwsh.param.command",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `powershell` schema (Windows PowerShell 5.1) in a top-level run: a background command outlives the turn and wakes an idle conversation, the standard variant (see `tool_surface`). A profile's `tools[].description` for `powershell` overrides this key.",
       "id": "tool.powershell.description",
       "placeholders": []
     },
     {
-      "description": "Root description of the `bash` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `bash` overrides this key.",
+      "description": "Root description of the `powershell` schema (Windows PowerShell 5.1) in its `child` variant (see `tool_surface`): offered to a child agent, whose background commands are stopped when it gives its final reply. A profile's `tools[].description` for `powershell` with `variant: \"child\"` overrides this key.",
+      "id": "tool.powershell.child.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `powershell`'s `command` parameter.",
+      "id": "tool.powershell.param.command",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `bash` schema in a top-level run: a background command outlives the turn and wakes an idle conversation, the standard variant (see `tool_surface`). A profile's `tools[].description` for `bash` overrides this key.",
       "id": "tool.bash.description",
       "placeholders": []
     },
     {
-      "description": "Root description of the `zsh` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `zsh` overrides this key.",
+      "description": "Root description of the `bash` schema in its `child` variant (see `tool_surface`): offered to a child agent, whose background commands are stopped when it gives its final reply. A profile's `tools[].description` for `bash` with `variant: \"child\"` overrides this key.",
+      "id": "tool.bash.child.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `bash`'s `command` parameter.",
+      "id": "tool.bash.param.command",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `zsh` schema in a top-level run: a background command outlives the turn and wakes an idle conversation, the standard variant (see `tool_surface`). A profile's `tools[].description` for `zsh` overrides this key.",
       "id": "tool.zsh.description",
       "placeholders": []
     },
     {
-      "description": "Root description of the `sh` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `sh` overrides this key.",
+      "description": "Root description of the `zsh` schema in its `child` variant (see `tool_surface`): offered to a child agent, whose background commands are stopped when it gives its final reply. A profile's `tools[].description` for `zsh` with `variant: \"child\"` overrides this key.",
+      "id": "tool.zsh.child.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `zsh`'s `command` parameter.",
+      "id": "tool.zsh.param.command",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `sh` schema in a top-level run: a background command outlives the turn and wakes an idle conversation, the standard variant (see `tool_surface`). A profile's `tools[].description` for `sh` overrides this key.",
       "id": "tool.sh.description",
       "placeholders": []
     },
     {
-      "description": "Root description of the `web_search` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `web_search` overrides this key.",
+      "description": "Root description of the `sh` schema in its `child` variant (see `tool_surface`): offered to a child agent, whose background commands are stopped when it gives its final reply. A profile's `tools[].description` for `sh` with `variant: \"child\"` overrides this key.",
+      "id": "tool.sh.child.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `sh`'s `command` parameter.",
+      "id": "tool.sh.param.command",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `description` parameter the shell tools (`pwsh`, `powershell`, `bash`, `zsh`, `sh`) share: what the one-sentence summary of a command should say.",
+      "id": "tool.shell.param.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `timeout` parameter the shell tools share; `{default_ms}` and `{max_ms}` are the default and the ceiling in milliseconds.",
+      "id": "tool.shell.param.timeout",
+      "placeholders": [
+        "default_ms",
+        "max_ms"
+      ]
+    },
+    {
+      "description": "Description of the `run_in_background` parameter the shell tools share.",
+      "id": "tool.shell.param.run_in_background",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `run_in_background` parameter the shell tools share, in their `child` variant: a background command ends with the child's final reply.",
+      "id": "tool.shell.child.param.run_in_background",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `web_search` schema answered by a search provider: the result is a list whose entries carry citable ids, the standard variant (see `tool_surface`). A profile's `tools[].description` for `web_search` overrides this key.",
       "id": "tool.web_search.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `web_search` schema in its `native` variant (see `tool_surface`): offered when the conversation's own model runs the search, so the result is its written report and the sites it consulted, with no ids. A profile's `tools[].description` for `web_search` with `variant: \"native\"` overrides this key.",
+      "id": "tool.web_search.native.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `web_search`'s `query` parameter.",
+      "id": "tool.web_search.param.query",
       "placeholders": []
     },
     {
@@ -305,9 +525,36 @@
       "placeholders": []
     },
     {
+      "description": "Description of `web_fetch`'s `urls` parameter.",
+      "id": "tool.web_fetch.param.urls",
+      "placeholders": []
+    },
+    {
+      "description": "Description of each element of `web_fetch`'s `urls` parameter.",
+      "id": "tool.web_fetch.param.urls.item",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `preview_start` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_start` overrides this key.",
       "id": "tool.preview_start.description",
       "placeholders": []
+    },
+    {
+      "description": "Description of `preview_start`'s `name` parameter.",
+      "id": "tool.preview_start.param.name",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `serverId` parameter of the preview tools that act on the conversation's page (every `preview_*` tool except `preview_start`, `preview_stop`, `preview_logs` and `preview_list`).",
+      "id": "tool.preview.param.server_id",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `serverId` parameter of the preview tools that address one dev server by its launch.json name (`preview_stop`, `preview_logs`); `{description}` is the lead phrase the tool gives it.",
+      "id": "tool.preview.param.named_server_id",
+      "placeholders": [
+        "description"
+      ]
     },
     {
       "description": "Root description of the `preview_stop` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_stop` overrides this key.",
@@ -325,13 +572,43 @@
       "placeholders": []
     },
     {
+      "description": "Description of `preview_logs`'s `level` parameter.",
+      "id": "tool.preview_logs.param.level",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_logs`'s `lines` parameter.",
+      "id": "tool.preview_logs.param.lines",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_logs`'s `search` parameter.",
+      "id": "tool.preview_logs.param.search",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `preview_console_logs` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_console_logs` overrides this key.",
       "id": "tool.preview_console_logs.description",
       "placeholders": []
     },
     {
+      "description": "Description of `preview_console_logs`'s `level` parameter.",
+      "id": "tool.preview_console_logs.param.level",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_console_logs`'s `lines` parameter.",
+      "id": "tool.preview_console_logs.param.lines",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `preview_screenshot` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_screenshot` overrides this key.",
       "id": "tool.preview_screenshot.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_screenshot`'s `scale` parameter.",
+      "id": "tool.preview_screenshot.param.scale",
       "placeholders": []
     },
     {
@@ -345,8 +622,33 @@
       "placeholders": []
     },
     {
+      "description": "Description of `preview_inspect`'s `selector` parameter.",
+      "id": "tool.preview_inspect.param.selector",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_inspect`'s `styles` parameter.",
+      "id": "tool.preview_inspect.param.styles",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `preview_click` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_click` overrides this key.",
       "id": "tool.preview_click.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_click`'s `selector` parameter.",
+      "id": "tool.preview_click.param.selector",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_click`'s `uid` parameter.",
+      "id": "tool.preview_click.param.uid",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_click`'s `doubleClick` parameter.",
+      "id": "tool.preview_click.param.double_click",
       "placeholders": []
     },
     {
@@ -355,8 +657,28 @@
       "placeholders": []
     },
     {
+      "description": "Description of `preview_fill`'s `selector` parameter.",
+      "id": "tool.preview_fill.param.selector",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_fill`'s `uid` parameter.",
+      "id": "tool.preview_fill.param.uid",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_fill`'s `value` parameter.",
+      "id": "tool.preview_fill.param.value",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `preview_eval` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_eval` overrides this key.",
       "id": "tool.preview_eval.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_eval`'s `expression` parameter.",
+      "id": "tool.preview_eval.param.expression",
       "placeholders": []
     },
     {
@@ -365,8 +687,38 @@
       "placeholders": []
     },
     {
+      "description": "Description of `preview_network`'s `filter` parameter.",
+      "id": "tool.preview_network.param.filter",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_network`'s `requestId` parameter.",
+      "id": "tool.preview_network.param.request_id",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `preview_resize` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_resize` overrides this key.",
       "id": "tool.preview_resize.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_resize`'s `preset` parameter.",
+      "id": "tool.preview_resize.param.preset",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_resize`'s `width` parameter.",
+      "id": "tool.preview_resize.param.width",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_resize`'s `height` parameter.",
+      "id": "tool.preview_resize.param.height",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_resize`'s `colorScheme` parameter.",
+      "id": "tool.preview_resize.param.color_scheme",
       "placeholders": []
     },
     {
@@ -375,18 +727,113 @@
       "placeholders": []
     },
     {
+      "description": "Description of `preview_upload_image`'s `image_id` parameter.",
+      "id": "tool.preview_upload_image.param.image_id",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_upload_image`'s `selector` parameter.",
+      "id": "tool.preview_upload_image.param.selector",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_upload_image`'s `filename` parameter.",
+      "id": "tool.preview_upload_image.param.filename",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `preview_dialog` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_dialog` overrides this key.",
       "id": "tool.preview_dialog.description",
       "placeholders": []
     },
     {
-      "description": "Root description of the `agent_spawn` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `agent_spawn` overrides this key.",
+      "description": "Description of `preview_dialog`'s `accept` parameter.",
+      "id": "tool.preview_dialog.param.accept",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `preview_dialog`'s `prompt_text` parameter.",
+      "id": "tool.preview_dialog.param.prompt_text",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `agent_spawn` schema on a model without asynchronous tool calls: the call answers with a dispatch receipt, and the result comes later through `task_wait` or a host notification, the standard variant (see `tool_surface`). A profile's `tools[].description` for `agent_spawn` overrides this key.",
       "id": "tool.agent_spawn.description",
       "placeholders": []
     },
     {
-      "description": "Root description of the `task_wait` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `task_wait` overrides this key.",
+      "description": "Root description of the `agent_spawn` schema in its `async` variant (see `tool_surface`): offered to a model that takes asynchronous tool calls, where the call is declared asynchronous, returns nothing at first, and the child's result arrives later as its own output. A profile's `tools[].description` for `agent_spawn` with `variant: \"async\"` overrides this key.",
+      "id": "tool.agent_spawn.async.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `agent_spawn`'s `prompt` parameter.",
+      "id": "tool.agent_spawn.param.prompt",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `agent_spawn`'s `agent_type` parameter in the static schema, which the model sees only when the conversation's roles could not be read for the request (`api::role_policy` unknown): no names are listed, and a name is checked when the child is spawned. Once roles are known the parameter carries `tool.agent_spawn.param.agent_type_roles` and an enum instead, or is removed when there are none.",
+      "id": "tool.agent_spawn.param.agent_type",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `agent_spawn`'s `agent_type` parameter when the conversation has roles and the schema lists them as an enum.",
+      "id": "tool.agent_spawn.param.agent_type_roles",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `agent_spawn`'s `name` parameter.",
+      "id": "tool.agent_spawn.param.name",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `agent_spawn`'s `label` parameter.",
+      "id": "tool.agent_spawn.param.label",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `agent_spawn`'s `context` parameter.",
+      "id": "tool.agent_spawn.param.context",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `agent_spawn`'s `schema` parameter.",
+      "id": "tool.agent_spawn.param.schema",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `task_wait` schema in a top-level run, the standard variant (see `tool_surface`). A profile's `tools[].description` for `task_wait` overrides this key.",
       "id": "tool.task_wait.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `task_wait` schema in its `child` variant (see `tool_surface`): offered to a child agent, which has background commands, terminals and pages to wait on but no children or workflows, and whose commands still running at its final reply are stopped. A profile's `tools[].description` for `task_wait` with `variant: \"child\"` overrides this key.",
+      "id": "tool.task_wait.child.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `task_wait`'s `tasks` parameter.",
+      "id": "tool.task_wait.param.tasks",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `task_wait`'s `tasks` parameter in the `child` variant: what an omitted list waits for in a child agent, which has no children or workflows.",
+      "id": "tool.task_wait.child.param.tasks",
+      "placeholders": []
+    },
+    {
+      "description": "Description of each element of `task_wait`'s `tasks` parameter.",
+      "id": "tool.task_wait.param.tasks.item",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `task_wait`'s `timeout_seconds` parameter.",
+      "id": "tool.task_wait.param.timeout_seconds",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `task_wait`'s `timeout_seconds` parameter in the `child` variant: ending the round at the deadline ends the child, and stops what it still runs.",
+      "id": "tool.task_wait.child.param.timeout_seconds",
       "placeholders": []
     },
     {
@@ -397,6 +844,11 @@
     {
       "description": "Root description of the `box` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `box` overrides this key. Declared only where the conversation's host messages come in `box`.",
       "id": "tool.box.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `box`'s `none` parameter, the one (always empty) argument the host's fabricated calls carry.",
+      "id": "tool.box.param.none",
       "placeholders": []
     },
     {
@@ -430,8 +882,118 @@
       "placeholders": []
     },
     {
+      "description": "Description of the `name` parameter of `read_global_memory` and `read_project_memory`.",
+      "id": "tool.memory.param.read_name",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `name` parameter of `create_global_memory` and `create_project_memory`.",
+      "id": "tool.memory.param.create_name",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `content` parameter of `create_global_memory` and `create_project_memory`.",
+      "id": "tool.memory.param.create_content",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `description` parameter of `create_global_memory` and `create_project_memory`.",
+      "id": "tool.memory.param.create_description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `name` parameter of `edit_global_memory` and `edit_project_memory`.",
+      "id": "tool.memory.param.edit_name",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `old_text` parameter of `edit_global_memory` and `edit_project_memory`.",
+      "id": "tool.memory.param.edit_old_text",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `new_text` parameter of `edit_global_memory` and `edit_project_memory`.",
+      "id": "tool.memory.param.edit_new_text",
+      "placeholders": []
+    },
+    {
+      "description": "Description of the `description` parameter of `edit_global_memory` and `edit_project_memory`.",
+      "id": "tool.memory.param.edit_description",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `ask_user` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `ask_user` overrides this key.",
       "id": "tool.ask_user.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `questions` parameter.",
+      "id": "tool.ask_user.param.questions",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `questions[].question` parameter.",
+      "id": "tool.ask_user.param.questions.question",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `questions[].header` parameter.",
+      "id": "tool.ask_user.param.questions.header",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `questions[].options` parameter.",
+      "id": "tool.ask_user.param.questions.options",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `questions[].options[].label` parameter.",
+      "id": "tool.ask_user.param.questions.options.label",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `questions[].options[].description` parameter.",
+      "id": "tool.ask_user.param.questions.options.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `questions[].options[].preview` parameter.",
+      "id": "tool.ask_user.param.questions.options.preview",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `questions[].multiSelect` parameter.",
+      "id": "tool.ask_user.param.questions.multi_select",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `answers` parameter.",
+      "id": "tool.ask_user.param.answers",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `annotations` parameter.",
+      "id": "tool.ask_user.param.annotations",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `annotations.preview` parameter.",
+      "id": "tool.ask_user.param.annotations.preview",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `annotations.notes` parameter.",
+      "id": "tool.ask_user.param.annotations.notes",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `metadata` parameter.",
+      "id": "tool.ask_user.param.metadata",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `ask_user`'s `metadata.source` parameter.",
+      "id": "tool.ask_user.param.metadata.source",
       "placeholders": []
     },
     {
@@ -440,13 +1002,86 @@
       "placeholders": []
     },
     {
-      "description": "Root description of the `workflow` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `workflow` overrides this key.",
+      "description": "Description of `fork`'s `prompt` parameter.",
+      "id": "tool.fork.param.prompt",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `workflow` schema on a model without asynchronous tool calls: the call answers at once, and the run's return value comes later through `task_wait` or a host notification, the standard variant (see `tool_surface`). A profile's `tools[].description` for `workflow` overrides this key.",
       "id": "tool.workflow.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `workflow` schema in its `async` variant (see `tool_surface`): offered to a model that takes asynchronous tool calls, where the call is declared asynchronous, returns nothing at first, and the run's return value arrives later as its own output. A profile's `tools[].description` for `workflow` with `variant: \"async\"` overrides this key.",
+      "id": "tool.workflow.async.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `workflow`'s `script` parameter. `{signature}` is the `agent()` signature line and `{agent_type_clause}` is one of the `tool.workflow.param.script.agent_type_*` texts.",
+      "id": "tool.workflow.param.script",
+      "placeholders": [
+        "signature",
+        "agent_type_clause"
+      ]
+    },
+    {
+      "description": "`{agent_type_clause}` of `tool.workflow.param.script` in the static schema, which the model sees only when the conversation's roles could not be read for the request: no `$defs.agentType` is given, and a name is checked when its step starts.",
+      "id": "tool.workflow.param.script.agent_type_unresolved",
+      "placeholders": []
+    },
+    {
+      "description": "`{agent_type_clause}` of `tool.workflow.param.script` when no role is available to the conversation: none is selected, or none of the selected ones could be loaded.",
+      "id": "tool.workflow.param.script.agent_type_none",
+      "placeholders": []
+    },
+    {
+      "description": "`{agent_type_clause}` of `tool.workflow.param.script` when roles exist and naming one is optional.",
+      "id": "tool.workflow.param.script.agent_type_optional",
+      "placeholders": []
+    },
+    {
+      "description": "`{agent_type_clause}` of `tool.workflow.param.script` when roles exist and every `agent()` call must name one.",
+      "id": "tool.workflow.param.script.agent_type_required",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `workflow`'s `name` parameter.",
+      "id": "tool.workflow.param.name",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `workflow`'s `args` parameter.",
+      "id": "tool.workflow.param.args",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `workflow`'s `token_budget` parameter.",
+      "id": "tool.workflow.param.token_budget",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `workflow`'s `resume_run_id` parameter.",
+      "id": "tool.workflow.param.resume_run_id",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `workflow`'s `$defs.agentType` entry, which lists the legal role names for the script's `agentType` option.",
+      "id": "tool.workflow.defs.agent_type",
       "placeholders": []
     },
     {
       "description": "Root description of the `plan` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `plan` overrides this key.",
       "id": "tool.plan.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `plan`'s `action` parameter.",
+      "id": "tool.plan.param.action",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `plan`'s `content` parameter.",
+      "id": "tool.plan.param.content",
       "placeholders": []
     },
     {
@@ -460,8 +1095,28 @@
       "placeholders": []
     },
     {
+      "description": "Description of `read_handoff_note`'s `name` parameter.",
+      "id": "tool.read_handoff_note.param.name",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `create_handoff_note` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `create_handoff_note` overrides this key.",
       "id": "tool.create_handoff_note.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `create_handoff_note`'s `name` parameter.",
+      "id": "tool.create_handoff_note.param.name",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `create_handoff_note`'s `content` parameter.",
+      "id": "tool.create_handoff_note.param.content",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `create_handoff_note`'s `description` parameter.",
+      "id": "tool.create_handoff_note.param.description",
       "placeholders": []
     },
     {
@@ -470,13 +1125,67 @@
       "placeholders": []
     },
     {
+      "description": "Description of `edit_handoff_note`'s `name` parameter.",
+      "id": "tool.edit_handoff_note.param.name",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `edit_handoff_note`'s `old_text` parameter.",
+      "id": "tool.edit_handoff_note.param.old_text",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `edit_handoff_note`'s `new_text` parameter.",
+      "id": "tool.edit_handoff_note.param.new_text",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `edit_handoff_note`'s `description` parameter.",
+      "id": "tool.edit_handoff_note.param.description",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `handoff` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `handoff` overrides this key.",
       "id": "tool.handoff.description",
       "placeholders": []
     },
     {
+      "description": "Description of the `workspace` parameter of the tools that act in a directory, added when the conversation has more than one workspace; `{default}` is the number a call that names none lands on.",
+      "id": "tool.param.workspace",
+      "placeholders": [
+        "default"
+      ]
+    },
+    {
+      "description": "Description of the `workspace` parameter of the tools that address one dev server, added when the conversation has more than one workspace.",
+      "id": "tool.param.workspace_server",
+      "placeholders": []
+    },
+    {
+      "description": "Sentence appended to a shell tool's `workspace` description when only some workspaces have that shell; `{shell}` is the shell's name and the leading space belongs to the text.",
+      "id": "tool.param.workspace_shell_suffix",
+      "placeholders": [
+        "shell"
+      ]
+    },
+    {
+      "description": "Description of the `workspace` parameter of the project memory tools, added when the conversation has more than one workspace.",
+      "id": "tool.param.workspace_project_memory",
+      "placeholders": []
+    },
+    {
       "description": "Addendum appended (after a `---` separator) to the system prompt of every spawned subagent and workflow step.",
       "id": "subagent.addendum",
+      "placeholders": []
+    },
+    {
+      "description": "Item added to the end of `subagent.addendum`'s notes list when the child holds a `preview_*` tool, which acts on the browser session it shares with the conversation.",
+      "id": "subagent.addendum.browser_note",
+      "placeholders": []
+    },
+    {
+      "description": "Item added last to `subagent.addendum`'s notes list when the child holds a shell tool: how its commands run in the background and that they stop with its final reply.",
+      "id": "subagent.addendum.shell_note",
       "placeholders": []
     },
     {
@@ -607,6 +1316,13 @@
       "placeholders": [
         "name",
         "trigger"
+      ]
+    },
+    {
+      "description": "One row of the skill trigger list for a skill whose `SKILL.md` gives no description to use as its trigger. It is listed anyway: the `skill` tool serves it, and `skill.name_description` tells the model the names are in its context.",
+      "id": "skill.listing_row_untriggered",
+      "placeholders": [
+        "name"
       ]
     },
     {
@@ -1365,14 +2081,6 @@
       ]
     },
     {
-      "description": "Result of a workflow run that exceeded the run deadline.",
-      "id": "workflow.timeout",
-      "placeholders": [
-        "seconds",
-        "unfinished"
-      ]
-    },
-    {
       "description": "Progress note written when the script returned while steps were still running.",
       "id": "workflow.losers_cancelled",
       "placeholders": [
@@ -1587,17 +2295,17 @@
       ]
     },
     {
-      "description": "Suffix on a `write`/`edit` result while the read-before-write or stale-write guard is on: the model need not read the file back.",
+      "description": "Suffix on a `write`/`edit` result while the conversation's file write guards are on: the model need not read the file back. Never sent with the guards off.",
       "id": "tool.file_state_current",
       "placeholders": []
     },
     {
-      "description": "Suffix on an `edit` result that applied to a file changed on disk since the model read it, because the find text still matched once (or, with replace_all, at least once).",
+      "description": "Suffix on an `edit` result that applied to a file changed on disk since the model read it, because the find text still matched once (or, with replace_all, at least once). Only the file write guards decide staleness, so it is never sent with them off.",
       "id": "tool.edit_stale_recovered",
       "placeholders": []
     },
     {
-      "description": "Round-start notice that a file the model read changed on disk, with the changed regions rendered with line numbers.",
+      "description": "Round-start notice that a file the model read changed on disk, with the changed regions rendered with line numbers. Part of the file write guards: never sent with them off.",
       "id": "tool.file_changed_notice",
       "placeholders": [
         "path",
@@ -1612,14 +2320,14 @@
       ]
     },
     {
-      "description": "Notice that a PostToolUse hook rewrote the file `write`/`edit` just wrote and the host re-read it.",
+      "description": "Notice that a PostToolUse hook rewrote the file `write`/`edit` just wrote and the host re-read it. Part of the file write guards: never sent with them off.",
       "id": "tool.hook_file_resynced",
       "placeholders": [
         "path"
       ]
     },
     {
-      "description": "Suffix on a shell result after a formatter-looking command changed files the model had read.",
+      "description": "Suffix on a shell result after a formatter-looking command changed files the model had read. Part of the file write guards: never sent with them off.",
       "id": "tool.shell_stale_read_hint",
       "placeholders": [
         "count",

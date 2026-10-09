@@ -7,7 +7,7 @@ export type ShellTaskOutcome = "succeeded" | "failed" | "stopped";
 export interface ShellTaskSnapshot {
   shellTaskId: string;
   conversationId: string;
-  /** `bash` or `powershell` — which tool is running. */
+  /** `bash`, `zsh`, `sh`, `pwsh` or `powershell` — which tool is running. */
   toolName: string;
   /** Display-truncated command text, already collapsed to one line. */
   command: string;

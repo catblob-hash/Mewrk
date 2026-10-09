@@ -3,7 +3,7 @@ import { emptyConversationPresetSettings } from "./conversationPresets";
 
 /** Fixed ID so repeated seeding replaces the same record rather than adding another. */
 const MEMORY_E2E_PRESET_ID = "memory-e2e-full-access";
-const MEMORY_E2E_SHELL_TOOLS: ReadonlySet<string> = new Set(["bash", "zsh", "sh", "powershell"]);
+const MEMORY_E2E_SHELL_TOOLS: ReadonlySet<string> = new Set(["bash", "zsh", "sh", "pwsh", "powershell"]);
 
 const PROTOCOLS = [
   "openai_responses",

@@ -3,9 +3,8 @@ import { describe, expect, it } from "vitest";
 // It needs neither Node types nor compilation.
 import storageSource from "../src-tauri/src/storage.rs?raw";
 import catalogSource from "../src-tauri/src/catalog.rs?raw";
-import agentRolesSource from "../src-tauri/src/agent_roles.rs?raw";
+import promptProfileSource from "../src-tauri/src/prompt_profile.rs?raw";
 import {
-  BUILTIN_AGENT_ROLE_IDS,
   BUILTIN_PRESET_ID,
   BUILTIN_PRESET_TEMPLATE_ID,
   createSeedDocument
@@ -75,15 +74,9 @@ describe("seed document", () => {
     expect(settings.apiProviders[1].id).toMatch(/^provider_/u);
     // Codex has no catalog until the user completes its OAuth flow.
     expect(settings.apiProviders[0].models).toEqual([]);
-    // Claude Agent ships its seed rows installed; fetching asks the CLI later.
-    const claudeModelIds = settings.apiProviders[1].models.map((model) => model.id);
-    expect(claudeModelIds).toContain("claude-opus-5-5");
-    expect(claudeModelIds).toContain("claude-sonnet-5-5");
-    expect(claudeModelIds).toContain("claude-opus-5");
-    expect(claudeModelIds).toContain("claude-sonnet-5");
-    expect(claudeModelIds).toContain("claude-haiku-4-5");
-    expect(claudeModelIds.filter((id) => id.includes("[1m]"))).toEqual([]);
-    expect(settings.apiProviders[1].activeModelId).toBe(claudeModelIds[0]);
+    // Nor does Claude Agent: its models are fetched from the installed CLI.
+    expect(settings.apiProviders[1].models).toEqual([]);
+    expect(settings.apiProviders[1].activeModelId).toBeNull();
     expect(settings.activeProviderId).toBe(settings.apiProviders[1].id);
     // Keep the TypeScript seed catalog aligned with Rust's product default.
     expect(settings.webSearch.providers.map((provider) => provider.kind)).toEqual([
@@ -96,7 +89,7 @@ describe("seed document", () => {
 
   it("ships workspace, web, and host-run orchestration tools", () => {
     const tools = createSeedDocument().tools;
-    expect(tools).toHaveLength(49);
+    expect(tools).toHaveLength(50);
     expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length);
     const webTools = tools.filter((tool) => tool.category === "web");
     expect(webTools.map((tool) => tool.name)).toEqual([
@@ -160,32 +153,30 @@ describe("seed document", () => {
     expect(preset.name).toBe("mewrk");
     expect(settings.defaultConversationPresetId).toBe(BUILTIN_PRESET_ID);
 
-    // The four built-in roles are selected by id. Their names, models and
-    // descriptions are computed by the host against the document's providers and
-    // arrive in the capability catalog, so the seed holds nothing of them but
-    // the ids — which the host's constants have to spell the same way.
-    expect(preset.settings.agentIds).toEqual(BUILTIN_AGENT_ROLE_IDS);
-    expect(preset.settings.agentIds).toEqual([
-      "agent_builtin_opus",
-      "agent_builtin_sonnet",
-      "agent_builtin_sol",
-      "agent_builtin_luna"
-    ]);
-    // A copy: editing a conversation's selection must not edit the constant.
-    expect(preset.settings.agentIds).not.toBe(BUILTIN_AGENT_ROLE_IDS);
-    for (const id of BUILTIN_AGENT_ROLE_IDS) {
-      expect(agentRolesSource).toContain(`"${id}"`);
-    }
-    // No role record rides in the preset any more.
+    // No role ships: roles are files the user writes, so the preset selects none
+    // and the catalog the seed carries lists none. No role record rides in the
+    // preset either.
+    expect(preset.settings.agentIds).toEqual([]);
+    expect(document.capabilities.agents).toEqual([]);
     expect(preset.settings).not.toHaveProperty("agentDefinitions");
+    // It words its tool descriptions with the concise built-in profile, whose id
+    // the host's constant has to spell the same way.
+    expect(preset.settings.toolDescriptionFileId).toBe("tooldesc_builtin_concise_en_us");
+    expect(promptProfileSource).toContain(
+      `pub const BUILTIN_CONCISE_EN_US_ID: &str = "${preset.settings.toolDescriptionFileId}";`
+    );
+    expect(catalogSource).toContain(
+      "tool_description_file_id: Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID.into())"
+    );
 
     expect(catalogSource).toContain(`const BUILTIN_PRESET_ID: &str = "${BUILTIN_PRESET_ID}";`);
     expect(catalogSource).toContain(
       `const BUILTIN_PRESET_TEMPLATE_ID: &str = "${BUILTIN_PRESET_TEMPLATE_ID}";`
     );
 
-    // No anonymous children: every subagent goes through one of the roles.
-    expect(preset.settings.allowRolelessSubagents).toBe(false);
+    // With no role selected, an anonymous child is the only kind `agent_spawn` and
+    // `workflow` can start.
+    expect(preset.settings.allowRolelessSubagents).toBe(true);
     // Everything on except the names the host derives for itself. The two web
     // tools among them: they follow `webSearchEnabled`, the plan tools follow
     // the security level and the handoff tools the conversation's context, not
@@ -196,7 +187,7 @@ describe("seed document", () => {
         || ["skill", "tool_search", "task_wait", "task_list", "box", "web_search", "web_fetch"].includes(name)
         || ["plan", "exit_plan_mode"].includes(name)
         || ["read_handoff_note", "create_handoff_note", "edit_handoff_note", "handoff"].includes(name)
-        || ["bash", "sh", "powershell"].includes(name)
+        || ["bash", "sh", "pwsh", "powershell"].includes(name)
       ))
     );
     expect(preset.settings.enabledTools).toEqual(expect.arrayContaining(["zsh", "preview_start", "workflow"]));
@@ -216,7 +207,6 @@ describe("seed document", () => {
     expect(preset.settings.skillIds).toEqual([]);
     expect(preset.settings.mcpIds).toEqual([]);
     expect(preset.settings.hookIds).toEqual([]);
-    expect(preset.settings.toolDescriptionFileId).toBeNull();
     // It opens with the system prompt the host writes behind this id.
     expect(preset.templateId).toBe(BUILTIN_PRESET_TEMPLATE_ID);
 
@@ -356,11 +346,44 @@ describe("seed document", () => {
 
   it("turns on the platform's most preferred shell in the built-in preset", () => {
     const shellsOn = (platform: string) => builtinPresetOf(platform).settings.enabledTools
-      .filter((name) => ["bash", "zsh", "sh", "powershell"].includes(name));
-    expect(shellsOn("Win32")).toEqual(["powershell"]);
+      .filter((name) => ["bash", "zsh", "sh", "pwsh", "powershell"].includes(name));
+    // Windows' priority list puts PowerShell 7 first; Windows PowerShell is not also turned on.
+    expect(shellsOn("Win32")).toEqual(["pwsh"]);
     expect(shellsOn("MacIntel")).toEqual(["zsh"]);
     expect(shellsOn("Linux x86_64")).toEqual(["bash"]);
     // A platform the table does not know gets the first shell in tool order.
     expect(shellsOn("")).toEqual(["bash"]);
+  });
+
+  it("ships PowerShell 7 and Windows PowerShell as two shell tools with the same parameters", () => {
+    const tools = createSeedDocument().tools;
+    const names = tools.map((tool) => tool.name);
+    // pwsh sits immediately before powershell.
+    expect(names.indexOf("pwsh")).toBeGreaterThanOrEqual(0);
+    expect(names.indexOf("powershell")).toBe(names.indexOf("pwsh") + 1);
+    const pwsh = tools.find((tool) => tool.name === "pwsh")!;
+    const powershell = tools.find((tool) => tool.name === "powershell")!;
+    expect(pwsh).toMatchObject({ label: "PowerShell 7", category: "shell", dangerous: true, description: "" });
+    expect(powershell).toMatchObject({ label: "Windows PowerShell", category: "shell", dangerous: true, description: "" });
+    expect(pwsh.parameters).toEqual(powershell.parameters);
+    expect(pwsh.parameters.map((parameter) => [parameter.name, parameter.type, parameter.required])).toEqual([
+      ["command", "multiline", true],
+      ["description", "string", false],
+      ["timeout", "number", false],
+      ["run_in_background", "boolean", false]
+    ]);
+    expect(pwsh.parameters[0]).toMatchObject({ placeholder: "Get-ChildItem -Force" });
+    expect(pwsh.parameters[1]).toMatchObject({ placeholder: "列出当前目录的文件" });
+    expect(pwsh.parameters[2]).toMatchObject({ placeholder: "120000" });
+    expect(pwsh.parameters[3]).toMatchObject({ defaultValue: false });
+  });
+
+  it("keeps a saved powershell selection as Windows PowerShell through normalization", () => {
+    const document = createSeedDocument("Win32");
+    const preset = document.globalSettings.conversationPresets.find((candidate) => candidate.id === BUILTIN_PRESET_ID)!;
+    preset.settings.enabledTools = ["read", "powershell", "pwsh"];
+    const kept = normalizeDocument(document).globalSettings.conversationPresets
+      .find((candidate) => candidate.id === BUILTIN_PRESET_ID)!;
+    expect(kept.settings.enabledTools).toEqual(expect.arrayContaining(["powershell", "pwsh"]));
   });
 });

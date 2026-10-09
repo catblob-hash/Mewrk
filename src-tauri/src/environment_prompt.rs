@@ -457,10 +457,10 @@ mod tests {
         );
         assert!(
             section.contains(
-                " - Workspaces — name one by its number in a tool's `workspace` parameter:\n\
-                 \x20 - 1: C:/work/app (this machine)\n\
-                 \x20 - 2: ~/services (SSH: devbox)\n\
-                 \x20 - 3: /srv/data (WSL: Ubuntu)\n - Platform:"
+                " - Workspaces — separate root directories, possibly on other machines. A tool call picks one by passing its number as the `workspace` argument, and its `path` is then relative to that workspace's root; the number is not a file or folder, so never write it into a path:\n\
+                 \x20 - Workspace 1: C:/work/app (this machine)\n\
+                 \x20 - Workspace 2: ~/services (SSH: devbox)\n\
+                 \x20 - Workspace 3: /srv/data (WSL: Ubuntu)\n - Platform:"
             ),
             "{section}"
         );

@@ -6,6 +6,7 @@ import type {
   GlobalSettings
 } from "../types";
 import { BUILTIN_PRESET_ID } from "../seed";
+import { fileWriteGuardsEnabledOf } from "./fileWriteGuards";
 import { hostMessageContainerOf } from "./hostMessages";
 import { defaultConversationWebSearchSettings } from "./runtime";
 import { isHostDerivedToolName } from "./taskTools";
@@ -37,7 +38,8 @@ export function emptyConversationPresetSettings(): ConversationPresetSettings {
     projectMemoryEnabled: false,
     skillToolEnabled: false,
     mcpToolDiscoveryEnabled: false,
-    hostMessageContainer: "user"
+    hostMessageContainer: "user",
+    fileWriteGuardsEnabled: true
   };
 }
 
@@ -73,7 +75,8 @@ export function captureConversationPresetSettings(
     projectMemoryEnabled: settings.projectMemoryEnabled,
     skillToolEnabled: settings.skillToolEnabled === true,
     mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled === true,
-    hostMessageContainer: hostMessageContainerOf(settings)
+    hostMessageContainer: hostMessageContainerOf(settings),
+    fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(settings)
   };
 }
 
@@ -116,6 +119,7 @@ export function sameConversationPresetSettings(
     && a.skillToolEnabled === b.skillToolEnabled
     && a.mcpToolDiscoveryEnabled === b.mcpToolDiscoveryEnabled
     && hostMessageContainerOf(a) === hostMessageContainerOf(b)
+    && fileWriteGuardsEnabledOf(a) === fileWriteGuardsEnabledOf(b)
     && a.webSearchEnabled === b.webSearchEnabled
     && sameIdSet(a.enabledTools, b.enabledTools)
     && sameIdSet(a.hookIds, b.hookIds)
@@ -178,6 +182,7 @@ export function cloneConversationSettings(
     skillToolEnabled: snapshot.skillToolEnabled === true,
     mcpToolDiscoveryEnabled: snapshot.mcpToolDiscoveryEnabled === true,
     hostMessageContainer: hostMessageContainerOf(snapshot),
+    fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(snapshot),
     // The conversation's own choice, which a branch keeps. Not a preset's: a
     // preset carries none, so a new conversation chooses by its model.
     ...(snapshot.compactionMethod ? { compactionMethod: snapshot.compactionMethod } : {})
@@ -224,6 +229,7 @@ export function applyConversationPresetSettings(
     projectMemoryEnabled: preset.projectMemoryEnabled === true,
     skillToolEnabled: preset.skillToolEnabled === true,
     mcpToolDiscoveryEnabled: preset.mcpToolDiscoveryEnabled === true,
-    hostMessageContainer: hostMessageContainerOf(preset)
+    hostMessageContainer: hostMessageContainerOf(preset),
+    fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(preset)
   };
 }

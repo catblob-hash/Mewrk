@@ -199,8 +199,7 @@ import {
   keepUnloadedBody
 } from "./lib/conversationBodies";
 import { memoryPool } from "./lib/memoryPool";
-import { hasConversationCommands, listWslDistros, settleConversationTitle, startedOnFreshInstall } from "./lib/runtime";
-import { setUpClaudeAgentOnFirstLaunch } from "./lib/claudeAgentFirstLaunch";
+import { hasConversationCommands, listWslDistros, settleConversationTitle } from "./lib/runtime";
 import { DEFAULT_REASONING_EFFORT, REASONING_EFFORTS } from "./lib/reasoningEffort";
 import { loadToolExplanations } from "./lib/localModel";
 import { applyConversationTemplate, attestEditedToolContext, attestInsertedToolContext, cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, deleteAgentRole, deleteConversationTemplate, deleteHook, deleteMcpServer, deleteSkill, executeTool, forkConversationContexts, captureConversationTemplate, listConversationTemplates, listForkDecisions, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, previewConversationTemplate, probeMcpServer, refreshCapabilities, capabilityFingerprint, revealCapabilityLocation, saveAgentRole, type SaveAgentRoleTarget, updateConversationTemplate, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, controlWorkflowStep, workflowStepRecord } from "./lib/runtime";
@@ -2532,11 +2531,6 @@ function App() {
       .then(async (loaded) => {
         if (cancelled) return;
         documentStore.load(loaded);
-        // In the background: the first draft opens on the seed model and moves to
-        // the CLI's Opus once it answers, unless the user picked a model first.
-        if (startedOnFreshInstall()) {
-          void setUpClaudeAgentOnFirstLaunch(loaded, (updater) => documentStore.update(updater));
-        }
         const firstWorkspace = loaded.workspaces[0];
         const firstConversationId = firstWorkspace?.conversations[0]?.id ?? null;
         if (firstConversationId) {

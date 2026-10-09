@@ -25,7 +25,8 @@ use crate::model::ToolResult;
 pub(crate) fn tool_names(tool: &str) -> &'static [&'static str] {
     match tool {
         "bash" | "zsh" | "sh" => &["Bash"],
-        "powershell" => &["PowerShell"],
+        // Claude Code has one PowerShell tool for both editions.
+        "pwsh" | "powershell" => &["PowerShell"],
         "read" => &["Read"],
         "write" => &["Write"],
         "edit" => &["Edit"],
@@ -139,7 +140,7 @@ pub(crate) fn tool_response(tool: &str, input: &Map<String, Value>, result: &Too
         response.entry(key).or_insert(value);
     };
     match tool {
-        "bash" | "zsh" | "sh" | "powershell" => {
+        "bash" | "zsh" | "sh" | "pwsh" | "powershell" => {
             add("stdout", Value::String(result.output.clone()));
             add("stderr", Value::String(String::new()));
             add("interrupted", Value::Bool(false));

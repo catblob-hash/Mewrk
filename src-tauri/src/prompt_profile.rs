@@ -6,20 +6,25 @@
 //! a workspace's own folder is never read) declares two things: per-tool
 //! description overrides (`tools`) and the wording of
 //! every place where Mewrk itself injects fixed text into a model request
-//! (`prompts`). There is one built-in profile, "Mewrk built-in": its English
-//! texts are code in [`english`], so they ship with each build and change with
+//! (`prompts`). There are two built-in profiles. "Mewrk guided" is the default:
+//! its English texts are code in [`english`] and steer a model through each
+//! tool. "Mewrk concise" keeps only what a frontier model cannot infer; its
+//! texts are code in [`concise`], which decides every key — keep the guided
+//! wording, say nothing, or say less. Both ship with each build and change with
 //! it. Nothing writes them to disk and nothing edits them in place. A user who
 //! wants other wording writes a tool-description file; it overrides only the
-//! keys it names, and every other key falls back to the built-in. The registry
-//! below carries the key ids, their placeholders and their documentation; the
-//! texts sit in [`english`], one match arm per key.
+//! keys it names, and every other key falls back to the guided built-in. The
+//! registry below carries the key ids, their placeholders and their
+//! documentation; the texts sit in [`english`] and [`concise`], one match arm
+//! per key.
 //!
 //! What lives here, in one sentence per group: the capability sections appended
 //! to the system prompt; the safety boundaries; the child agent addendum and
 //! its internal tools; the wording of receipts the host writes back to the
 //! model (task waits, task lists, background notifications, memory
 //! acknowledgements, skill loads); the isolated web-search executor's prompts;
-//! and the framing lines file/shell tools put around their output.
+//! the framing lines file/shell tools put around their output; and the
+//! descriptions in the built-in tools' JSON Schemas, root and parameter alike.
 //!
 //! A key may ship an *empty* default, which means the host says nothing at that
 //! point unless a profile fills it in. The web-evidence texts are the ones that
@@ -45,13 +50,26 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::model::{ResolvedLanguage, ToolDescriptionEntry};
+use crate::tool_surface::ToolVariant;
 
+mod concise;
 mod english;
 
-/// Stable resource id of the built-in profile. Selecting it and selecting
-/// nothing are the same thing. Saved conversations and presets reference this
-/// exact value, `_en_us` suffix included.
+/// Stable resource id of the guided built-in profile, the default. Selecting it
+/// and selecting nothing are the same thing. Saved conversations and presets
+/// reference this exact value, `_en_us` suffix included.
 pub const BUILTIN_EN_US_ID: &str = "tooldesc_builtin_en_us";
+
+/// Stable resource id of the concise built-in profile.
+pub const BUILTIN_CONCISE_EN_US_ID: &str = "tooldesc_builtin_concise_en_us";
+
+/// Which built-in table a profile falls back to for the keys it does not
+/// override. A user file always falls back to the guided one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Base {
+    Guided,
+    Concise,
+}
 
 /// Declares the registry. Each entry is one injection point: the enum variant,
 /// its stable id, the placeholders its text may use, and a one-line description
@@ -152,6 +170,8 @@ prompt_keys! {
         "The host message delivering a skill selected after the conversation started, when skill bodies go into the prompt rather than behind the `skill` tool."),
     SystemSkillAddedTrigger => ("system.skill_added_trigger", ["name", "trigger"],
         "The host message announcing a skill selected after the conversation started, when skills are loaded on demand; the body stays behind the `skill` tool."),
+    SystemSkillAddedUntriggered => ("system.skill_added_untriggered", ["name"],
+        "`system.skill_added_trigger` for a skill whose `SKILL.md` gives no description to use as its trigger: the skill is still announced, since the `skill` tool serves it, but with no trigger to fill a `{trigger}` slot."),
     SystemCapabilityRow => ("system.capability_row", ["name", "description"],
         "One row of the MCP-server or hook list in the system prompt."),
     SystemHookMatcherDetail => ("system.hook_matcher_detail", ["matcher"],
@@ -184,76 +204,266 @@ prompt_keys! {
     // JSON Schema. `skill` is absent on purpose: its description already has a
     // key of its own (`skill.tool_description`), and
     // `PromptKey::for_tool_description` maps the tool name onto it.
+    //
+    // The parameter descriptions of the same schemas are keys too, each placed
+    // right after its tool's root key: `tool.<name>.param.<path>` (nested
+    // properties joined with `.`, `items` wrappers skipped; the element of an
+    // array that has a description of its own is `<path>.item`) and
+    // `tool.<name>.defs.<name>` for `$defs`. A description several tools share
+    // is one key under a generic segment, placed after the first of them:
+    // `tool.shell.param.*`, `tool.memory.param.*`, `tool.preview.param.*`. The
+    // `workspace` parameter, added to a tool's schema at run time when the
+    // conversation has more than one workspace, closes the block as
+    // `tool.param.workspace*`.
     ToolLsDescription => ("tool.ls.description", [],
         "Root description of the `ls` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `ls` overrides this key."),
+    ToolLsParamPath => ("tool.ls.param.path", [],
+        "Description of `ls`'s `path` parameter."),
+    ToolLsParamDepth => ("tool.ls.param.depth", [],
+        "Description of `ls`'s `depth` parameter."),
     ToolGrepDescription => ("tool.grep.description", [],
         "Root description of the `grep` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `grep` overrides this key."),
+    ToolGrepParamPattern => ("tool.grep.param.pattern", [],
+        "Description of `grep`'s `pattern` parameter."),
+    ToolGrepParamPath => ("tool.grep.param.path", [],
+        "Description of `grep`'s `path` parameter."),
+    ToolGrepParamCaseSensitive => ("tool.grep.param.case_sensitive", [],
+        "Description of `grep`'s `case_sensitive` parameter."),
+    ToolGrepParamLimit => ("tool.grep.param.limit", [],
+        "Description of `grep`'s `limit` parameter."),
+    ToolGrepParamOffset => ("tool.grep.param.offset", [],
+        "Description of `grep`'s `offset` parameter."),
     ToolFindDescription => ("tool.find.description", [],
         "Root description of the `find` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `find` overrides this key."),
+    ToolFindParamQuery => ("tool.find.param.query", [],
+        "Description of `find`'s `query` parameter."),
+    ToolFindParamPath => ("tool.find.param.path", [],
+        "Description of `find`'s `path` parameter."),
     ToolReadDescription => ("tool.read.description", [],
-        "Root description of the `read` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `read` overrides this key."),
+        "Root description of the `read` schema for a model that takes images: it reads text files and shows images, the standard variant (see `tool_surface`). A profile's `tools[].description` for `read` overrides this key."),
+    ToolReadParamPath => ("tool.read.param.path", [],
+        "Description of `read`'s `path` parameter."),
+    ToolReadParamStartLine => ("tool.read.param.start_line", [],
+        "Description of `read`'s `start_line` parameter."),
+    ToolReadParamEndLine => ("tool.read.param.end_line", [],
+        "Description of `read`'s `end_line` parameter."),
+    ToolReadTextOnlyDescription => ("tool.read.text_only.description", [],
+        "Root description of the `read` schema in its `text_only` variant (see `tool_surface`): offered to a model that does not take images, so it reads text files and refuses an image. A profile's `tools[].description` for `read` with `variant: \"text_only\"` overrides this key."),
+    ToolReadTextOnlyParamStartLine => ("tool.read.text_only.param.start_line", [],
+        "Description of `read`'s `start_line` parameter in the `text_only` variant."),
+    ToolReadTextOnlyParamEndLine => ("tool.read.text_only.param.end_line", [],
+        "Description of `read`'s `end_line` parameter in the `text_only` variant."),
     ToolLspDescription => ("tool.lsp.description", [],
         "Root description of the `lsp` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `lsp` overrides this key."),
+    ToolLspParamOperation => ("tool.lsp.param.operation", [],
+        "Description of `lsp`'s `operation` parameter."),
+    ToolLspParamFilePath => ("tool.lsp.param.file_path", [],
+        "Description of `lsp`'s `filePath` parameter."),
+    ToolLspParamLine => ("tool.lsp.param.line", [],
+        "Description of `lsp`'s `line` parameter."),
+    ToolLspParamCharacter => ("tool.lsp.param.character", [],
+        "Description of `lsp`'s `character` parameter."),
+    ToolLspParamQuery => ("tool.lsp.param.query", [],
+        "Description of `lsp`'s `query` parameter."),
     ToolWriteDescription => ("tool.write.description", [],
-        "Root description of the `write` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `write` overrides this key."),
+        "Root description of the `write` schema while the conversation's file write guards are on: an existing file has to have been read in this conversation first, the standard variant (see `tool_surface`). A profile's `tools[].description` for `write` overrides this key."),
+    ToolWriteUnguardedDescription => ("tool.write.unguarded.description", [],
+        "Root description of the `write` schema in its `unguarded` variant (see `tool_surface`): offered while the conversation's file write guards are off, so nothing has to have been read first and nothing is refused as stale. A profile's `tools[].description` for `write` with `variant: \"unguarded\"` overrides this key."),
+    ToolWriteParamPath => ("tool.write.param.path", [],
+        "Description of `write`'s `path` parameter."),
+    ToolWriteParamContent => ("tool.write.param.content", [],
+        "Description of `write`'s `content` parameter."),
     ToolEditDescription => ("tool.edit.description", [],
-        "Root description of the `edit` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `edit` overrides this key."),
-    ToolEditReadFirst => ("tool.edit.read_first", [],
-        "Sentence appended to the `edit` description while the read-before-write guard is on: the file must have been `read` in this conversation first."),
-    ToolWriteReadFirst => ("tool.write.read_first", [],
-        "Sentence appended to the `write` description while the read-before-write guard is on: an existing file must have been `read` in this conversation first."),
-    ToolAsyncResult => ("tool.async_result", [],
-        "Sentence appended to the `agent_spawn` and `workflow` descriptions on a model that takes asynchronous tool calls, where both are declared asynchronous: the call returns nothing at first, and the task's result arrives later as the call's own output."),
+        "Root description of the `edit` schema while the conversation's file write guards are on: the file has to have been read in this conversation first, the standard variant (see `tool_surface`). A profile's `tools[].description` for `edit` overrides this key."),
+    ToolEditUnguardedDescription => ("tool.edit.unguarded.description", [],
+        "Root description of the `edit` schema in its `unguarded` variant (see `tool_surface`): offered while the conversation's file write guards are off, so nothing has to have been read first and nothing is refused as stale. A profile's `tools[].description` for `edit` with `variant: \"unguarded\"` overrides this key."),
+    ToolEditParamPath => ("tool.edit.param.path", [],
+        "Description of `edit`'s `path` parameter."),
+    ToolEditParamFind => ("tool.edit.param.find", [],
+        "Description of `edit`'s `find` parameter."),
+    ToolEditParamReplace => ("tool.edit.param.replace", [],
+        "Description of `edit`'s `replace` parameter."),
+    ToolEditParamReplaceAll => ("tool.edit.param.replace_all", [],
+        "Description of `edit`'s `replace_all` parameter."),
+    // The two PowerShell editions are two tools (`shell_backend`): `pwsh` is
+    // PowerShell 7, `powershell` is Windows PowerShell 5.1, and each one's
+    // text describes that edition's language alone.
+    ToolPwshDescription => ("tool.pwsh.description", [],
+        "Root description of the `pwsh` schema (PowerShell 7) in a top-level run: a background command outlives the turn and wakes an idle conversation, the standard variant (see `tool_surface`). A profile's `tools[].description` for `pwsh` overrides this key."),
+    ToolPwshChildDescription => ("tool.pwsh.child.description", [],
+        "Root description of the `pwsh` schema (PowerShell 7) in its `child` variant (see `tool_surface`): offered to a child agent, whose background commands are stopped when it gives its final reply. A profile's `tools[].description` for `pwsh` with `variant: \"child\"` overrides this key."),
+    ToolPwshParamCommand => ("tool.pwsh.param.command", [],
+        "Description of `pwsh`'s `command` parameter."),
     ToolPowershellDescription => ("tool.powershell.description", [],
-        "Root description of the `powershell` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `powershell` overrides this key."),
+        "Root description of the `powershell` schema (Windows PowerShell 5.1) in a top-level run: a background command outlives the turn and wakes an idle conversation, the standard variant (see `tool_surface`). A profile's `tools[].description` for `powershell` overrides this key."),
+    ToolPowershellChildDescription => ("tool.powershell.child.description", [],
+        "Root description of the `powershell` schema (Windows PowerShell 5.1) in its `child` variant (see `tool_surface`): offered to a child agent, whose background commands are stopped when it gives its final reply. A profile's `tools[].description` for `powershell` with `variant: \"child\"` overrides this key."),
+    ToolPowershellParamCommand => ("tool.powershell.param.command", [],
+        "Description of `powershell`'s `command` parameter."),
     ToolBashDescription => ("tool.bash.description", [],
-        "Root description of the `bash` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `bash` overrides this key."),
+        "Root description of the `bash` schema in a top-level run: a background command outlives the turn and wakes an idle conversation, the standard variant (see `tool_surface`). A profile's `tools[].description` for `bash` overrides this key."),
+    ToolBashChildDescription => ("tool.bash.child.description", [],
+        "Root description of the `bash` schema in its `child` variant (see `tool_surface`): offered to a child agent, whose background commands are stopped when it gives its final reply. A profile's `tools[].description` for `bash` with `variant: \"child\"` overrides this key."),
+    ToolBashParamCommand => ("tool.bash.param.command", [],
+        "Description of `bash`'s `command` parameter."),
     ToolZshDescription => ("tool.zsh.description", [],
-        "Root description of the `zsh` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `zsh` overrides this key."),
+        "Root description of the `zsh` schema in a top-level run: a background command outlives the turn and wakes an idle conversation, the standard variant (see `tool_surface`). A profile's `tools[].description` for `zsh` overrides this key."),
+    ToolZshChildDescription => ("tool.zsh.child.description", [],
+        "Root description of the `zsh` schema in its `child` variant (see `tool_surface`): offered to a child agent, whose background commands are stopped when it gives its final reply. A profile's `tools[].description` for `zsh` with `variant: \"child\"` overrides this key."),
+    ToolZshParamCommand => ("tool.zsh.param.command", [],
+        "Description of `zsh`'s `command` parameter."),
     ToolShDescription => ("tool.sh.description", [],
-        "Root description of the `sh` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `sh` overrides this key."),
+        "Root description of the `sh` schema in a top-level run: a background command outlives the turn and wakes an idle conversation, the standard variant (see `tool_surface`). A profile's `tools[].description` for `sh` overrides this key."),
+    ToolShChildDescription => ("tool.sh.child.description", [],
+        "Root description of the `sh` schema in its `child` variant (see `tool_surface`): offered to a child agent, whose background commands are stopped when it gives its final reply. A profile's `tools[].description` for `sh` with `variant: \"child\"` overrides this key."),
+    ToolShParamCommand => ("tool.sh.param.command", [],
+        "Description of `sh`'s `command` parameter."),
+    ToolShellParamDescription => ("tool.shell.param.description", [],
+        "Description of the `description` parameter the shell tools (`pwsh`, `powershell`, `bash`, `zsh`, `sh`) share: what the one-sentence summary of a command should say."),
+    ToolShellParamTimeout => ("tool.shell.param.timeout", ["default_ms", "max_ms"],
+        "Description of the `timeout` parameter the shell tools share; `{default_ms}` and `{max_ms}` are the default and the ceiling in milliseconds."),
+    ToolShellParamRunInBackground => ("tool.shell.param.run_in_background", [],
+        "Description of the `run_in_background` parameter the shell tools share."),
+    ToolShellChildParamRunInBackground => ("tool.shell.child.param.run_in_background", [],
+        "Description of the `run_in_background` parameter the shell tools share, in their `child` variant: a background command ends with the child's final reply."),
     ToolWebSearchDescription => ("tool.web_search.description", [],
-        "Root description of the `web_search` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `web_search` overrides this key."),
+        "Root description of the `web_search` schema answered by a search provider: the result is a list whose entries carry citable ids, the standard variant (see `tool_surface`). A profile's `tools[].description` for `web_search` overrides this key."),
+    ToolWebSearchNativeDescription => ("tool.web_search.native.description", [],
+        "Root description of the `web_search` schema in its `native` variant (see `tool_surface`): offered when the conversation's own model runs the search, so the result is its written report and the sites it consulted, with no ids. A profile's `tools[].description` for `web_search` with `variant: \"native\"` overrides this key."),
+    ToolWebSearchParamQuery => ("tool.web_search.param.query", [],
+        "Description of `web_search`'s `query` parameter."),
     ToolWebFetchDescription => ("tool.web_fetch.description", [],
         "Root description of the `web_fetch` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `web_fetch` overrides this key."),
+    ToolWebFetchParamUrls => ("tool.web_fetch.param.urls", [],
+        "Description of `web_fetch`'s `urls` parameter."),
+    ToolWebFetchParamUrlsItem => ("tool.web_fetch.param.urls.item", [],
+        "Description of each element of `web_fetch`'s `urls` parameter."),
     ToolPreviewStartDescription => ("tool.preview_start.description", [],
         "Root description of the `preview_start` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_start` overrides this key."),
+    ToolPreviewStartParamName => ("tool.preview_start.param.name", [],
+        "Description of `preview_start`'s `name` parameter."),
+    ToolPreviewParamServerId => ("tool.preview.param.server_id", [],
+        "Description of the `serverId` parameter of the preview tools that act on the conversation's page (every `preview_*` tool except `preview_start`, `preview_stop`, `preview_logs` and `preview_list`)."),
+    ToolPreviewParamNamedServerId => ("tool.preview.param.named_server_id", ["description"],
+        "Description of the `serverId` parameter of the preview tools that address one dev server by its launch.json name (`preview_stop`, `preview_logs`); `{description}` is the lead phrase the tool gives it."),
     ToolPreviewStopDescription => ("tool.preview_stop.description", [],
         "Root description of the `preview_stop` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_stop` overrides this key."),
     ToolPreviewListDescription => ("tool.preview_list.description", [],
         "Root description of the `preview_list` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_list` overrides this key."),
     ToolPreviewLogsDescription => ("tool.preview_logs.description", [],
         "Root description of the `preview_logs` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_logs` overrides this key."),
+    ToolPreviewLogsParamLevel => ("tool.preview_logs.param.level", [],
+        "Description of `preview_logs`'s `level` parameter."),
+    ToolPreviewLogsParamLines => ("tool.preview_logs.param.lines", [],
+        "Description of `preview_logs`'s `lines` parameter."),
+    ToolPreviewLogsParamSearch => ("tool.preview_logs.param.search", [],
+        "Description of `preview_logs`'s `search` parameter."),
     ToolPreviewConsoleLogsDescription => ("tool.preview_console_logs.description", [],
         "Root description of the `preview_console_logs` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_console_logs` overrides this key."),
+    ToolPreviewConsoleLogsParamLevel => ("tool.preview_console_logs.param.level", [],
+        "Description of `preview_console_logs`'s `level` parameter."),
+    ToolPreviewConsoleLogsParamLines => ("tool.preview_console_logs.param.lines", [],
+        "Description of `preview_console_logs`'s `lines` parameter."),
     ToolPreviewScreenshotDescription => ("tool.preview_screenshot.description", [],
         "Root description of the `preview_screenshot` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_screenshot` overrides this key."),
+    ToolPreviewScreenshotParamScale => ("tool.preview_screenshot.param.scale", [],
+        "Description of `preview_screenshot`'s `scale` parameter."),
     ToolPreviewSnapshotDescription => ("tool.preview_snapshot.description", [],
         "Root description of the `preview_snapshot` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_snapshot` overrides this key."),
     ToolPreviewInspectDescription => ("tool.preview_inspect.description", [],
         "Root description of the `preview_inspect` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_inspect` overrides this key."),
+    ToolPreviewInspectParamSelector => ("tool.preview_inspect.param.selector", [],
+        "Description of `preview_inspect`'s `selector` parameter."),
+    ToolPreviewInspectParamStyles => ("tool.preview_inspect.param.styles", [],
+        "Description of `preview_inspect`'s `styles` parameter."),
     ToolPreviewClickDescription => ("tool.preview_click.description", [],
         "Root description of the `preview_click` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_click` overrides this key."),
+    ToolPreviewClickParamSelector => ("tool.preview_click.param.selector", [],
+        "Description of `preview_click`'s `selector` parameter."),
+    ToolPreviewClickParamUid => ("tool.preview_click.param.uid", [],
+        "Description of `preview_click`'s `uid` parameter."),
+    ToolPreviewClickParamDoubleClick => ("tool.preview_click.param.double_click", [],
+        "Description of `preview_click`'s `doubleClick` parameter."),
     ToolPreviewFillDescription => ("tool.preview_fill.description", [],
         "Root description of the `preview_fill` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_fill` overrides this key."),
+    ToolPreviewFillParamSelector => ("tool.preview_fill.param.selector", [],
+        "Description of `preview_fill`'s `selector` parameter."),
+    ToolPreviewFillParamUid => ("tool.preview_fill.param.uid", [],
+        "Description of `preview_fill`'s `uid` parameter."),
+    ToolPreviewFillParamValue => ("tool.preview_fill.param.value", [],
+        "Description of `preview_fill`'s `value` parameter."),
     ToolPreviewEvalDescription => ("tool.preview_eval.description", [],
         "Root description of the `preview_eval` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_eval` overrides this key."),
+    ToolPreviewEvalParamExpression => ("tool.preview_eval.param.expression", [],
+        "Description of `preview_eval`'s `expression` parameter."),
     ToolPreviewNetworkDescription => ("tool.preview_network.description", [],
         "Root description of the `preview_network` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_network` overrides this key."),
+    ToolPreviewNetworkParamFilter => ("tool.preview_network.param.filter", [],
+        "Description of `preview_network`'s `filter` parameter."),
+    ToolPreviewNetworkParamRequestId => ("tool.preview_network.param.request_id", [],
+        "Description of `preview_network`'s `requestId` parameter."),
     ToolPreviewResizeDescription => ("tool.preview_resize.description", [],
         "Root description of the `preview_resize` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_resize` overrides this key."),
+    ToolPreviewResizeParamPreset => ("tool.preview_resize.param.preset", [],
+        "Description of `preview_resize`'s `preset` parameter."),
+    ToolPreviewResizeParamWidth => ("tool.preview_resize.param.width", [],
+        "Description of `preview_resize`'s `width` parameter."),
+    ToolPreviewResizeParamHeight => ("tool.preview_resize.param.height", [],
+        "Description of `preview_resize`'s `height` parameter."),
+    ToolPreviewResizeParamColorScheme => ("tool.preview_resize.param.color_scheme", [],
+        "Description of `preview_resize`'s `colorScheme` parameter."),
     ToolPreviewUploadImageDescription => ("tool.preview_upload_image.description", [],
         "Root description of the `preview_upload_image` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_upload_image` overrides this key."),
+    ToolPreviewUploadImageParamImageId => ("tool.preview_upload_image.param.image_id", [],
+        "Description of `preview_upload_image`'s `image_id` parameter."),
+    ToolPreviewUploadImageParamSelector => ("tool.preview_upload_image.param.selector", [],
+        "Description of `preview_upload_image`'s `selector` parameter."),
+    ToolPreviewUploadImageParamFilename => ("tool.preview_upload_image.param.filename", [],
+        "Description of `preview_upload_image`'s `filename` parameter."),
     ToolPreviewDialogDescription => ("tool.preview_dialog.description", [],
         "Root description of the `preview_dialog` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `preview_dialog` overrides this key."),
+    ToolPreviewDialogParamAccept => ("tool.preview_dialog.param.accept", [],
+        "Description of `preview_dialog`'s `accept` parameter."),
+    ToolPreviewDialogParamPromptText => ("tool.preview_dialog.param.prompt_text", [],
+        "Description of `preview_dialog`'s `prompt_text` parameter."),
     ToolAgentSpawnDescription => ("tool.agent_spawn.description", [],
-        "Root description of the `agent_spawn` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `agent_spawn` overrides this key."),
+        "Root description of the `agent_spawn` schema on a model without asynchronous tool calls: the call answers with a dispatch receipt, and the result comes later through `task_wait` or a host notification, the standard variant (see `tool_surface`). A profile's `tools[].description` for `agent_spawn` overrides this key."),
+    ToolAgentSpawnAsyncDescription => ("tool.agent_spawn.async.description", [],
+        "Root description of the `agent_spawn` schema in its `async` variant (see `tool_surface`): offered to a model that takes asynchronous tool calls, where the call is declared asynchronous, returns nothing at first, and the child's result arrives later as its own output. A profile's `tools[].description` for `agent_spawn` with `variant: \"async\"` overrides this key."),
+    ToolAgentSpawnParamPrompt => ("tool.agent_spawn.param.prompt", [],
+        "Description of `agent_spawn`'s `prompt` parameter."),
+    ToolAgentSpawnParamAgentType => ("tool.agent_spawn.param.agent_type", [],
+        "Description of `agent_spawn`'s `agent_type` parameter in the static schema, which the model sees only when the conversation's roles could not be read for the request (`api::role_policy` unknown): no names are listed, and a name is checked when the child is spawned. Once roles are known the parameter carries `tool.agent_spawn.param.agent_type_roles` and an enum instead, or is removed when there are none."),
+    ToolAgentSpawnParamAgentTypeRoles => ("tool.agent_spawn.param.agent_type_roles", [],
+        "Description of `agent_spawn`'s `agent_type` parameter when the conversation has roles and the schema lists them as an enum."),
+    ToolAgentSpawnParamName => ("tool.agent_spawn.param.name", [],
+        "Description of `agent_spawn`'s `name` parameter."),
+    ToolAgentSpawnParamLabel => ("tool.agent_spawn.param.label", [],
+        "Description of `agent_spawn`'s `label` parameter."),
+    ToolAgentSpawnParamContext => ("tool.agent_spawn.param.context", [],
+        "Description of `agent_spawn`'s `context` parameter."),
+    ToolAgentSpawnParamSchema => ("tool.agent_spawn.param.schema", [],
+        "Description of `agent_spawn`'s `schema` parameter."),
     ToolTaskWaitDescription => ("tool.task_wait.description", [],
-        "Root description of the `task_wait` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `task_wait` overrides this key."),
+        "Root description of the `task_wait` schema in a top-level run, the standard variant (see `tool_surface`). A profile's `tools[].description` for `task_wait` overrides this key."),
+    ToolTaskWaitChildDescription => ("tool.task_wait.child.description", [],
+        "Root description of the `task_wait` schema in its `child` variant (see `tool_surface`): offered to a child agent, which has background commands, terminals and pages to wait on but no children or workflows, and whose commands still running at its final reply are stopped. A profile's `tools[].description` for `task_wait` with `variant: \"child\"` overrides this key."),
+    ToolTaskWaitParamTasks => ("tool.task_wait.param.tasks", [],
+        "Description of `task_wait`'s `tasks` parameter."),
+    ToolTaskWaitChildParamTasks => ("tool.task_wait.child.param.tasks", [],
+        "Description of `task_wait`'s `tasks` parameter in the `child` variant: what an omitted list waits for in a child agent, which has no children or workflows."),
+    ToolTaskWaitParamTasksItem => ("tool.task_wait.param.tasks.item", [],
+        "Description of each element of `task_wait`'s `tasks` parameter."),
+    ToolTaskWaitParamTimeoutSeconds => ("tool.task_wait.param.timeout_seconds", [],
+        "Description of `task_wait`'s `timeout_seconds` parameter."),
+    ToolTaskWaitChildParamTimeoutSeconds => ("tool.task_wait.child.param.timeout_seconds", [],
+        "Description of `task_wait`'s `timeout_seconds` parameter in the `child` variant: ending the round at the deadline ends the child, and stops what it still runs."),
     ToolTaskListDescription => ("tool.task_list.description", [],
         "Root description of the `task_list` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `task_list` overrides this key."),
     ToolBoxDescription => ("tool.box.description", [],
         "Root description of the `box` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `box` overrides this key. Declared only where the conversation's host messages come in `box`."),
+    ToolBoxParamNone => ("tool.box.param.none", [],
+        "Description of `box`'s `none` parameter, the one (always empty) argument the host's fabricated calls carry."),
     ToolReadGlobalMemoryDescription => ("tool.read_global_memory.description", [],
         "Root description of the `read_global_memory` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `read_global_memory` overrides this key."),
     ToolReadProjectMemoryDescription => ("tool.read_project_memory.description", [],
@@ -266,28 +476,128 @@ prompt_keys! {
         "Root description of the `edit_global_memory` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `edit_global_memory` overrides this key."),
     ToolEditProjectMemoryDescription => ("tool.edit_project_memory.description", [],
         "Root description of the `edit_project_memory` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `edit_project_memory` overrides this key."),
+    ToolMemoryParamReadName => ("tool.memory.param.read_name", [],
+        "Description of the `name` parameter of `read_global_memory` and `read_project_memory`."),
+    ToolMemoryParamCreateName => ("tool.memory.param.create_name", [],
+        "Description of the `name` parameter of `create_global_memory` and `create_project_memory`."),
+    ToolMemoryParamCreateContent => ("tool.memory.param.create_content", [],
+        "Description of the `content` parameter of `create_global_memory` and `create_project_memory`."),
+    ToolMemoryParamCreateDescription => ("tool.memory.param.create_description", [],
+        "Description of the `description` parameter of `create_global_memory` and `create_project_memory`."),
+    ToolMemoryParamEditName => ("tool.memory.param.edit_name", [],
+        "Description of the `name` parameter of `edit_global_memory` and `edit_project_memory`."),
+    ToolMemoryParamEditOldText => ("tool.memory.param.edit_old_text", [],
+        "Description of the `old_text` parameter of `edit_global_memory` and `edit_project_memory`."),
+    ToolMemoryParamEditNewText => ("tool.memory.param.edit_new_text", [],
+        "Description of the `new_text` parameter of `edit_global_memory` and `edit_project_memory`."),
+    ToolMemoryParamEditDescription => ("tool.memory.param.edit_description", [],
+        "Description of the `description` parameter of `edit_global_memory` and `edit_project_memory`."),
     ToolAskUserDescription => ("tool.ask_user.description", [],
         "Root description of the `ask_user` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `ask_user` overrides this key."),
+    ToolAskUserParamQuestions => ("tool.ask_user.param.questions", [],
+        "Description of `ask_user`'s `questions` parameter."),
+    ToolAskUserParamQuestionsQuestion => ("tool.ask_user.param.questions.question", [],
+        "Description of `ask_user`'s `questions[].question` parameter."),
+    ToolAskUserParamQuestionsHeader => ("tool.ask_user.param.questions.header", [],
+        "Description of `ask_user`'s `questions[].header` parameter."),
+    ToolAskUserParamQuestionsOptions => ("tool.ask_user.param.questions.options", [],
+        "Description of `ask_user`'s `questions[].options` parameter."),
+    ToolAskUserParamQuestionsOptionsLabel => ("tool.ask_user.param.questions.options.label", [],
+        "Description of `ask_user`'s `questions[].options[].label` parameter."),
+    ToolAskUserParamQuestionsOptionsDescription => ("tool.ask_user.param.questions.options.description", [],
+        "Description of `ask_user`'s `questions[].options[].description` parameter."),
+    ToolAskUserParamQuestionsOptionsPreview => ("tool.ask_user.param.questions.options.preview", [],
+        "Description of `ask_user`'s `questions[].options[].preview` parameter."),
+    ToolAskUserParamQuestionsMultiSelect => ("tool.ask_user.param.questions.multi_select", [],
+        "Description of `ask_user`'s `questions[].multiSelect` parameter."),
+    ToolAskUserParamAnswers => ("tool.ask_user.param.answers", [],
+        "Description of `ask_user`'s `answers` parameter."),
+    ToolAskUserParamAnnotations => ("tool.ask_user.param.annotations", [],
+        "Description of `ask_user`'s `annotations` parameter."),
+    ToolAskUserParamAnnotationsPreview => ("tool.ask_user.param.annotations.preview", [],
+        "Description of `ask_user`'s `annotations.preview` parameter."),
+    ToolAskUserParamAnnotationsNotes => ("tool.ask_user.param.annotations.notes", [],
+        "Description of `ask_user`'s `annotations.notes` parameter."),
+    ToolAskUserParamMetadata => ("tool.ask_user.param.metadata", [],
+        "Description of `ask_user`'s `metadata` parameter."),
+    ToolAskUserParamMetadataSource => ("tool.ask_user.param.metadata.source", [],
+        "Description of `ask_user`'s `metadata.source` parameter."),
     ToolForkDescription => ("tool.fork.description", [],
         "Root description of the `fork` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `fork` overrides this key."),
+    ToolForkParamPrompt => ("tool.fork.param.prompt", [],
+        "Description of `fork`'s `prompt` parameter."),
     ToolWorkflowDescription => ("tool.workflow.description", [],
-        "Root description of the `workflow` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `workflow` overrides this key."),
+        "Root description of the `workflow` schema on a model without asynchronous tool calls: the call answers at once, and the run's return value comes later through `task_wait` or a host notification, the standard variant (see `tool_surface`). A profile's `tools[].description` for `workflow` overrides this key."),
+    ToolWorkflowAsyncDescription => ("tool.workflow.async.description", [],
+        "Root description of the `workflow` schema in its `async` variant (see `tool_surface`): offered to a model that takes asynchronous tool calls, where the call is declared asynchronous, returns nothing at first, and the run's return value arrives later as its own output. A profile's `tools[].description` for `workflow` with `variant: \"async\"` overrides this key."),
+    ToolWorkflowParamScript => ("tool.workflow.param.script", ["signature", "agent_type_clause"],
+        "Description of `workflow`'s `script` parameter. `{signature}` is the `agent()` signature line and `{agent_type_clause}` is one of the `tool.workflow.param.script.agent_type_*` texts."),
+    ToolWorkflowParamScriptAgentTypeUnresolved => ("tool.workflow.param.script.agent_type_unresolved", [],
+        "`{agent_type_clause}` of `tool.workflow.param.script` in the static schema, which the model sees only when the conversation's roles could not be read for the request: no `$defs.agentType` is given, and a name is checked when its step starts."),
+    ToolWorkflowParamScriptAgentTypeNone => ("tool.workflow.param.script.agent_type_none", [],
+        "`{agent_type_clause}` of `tool.workflow.param.script` when no role is available to the conversation: none is selected, or none of the selected ones could be loaded."),
+    ToolWorkflowParamScriptAgentTypeOptional => ("tool.workflow.param.script.agent_type_optional", [],
+        "`{agent_type_clause}` of `tool.workflow.param.script` when roles exist and naming one is optional."),
+    ToolWorkflowParamScriptAgentTypeRequired => ("tool.workflow.param.script.agent_type_required", [],
+        "`{agent_type_clause}` of `tool.workflow.param.script` when roles exist and every `agent()` call must name one."),
+    ToolWorkflowParamName => ("tool.workflow.param.name", [],
+        "Description of `workflow`'s `name` parameter."),
+    ToolWorkflowParamArgs => ("tool.workflow.param.args", [],
+        "Description of `workflow`'s `args` parameter."),
+    ToolWorkflowParamTokenBudget => ("tool.workflow.param.token_budget", [],
+        "Description of `workflow`'s `token_budget` parameter."),
+    ToolWorkflowParamResumeRunId => ("tool.workflow.param.resume_run_id", [],
+        "Description of `workflow`'s `resume_run_id` parameter."),
+    ToolWorkflowDefsAgentType => ("tool.workflow.defs.agent_type", [],
+        "Description of `workflow`'s `$defs.agentType` entry, which lists the legal role names for the script's `agentType` option."),
     ToolPlanDescription => ("tool.plan.description", [],
         "Root description of the `plan` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `plan` overrides this key."),
+    ToolPlanParamAction => ("tool.plan.param.action", [],
+        "Description of `plan`'s `action` parameter."),
+    ToolPlanParamContent => ("tool.plan.param.content", [],
+        "Description of `plan`'s `content` parameter."),
     ToolExitPlanModeDescription => ("tool.exit_plan_mode.description", [],
         "Root description of the `exit_plan_mode` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `exit_plan_mode` overrides this key."),
     ToolReadHandoffNoteDescription => ("tool.read_handoff_note.description", [],
         "Root description of the `read_handoff_note` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `read_handoff_note` overrides this key."),
+    ToolReadHandoffNoteParamName => ("tool.read_handoff_note.param.name", [],
+        "Description of `read_handoff_note`'s `name` parameter."),
     ToolCreateHandoffNoteDescription => ("tool.create_handoff_note.description", [],
         "Root description of the `create_handoff_note` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `create_handoff_note` overrides this key."),
+    ToolCreateHandoffNoteParamName => ("tool.create_handoff_note.param.name", [],
+        "Description of `create_handoff_note`'s `name` parameter."),
+    ToolCreateHandoffNoteParamContent => ("tool.create_handoff_note.param.content", [],
+        "Description of `create_handoff_note`'s `content` parameter."),
+    ToolCreateHandoffNoteParamDescription => ("tool.create_handoff_note.param.description", [],
+        "Description of `create_handoff_note`'s `description` parameter."),
     ToolEditHandoffNoteDescription => ("tool.edit_handoff_note.description", [],
         "Root description of the `edit_handoff_note` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `edit_handoff_note` overrides this key."),
+    ToolEditHandoffNoteParamName => ("tool.edit_handoff_note.param.name", [],
+        "Description of `edit_handoff_note`'s `name` parameter."),
+    ToolEditHandoffNoteParamOldText => ("tool.edit_handoff_note.param.old_text", [],
+        "Description of `edit_handoff_note`'s `old_text` parameter."),
+    ToolEditHandoffNoteParamNewText => ("tool.edit_handoff_note.param.new_text", [],
+        "Description of `edit_handoff_note`'s `new_text` parameter."),
+    ToolEditHandoffNoteParamDescription => ("tool.edit_handoff_note.param.description", [],
+        "Description of `edit_handoff_note`'s `description` parameter."),
     ToolHandoffDescription => ("tool.handoff.description", [],
         "Root description of the `handoff` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `handoff` overrides this key."),
+    ToolParamWorkspace => ("tool.param.workspace", ["default"],
+        "Description of the `workspace` parameter of the tools that act in a directory, added when the conversation has more than one workspace; `{default}` is the number a call that names none lands on."),
+    ToolParamWorkspaceServer => ("tool.param.workspace_server", [],
+        "Description of the `workspace` parameter of the tools that address one dev server, added when the conversation has more than one workspace."),
+    ToolParamWorkspaceShellSuffix => ("tool.param.workspace_shell_suffix", ["shell"],
+        "Sentence appended to a shell tool's `workspace` description when only some workspaces have that shell; `{shell}` is the shell's name and the leading space belongs to the text."),
+    ToolParamWorkspaceProjectMemory => ("tool.param.workspace_project_memory", [],
+        "Description of the `workspace` parameter of the project memory tools, added when the conversation has more than one workspace."),
 
     // ---- Child agents --------------------------------------------------
     SubagentAddendum => ("subagent.addendum", [],
         "Addendum appended (after a `---` separator) to the system prompt of every spawned subagent and workflow step."),
+    SubagentAddendumBrowserNote => ("subagent.addendum.browser_note", [],
+        "Item added to the end of `subagent.addendum`'s notes list when the child holds a `preview_*` tool, which acts on the browser session it shares with the conversation."),
+    SubagentAddendumShellNote => ("subagent.addendum.shell_note", [],
+        "Item added last to `subagent.addendum`'s notes list when the child holds a shell tool: how its commands run in the background and that they stop with its final reply."),
     SubagentUpdateToolDescription => ("subagent.update_tool_description", [],
         "Schema description of the child-only `subagent_update` tool."),
     SubagentUpdateMessageDescription => ("subagent.update_message_description", [],
@@ -336,6 +646,8 @@ prompt_keys! {
         "Heading of the skill trigger list in the system prompt."),
     SkillListingRow => ("skill.listing_row", ["name", "trigger"],
         "One row of the skill trigger list."),
+    SkillListingRowUntriggered => ("skill.listing_row_untriggered", ["name"],
+        "One row of the skill trigger list for a skill whose `SKILL.md` gives no description to use as its trigger. It is listed anyway: the `skill` tool serves it, and `skill.name_description` tells the model the names are in its context."),
     SkillResult => ("skill.result", ["directory", "body"],
         "Tool result of a successful `skill` call."),
     ToolSearchToolDescription => ("tool_search.tool_description", [],
@@ -585,8 +897,6 @@ prompt_keys! {
         "Resume hint used when journal writes failed, so a resume replays nothing."),
     WorkflowResumeRepeatedWarning => ("workflow.resume_repeated_warning", ["count"],
         "Line appended to a resume hint when steps kept starting without ever finishing."),
-    WorkflowTimeout => ("workflow.timeout", ["seconds", "unfinished"],
-        "Result of a workflow run that exceeded the run deadline."),
     WorkflowLosersCancelled => ("workflow.losers_cancelled", ["count", "steps"],
         "Progress note written when the script returned while steps were still running."),
     WorkflowStepNoStructured => ("workflow.step_no_structured", [],
@@ -645,17 +955,17 @@ prompt_keys! {
     ToolEditDoneAll => ("tool.edit_done_all", ["path", "count"],
         "`edit` result with replace_all: how many occurrences were replaced. The default leaves out the file; the value stays available to a profile that wants to name it."),
     ToolFileStateCurrent => ("tool.file_state_current", [],
-        "Suffix on a `write`/`edit` result while the read-before-write or stale-write guard is on: the model need not read the file back."),
+        "Suffix on a `write`/`edit` result while the conversation's file write guards are on: the model need not read the file back. Never sent with the guards off."),
     ToolEditStaleRecovered => ("tool.edit_stale_recovered", [],
-        "Suffix on an `edit` result that applied to a file changed on disk since the model read it, because the find text still matched once (or, with replace_all, at least once)."),
+        "Suffix on an `edit` result that applied to a file changed on disk since the model read it, because the find text still matched once (or, with replace_all, at least once). Only the file write guards decide staleness, so it is never sent with them off."),
     ToolFileChangedNotice => ("tool.file_changed_notice", ["path", "snippet"],
-        "Round-start notice that a file the model read changed on disk, with the changed regions rendered with line numbers."),
+        "Round-start notice that a file the model read changed on disk, with the changed regions rendered with line numbers. Part of the file write guards: never sent with them off."),
     ToolFileChangedOmitted => ("tool.file_changed_omitted", ["path"],
         "The same notice when earlier files in the round already used up the snippet budget."),
     ToolHookFileResynced => ("tool.hook_file_resynced", ["path"],
-        "Notice that a PostToolUse hook rewrote the file `write`/`edit` just wrote and the host re-read it."),
+        "Notice that a PostToolUse hook rewrote the file `write`/`edit` just wrote and the host re-read it. Part of the file write guards: never sent with them off."),
     ToolShellStaleReadHint => ("tool.shell_stale_read_hint", ["count", "files"],
-        "Suffix on a shell result after a formatter-looking command changed files the model had read."),
+        "Suffix on a shell result after a formatter-looking command changed files the model had read. Part of the file write guards: never sent with them off."),
     ToolShellStaleReadMore => ("tool.shell_stale_read_more", ["count"],
         "Tail of the file list in the shell stale-read hint once more than five files changed."),
     ToolShellCwdOutsideWorkspace => ("tool.shell_cwd_outside_workspace", ["directory", "workspace", "root"],
@@ -678,16 +988,44 @@ prompt_keys! {
 }
 
 impl PromptKey {
-    /// The key holding the model-facing description of the built-in tool
-    /// `tool_name`, or `None` when no built-in tool goes by that name.
+    /// The key holding the model-facing description of `variant` of the
+    /// built-in tool `tool_name`, or `None` when no built-in tool goes by that
+    /// name or the tool has no such variant.
     ///
-    /// This is the single slot for "what this tool is". A profile fills it
-    /// either through `prompts` directly or through the tool-facing channel,
-    /// `tools[].description`; both end up here, so a switched profile really
-    /// does change the description the model reads. Tools discovered at run
-    /// time (MCP) have no key: their description belongs to the server that
-    /// declared it, and a profile overrides it on the descriptor instead.
-    pub fn for_tool_description(tool_name: &str) -> Option<Self> {
+    /// This is the single slot for "what this tool is" in that variant. A
+    /// profile fills it either through `prompts` directly or through the
+    /// tool-facing channel, `tools[].description` (with `tools[].variant` for
+    /// any but the standard one); both end up here, so a switched profile
+    /// really does change the description the model reads. Tools discovered at
+    /// run time (MCP) have no key: their description belongs to the server
+    /// that declared it, and a profile overrides it on the descriptor instead.
+    ///
+    /// The variant arms are spelled out one by one, like the axes in
+    /// `tool_surface`: a variant is a different tool, and its text is never
+    /// derived from the standard one's.
+    pub fn for_tool_description(tool_name: &str, variant: ToolVariant) -> Option<Self> {
+        let key = match (tool_name, variant) {
+            (_, ToolVariant::Standard) => return Self::for_standard_tool_description(tool_name),
+            ("read", ToolVariant::TextOnly) => PromptKey::ToolReadTextOnlyDescription,
+            ("write", ToolVariant::Unguarded) => PromptKey::ToolWriteUnguardedDescription,
+            ("edit", ToolVariant::Unguarded) => PromptKey::ToolEditUnguardedDescription,
+            ("pwsh", ToolVariant::Child) => PromptKey::ToolPwshChildDescription,
+            ("powershell", ToolVariant::Child) => PromptKey::ToolPowershellChildDescription,
+            ("bash", ToolVariant::Child) => PromptKey::ToolBashChildDescription,
+            ("zsh", ToolVariant::Child) => PromptKey::ToolZshChildDescription,
+            ("sh", ToolVariant::Child) => PromptKey::ToolShChildDescription,
+            ("web_search", ToolVariant::Native) => PromptKey::ToolWebSearchNativeDescription,
+            ("agent_spawn", ToolVariant::Async) => PromptKey::ToolAgentSpawnAsyncDescription,
+            ("task_wait", ToolVariant::Child) => PromptKey::ToolTaskWaitChildDescription,
+            ("workflow", ToolVariant::Async) => PromptKey::ToolWorkflowAsyncDescription,
+            _ => return None,
+        };
+        Some(key)
+    }
+
+    /// The standard variant's description key of the built-in tool
+    /// `tool_name`.
+    fn for_standard_tool_description(tool_name: &str) -> Option<Self> {
         match tool_name {
             // `skill` predates this section and keeps its own key.
             "skill" => Some(PromptKey::SkillToolDescription),
@@ -702,6 +1040,7 @@ impl PromptKey {
             "lsp" => Some(PromptKey::ToolLspDescription),
             "write" => Some(PromptKey::ToolWriteDescription),
             "edit" => Some(PromptKey::ToolEditDescription),
+            "pwsh" => Some(PromptKey::ToolPwshDescription),
             "powershell" => Some(PromptKey::ToolPowershellDescription),
             "bash" => Some(PromptKey::ToolBashDescription),
             "zsh" => Some(PromptKey::ToolZshDescription),
@@ -761,6 +1100,7 @@ pub struct PromptProfile {
     /// and the language recorded on fork bindings. It does not pick texts: every
     /// key a profile leaves out falls back to the English built-in.
     pub language: ResolvedLanguage,
+    base: Base,
     overrides: HashMap<PromptKey, String>,
     /// Per-tool description overrides.
     pub tools: Vec<ToolDescriptionEntry>,
@@ -773,16 +1113,24 @@ impl Default for PromptProfile {
 }
 
 impl PromptKey {
-    /// The built-in English text — the fallback of every profile. It is code in
-    /// [`english`], so it ships with the build and changes with it.
+    /// The guided built-in English text — the fallback of every user file. It
+    /// is code in [`english`], so it ships with the build and changes with it.
     pub fn builtin_en(self) -> &'static str {
         english::text(self)
+    }
+
+    /// The concise built-in text: [`concise`]'s decision for this key, which
+    /// is the guided text wherever it keeps it.
+    pub fn builtin_concise(self) -> &'static str {
+        concise::text(self).unwrap_or_else(|| english::text(self))
     }
 }
 
 /// Folds each non-empty `tools[].description` onto the description key of the
-/// tool it names, so it replaces the built-in wording instead of arriving
-/// beside it.
+/// tool and variant it names, so it replaces the built-in wording of that one
+/// variant instead of arriving beside it. An entry naming no variant is the
+/// standard one's; an entry naming a variant this build or this tool does not
+/// have reaches nothing.
 fn fold_tool_descriptions(
     tools: &[ToolDescriptionEntry],
     overrides: &mut HashMap<PromptKey, String>,
@@ -791,9 +1139,18 @@ fn fold_tool_descriptions(
         if entry.description.trim().is_empty() {
             continue;
         }
-        if let Some(key) = PromptKey::for_tool_description(entry.tool_name.trim()) {
+        if let Some(key) = entry.description_key() {
             overrides.insert(key, entry.description.clone());
         }
+    }
+}
+
+impl ToolDescriptionEntry {
+    /// The description key this entry overrides, or `None` when it names no
+    /// built-in tool or a variant that tool does not have.
+    pub fn description_key(&self) -> Option<PromptKey> {
+        let variant = ToolVariant::parse(&self.variant)?;
+        PromptKey::for_tool_description(self.tool_name.trim(), variant)
     }
 }
 
@@ -814,15 +1171,45 @@ pub fn parse_prompt_overrides(value: &Value) -> HashMap<PromptKey, String> {
 }
 
 impl PromptProfile {
-    /// The built-in profile: the compiled English texts, no overrides.
+    /// The guided built-in profile, the default: the compiled English texts,
+    /// no overrides.
     pub fn builtin_english() -> Self {
         Self {
             id: BUILTIN_EN_US_ID.to_owned(),
-            name: "Mewrk built-in".to_owned(),
+            name: "Mewrk guided".to_owned(),
             language: ResolvedLanguage::EnUs,
+            base: Base::Guided,
             overrides: HashMap::new(),
             tools: Vec::new(),
         }
+    }
+
+    /// The concise built-in profile: the compiled concise texts, no overrides.
+    pub fn builtin_concise() -> Self {
+        Self {
+            id: BUILTIN_CONCISE_EN_US_ID.to_owned(),
+            name: "Mewrk concise".to_owned(),
+            language: ResolvedLanguage::EnUs,
+            base: Base::Concise,
+            overrides: HashMap::new(),
+            tools: Vec::new(),
+        }
+    }
+
+    /// The built-in profile `id` names, or `None` when it names none. An
+    /// empty id is not a built-in's: callers decide what "nothing selected"
+    /// resolves to.
+    pub fn builtin(id: &str) -> Option<Self> {
+        match id {
+            BUILTIN_EN_US_ID => Some(Self::builtin_english()),
+            BUILTIN_CONCISE_EN_US_ID => Some(Self::builtin_concise()),
+            _ => None,
+        }
+    }
+
+    /// Every built-in profile, the default first.
+    pub fn builtins() -> [Self; 2] {
+        [Self::builtin_english(), Self::builtin_concise()]
     }
 
     /// A user-authored profile. `language` is the application language: a file
@@ -848,17 +1235,21 @@ impl PromptProfile {
             id,
             name,
             language,
+            base: Base::Guided,
             overrides,
             tools,
         }
     }
 
-    /// The text for `key`: the profile's override, else the built-in English
+    /// The text for `key`: the profile's override, else its built-in table's
     /// text.
     pub fn text(&self, key: PromptKey) -> &str {
         match self.overrides.get(&key) {
             Some(text) => text,
-            None => key.builtin_en(),
+            None => match self.base {
+                Base::Guided => key.builtin_en(),
+                Base::Concise => key.builtin_concise(),
+            },
         }
     }
 
@@ -1093,13 +1484,18 @@ mod tests {
     /// so a key without a text does not compile.
     #[test]
     fn english_texts_are_listed_in_registry_order() {
+        // An arm is a literal, or — for the variants of one tool, which share
+        // most of their text — a `concat!` or a text macro of the file's own.
         let listed = include_str!("prompt_profile/english.rs")
             .lines()
             .filter_map(|line| {
-                let (variant, _) = line.strip_prefix("    ")?.split_once(" => \"")?;
-                variant
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric())
+                let (variant, value) = line.strip_prefix("    ")?.split_once(" => ")?;
+                let arm = value.starts_with('"')
+                    || value.starts_with("concat!(")
+                    || value.split_once("!(").is_some_and(|(name, _)| {
+                        name.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                    });
+                (arm && variant.bytes().all(|byte| byte.is_ascii_alphanumeric()))
                     .then_some(variant.to_owned())
             })
             .collect::<Vec<_>>();
@@ -1125,6 +1521,138 @@ mod tests {
         }
     }
 
+    /// Texts the renderer or the host parses back out of what it wrote: the
+    /// `[name · status]` slots, the wait roll-up heading, the progress label a
+    /// recorded wait is scanned for, the memory block the send gate counts tags
+    /// in, and the meta lines the tool renderers match. Rewording one in the
+    /// concise profile would break that parse — and, for the progress label,
+    /// misread every conversation the other profile wrote — so concise keeps them.
+    const CONCISE_KEEPS_GUIDED: &[PromptKey] = &[
+        PromptKey::TaskProgressUpdateLabel,
+        PromptKey::TaskWaitStatusHeading,
+        PromptKey::TaskStatusCompleted,
+        PromptKey::TaskStatusInterrupted,
+        PromptKey::TaskStatusFailed,
+        PromptKey::TaskStatusStopped,
+        PromptKey::TaskStatusRoundLimit,
+        PromptKey::TaskStatusRunning,
+        PromptKey::TaskStatusIdle,
+        PromptKey::TaskPreviewStarting,
+        PromptKey::TaskPreviewRunning,
+        PromptKey::TaskPreviewStopped,
+        PromptKey::TaskTerminalRunning,
+        PromptKey::TaskTerminalIdle,
+        PromptKey::TaskTerminalExited,
+        PromptKey::TaskTerminalClosed,
+        PromptKey::TaskShellAborted,
+        PromptKey::TaskShellAborting,
+        PromptKey::TaskShellRunning,
+        PromptKey::TaskShellFinished,
+        PromptKey::MemoryContextIntro,
+        PromptKey::MemoryTierGlobal,
+        PromptKey::MemoryTierProject,
+        PromptKey::MemoryTierProjectOfWorkspace,
+        PromptKey::MemoryIndexHeading,
+        PromptKey::ToolLsLimit,
+        PromptKey::ToolLsLimitPartial,
+        PromptKey::ToolGrepLimit,
+        PromptKey::ToolFindLimit,
+        PromptKey::ToolFindIgnoredNote,
+        PromptKey::ToolFindScanLimit,
+        PromptKey::ToolFindNoMatch,
+        PromptKey::ToolReadLimit,
+        PromptKey::ToolShellExitUnknown,
+        PromptKey::ToolShellExitCode,
+        PromptKey::ToolOutputTruncated,
+        PromptKey::ToolDiffTruncated,
+        PromptKey::FormatListSeparator,
+    ];
+
+    /// The non-description keys the concise profile leaves empty on purpose:
+    /// guidance the host appends only when it has text, so empty means the
+    /// sentence is simply not said. Any other runtime text — a receipt, a
+    /// notice, a heading — must keep saying something.
+    const CONCISE_OMITS: &[PromptKey] = &[];
+
+    /// A tool's or parameter's description: what a model reads about a tool
+    /// before it calls it. The concise profile may leave these empty and may
+    /// drop the placeholders of a sentence it leaves out.
+    fn is_description_key(key: PromptKey) -> bool {
+        let id = key.id();
+        id.ends_with(".description")
+            || id.ends_with("_description")
+            || id.contains(".param.")
+            || id.contains(".defs.")
+    }
+
+    /// `concise.rs` lists its decisions in registry order, like `english.rs`.
+    /// Completeness needs no test: its match is exhaustive too.
+    #[test]
+    fn concise_texts_are_listed_in_registry_order() {
+        assert_eq!(super::concise::ORDER, PromptKey::ALL);
+    }
+
+    #[test]
+    fn concise_texts_keep_their_facts_and_their_parsed_forms() {
+        for key in PromptKey::ALL {
+            let text = key.builtin_concise();
+            let guided = key.builtin_en();
+            assert!(!has_cjk(text), "{} concise text contains CJK", key.id());
+            let declared = key
+                .placeholders()
+                .iter()
+                .map(|placeholder| (*placeholder).to_owned())
+                .collect::<HashSet<_>>();
+            let used = placeholders_in(text).into_iter().collect::<HashSet<_>>();
+            assert!(
+                used.is_subset(&declared),
+                "{} uses {used:?} but declares {declared:?}",
+                key.id()
+            );
+            if CONCISE_KEEPS_GUIDED.contains(key) {
+                assert_eq!(text, guided, "{} is parsed back and must keep its guided text", key.id());
+                continue;
+            }
+            if is_description_key(*key) {
+                continue;
+            }
+            if text.is_empty() {
+                assert!(
+                    guided.is_empty() || CONCISE_OMITS.contains(key),
+                    "{} is a runtime text; concise may not leave it empty unless listed in CONCISE_OMITS",
+                    key.id()
+                );
+                continue;
+            }
+            // A runtime text carries its facts in its placeholders: an id, a
+            // count, a name. A shorter sentence still says all of them.
+            let guided_used = placeholders_in(guided).into_iter().collect::<HashSet<_>>();
+            assert_eq!(
+                used,
+                guided_used,
+                "{} must keep the placeholders its guided text uses",
+                key.id()
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_builtins_resolve_by_id_and_differ_only_in_their_base() {
+        let guided = PromptProfile::builtin(BUILTIN_EN_US_ID).expect("guided");
+        let concise = PromptProfile::builtin(BUILTIN_CONCISE_EN_US_ID).expect("concise");
+        assert_eq!(guided, PromptProfile::builtin_english());
+        assert_eq!(concise, PromptProfile::builtin_concise());
+        assert_eq!(PromptProfile::builtin(""), None);
+        assert_eq!(PromptProfile::builtin("tooldesc_builtin_zh_cn"), None);
+        assert_eq!(concise.language, guided.language);
+        for key in PromptKey::ALL {
+            assert_eq!(guided.text(*key), key.builtin_en());
+            assert_eq!(concise.text(*key), key.builtin_concise());
+        }
+        let ids = PromptProfile::builtins().map(|profile| profile.id);
+        assert_eq!(ids, [BUILTIN_EN_US_ID.to_owned(), BUILTIN_CONCISE_EN_US_ID.to_owned()]);
+    }
+
     /// A file's `language` is the app language and never picks texts: every key
     /// it leaves out keeps the built-in English wording.
     #[test]
@@ -1139,6 +1667,7 @@ mod tests {
                 overrides.clone(),
                 vec![ToolDescriptionEntry {
                     tool_name: "grep".to_owned(),
+                    variant: String::new(),
                     description: "notes".to_owned(),
                 }],
             );
@@ -1274,6 +1803,7 @@ mod tests {
 
     fn golden_files() -> Vec<(&'static str, String)> {
         let builtin = PromptProfile::builtin_english().to_document();
+        let concise = PromptProfile::builtin_concise().to_document();
         let manifest = serde_json::json!({
             "kind": "mewrk-prompt-profile-keys",
             "note": "Every host injection point a tool-description file may override under `prompts`. Generated by prompt_profile.rs tests; regenerate with: cargo test --lib -- prompt_profile::tests::regenerate_prompt_profile_baselines --ignored",
@@ -1283,8 +1813,161 @@ mod tests {
         });
         vec![
             ("prompt-profile.en-US.json", pretty(&builtin)),
+            ("prompt-profile.concise.en-US.json", pretty(&concise)),
             ("prompt-profile-keys.json", pretty(&manifest)),
         ]
+    }
+
+    /// Every variant of every built-in tool (`crate::tool_surface`) has a
+    /// description key of its own, and the guided texts of two variants of one
+    /// tool differ: a variant is a different tool, so if the two read the same
+    /// one of them is describing the wrong tool.
+    #[test]
+    fn every_tool_variant_has_a_description_of_its_own() {
+        let guided = PromptProfile::builtin_english();
+        for tool in crate::catalog::tool_catalog() {
+            let variants = crate::tool_surface::variants_of(&tool.name);
+            let keys = variants
+                .iter()
+                .map(|variant| {
+                    PromptKey::for_tool_description(&tool.name, *variant).unwrap_or_else(|| {
+                        panic!("{} has no description key for {variant:?}", tool.name)
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (index, key) in keys.iter().enumerate() {
+                assert!(!guided.text(*key).is_empty(), "{} {:?}", tool.name, variants[index]);
+                for other in &keys[index + 1..] {
+                    assert_ne!(key, other, "{} shares a key between variants", tool.name);
+                    assert_ne!(
+                        guided.text(*key),
+                        guided.text(*other),
+                        "{}: two variants read the same",
+                        tool.name
+                    );
+                }
+            }
+            // A variant the tool does not have has no key.
+            for axis in crate::tool_surface::Axis::ALL {
+                for variant in axis.variants() {
+                    if !variants.contains(variant) {
+                        assert_eq!(PromptKey::for_tool_description(&tool.name, *variant), None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A sentence about another tool is marked so a run without that tool
+    /// never reads it (`tool_mentions`). Every marker in both built-in
+    /// profiles is closed and names a tool the catalog has.
+    #[test]
+    fn every_mention_marker_is_balanced_and_names_a_real_tool() {
+        for profile in [PromptProfile::builtin_english(), PromptProfile::builtin_concise()] {
+            for key in PromptKey::ALL {
+                let text = profile.text(*key);
+                assert!(
+                    crate::tool_mentions::is_balanced(text),
+                    "{}: unbalanced mention markers",
+                    key.id()
+                );
+                for name in crate::tool_mentions::mentioned_tools(text) {
+                    assert!(
+                        crate::tool_mentions::is_known_name(&name),
+                        "{} names {name}, which no catalog tool is",
+                        key.id()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The shell tools' advice resolves to grammatical text whichever of the
+    /// dedicated tools a run offers, and names only the ones it offers.
+    #[test]
+    fn a_shell_description_names_only_the_dedicated_tools_on_offer() {
+        use crate::tool_mentions::{resolve, OfferedTools};
+        let guided = PromptProfile::builtin_english();
+        let siblings = ["find", "grep", "read", "edit", "write", "ls"];
+        for key in [
+            PromptKey::ToolBashDescription,
+            PromptKey::ToolShDescription,
+            PromptKey::ToolPwshDescription,
+            PromptKey::ToolPowershellChildDescription,
+        ] {
+            let all = resolve(guided.text(key), &OfferedTools::from_names(siblings)).into_owned();
+            for sibling in siblings {
+                assert!(all.contains(&format!("the {sibling} tool")) || all.contains(&format!("use {sibling}")), "{}: {sibling}", key.id());
+            }
+            let bare = resolve(guided.text(key), &OfferedTools::from_names([])).into_owned();
+            assert!(!bare.contains("IMPORTANT"), "{}: {bare}", key.id());
+            assert!(!bare.contains("use ls"), "{}", key.id());
+            assert!(
+                bare.contains("first 2,000 characters instead."),
+                "{}: the spill bullet still ends its sentence",
+                key.id()
+            );
+            let read_only = resolve(guided.text(key), &OfferedTools::from_names(["read"])).into_owned();
+            assert!(read_only.contains("Read files: use the read tool"), "{}", key.id());
+            assert!(!read_only.contains("grep tool"), "{}", key.id());
+            assert!(read_only.contains("use read on that path"), "{}", key.id());
+        }
+    }
+
+    /// Each PowerShell edition describes its own language: 7's operators are
+    /// offered by `pwsh` and refused by `powershell`, and only 5.1 warns about
+    /// the ANSI default.
+    #[test]
+    fn each_powershell_edition_says_only_what_is_true_of_it() {
+        for profile in [PromptProfile::builtin_english(), PromptProfile::builtin_concise()] {
+            let pwsh = profile.text(PromptKey::ToolPwshDescription);
+            let windows = profile.text(PromptKey::ToolPowershellDescription);
+            assert!(pwsh.contains("PowerShell 7"), "{pwsh}");
+            assert!(!pwsh.contains("ANSI"), "{pwsh}");
+            assert!(windows.contains("5.1"), "{windows}");
+            assert!(windows.contains("ANSI"), "{windows}");
+            assert!(windows.contains("if ($?)"), "{windows}");
+        }
+    }
+
+    /// A `tools[]` entry overrides the description of the one variant it
+    /// names: no `variant` is the standard one, an id the tool has is that
+    /// variant, and anything else reaches nothing.
+    #[test]
+    fn a_tools_entry_overrides_exactly_the_variant_it_names() {
+        let entry = |tool: &str, variant: &str, description: &str| ToolDescriptionEntry {
+            tool_name: tool.to_owned(),
+            variant: variant.to_owned(),
+            description: description.to_owned(),
+        };
+        let profile = PromptProfile::from_file(
+            "f".into(),
+            "F".into(),
+            ResolvedLanguage::EnUs,
+            HashMap::new(),
+            vec![
+                entry("edit", "", "GUARDED"),
+                entry("write", "unguarded", "UNGUARDED WRITE"),
+                entry("ls", "child", "NO SUCH VARIANT"),
+                entry("bash", "grandchild", "NO SUCH ID"),
+            ],
+        );
+        let guided = PromptProfile::builtin_english();
+        assert_eq!(profile.text(PromptKey::ToolEditDescription), "GUARDED");
+        assert_eq!(
+            profile.text(PromptKey::ToolEditUnguardedDescription),
+            guided.text(PromptKey::ToolEditUnguardedDescription)
+        );
+        assert_eq!(profile.text(PromptKey::ToolWriteUnguardedDescription), "UNGUARDED WRITE");
+        assert_eq!(
+            profile.text(PromptKey::ToolWriteDescription),
+            guided.text(PromptKey::ToolWriteDescription)
+        );
+        assert_eq!(profile.text(PromptKey::ToolLsDescription), guided.text(PromptKey::ToolLsDescription));
+        assert_eq!(
+            profile.text(PromptKey::ToolBashChildDescription),
+            guided.text(PromptKey::ToolBashChildDescription)
+        );
     }
 
     #[test]

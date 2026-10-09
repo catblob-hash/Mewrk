@@ -28,7 +28,8 @@ const winbox: SshMachineConfig = {
 const windowsProbe: MachineShells = {
   os: "windows",
   shells: [
-    { backend: "powershell", path: "C:\\Program Files\\PowerShell\\7\\pwsh.exe" },
+    { backend: "pwsh", path: "C:\\Program Files\\PowerShell\\7\\pwsh.exe" },
+    { backend: "powershell", path: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" },
     { backend: "bash", path: "C:\\Program Files\\Git\\bin\\bash.exe" }
   ],
   probedAt: "2026-09-23T00:00:00Z"
@@ -102,14 +103,49 @@ describe("a machine's shells in its settings", () => {
     const shells = control({ probes: { "ssh:winbox": windowsProbe } });
     const handlers = renderDialog({ kind: "ssh", machineId: "winbox" }, shells);
     const select = screen.getByRole("combobox", { name: "代理 shell" });
-    // Nothing chosen yet: Windows' default priority puts PowerShell first.
-    expect(select).toHaveValue("powershell");
+    // Nothing chosen yet: Windows' default priority puts PowerShell 7 first.
+    expect(select).toHaveValue("pwsh");
     await userEvent.selectOptions(select, "bash");
     await userEvent.click(screen.getByRole("button", { name: "保存" }));
     expect(handlers.onSaveSshMachine).toHaveBeenCalledWith(expect.objectContaining({
       id: "winbox",
       agentShell: "bash"
     }));
+  });
+
+  it("offers PowerShell 7 and Windows PowerShell as two agent shells on a Windows machine", async () => {
+    const shells = control({ probes: { "ssh:winbox": windowsProbe } });
+    const handlers = renderDialog({ kind: "ssh", machineId: "winbox" }, shells);
+    const select = screen.getByRole("combobox", { name: "代理 shell" });
+    expect(within(select).getAllByRole("option").map((option) => [option.getAttribute("value"), option.textContent]))
+      .toEqual([
+        ["pwsh", "PowerShell 7"],
+        ["powershell", "Windows PowerShell"],
+        ["bash", "Bash"]
+      ]);
+    // The found-shells list names both editions, each with its own path.
+    const section = screen.getByRole("region", { name: "Shell 后端" });
+    expect(within(section).getByText("C:\\Program Files\\PowerShell\\7\\pwsh.exe")).toBeInTheDocument();
+    expect(within(section).getByText("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"))
+      .toBeInTheDocument();
+    await userEvent.selectOptions(select, "powershell");
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect(handlers.onSaveSshMachine).toHaveBeenCalledWith(expect.objectContaining({
+      id: "winbox",
+      agentShell: "powershell"
+    }));
+  });
+
+  it("keeps a saved PowerShell 7 agent shell when the dialog is saved untouched", async () => {
+    const saved: SshMachineConfig = { ...winbox, agentShell: "pwsh" };
+    const shells = control({
+      probes: { "ssh:winbox": windowsProbe },
+      environments: { sshMachines: [saved], envVars: {} }
+    });
+    const handlers = renderDialog({ kind: "ssh", machineId: "winbox" }, shells);
+    expect(screen.getByRole("combobox", { name: "代理 shell" })).toHaveValue("pwsh");
+    await userEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect(handlers.onSaveSshMachine).toHaveBeenCalledWith(expect.objectContaining({ agentShell: "pwsh" }));
   });
 
   it("says a machine has not been probed and shows why a probe failed", async () => {

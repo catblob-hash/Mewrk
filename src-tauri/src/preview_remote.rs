@@ -927,7 +927,7 @@ while ($true) {
             &host,
             "ssh:e2e-windows",
             true,
-            &[AgentShell::new(ShellBackend::PowerShell, "powershell.exe"), AgentShell::default()],
+            &[AgentShell::new(ShellBackend::WindowsPowerShell, "powershell.exe"), AgentShell::default()],
         );
     }
 }

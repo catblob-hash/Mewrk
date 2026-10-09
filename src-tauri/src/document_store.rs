@@ -103,10 +103,6 @@ struct StoreState {
     /// unpersisted attachment reference after an upload call returns.
     process_lease: Option<ProcessLease>,
     ipc_ready: bool,
-    /// Whether this process's startup load seeded a brand-new install
-    /// ([`storage::LoadedDocument::fresh_install`]). Fixed for the process: a
-    /// renderer that reloads asks again and gets the same answer.
-    fresh_install: bool,
 }
 
 struct ProcessLease {
@@ -378,7 +374,6 @@ impl DocumentStore {
             .map_err(Clone::clone)
             .and_then(|loaded| reconcile(&loaded.document, &loaded.refs));
         let loaded = loaded?;
-        state.fresh_install = loaded.fresh_install;
         let (document, refs) = hollowed(loaded.document, loaded.refs);
         state.snapshot = Some(Snapshot {
             document: document.clone(),
@@ -431,13 +426,6 @@ impl DocumentStore {
                 "The document has not been loaded yet"
             )),
         }
-    }
-
-    /// Whether this process started on a brand-new install, its startup load
-    /// having written the seed. The renderer reads it with the document to run
-    /// first-launch setup (the Claude Agent models).
-    pub fn fresh_install(&self) -> bool {
-        self.lock().fresh_install
     }
 
     /// Returns the current document snapshot, loading (and migrating +

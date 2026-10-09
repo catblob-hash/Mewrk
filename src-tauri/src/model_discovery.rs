@@ -308,48 +308,6 @@ fn open_ai_compatible_as(
     openai_items(&value)
 }
 
-/// The models a fresh install's Claude Agent row starts with: id, display name,
-/// context window, and maximum output tokens. Seed only — building the default
-/// document cannot start a CLI — and never consulted by the model fetch, which
-/// asks the CLI. Mirrored by `CLAUDE_AGENT_REGISTRY` in the renderer. No id
-/// carries Claude Code's `[1m]` suffix: the window picks the CLI's budget.
-const CLAUDE_AGENT_SEED_MODELS: &[(&str, &str, u64, u64)] = &[
-    ("claude-fable-5-1", "Claude Fable 5.1", 1_000_000, 128_000),
-    ("claude-fable-5", "Claude Fable 5", 1_000_000, 128_000),
-    ("claude-opus-5-5", "Claude Opus 5.5", 1_000_000, 128_000),
-    ("claude-opus-5", "Claude Opus 5", 200_000, 128_000),
-    ("claude-sonnet-5-5", "Claude Sonnet 5.5", 1_000_000, 128_000),
-    ("claude-sonnet-5", "Claude Sonnet 5", 1_000_000, 128_000),
-    ("claude-opus-4-8", "Claude Opus 4.8", 200_000, 128_000),
-    ("claude-opus-4-7", "Claude Opus 4.7", 200_000, 128_000),
-    ("claude-opus-4-6", "Claude Opus 4.6", 200_000, 128_000),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6", 200_000, 128_000),
-    ("claude-opus-4-5", "Claude Opus 4.5", 200_000, 64_000),
-    ("claude-opus-4-1", "Claude Opus 4.1", 200_000, 32_000),
-    ("claude-sonnet-4-5", "Claude Sonnet 4.5", 200_000, 64_000),
-    ("claude-haiku-4-5", "Claude Haiku 4.5", 200_000, 64_000),
-];
-
-/// The seed rows in [`CLAUDE_AGENT_SEED_MODELS`], projected exactly as a fetch
-/// would project them — group, capabilities and reasoning shape included.
-///
-/// Limits travel through `raw`, so the table wins over [`crate::model_registry`]
-/// by the same "upstream declaration beats catalog" rule every leg obeys.
-pub fn claude_agent_seed_models(provider: &ApiProvider) -> Vec<ModelProfile> {
-    let fetched = CLAUDE_AGENT_SEED_MODELS
-        .iter()
-        .map(|(id, name, context_window, max_output_tokens)| {
-            let raw = serde_json::json!({
-                "context_window": context_window,
-                "max_output_tokens": max_output_tokens,
-                "supports_vision": true,
-            });
-            Fetched::new(*id).named(Some(name)).with_raw(&raw)
-        })
-        .collect();
-    finish(provider, dedup(fetched))
-}
-
 /// The bundled Claude Code's model picker under the user's current login.
 ///
 /// The CLI resolves the list against that login, so it changes when the user

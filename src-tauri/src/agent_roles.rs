@@ -7,18 +7,14 @@
 //! role: a conversation offers the ones it selects by the id discovery mints
 //! from the file's location (`ConversationSettings::agent_ids`), and the host
 //! resolves a spawn against those files, never against anything the renderer
-//! sends.
+//! sends. No role is built in: every one the catalog lists is a file.
 //!
-//! The four built-in roles are the exception: they are compiled in, computed
-//! against the document's providers on demand, read-only, and addressed by
-//! constant ids so a conversation keeps them across versions.
-//!
-//! Everything tool-like a role holds is its own — its tool list, its skills
-//! and MCP servers, and its whole web-search configuration. Only its model
-//! (`inherit`) and its reasoning effort (`null`) may follow the caller. Hooks
-//! are the one kind that adds rather than replaces: a role's child runs the
-//! guards its caller runs (`api::hook_runs_in_subagent`) and the role's own
-//! hooks on top, so no role can step outside a conversation's guards.
+//! Everything tool-like a role holds is its own — its tool list, its skills,
+//! MCP servers and hooks, and its whole web-search configuration — and
+//! replaces the caller's: a conversation's guard hooks reach a role's child
+//! only when the role selects them too. Only its model (`inherit`), its
+//! reasoning effort (`null`) and its tool-description file (`null`) may
+//! follow the caller.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -36,20 +32,16 @@ use crate::model::{
     ResourceDescriptor, ResourceSource, ToolCategory,
 };
 
-/// The built-in roles' ids. Constants rather than hashes of a location: a
-/// built-in has no file, and a conversation that selected one keeps it across
-/// versions. `src/seed.ts` names the same four for the built-in preset.
-pub const BUILTIN_OPUS_ID: &str = "agent_builtin_opus";
-pub const BUILTIN_SONNET_ID: &str = "agent_builtin_sonnet";
-pub const BUILTIN_SOL_ID: &str = "agent_builtin_sol";
-pub const BUILTIN_LUNA_ID: &str = "agent_builtin_luna";
-
-/// The four built-in ids, in the order the catalog lists them.
-pub const BUILTIN_ROLE_IDS: [&str; 4] = [
-    BUILTIN_OPUS_ID,
-    BUILTIN_SONNET_ID,
-    BUILTIN_SOL_ID,
-    BUILTIN_LUNA_ID,
+/// The ids of the four roles earlier builds shipped compiled in (Opus,
+/// Sonnet, Sol and Luna). They are gone, and no file can mint one of these —
+/// a file's id is a hash of its location — so storage drops them from every
+/// selection on load ([`drop_retired_builtin_roles`]) rather than leave each
+/// conversation that had them listing four dangling rows.
+const RETIRED_BUILTIN_ROLE_IDS: [&str; 4] = [
+    "agent_builtin_opus",
+    "agent_builtin_sonnet",
+    "agent_builtin_sol",
+    "agent_builtin_luna",
 ];
 
 /// The largest role file read, as for a skill's manifest.
@@ -69,62 +61,51 @@ const MAX_NEW_FILE_ATTEMPTS: usize = 64;
 /// each legacy role was exported to (see [`migrate_legacy_agent_definitions`]).
 const EXPORT_RECORD_FILE: &str = "agent-role-export.json";
 
-/// The built-in roles: id, name, the provider family it runs on, its model,
-/// and what it is for.
-///
-/// Each role is bound to one model, and the binding is kept while that model
-/// does not exist yet — Codex lists nothing until the user signs in — so the
-/// role starts working the moment its model shows up. The descriptions reach
-/// the model as the role listing on `agent_spawn`/`workflow`, so they say what
-/// each model is good and bad at and when to pick it.
-const BUILTIN_ROLES: &[(&str, &str, ProviderFamily, &str, &str)] = &[
+/// The roles earlier builds seeded into conversations before roles were
+/// files: name, provider family, model and description, in every form a build
+/// wrote them. A legacy copy that still matches one exactly is that seed,
+/// untouched — not a role of the user's — so the migration drops it rather
+/// than export it as a file ([`is_seeded_copy`]).
+const SEEDED_ROLES: &[(&str, ProviderFamily, &str, &str)] = &[
     (
-        BUILTIN_OPUS_ID,
         "Opus",
         ProviderFamily::ClaudeAgent,
         "claude-opus-5-5",
         "Claude Opus 5.5 (Anthropic). Excellent judgement and taste. Takes on ambiguous, open-ended and hard problems, including ones where it is not yet clear what the problem is, and its conclusions can be relied on. Pick it for the hardest work and for anything that needs sound judgement across a wide area: design, diagnosis, review and deciding what to do.",
     ),
     (
-        BUILTIN_SONNET_ID,
+        "Opus",
+        ProviderFamily::ClaudeAgent,
+        "claude-opus-5-5",
+        "Claude Opus 5.5 (Anthropic). Strongest at long, sprawling engineering work: codebase-wide migrations and audits, hard debugging, and changes that need careful judgement and checking its own work. Pick it for the largest and hardest tasks.",
+    ),
+    (
         "Sonnet",
         ProviderFamily::ClaudeAgent,
         "claude-sonnet-5-5",
         "Claude Sonnet 5.5 (Anthropic). Has the strengths of Opus in a lighter form: good judgement and able to work through ambiguous problems, though less reliably on the hardest ones, and at a lower cost. Pick it for work that needs judgement but not Opus's full depth.",
     ),
     (
-        BUILTIN_SOL_ID,
         "Sol",
         ProviderFamily::OpenaiCodex,
         "gpt-6.1-sol",
         "GPT-6.1 Sol (OpenAI). Rigorous, precise reasoning that very rarely makes a mistake, but weak judgement: it does poorly on vague tasks and on ones that call for weighing many things across a wide area, and is at its best on a focused, local problem. Pick it for clearly specified, verifiable work where correctness matters most; give it the exact goal and how to check the result, and keep open-ended decisions away from it.",
     ),
     (
-        BUILTIN_LUNA_ID,
+        "Sol",
+        ProviderFamily::OpenaiCodex,
+        "gpt-6-sol",
+        "GPT-6 Sol (OpenAI). Built for complex coding and agentic workflows that need strong reasoning: multi-step implementation, refactoring and debugging across several files. Pick it for demanding coding tasks.",
+    ),
+    (
         "Luna",
         ProviderFamily::OpenaiCodex,
         "gpt-6-luna",
         "GPT-6 Luna (OpenAI). Very cheap, with limited reasoning: don't ask it to make judgement calls or to verify anything that is hard to check. Pick it for simple, mechanical, easily checked chores in bulk, such as repetitive edits, searches and lookups, and collecting or summarizing output, and for many parallel workers.",
     ),
-];
-
-/// The model ids and descriptions earlier builds seeded the built-in roles
-/// with, by built-in id — the current ones are in [`BUILTIN_ROLES`]. A legacy
-/// copy a conversation kept from one of those builds is still an untouched
-/// built-in, not a role of the user's (see [`builtin_copy_of`]).
-const EARLIER_BUILTIN_ROLES: &[(&str, &str, &str)] = &[
     (
-        BUILTIN_OPUS_ID,
-        "claude-opus-5-5",
-        "Claude Opus 5.5 (Anthropic). Strongest at long, sprawling engineering work: codebase-wide migrations and audits, hard debugging, and changes that need careful judgement and checking its own work. Pick it for the largest and hardest tasks.",
-    ),
-    (
-        BUILTIN_SOL_ID,
-        "gpt-6-sol",
-        "GPT-6 Sol (OpenAI). Built for complex coding and agentic workflows that need strong reasoning: multi-step implementation, refactoring and debugging across several files. Pick it for demanding coding tasks.",
-    ),
-    (
-        BUILTIN_LUNA_ID,
+        "Luna",
+        ProviderFamily::OpenaiCodex,
         "gpt-6-luna",
         "GPT-6 Luna (OpenAI). Fast and low-cost, for focused, high-volume work: well-scoped edits, searches and lookups, running tests and summarizing their output. Pick it for repeatable tasks at scale and for many parallel workers.",
     ),
@@ -158,9 +139,8 @@ pub struct AgentRoleFile {
     pub tools: Option<Vec<String>>,
     #[serde(default)]
     pub disallowed_tools: Vec<String>,
-    /// The role's own skills, MCP servers and hooks, by catalog id. Its
-    /// skills and servers are the child's whole set; its hooks run on top of
-    /// the calling conversation's guards, which every child runs.
+    /// The role's own skills, MCP servers and hooks, by catalog id: the
+    /// child's whole set of each, in place of the calling conversation's.
     #[serde(default)]
     pub skill_ids: Vec<String>,
     #[serde(default)]
@@ -175,6 +155,12 @@ pub struct AgentRoleFile {
     /// `agent_spawn` child. May dangle.
     #[serde(default)]
     pub template_id: Option<String>,
+    /// The tool-description file the child renders with, by catalog id — a
+    /// built-in's or a `~/.mewrk/tool-descriptions` file's. `None` renders
+    /// with the caller's. May dangle, and then reads as the guided built-in,
+    /// as a conversation's selection does.
+    #[serde(default)]
+    pub tool_description_file_id: Option<String>,
 }
 
 /// A role as the catalog lists it: the row every capability has, and the
@@ -351,91 +337,9 @@ pub fn all_role_tool_names() -> Vec<String> {
         .clone()
 }
 
-/// Whether `id` is one of the built-in roles.
-pub fn is_builtin_id(id: &str) -> bool {
-    BUILTIN_ROLE_IDS.contains(&id)
-}
-
-fn builtin_read_only() -> String {
-    crate::ui_text::pick(
-        "内置角色随 Mewrk 发布，不能修改或删除；可以把它另存为全局角色",
-        "A built-in role ships with Mewrk and cannot be changed or deleted; save it as a global role instead",
-    )
-    .to_owned()
-}
-
-/// The built-in roles as files, against `document`'s providers: each runs on
-/// the first provider of its family, and one whose family no provider has is
-/// still listed, with its model unavailable.
-pub(crate) fn builtin_role_files(document: &AppDocument) -> Vec<(&'static str, AgentRoleFile)> {
-    BUILTIN_ROLES
-        .iter()
-        .map(|(id, name, family, model_id, description)| {
-            let model_selection = document
-                .assets
-                .api_providers
-                .iter()
-                .find(|provider| provider.family == *family)
-                .map(|provider| AgentModelSelection::Explicit {
-                    provider_id: provider.id.clone(),
-                    model_id: (*model_id).to_owned(),
-                })
-                .unwrap_or(AgentModelSelection::Unavailable);
-            (
-                *id,
-                AgentRoleFile {
-                    name: (*name).to_owned(),
-                    description: (*description).to_owned(),
-                    model_selection,
-                    effort: Some(ReasoningEffort::Medium),
-                    tools: Some(all_role_tool_names()),
-                    disallowed_tools: Vec::new(),
-                    skill_ids: Vec::new(),
-                    mcp_ids: Vec::new(),
-                    hook_ids: Vec::new(),
-                    web_search: ConversationWebSearchSettings::default(),
-                    template_id: None,
-                },
-            )
-        })
-        .collect()
-}
-
-/// The built-in roles as catalog rows, first in the list.
-pub(crate) fn builtin_descriptors(document: &AppDocument) -> Vec<AgentRoleDescriptor> {
-    builtin_role_files(document)
-        .into_iter()
-        .map(|(id, role)| AgentRoleDescriptor {
-            descriptor: ResourceDescriptor {
-                id: id.to_owned(),
-                name: role.name.clone(),
-                description: role.description.clone(),
-                location: format!("builtin:agents/{}.json", role.name.to_lowercase()),
-                source: ResourceSource::Builtin,
-                available: true,
-                workspace_key: None,
-            },
-            role: Some(role),
-        })
-        .collect()
-}
-
-/// The built-in role `id` names, as the runtime resolves it.
-pub(crate) fn builtin_definition(document: &AppDocument, id: &str) -> Option<AgentDefinition> {
-    if !is_builtin_id(id) {
-        return None;
-    }
-    builtin_role_files(document)
-        .into_iter()
-        .find(|(builtin, _)| *builtin == id)
-        .map(|(_, role)| {
-            definition_of(&role, AgentDefinitionSource::Plugin, "builtin".to_owned(), id)
-        })
-}
-
 /// The source a role read at `level` resolves with. Precedence runs Managed >
 /// Project > User > Plugin, so a workspace's role shadows a global one of the
-/// same name, and either shadows a built-in.
+/// same name.
 ///
 /// A workspace role's key is a digest of its workspace's key: stable across
 /// runs, bounded in length, and different for every workspace.
@@ -471,9 +375,11 @@ pub(crate) fn role_revision(id: &str) -> u64 {
 
 /// The runtime definition of a role file, `id` the role's. Everything a file
 /// can say is the role's own answer, so every override is `Some`: the role
-/// never takes its tools, its skills or MCP servers, or any part of its web
-/// search from the conversation that calls it. Its hooks run on top of the
-/// caller's guards (`api::apply_role_capabilities`).
+/// never takes its tools, its skills, MCP servers or hooks, or any part of
+/// its web search from the conversation that calls it
+/// (`api::apply_role_capabilities`). Its tool-description
+/// file is carried as the file says it, `None` included: that one may follow
+/// the caller.
 fn definition_of(
     role: &AgentRoleFile,
     source: AgentDefinitionSource,
@@ -513,14 +419,15 @@ fn definition_of(
         native_search_tool: Some(web.native_search_tool),
         native_fetch_tool: Some(web.native_fetch_tool),
         template_id: role.template_id.clone(),
+        tool_description_file_id: role.tool_description_file_id.clone(),
     }
 }
 
-/// The roles `conversation` offers, in the order it selected them: a built-in
-/// id resolves against the document, any other against `registry`, where a
-/// role counts only if it was read at the global level or at one of this
-/// conversation's own workspaces. Anything else — a dangling id, a role of a
-/// workspace this conversation does not work in — is skipped.
+/// The roles `conversation` offers, in the order it selected them, resolved
+/// against `registry`, where a role counts only if it was read at the global
+/// level or at one of this conversation's own workspaces. Anything else — a
+/// dangling id, a role of a workspace this conversation does not work in — is
+/// skipped.
 pub(crate) fn selected_definitions(
     document: &AppDocument,
     conversation: &Conversation,
@@ -538,9 +445,6 @@ pub(crate) fn selected_definitions(
         .iter()
         .filter(|id| seen.insert(id.as_str()))
         .filter_map(|id| {
-            if let Some(definition) = builtin_definition(document, id) {
-                return Some(definition);
-            }
             let role = registry.get(id)?;
             match &role.level {
                 RoleLevel::Global => Some(role.definition.clone()),
@@ -551,8 +455,8 @@ pub(crate) fn selected_definitions(
         .collect()
 }
 
-/// The id prefix of a role read at `source`'s level. A built-in's whole id is
-/// a constant ([`BUILTIN_ROLE_IDS`]); this prefix is theirs only for symmetry.
+/// The id prefix of a role read at `source`'s level. No role is built in; that
+/// arm keeps the prefix the retired ones were named with.
 pub(crate) fn id_prefix(source: ResourceSource) -> &'static str {
     match source {
         ResourceSource::User => "agent_user",
@@ -678,6 +582,26 @@ pub(crate) fn validate_role(role: &AgentRoleFile) -> Result<(), String> {
             )
             .to_owned());
         }
+    }
+    // The rule a conversation's selection meets. Whether the id names a file
+    // is not checked: a dangling one renders with the guided built-in, as a
+    // conversation's does.
+    match crate::storage::tool_description_selection_problem(role.tool_description_file_id.as_deref()) {
+        Some(crate::storage::ToolDescriptionSelectionProblem::Blank) => {
+            return Err(crate::ui_text::pick(
+                "角色的工具描述 ID 不能为空",
+                "The role's tool-description id may not be empty",
+            )
+            .to_owned());
+        }
+        Some(crate::storage::ToolDescriptionSelectionProblem::TooLong) => {
+            let limit = crate::storage::MAX_TOOL_DESCRIPTION_ID_BYTES;
+            return Err(crate::ui_text::ui_text!(
+                "角色的工具描述 ID 不能超过 {limit} 字节",
+                "The role's tool-description id may have at most {limit} bytes"
+            ));
+        }
+        None => {}
     }
     validate_role_web_search(&role.web_search)
 }
@@ -991,9 +915,9 @@ fn no_free_file_name() -> String {
 /// An id names a file a fresh scan of the levels finds, never one the
 /// renderer describes: the file is overwritten in place and keeps its name,
 /// so renaming a role keeps its id. Without an id the role gets a new file in
-/// `.mewrk/agents` of the level the workspace key names. A built-in role is
-/// never written, and a role that would be unusable — invalid, or too large
-/// to read back — is refused rather than written.
+/// `.mewrk/agents` of the level the workspace key names. A role that would be
+/// unusable — invalid, or too large to read back — is refused rather than
+/// written.
 pub(crate) fn plan_save(
     levels: &[crate::capabilities::ConfigLevel],
     target: &SaveAgentRoleTarget,
@@ -1007,7 +931,6 @@ pub(crate) fn plan_save(
         return Err(too_large_to_save());
     }
     let (level, planned) = match target.id.as_deref() {
-        Some(id) if is_builtin_id(id) => return Err(builtin_read_only()),
         Some(id) => {
             let scan = crate::capabilities::scan_agent_roles(levels);
             let row = scan
@@ -1291,15 +1214,11 @@ pub(crate) struct PlannedDelete {
     level: crate::capabilities::ConfigLevel,
 }
 
-/// Finds the role file `id` names in a fresh scan of `levels`. A built-in
-/// role is never deleted.
+/// Finds the role file `id` names in a fresh scan of `levels`.
 pub(crate) fn plan_delete(
     levels: &[crate::capabilities::ConfigLevel],
     id: &str,
 ) -> Result<PlannedDelete, String> {
-    if is_builtin_id(id) {
-        return Err(builtin_read_only());
-    }
     let scan = crate::capabilities::scan_agent_roles(levels);
     let row = scan
         .rows
@@ -1445,52 +1364,42 @@ fn legacy_role_key(definition: &AgentDefinition) -> String {
     crate::api::sha256_hex(&canonical)
 }
 
-/// The built-in role a legacy role is an untouched copy of, if it is one:
-/// the preset this build replaces seeded these into every conversation, with
-/// the model and description of the build that seeded it — this build's
-/// ([`BUILTIN_ROLES`]) or an earlier one's ([`EARLIER_BUILTIN_ROLES`]).
-fn builtin_copy_of(
-    definition: &AgentDefinition,
-    providers: &[crate::model::ApiProvider],
-) -> Option<&'static str> {
+/// Whether a legacy role is an untouched copy of one an earlier build seeded
+/// ([`SEEDED_ROLES`]): the preset roles-as-files replaced put these into every
+/// conversation, with the model and description of the build that seeded it.
+fn is_seeded_copy(definition: &AgentDefinition, providers: &[crate::model::ApiProvider]) -> bool {
     let AgentModelSelection::Explicit {
         provider_id,
         model_id,
     } = &definition.model_selection
     else {
-        return None;
+        return false;
     };
-    let family = providers
+    let Some(family) = providers
         .iter()
-        .find(|provider| &provider.id == provider_id)?
-        .family;
-    let seeded_as = |id: &str, model: &str, description: &str| {
-        BUILTIN_ROLES
-            .iter()
-            .map(|(builtin, _, _, model, description)| (*builtin, *model, *description))
-            .chain(EARLIER_BUILTIN_ROLES.iter().copied())
-            .any(|seeded| seeded == (id, model, description))
+        .find(|provider| &provider.id == provider_id)
+        .map(|provider| provider.family)
+    else {
+        return false;
     };
-    BUILTIN_ROLES
-        .iter()
-        .find(|(id, name, builtin_family, _, _)| {
-            definition.name == *name
-                && family == *builtin_family
-                && seeded_as(id, model_id, &definition.description)
-                && definition.effort == Some(ReasoningEffort::Medium)
-                && definition.tools.is_none()
-                && definition.disallowed_tools.is_empty()
-                && definition.skill_ids.is_none()
-                && definition.mcp_ids.is_none()
-                && definition.hook_ids.is_none()
-                && definition.search_provider.is_none()
-                && definition.fetch_provider.is_none()
-                && definition.domain_filter.is_none()
-                && definition.include_domains.is_empty()
-                && definition.exclude_domains.is_empty()
-                && definition.template_id.is_none()
-        })
-        .map(|(id, ..)| *id)
+    SEEDED_ROLES.iter().any(|(name, seeded_family, model, description)| {
+        definition.name == *name
+            && family == *seeded_family
+            && model_id == model
+            && definition.description == *description
+    }) && definition.effort == Some(ReasoningEffort::Medium)
+        && definition.tools.is_none()
+        && definition.disallowed_tools.is_empty()
+        && definition.skill_ids.is_none()
+        && definition.mcp_ids.is_none()
+        && definition.hook_ids.is_none()
+        && definition.search_provider.is_none()
+        && definition.fetch_provider.is_none()
+        && definition.domain_filter.is_none()
+        && definition.include_domains.is_empty()
+        && definition.exclude_domains.is_empty()
+        && definition.template_id.is_none()
+        && definition.tool_description_file_id.is_none()
 }
 
 /// A legacy role as a role file: what it named, and the defaults for what it
@@ -1528,6 +1437,9 @@ fn legacy_role_file(definition: &AgentDefinition) -> AgentRoleFile {
         hook_ids: definition.hook_ids.clone().unwrap_or_default(),
         web_search,
         template_id: definition.template_id.clone(),
+        // Roles kept in a conversation predate the choice, and followed their
+        // caller's file.
+        tool_description_file_id: None,
     }
 }
 
@@ -1565,10 +1477,9 @@ fn for_each_role_carrier(
 /// Each distinct user role becomes one file in `user_agents_dir`
 /// (`~/.mewrk/agents`), named after it and never over another file — or
 /// reuses the file there that already holds exactly that role, which another
-/// data folder sharing the directory exported; an untouched copy of a
-/// built-in role, as this build or an earlier one seeded it, becomes that
-/// built-in's id instead. Which
-/// file each role went to is recorded in [`EXPORT_RECORD_FILE`] under a
+/// data folder sharing the directory exported; an untouched copy of a role an
+/// earlier build seeded is dropped instead, as the built-in roles those seeds
+/// became are gone. Which file each role went to is recorded in [`EXPORT_RECORD_FILE`] under a
 /// digest of its content, so this is done once: every later load — which
 /// still finds the legacy list in a conversation not written since — reuses
 /// the record, and a role whose file the user has since deleted is not
@@ -1602,7 +1513,7 @@ pub(crate) fn migrate_legacy_agent_definitions(
         if definition.deleted || definition.source != AgentDefinitionSource::User {
             continue;
         }
-        if builtin_copy_of(definition, &providers).is_some() {
+        if is_seeded_copy(definition, &providers) {
             continue;
         }
         let key = legacy_role_key(definition);
@@ -1651,11 +1562,10 @@ pub(crate) fn migrate_legacy_agent_definitions(
                 kept.push(definition);
                 continue;
             }
-            let id = match builtin_copy_of(&definition, &providers) {
-                Some(id) => Some(id.to_owned()),
-                None => mapped.get(&legacy_role_key(&definition)).cloned().flatten(),
-            };
-            match id {
+            if is_seeded_copy(&definition, &providers) {
+                continue;
+            }
+            match mapped.get(&legacy_role_key(&definition)).cloned().flatten() {
                 Some(id) => {
                     if definition.enabled && !ids.contains(&id) {
                         ids.push(id);
@@ -1665,6 +1575,15 @@ pub(crate) fn migrate_legacy_agent_definitions(
             }
         }
         *definitions = kept;
+    });
+}
+
+/// Removes the retired built-in roles ([`RETIRED_BUILTIN_ROLE_IDS`]) from
+/// every role selection the document keeps. Runs on every load, as the legacy
+/// migration does, and finds nothing once each carrier has been written since.
+pub(crate) fn drop_retired_builtin_roles(document: &mut AppDocument) {
+    for_each_role_carrier(document, &mut |_, ids| {
+        ids.retain(|id| !RETIRED_BUILTIN_ROLE_IDS.contains(&id.as_str()));
     });
 }
 
@@ -1753,6 +1672,7 @@ mod tests {
             hook_ids: Vec::new(),
             web_search: ConversationWebSearchSettings::default(),
             template_id: None,
+            tool_description_file_id: None,
         }
     }
 
@@ -1857,44 +1777,6 @@ mod tests {
     }
 
     #[test]
-    fn built_in_roles_run_on_the_first_provider_of_their_family() {
-        let mut document = crate::catalog::product_default_document();
-        let rows = builtin_descriptors(&document);
-        assert_eq!(
-            rows.iter().map(|row| row.descriptor.id.as_str()).collect::<Vec<_>>(),
-            BUILTIN_ROLE_IDS
-        );
-        assert!(rows.iter().all(|row| row.descriptor.source == ResourceSource::Builtin));
-        assert_eq!(rows[0].descriptor.location, "builtin:agents/opus.json");
-
-        document.assets.api_providers.retain(|provider| provider.family != ProviderFamily::OpenaiCodex);
-        let opus = builtin_definition(&document, BUILTIN_OPUS_ID).unwrap();
-        let claude = document
-            .assets
-            .api_providers
-            .iter()
-            .find(|provider| provider.family == ProviderFamily::ClaudeAgent)
-            .map(|provider| provider.id.clone());
-        match (&opus.model_selection, claude) {
-            (AgentModelSelection::Explicit { provider_id, model_id }, Some(claude)) => {
-                assert_eq!(provider_id, &claude);
-                assert_eq!(model_id, "claude-opus-5-5");
-            }
-            (selection, claude) => panic!("{selection:?} for {claude:?}"),
-        }
-        assert_eq!(opus.source, AgentDefinitionSource::Plugin);
-        assert_eq!(opus.source_key, "builtin");
-        assert_eq!(opus.effort, Some(ReasoningEffort::Medium));
-        assert_eq!(opus.tools, Some(all_role_tool_names()));
-        assert_eq!(opus.skill_ids, Some(Vec::new()));
-        assert_eq!(opus.search_provider, Some(crate::model::SearchProviderSelection::Native));
-        // No provider of its family: still listed, with its model unavailable.
-        let sol = builtin_definition(&document, BUILTIN_SOL_ID).unwrap();
-        assert_eq!(sol.model_selection, AgentModelSelection::Unavailable);
-        assert!(builtin_definition(&document, "agent_user_x_00000000").is_none());
-    }
-
-    #[test]
     fn a_workspace_role_projects_to_a_project_source_its_caller_cannot_widen() {
         let mut file = role("reviewer");
         file.web_search.max_searches_per_call = 3;
@@ -1927,8 +1809,7 @@ mod tests {
 
     /// A role's revision is its id's: the same for every edit of the file, a
     /// rename of the role inside it included, and different for every other
-    /// file — a built-in's constant id among them — always a positive integer
-    /// JavaScript holds exactly.
+    /// file — always a positive integer JavaScript holds exactly.
     #[test]
     fn a_roles_revision_follows_its_file_not_its_content() {
         let id = "agent_user_reviewer_1a2b3c4d";
@@ -1942,9 +1823,7 @@ mod tests {
             registered_definition(&role("reviewer"), &RoleLevel::Global, "agent_user_reviewer_5e6f7a8b").revision,
             first.revision
         );
-        let opus = builtin_definition(&crate::catalog::product_default_document(), BUILTIN_OPUS_ID).unwrap();
-        assert_eq!(opus.revision, role_revision(BUILTIN_OPUS_ID));
-        for id in ["", id, BUILTIN_OPUS_ID, BUILTIN_SONNET_ID, BUILTIN_SOL_ID, BUILTIN_LUNA_ID] {
+        for id in ["", id, "agent_workspace_reviewer_5e6f7a8b"] {
             let revision = role_revision(id);
             assert!(revision >= 1 && revision <= (1 << 53) - 1, "{id}: {revision}");
             assert_eq!(revision, role_revision(id), "stable");
@@ -1993,7 +1872,7 @@ mod tests {
             });
         }
         let settings = &mut document.workspaces[0].conversations[0].settings;
-        settings.agent_ids = ["elsewhere", "mine", "dangling", BUILTIN_LUNA_ID, "global", "mine"]
+        settings.agent_ids = ["elsewhere", "mine", "dangling", "agent_builtin_luna", "global", "mine"]
             .map(str::to_owned)
             .to_vec();
         let conversation = document.workspaces[0].conversations[0].clone();
@@ -2001,7 +1880,7 @@ mod tests {
             .into_iter()
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
-        assert_eq!(names, ["mine", "Luna", "global"]);
+        assert_eq!(names, ["mine", "global"], "no id resolves as a built-in");
     }
 
     #[test]
@@ -2097,7 +1976,7 @@ mod tests {
         assert_eq!(written.name, "critic");
 
         for refused in [
-            SaveAgentRoleTarget { id: Some(BUILTIN_OPUS_ID.into()), workspace_key: None },
+            SaveAgentRoleTarget { id: Some("agent_builtin_opus".into()), workspace_key: None },
             SaveAgentRoleTarget { id: Some("agent_user_ghost_00000000".into()), workspace_key: None },
         ] {
             assert!(save_role_in(&levels, &refused, role("x")).is_err());
@@ -2106,10 +1985,63 @@ mod tests {
         assert!(!agents.join("x.json").exists(), "a refused save writes nothing");
 
         // Delete.
-        assert!(delete_role_in(&levels, BUILTIN_OPUS_ID).is_err());
+        assert!(delete_role_in(&levels, "agent_builtin_opus").is_err());
         assert!(delete_role_in(&levels, "agent_user_ghost_00000000").is_err());
         delete_role_in(&levels, &second.id).unwrap();
         assert!(!agents.join("reviewer-2.json").exists());
+    }
+
+    /// A role's tool-description file is written and read back as it was
+    /// chosen, and reaches the definition a spawn resolves. Following the
+    /// caller is written as `null`, like `effort`, and a file without the key
+    /// follows the caller too. An id meets the rule a conversation's selection
+    /// meets and is never looked up, so a dangling one is kept.
+    #[test]
+    fn a_roles_tool_description_file_round_trips_and_is_checked_like_a_conversations() {
+        let concise = crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID;
+        let home = tempfile::tempdir().unwrap();
+        let levels = [level(home.path(), None)];
+        let mut chosen = role("reviewer");
+        chosen.tool_description_file_id = Some(concise.into());
+        let saved = save_role_in(&levels, &SaveAgentRoleTarget::default(), chosen.clone()).unwrap();
+        let text = fs::read_to_string(home.path().join(".mewrk").join("agents").join("reviewer.json")).unwrap();
+        assert!(text.contains(&format!(r#""toolDescriptionFileId": "{concise}""#)), "{text}");
+        assert_eq!(role_from_bytes(text.as_bytes(), "reviewer").unwrap(), chosen);
+        assert_eq!(saved.registered.definition.tool_description_file_id.as_deref(), Some(concise));
+        let listed = crate::capabilities::scan_agent_roles(&levels);
+        let listed = listed.roles.iter().find(|role| role.id == saved.id).expect("listed");
+        assert_eq!(listed.definition.tool_description_file_id.as_deref(), Some(concise));
+
+        let following = role_file_text(&role("reviewer")).unwrap();
+        assert!(following.contains(r#""toolDescriptionFileId": null"#), "{following}");
+        for text in [&br#"{"name":"x"}"#[..], &br#"{"toolDescriptionFileId":null}"#[..]] {
+            let read = role_from_bytes(text, "x").unwrap();
+            assert_eq!(read.tool_description_file_id, None);
+            assert_eq!(registered_definition(&read, &RoleLevel::Global, "x").tool_description_file_id, None);
+        }
+        let dangling = role_from_bytes(br#"{"toolDescriptionFileId":"tooldesc_user_gone_00000000"}"#, "x").unwrap();
+        assert_eq!(dangling.tool_description_file_id.as_deref(), Some("tooldesc_user_gone_00000000"));
+
+        let longest = "x".repeat(crate::storage::MAX_TOOL_DESCRIPTION_ID_BYTES);
+        for (id, accepted) in [
+            (String::new(), false),
+            ("   ".to_owned(), false),
+            (format!("{longest}x"), false),
+            (longest.clone(), true),
+        ] {
+            let mut candidate = role("reviewer");
+            candidate.tool_description_file_id = Some(id.clone());
+            assert_eq!(validate_role(&candidate).is_ok(), accepted, "{id:?}");
+            let file = format!(r#"{{"toolDescriptionFileId":"{id}"}}"#);
+            let read = role_from_bytes(file.as_bytes(), "x");
+            assert_eq!(read.is_ok(), accepted, "{id:?}: {read:?}");
+            if !accepted {
+                let error = read.unwrap_err();
+                assert!(error.contains("tool-description") || error.contains("工具描述"), "{error}");
+                assert!(save_role_in(&levels, &SaveAgentRoleTarget::default(), candidate).is_err());
+            }
+        }
+        assert!(!home.path().join(".mewrk").join("agents").join("reviewer-2.json").exists(), "a refused save writes nothing");
     }
 
     fn legacy(name: &str, enabled: bool) -> AgentDefinition {
@@ -2141,9 +2073,9 @@ mod tests {
             .unwrap();
         let claude = provider.id.clone();
         document.assets.api_providers.push(provider);
-        let builtin_copy = AgentDefinition {
+        let seeded_copy = AgentDefinition {
             name: "Opus".into(),
-            description: BUILTIN_ROLES[0].4.into(),
+            description: SEEDED_ROLES[0].3.into(),
             model_selection: AgentModelSelection::Explicit {
                 provider_id: claude,
                 model_id: "claude-opus-5-5".into(),
@@ -2160,7 +2092,7 @@ mod tests {
         let mut tombstone = legacy("gone", false);
         tombstone.deleted = true;
         document.presets.conversation_presets[0].settings.agent_definitions =
-            vec![builtin_copy.clone(), reviewer.clone(), quiet.clone()];
+            vec![seeded_copy.clone(), reviewer.clone(), quiet.clone()];
         document.workspaces[0].conversations[0].settings.agent_definitions =
             vec![reviewer.clone(), other_reviewer.clone(), tombstone];
 
@@ -2181,13 +2113,16 @@ mod tests {
         assert!(!text.contains("\"tools\""), "{text}");
 
         let preset = &document.presets.conversation_presets[0].settings;
-        assert!(preset.agent_definitions.is_empty());
-        assert_eq!(preset.agent_ids.len(), 2, "the disabled role is exported but not selected");
-        assert_eq!(preset.agent_ids[0], BUILTIN_OPUS_ID);
+        assert!(preset.agent_definitions.is_empty(), "the seeded copy is dropped, not kept");
+        assert_eq!(
+            preset.agent_ids.len(),
+            1,
+            "the seeded copy is not selected, and the disabled role is exported but not selected"
+        );
         let conversation = &document.workspaces[0].conversations[0].settings;
         assert!(conversation.agent_definitions.is_empty(), "tombstones go too");
         assert_eq!(conversation.agent_ids.len(), 2);
-        assert_eq!(conversation.agent_ids[0], preset.agent_ids[1], "the same role is one file");
+        assert_eq!(conversation.agent_ids[0], preset.agent_ids[0], "the same role is one file");
         assert_ne!(conversation.agent_ids[0], conversation.agent_ids[1]);
 
         // A later load still finds the legacy lists; the record answers them
@@ -2198,7 +2133,7 @@ mod tests {
         migrate_legacy_agent_definitions(&mut again, app_data.path(), Some(&agents));
         assert!(!agents.join("quiet.json").exists());
         assert_eq!(fs::read_dir(&agents).unwrap().count(), 2);
-        assert_eq!(again.workspaces[0].conversations[0].settings.agent_ids, [preset.agent_ids[1].clone()]);
+        assert_eq!(again.workspaces[0].conversations[0].settings.agent_ids, [preset.agent_ids[0].clone()]);
 
         // Nowhere to write: the roles stay for the next load.
         let mut stuck = crate::catalog::default_document();
@@ -2420,7 +2355,7 @@ mod tests {
         assert!(!publish_scan(&authority, &registry, started, &early.levels, early.roles));
         assert!(registry.read().unwrap().get(&id).is_none());
         assert!(authority.try_write().is_ok(), "the fence is let go");
-        assert!(delete_role_fenced(&levels, BUILTIN_OPUS_ID, &authority, &registry).is_err());
+        assert!(delete_role_fenced(&levels, "agent_builtin_opus", &authority, &registry).is_err());
     }
 
     /// `~/.mewrk/agents` is shared by every data folder on the computer, and
@@ -2452,11 +2387,12 @@ mod tests {
         assert!(agents.join("reviewer-2.json").is_file());
     }
 
-    /// A copy of a built-in role an earlier build seeded — with that build's
-    /// model or description — is still the built-in, not a role of the
-    /// user's to export; a copy the user changed is theirs.
+    /// A copy of a role an earlier build seeded — in any form a build wrote
+    /// it — is that seed, untouched: the built-in role it became is gone, so
+    /// it is dropped rather than exported or selected. A copy the user changed
+    /// is theirs.
     #[test]
-    fn legacy_copies_of_earlier_built_ins_map_to_the_built_in() {
+    fn legacy_copies_of_seeded_roles_are_dropped() {
         let app_data = tempfile::tempdir().unwrap();
         let agents = app_data.path().join("agents");
         let mut document = crate::catalog::default_document();
@@ -2482,25 +2418,48 @@ mod tests {
             effort: Some(ReasoningEffort::Medium),
             ..legacy(name, true)
         };
-        let mut seeded = EARLIER_BUILTIN_ROLES
+        let mut seeded = SEEDED_ROLES
             .iter()
-            .map(|&(id, model, description)| {
-                let (_, name, family, ..) = BUILTIN_ROLES.iter().find(|(builtin, ..)| *builtin == id).unwrap();
-                let provider = if *family == ProviderFamily::OpenaiCodex { &codex } else { &claude };
+            .map(|&(name, family, model, description)| {
+                let provider = if family == ProviderFamily::OpenaiCodex { &codex } else { &claude };
                 copy(name, provider, model, description)
             })
             .collect::<Vec<_>>();
-        // The earlier model with today's description was never seeded: it is
-        // the user's.
-        let edited = copy("Sol", &codex, "gpt-6-sol", BUILTIN_ROLES[2].4);
-        seeded.push(edited);
+        // The earlier model with the latest description was never seeded: it
+        // is the user's.
+        let latest_sol = SEEDED_ROLES.iter().find(|(name, ..)| *name == "Sol").unwrap().3;
+        seeded.push(copy("Sol", &codex, "gpt-6-sol", latest_sol));
         document.assets.api_providers.extend([codex.clone(), claude.clone()]);
         document.workspaces[0].conversations[0].settings.agent_definitions = seeded;
         migrate_legacy_agent_definitions(&mut document, app_data.path(), Some(&agents));
-        let ids = &document.workspaces[0].conversations[0].settings.agent_ids;
-        assert_eq!(ids[..3], [BUILTIN_OPUS_ID, BUILTIN_SOL_ID, BUILTIN_LUNA_ID]);
-        assert_eq!(ids.len(), 4, "{ids:?}");
-        assert!(ids[3].starts_with("agent_user_sol_"), "{ids:?}");
+        let settings = &document.workspaces[0].conversations[0].settings;
+        assert!(settings.agent_definitions.is_empty(), "{:?}", settings.agent_definitions);
+        assert_eq!(settings.agent_ids.len(), 1, "{:?}", settings.agent_ids);
+        assert!(settings.agent_ids[0].starts_with("agent_user_sol_"), "{:?}", settings.agent_ids);
         assert_eq!(fs::read_dir(&agents).unwrap().count(), 1, "only the edited copy is exported");
+    }
+
+    /// The retired built-in roles leave every selection the document keeps,
+    /// each other id staying where it was.
+    #[test]
+    fn retired_built_in_roles_leave_every_selection() {
+        let mut document = crate::catalog::default_document();
+        let mixed = || {
+            ["agent_builtin_opus", "agent_user_reviewer_00000001", "agent_builtin_luna", "dangling"]
+                .map(str::to_owned)
+                .to_vec()
+        };
+        document.presets.conversation_presets[0].settings.agent_ids = mixed();
+        document.workspaces[0].conversations[0].settings.agent_ids = mixed();
+        let mut remembered = document.workspaces[0].conversations[0].settings.clone();
+        remembered.agent_ids = RETIRED_BUILTIN_ROLE_IDS.map(str::to_owned).to_vec();
+        document.workspaces[0].last_conversation_settings = Some(remembered);
+
+        drop_retired_builtin_roles(&mut document);
+
+        let kept = ["agent_user_reviewer_00000001", "dangling"];
+        assert_eq!(document.presets.conversation_presets[0].settings.agent_ids, kept);
+        assert_eq!(document.workspaces[0].conversations[0].settings.agent_ids, kept);
+        assert!(document.workspaces[0].last_conversation_settings.as_ref().unwrap().agent_ids.is_empty());
     }
 }

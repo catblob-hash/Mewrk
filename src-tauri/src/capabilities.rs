@@ -11,8 +11,8 @@ use crate::{
     mcp::RuntimeMcpServer,
     mcp_config, memory_archive_file,
     model::{
-        AddedSkill, AppDocument, AttachedWorkspace, CapabilityCatalog, Conversation, HookDefinition,
-        HookEvent,
+        AddedSkill, AddedSkillForm, AppDocument, AttachedWorkspace, CapabilityCatalog, Conversation,
+        HookDefinition, HookEvent,
         McpServerConfig, ResolvedLanguage, ResolvedSkill, ResourceDescriptor, ResourceSource,
         ToolDescriptionEntry, Workspace,
     },
@@ -321,8 +321,8 @@ pub fn levels_for_conversation(
 
 /// Discovers the current capability catalog: skills, MCP servers, hooks and
 /// subagent roles from `~/.mewrk` and every workspace's `.mewrk`, plus the
-/// global tool-description files, the built-in prompt profile and the built-in
-/// roles. The app itself goes through [`discover_document`], which also hands
+/// global tool-description files and the built-in prompt profiles. The app
+/// itself goes through [`discover_document`], which also hands
 /// back what the role registry is refreshed from.
 #[cfg(test)]
 pub fn discover(document: &AppDocument, _app_data: &Path) -> CapabilityCatalog {
@@ -337,11 +337,6 @@ pub(crate) fn discover_document(document: &AppDocument) -> DiscoveredCapabilitie
         document.global_settings.resolved_app_language,
     );
     discovered.catalog.tool_description_files = discover_tool_description_files();
-    // The built-in roles are not a level either; like the built-in skill they
-    // are listed first, whatever levels the scan read.
-    let mut agents = crate::agent_roles::builtin_descriptors(document);
-    agents.append(&mut discovered.catalog.agents);
-    discovered.catalog.agents = agents;
     discovered
 }
 
@@ -894,9 +889,9 @@ fn remote_parent(path: &str) -> String {
 /// version now dangles, which [`resolve_prompt_profile`] resolves to the
 /// built-in profile.
 ///
-/// The built-in profile comes first and is always present: it is the default
-/// every conversation renders with until it selects something else, and it has
-/// no location a user could delete.
+/// The built-in profiles come first and are always present: the guided one is
+/// the default every conversation renders with until it selects something
+/// else, and neither has a location a user could delete.
 fn discover_tool_description_files() -> Vec<ResourceDescriptor> {
     tool_description_files_under(ConfigLevel::user().as_ref().map(|level| level.base.as_path()))
 }
@@ -911,25 +906,40 @@ fn tool_description_files_under(home: Option<&Path>) -> Vec<ResourceDescriptor> 
         );
     }
     files.sort_by(resource_sort);
-    let mut catalog = vec![builtin_prompt_profile_descriptor()];
+    let mut catalog = builtin_prompt_profile_descriptors();
     catalog.extend(files);
     catalog
 }
 
-/// The built-in profile as a catalog entry. `location` is a `builtin:`
-/// pseudo-location so the renderer can tell it from the files a user added.
-fn builtin_prompt_profile_descriptor() -> ResourceDescriptor {
-    let profile = PromptProfile::builtin_english();
-    ResourceDescriptor {
-        id: profile.id,
-        name: profile.name,
-        description: "Built-in prompts and tool descriptions; ships with this version of Mewrk"
-            .to_owned(),
-        location: "builtin:en-US".to_owned(),
-        source: ResourceSource::Builtin,
-        available: true,
-        workspace_key: None,
-    }
+/// The built-in profiles as catalog entries, the default first. `location` is
+/// a `builtin:` pseudo-location so the renderer can tell them from the files a
+/// user added.
+fn builtin_prompt_profile_descriptors() -> Vec<ResourceDescriptor> {
+    PromptProfile::builtins()
+        .into_iter()
+        .map(|profile| {
+            let (description, location) = if profile.id == prompt_profile::BUILTIN_CONCISE_EN_US_ID {
+                (
+                    "Built-in prompts and tool descriptions cut to what a frontier model cannot infer; ships with this version of Mewrk",
+                    "builtin:en-US/concise",
+                )
+            } else {
+                (
+                    "Built-in prompts and tool descriptions with usage guidance, the default; ships with this version of Mewrk",
+                    "builtin:en-US",
+                )
+            };
+            ResourceDescriptor {
+                id: profile.id,
+                name: profile.name,
+                description: description.to_owned(),
+                location: location.to_owned(),
+                source: ResourceSource::Builtin,
+                available: true,
+                workspace_key: None,
+            }
+        })
+        .collect()
 }
 
 /// Runtime context for this turn: the system-prompt addendum, the skills
@@ -963,10 +973,10 @@ pub struct RuntimeContext {
     /// that cannot be used this turn can be taken out of the prompt again.
     pub mcp_section: McpPromptSection,
     /// The own hooks of each of the conversation's roles that chooses them,
-    /// by role name, for the turn's hook confirmation to list: a child
-    /// spawned this turn runs the run's own guards, which the confirmation
-    /// lists anyway, and of its role's own hooks only those it allowed
-    /// (`api::apply_role_capabilities`). A role whose hooks cannot be
+    /// by role name, for the turn's hook confirmation to list: a role's child
+    /// spawned this turn runs its role's own hooks, and only those the
+    /// confirmation allowed (`api::apply_role_capabilities`); a child without
+    /// a role runs the run's own, which the confirmation lists anyway. A role whose hooks cannot be
     /// resolved is left out; its spawn fails with the reason.
     pub role_hooks: std::collections::BTreeMap<String, Vec<HookDefinition>>,
     /// The role files the scan of this conversation's levels read, and those
@@ -983,11 +993,20 @@ pub struct RuntimeContext {
 /// then: its settings take no part in the caller's prompt cache, so a change
 /// applies to the next child. The caller's half is fixed for the turn, as the
 /// caller's own run is.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RoleBasis {
     /// The run's environment block, which a role's prompt opens with as the
-    /// run's own does.
+    /// run's own does — in the wording of the run's own profile.
     pub environment: String,
+    /// What `environment` was rendered from: the id of the profile it is
+    /// worded in, the facts it states, and whether it says the host's
+    /// messages come as user messages. A role that chooses another
+    /// tool-description file opens with the same facts in its own wording
+    /// ([`Self::environment_for`]); the run's facts are read once, at its
+    /// start, for every child alike.
+    pub prompt_profile_id: String,
+    pub environment_facts: crate::environment_prompt::EnvironmentFacts,
+    pub host_messages_in_user: bool,
     /// The conversation's selections the run was resolved from, which a role
     /// takes for any kind it leaves to its caller: the ones the caller runs
     /// with.
@@ -995,11 +1014,43 @@ pub struct RoleBasis {
     pub mcp_ids: Vec<String>,
     pub hook_ids: Vec<String>,
     /// How the conversation delivers skills. A role's are delivered the same
-    /// way.
+    /// way, unless it refuses the `skill` tool ([`role_refuses_skill_tool`]).
     pub skill_tool: bool,
     /// [`RuntimeContext::role_hooks`]: what the turn's hook confirmation
     /// listed for the roles.
     pub confirmed_role_hooks: std::collections::BTreeMap<String, Vec<HookDefinition>>,
+}
+
+/// A basis no run resolved — a test's, or a request built in memory — stands
+/// for a run of the default profile, as a request's default profile does: its
+/// block, empty, is that profile's.
+impl Default for RoleBasis {
+    fn default() -> Self {
+        Self {
+            environment: String::new(),
+            prompt_profile_id: crate::prompt_profile::BUILTIN_EN_US_ID.to_owned(),
+            environment_facts: Default::default(),
+            host_messages_in_user: false,
+            skill_ids: Vec::new(),
+            mcp_ids: Vec::new(),
+            hook_ids: Vec::new(),
+            skill_tool: false,
+            confirmed_role_hooks: Default::default(),
+        }
+    }
+}
+
+impl RoleBasis {
+    /// The environment block a role's prompt opens with, in `profile`'s
+    /// wording: the run's own block, byte for byte, when `profile` is the
+    /// run's, and the run's facts worded again when the role chose another
+    /// file.
+    pub fn environment_for(&self, profile: &PromptProfile) -> String {
+        if profile.id == self.prompt_profile_id {
+            return self.environment.clone();
+        }
+        crate::run_environment_block(profile, &self.environment_facts, self.host_messages_in_user)
+    }
 }
 
 /// One subagent role's skills, MCP servers and hooks: its own for each kind
@@ -1021,6 +1072,20 @@ pub fn role_chooses_capabilities(definition: &crate::model::AgentDefinition) -> 
     definition.skill_ids.is_some() || definition.mcp_ids.is_some() || definition.hook_ids.is_some()
 }
 
+/// Whether a role names `skill` in its `disallowedTools`.
+///
+/// `skill` is derived by the host, so the denial is not the end of it: a child
+/// that cannot load skills on demand gets its skills the way a conversation
+/// with the switch off does, as bodies in its prompt. Otherwise its prompt
+/// would list skills to load with a tool it does not hold, and the
+/// instructions themselves would reach it by no route at all.
+pub fn role_refuses_skill_tool(definition: &crate::model::AgentDefinition) -> bool {
+    definition
+        .disallowed_tools
+        .iter()
+        .any(|name| name == SKILL_TOOL)
+}
+
 /// What one run's capabilities are resolved from: the selected ids, how
 /// skills are delivered, and which skills its opening prompt was built with
 /// (`None`: every selected one).
@@ -1034,14 +1099,15 @@ struct CapabilitySelection<'a> {
 
 impl<'a> CapabilitySelection<'a> {
     /// A role's: its own list for each kind it chooses, the caller's for the
-    /// rest, delivered the way the caller delivers skills. A child opens a
-    /// prompt of its own, so every skill belongs to it.
+    /// rest, delivered the way the caller delivers skills — as bodies when
+    /// the role refuses `skill`. A child opens a prompt of its own, so every
+    /// skill belongs to it.
     fn of_role(basis: &'a RoleBasis, definition: &'a crate::model::AgentDefinition) -> Self {
         Self {
             skill_ids: definition.skill_ids.as_deref().unwrap_or(&basis.skill_ids),
             mcp_ids: definition.mcp_ids.as_deref().unwrap_or(&basis.mcp_ids),
             hook_ids: definition.hook_ids.as_deref().unwrap_or(&basis.hook_ids),
-            via_tool: basis.skill_tool,
+            via_tool: basis.skill_tool && !role_refuses_skill_tool(definition),
             prompt_skill_ids: None,
         }
     }
@@ -1161,8 +1227,7 @@ pub(crate) fn runtime_context_with(
 }
 
 /// The own hooks of every role `conversation` selects, resolved from
-/// `discovered`, by role name. A built-in role has none; where two selected
-/// roles share a name, the one a spawn resolves to — the higher source — is
+/// `discovered`, by role name. Where two selected roles share a name, the one a spawn resolves to — the higher source — is
 /// the one listed.
 fn role_hooks(
     conversation: &Conversation,
@@ -1220,8 +1285,8 @@ thread_local! {
 /// of `conversation`'s levels: its own for each kind it chooses, `basis`'s for
 /// the rest. Reads the levels on other machines, so it waits on them — unless
 /// there is nothing to resolve: a selection of no skill, server or hook is
-/// none of any, and needs no file read to say so. Every built-in role, and
-/// every role file that selects none of its own, is that selection.
+/// none of any, and needs no file read to say so. Every role file that
+/// selects none of its own is that selection.
 pub(crate) fn resolve_role(
     document: &AppDocument,
     conversation: &Conversation,
@@ -1577,21 +1642,33 @@ fn context_for_selection(
                     "This conversation selected two skills whose directories are both named \"{name}\". On-demand loading selects skills by directory name, so one would be unreachable; rename one directory or select only one."
                 ));
             }
+            // A skill with no trigger is listed all the same, by name alone:
+            // it is in `skills`, so the `skill` tool is derived for it, and
+            // that tool's schema says the names are in the context. Leaving
+            // it out would make it a skill the model holds and cannot name.
+            let untriggered = parsed.trigger.trim().is_empty();
             if opening {
-                if !parsed.trigger.trim().is_empty() {
-                    listing_rows.push(profile.render(
+                listing_rows.push(if untriggered {
+                    profile.render(PromptKey::SkillListingRowUntriggered, &[("name", &name)])
+                } else {
+                    profile.render(
                         PromptKey::SkillListingRow,
                         &[("name", &name), ("trigger", &parsed.trigger)],
-                    ));
-                }
+                    )
+                });
             } else {
                 added_skills.push(AddedSkill {
                     resource_id: resource_id.clone(),
                     name: name.clone(),
-                    content: profile.render(
-                        PromptKey::SystemSkillAddedTrigger,
-                        &[("name", &name), ("trigger", &parsed.trigger)],
-                    ),
+                    content: if untriggered {
+                        profile.render(PromptKey::SystemSkillAddedUntriggered, &[("name", &name)])
+                    } else {
+                        profile.render(
+                            PromptKey::SystemSkillAddedTrigger,
+                            &[("name", &name), ("trigger", &parsed.trigger)],
+                        )
+                    },
+                    form: AddedSkillForm::Trigger,
                 });
             }
             skills.push(ResolvedSkill {
@@ -1601,6 +1678,11 @@ fn context_for_selection(
                 directory: directory.unwrap_or_else(|| skill_directory(descriptor)),
             });
         } else if !parsed.body.is_empty() {
+            // What a card already in the transcript is checked for, should it
+            // be one an older build wrote under the id both forms shared.
+            let form = AddedSkillForm::Body {
+                body: parsed.body.clone(),
+            };
             // The body says `scripts/check.sh`, so the model is told where that
             // is, as the `skill` tool tells it on demand.
             let body = match &directory {
@@ -1623,6 +1705,7 @@ fn context_for_selection(
                         PromptKey::SystemSkillAddedBody,
                         &[("name", &descriptor.name), ("body", &body)],
                     ),
+                    form,
                 });
             }
         }
@@ -3043,11 +3126,20 @@ pub(crate) fn parse_tool_description_entries(value: &Value) -> Vec<ToolDescripti
         if description.trim().is_empty() {
             continue;
         }
-        if !seen.insert(tool_name.clone()) {
+        // A tool a run property turns into another tool is described once per
+        // variant, so the first entry for each (tool, variant) pair wins.
+        let variant = record
+            .get("variant")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if !seen.insert((tool_name.clone(), variant.clone())) {
             continue;
         }
         entries.push(ToolDescriptionEntry {
             tool_name,
+            variant,
             description,
         });
     }
@@ -3091,13 +3183,15 @@ fn read_tool_description_document(
 
 /// Whether a `tools[]` entry can reach anything at run time.
 ///
-/// A built-in tool is addressed by its exact catalog name; an MCP tool by the
-/// `mcp__server__tool` name the model sees. Anything else — a retired name, a
-/// display label, the wrong case — parses fine and then matches nothing, so the
-/// catalog entry says so rather than counting it as an override that works.
-fn tool_description_entry_is_addressable(tool_name: &str) -> bool {
-    let name = tool_name.trim();
-    PromptKey::for_tool_description(name).is_some() || name.starts_with("mcp__")
+/// A built-in tool is addressed by its exact catalog name and, for any but its
+/// standard variant, the variant's id; an MCP tool by the `mcp__server__tool`
+/// name the model sees, and it has no variants. Anything else — a retired
+/// name, a display label, the wrong case, a variant the tool does not have —
+/// parses fine and then matches nothing, so the catalog entry says so rather
+/// than counting it as an override that works.
+fn tool_description_entry_is_addressable(entry: &ToolDescriptionEntry) -> bool {
+    entry.description_key().is_some()
+        || (entry.tool_name.trim().starts_with("mcp__") && entry.variant.trim().is_empty())
 }
 
 fn tool_description_descriptor(path: &Path, location: String) -> ResourceDescriptor {
@@ -3112,7 +3206,7 @@ fn tool_description_descriptor(path: &Path, location: String) -> ResourceDescrip
             let unmatched = document
                 .entries
                 .iter()
-                .filter(|entry| !tool_description_entry_is_addressable(&entry.tool_name))
+                .filter(|entry| !tool_description_entry_is_addressable(entry))
                 .count();
             (document.entries.len(), unmatched, document.prompts.len())
         })
@@ -3169,11 +3263,12 @@ fn scan_tool_description_root(root: &Path, output: &mut Vec<ResourceDescriptor>)
 /// Resolves the conversation's selected tool-description file into the prompt
 /// profile the run renders with.
 ///
-/// No selection, the built-in id, a dangling id, or an unreadable file all
-/// resolve to the built-in profile — the one that is always present, compiled
-/// into this build. A selected file declares no language of its own, so it
-/// carries the application language; the keys it does not override keep the
-/// built-in English wording.
+/// No selection, the guided built-in's id, a dangling id, or an unreadable
+/// file all resolve to the guided built-in — the default, always present and
+/// compiled into this build; the concise built-in's id resolves to it. A
+/// selected file declares no language of its own, so it carries the
+/// application language; the keys it does not override keep the guided
+/// built-in's English wording. See [`resolve_prompt_profile_id`].
 pub fn resolve_prompt_profile(
     document: &AppDocument,
     conversation: &Conversation,
@@ -3186,24 +3281,47 @@ pub fn resolve_prompt_profile(
     )
 }
 
-/// [`resolve_prompt_profile`] for the global level at `home`. The folder is
-/// scanned only when a file is selected: a run with the built-in profile reads
-/// nothing.
+/// [`resolve_prompt_profile`] for the global level at `home`.
 fn prompt_profile_at(
     home: Option<&Path>,
     document: &AppDocument,
     conversation: &Conversation,
 ) -> PromptProfile {
+    prompt_profile_for_id_at(
+        home,
+        document,
+        conversation.settings.tool_description_file_id.as_deref(),
+    )
+}
+
+/// The profile a tool-description file id resolves to, by the conversation's
+/// rule: nothing selected → the guided built-in; a built-in's id → that
+/// built-in; a global file's id → that file; a dangling id or an unreadable
+/// file → the guided built-in. A subagent role that names a file resolves it
+/// here too, so a role and a conversation naming the same id render alike.
+pub fn resolve_prompt_profile_id(document: &AppDocument, id: Option<&str>) -> PromptProfile {
+    prompt_profile_for_id_at(
+        ConfigLevel::user().as_ref().map(|level| level.base.as_path()),
+        document,
+        id,
+    )
+}
+
+/// [`resolve_prompt_profile_id`] for the global level at `home`. The folder is
+/// scanned only when a file is selected: a run with a built-in profile reads
+/// nothing.
+fn prompt_profile_for_id_at(
+    home: Option<&Path>,
+    document: &AppDocument,
+    id: Option<&str>,
+) -> PromptProfile {
     let app_language = document.global_settings.resolved_app_language;
-    let Some(selected) = conversation
-        .settings
-        .tool_description_file_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty() && *id != prompt_profile::BUILTIN_EN_US_ID)
-    else {
+    let Some(selected) = id.map(str::trim).filter(|id| !id.is_empty()) else {
         return PromptProfile::builtin_english();
     };
+    if let Some(builtin) = PromptProfile::builtin(selected) {
+        return builtin;
+    }
     tool_description_files_under(home)
         .iter()
         .find(|descriptor| descriptor.id == selected)
@@ -3430,17 +3548,26 @@ mod tests {
 
         let mut document = crate::catalog::default_document();
         let catalog = tool_description_files_under(Some(&home));
-        assert_eq!(catalog.len(), 2);
-        // The built-in comes first, under a `builtin:` pseudo-location, and
-        // names no path: there is nothing on disk to edit.
-        let builtin = &catalog[0];
-        assert_eq!(builtin.id, prompt_profile::BUILTIN_EN_US_ID);
-        assert_eq!(builtin.name, "Mewrk built-in");
-        assert_eq!(builtin.source, ResourceSource::Builtin);
-        assert!(builtin.location.starts_with("builtin:"));
-        assert!(!builtin.description.contains(&*directory.path().to_string_lossy()));
-        assert_eq!(catalog[1].name, "strict");
-        let found = &catalog[1];
+        assert_eq!(catalog.len(), 3);
+        // The built-ins come first, the default (guided) one leading, under
+        // `builtin:` pseudo-locations, and name no path: there is nothing on
+        // disk to edit.
+        let builtins = &catalog[..2];
+        assert_eq!(
+            builtins.iter().map(|builtin| (builtin.id.as_str(), builtin.name.as_str())).collect::<Vec<_>>(),
+            [
+                (prompt_profile::BUILTIN_EN_US_ID, "Mewrk guided"),
+                (prompt_profile::BUILTIN_CONCISE_EN_US_ID, "Mewrk concise"),
+            ]
+        );
+        for builtin in builtins {
+            assert_eq!(builtin.source, ResourceSource::Builtin);
+            assert!(builtin.location.starts_with("builtin:"));
+            assert!(!builtin.description.contains(&*directory.path().to_string_lossy()));
+        }
+        assert_ne!(builtins[0].location, builtins[1].location);
+        assert_eq!(catalog[2].name, "strict");
+        let found = &catalog[2];
         assert_eq!(found.description, "2 个工具描述 · 1 条提示词覆盖");
         assert!(found.available);
         assert_eq!(found.source, ResourceSource::User);
@@ -3468,10 +3595,12 @@ mod tests {
             [
                 ToolDescriptionEntry {
                     tool_name: "ls".to_owned(),
+                    variant: String::new(),
                     description: "Paths must be absolute.".to_owned(),
                 },
                 ToolDescriptionEntry {
                     tool_name: "grep".to_owned(),
+                    variant: String::new(),
                     description: "Regex search.".to_owned(),
                 },
             ]
@@ -3519,11 +3648,28 @@ mod tests {
         let profile = resolve(&document);
         assert_eq!(profile, PromptProfile::builtin_english());
 
-        // Selecting the built-in by id is the same as selecting nothing.
+        // Selecting the guided built-in by id is the same as selecting nothing.
         document.workspaces[0].conversations[0]
             .settings
             .tool_description_file_id = Some(prompt_profile::BUILTIN_EN_US_ID.to_owned());
         assert_eq!(resolve(&document), PromptProfile::builtin_english());
+
+        // The concise built-in is a choice of its own, and a role naming it
+        // resolves the same way.
+        document.workspaces[0].conversations[0]
+            .settings
+            .tool_description_file_id = Some(prompt_profile::BUILTIN_CONCISE_EN_US_ID.to_owned());
+        assert_eq!(resolve(&document), PromptProfile::builtin_concise());
+        assert_eq!(
+            resolve_prompt_profile_id(&document, Some(prompt_profile::BUILTIN_CONCISE_EN_US_ID)),
+            PromptProfile::builtin_concise()
+        );
+        assert_eq!(resolve_prompt_profile_id(&document, None), PromptProfile::builtin_english());
+        assert_eq!(resolve_prompt_profile_id(&document, Some("  ")), PromptProfile::builtin_english());
+        assert_eq!(
+            resolve_prompt_profile_id(&document, Some("missing-profile")),
+            PromptProfile::builtin_english()
+        );
 
         // A dangling id — a removed file, or the retired Chinese built-in's id
         // still saved on an older conversation — resolves to the built-in.
@@ -3587,7 +3733,7 @@ mod tests {
         let files = tool_description_files_under(Some(&home));
         assert_eq!(
             files.iter().map(|file| file.name.as_str()).collect::<Vec<_>>(),
-            ["Mewrk built-in", "global"]
+            ["Mewrk guided", "Mewrk concise", "global"]
         );
 
         // The catalog — whose global level is the real home — offers nothing
@@ -3635,7 +3781,7 @@ mod tests {
         let names = |home: &Path| {
             tool_description_files_under(Some(home))
                 .into_iter()
-                .skip(1)
+                .skip(2)
                 .map(|file| file.name)
                 .collect::<Vec<_>>()
         };
@@ -3650,8 +3796,8 @@ mod tests {
         write(&both, ".mewrk", "current");
         assert_eq!(names(&both), ["current"]);
 
-        // No home, or one with no folder, offers the built-in profile alone.
-        assert_eq!(tool_description_files_under(None).len(), 1);
+        // No home, or one with no folder, offers the built-in profiles alone.
+        assert_eq!(tool_description_files_under(None).len(), 2);
         assert!(names(&directory.path().join("empty")).is_empty());
     }
 
@@ -3673,10 +3819,12 @@ mod tests {
             [
                 ToolDescriptionEntry {
                     tool_name: "ls".to_owned(),
+                    variant: String::new(),
                     description: "Paths must be absolute.".to_owned(),
                 },
                 ToolDescriptionEntry {
                     tool_name: "grep".to_owned(),
+                    variant: String::new(),
                     description: "Regex search.".to_owned(),
                 },
             ]
@@ -3703,18 +3851,22 @@ mod tests {
             [
                 ToolDescriptionEntry {
                     tool_name: "ls".to_owned(),
+                    variant: String::new(),
                     description: "Legacy wording.".to_owned(),
                 },
                 ToolDescriptionEntry {
                     tool_name: "read".to_owned(),
+                    variant: String::new(),
                     description: "New wording.".to_owned(),
                 },
                 ToolDescriptionEntry {
                     tool_name: "grep".to_owned(),
+                    variant: String::new(),
                     description: "Legacy fallback.".to_owned(),
                 },
                 ToolDescriptionEntry {
                     tool_name: "edit".to_owned(),
+                    variant: String::new(),
                     description: "Legacy for a non-string.".to_owned(),
                 },
             ]
@@ -4142,6 +4294,14 @@ mod tests {
         assert!(inline.added_skills[0]
             .content
             .contains("MEWRK_SKILL_BODY_E2E"));
+        // The body as the notice quotes it, before its folder line: what an
+        // older card under the announcement's id is checked for.
+        assert_eq!(
+            inline.added_skills[0].form,
+            AddedSkillForm::Body {
+                body: "MEWRK_SKILL_BODY_E2E".into()
+            }
+        );
 
         document.workspaces[0].conversations[0]
             .settings
@@ -4162,8 +4322,81 @@ mod tests {
         assert!(on_demand.added_skills[0]
             .content
             .contains("Use when probing"));
+        assert_eq!(on_demand.added_skills[0].form, AddedSkillForm::Trigger);
         assert_eq!(on_demand.skills.len(), 1);
         assert_eq!(on_demand.skills[0].body, "MEWRK_SKILL_BODY_E2E");
+    }
+
+    /// A skill whose `SKILL.md` gives no description is still listed when
+    /// skills load on demand, by its name alone: the `skill` tool is derived
+    /// for it all the same, and that tool's schema tells the model the names
+    /// are in its context. Selected mid-conversation, it is announced the
+    /// same way, with no colon left dangling where a trigger would go — in
+    /// both built-in profiles.
+    #[test]
+    fn a_skill_without_a_trigger_is_still_listed_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("bare-skill");
+        fs::create_dir_all(&directory).unwrap();
+        let skill_path = directory.join(SKILL_MANIFEST);
+        // No description, and nothing in the body to infer one from.
+        fs::write(&skill_path, "---\nname: Bare Skill\n---\n\n# Bare Skill\n").unwrap();
+        let (mut document, catalog) = skill_only_fixture(&skill_path);
+        document.workspaces[0].conversations[0]
+            .settings
+            .skill_tool_enabled = true;
+        let scan = || discovered(catalog.clone(), HashMap::new());
+
+        for profile in [PromptProfile::builtin_english(), PromptProfile::builtin_concise()] {
+            document.workspaces[0].conversations[0].settings.tool_lock = None;
+            let opening = runtime_context_from_discovery(
+                &document.workspaces[0].conversations[0],
+                &scan(),
+                &profile,
+                &WorkspacePlaces::default(),
+            )
+            .unwrap();
+            assert_eq!(opening.skills.len(), 1);
+            assert_eq!(opening.skills[0].trigger, "");
+            assert_eq!(
+                opening.addendum,
+                format!(
+                    "{}\n{}",
+                    profile.text(PromptKey::SkillListingHeading),
+                    profile.render(PromptKey::SkillListingRowUntriggered, &[("name", "bare-skill")])
+                )
+            );
+            assert!(!opening.addendum.contains("bare-skill:"), "{}", opening.addendum);
+
+            document.workspaces[0].conversations[0].settings.tool_lock =
+                Some(crate::model::ConversationToolLock {
+                    prompt_skill_ids: Some(Vec::new()),
+                    ..Default::default()
+                });
+            let added = runtime_context_from_discovery(
+                &document.workspaces[0].conversations[0],
+                &scan(),
+                &profile,
+                &WorkspacePlaces::default(),
+            )
+            .unwrap();
+            assert_eq!(added.addendum, "");
+            assert_eq!(added.added_skills.len(), 1);
+            let content = &added.added_skills[0].content;
+            assert_eq!(
+                content,
+                &profile.render(PromptKey::SystemSkillAddedUntriggered, &[("name", "bare-skill")])
+            );
+            assert!(content.contains("bare-skill"), "{content}");
+            assert!(!content.contains("bare-skill:"), "{content}");
+            assert!(!content.trim_end().ends_with(':'), "{content}");
+        }
+        // The guided wording, spelled out.
+        assert_eq!(
+            PromptProfile::builtin_english()
+                .render(PromptKey::SkillListingRowUntriggered, &[("name", "bare-skill")]),
+            "- bare-skill (no description: load it to see when it applies)"
+        );
     }
 
     /// A conversation selecting one skill and a catalog containing only that skill.
@@ -4645,6 +4878,9 @@ mod tests {
 
         let basis = RoleBasis {
             environment: String::new(),
+            prompt_profile_id: profile.id.clone(),
+            environment_facts: Default::default(),
+            host_messages_in_user: false,
             skill_ids: conversation.settings.skill_ids.clone(),
             mcp_ids: conversation.settings.mcp_ids.clone(),
             hook_ids: conversation.settings.hook_ids.clone(),
@@ -4683,8 +4919,9 @@ mod tests {
 
     /// Role files are read at every level and listed whether or not they can
     /// be used; the usable ones are handed on for the registry with the level
-    /// they were read at, the catalog lists the built-in roles first, and the
-    /// fingerprint the settings pane polls moves when a role file appears.
+    /// they were read at, the catalog lists nothing but files — no role is
+    /// built in — and the fingerprint the settings pane polls moves when a
+    /// role file appears.
     #[test]
     fn role_files_are_discovered_at_every_level() {
         let home = tempfile::tempdir().unwrap();
@@ -4748,10 +4985,8 @@ mod tests {
         let mut document = crate::catalog::default_document();
         document.workspaces[0].path = workspace.path().to_string_lossy().into_owned();
         let catalog = discover(&document, home.path());
-        assert_eq!(
-            catalog.agents.iter().take(4).map(|row| row.descriptor.id.as_str()).collect::<Vec<_>>(),
-            crate::agent_roles::BUILTIN_ROLE_IDS
-        );
+        assert!(catalog.agents.iter().all(|row| row.descriptor.source != ResourceSource::Builtin));
+        assert!(catalog.agents.iter().any(|row| row.descriptor.id == project.descriptor.id));
         let before = fingerprint(&document);
         write(workspace.path(), "new.json", "{}");
         assert_ne!(fingerprint(&document), before);

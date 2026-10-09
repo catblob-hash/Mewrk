@@ -500,6 +500,32 @@ impl FileReadRegistry {
         scopes.retain(|scope, _| conversation_of_scope(scope) != conversation_id);
     }
 
+    /// Forgets what a conversation's own scope recorded, saved records
+    /// included, for a run of a conversation whose file write guards are off.
+    ///
+    /// Such a run records nothing of what it reads or writes, so a record kept
+    /// from before would be out of date the moment the guards came back on —
+    /// every file the model edited meanwhile would read as changed behind its
+    /// back. Dropping it makes turning the guards back on start where a fresh
+    /// conversation starts. Child scopes are left alone: a child spawned while
+    /// the guards were on keeps enforcing them over its own copy until it ends.
+    pub fn forget_conversation(&self, conversation_id: &str) {
+        self.scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(conversation_id);
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(store) = store {
+            if let Err(error) = store.delete_file_read_records(conversation_id) {
+                eprintln!("Could not forget the saved file reads of {conversation_id}: {error}");
+            }
+        }
+    }
+
     /// Drops every scope whose conversation is not in `retained`. Called after
     /// a document save, the one event that can make a conversation go away.
     pub fn retain_conversations(&self, retained: &HashSet<String>) {

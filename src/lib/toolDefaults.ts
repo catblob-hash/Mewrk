@@ -206,7 +206,8 @@ const englishParameterPlaceholders: Record<string, string> = {
 const englishToolLabels: Record<string, string> = {
   ls: "List files",
   grep: "Search content",
-  powershell: "PowerShell",
+  pwsh: "PowerShell 7",
+  powershell: "Windows PowerShell",
   bash: "Bash",
   zsh: "zsh",
   sh: "sh",

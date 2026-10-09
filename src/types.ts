@@ -392,9 +392,8 @@ export interface ConversationSettings {
    * The subagent roles this conversation offers the model, by catalog id
    * (`CapabilityCatalog.agents`), exactly as `skillIds` selects skills. A role
    * is a JSON file under `~/.mewrk/agents/` or a workspace's
-   * `.mewrk/agents/` (or one of the built-ins), never a record of the
-   * conversation's own, so editing one reaches every conversation that selects
-   * it. An id discovery cannot find is kept and skipped (dangling). A preset
+   * `.mewrk/agents/`, never a record of the conversation's own, so editing one
+   * reaches every conversation that selects it. An id discovery cannot find is kept and skipped (dangling). A preset
    * component, so applying a preset replaces the whole selection.
    */
   agentIds: string[];
@@ -477,11 +476,16 @@ export interface ConversationSettings {
   /* The sandbox used to be a setting here. It belongs to each workspace now
    * (`ExecutionEnvironmentAssets.sandboxes`); the host hands an old
    * conversation's to its workspaces when it loads and never sends it here. */
-  /* The five file write guards used to be switches here. They are now
-   * unconditional in the host — every conversation, and every child of one,
-   * runs with read-before-write, the stale-write refusal, external-change
-   * notices, hook re-sync and the formatter hint — so there is nothing left for
-   * a conversation to carry about them. See `FileGuard` on the Rust side. */
+  /**
+   * Whether this conversation's file tools run with their write guards:
+   * read-before-write, the stale-write refusal, external-change notices, hook
+   * re-sync and the formatter hint, together with the rules the `edit` and
+   * `write` tool descriptions carry for them. One switch for all five, and
+   * subagents and workflows follow the conversation that started them. Absent
+   * means on; only an explicit `false` turns them off. Mirrors Rust
+   * `ConversationSettings::file_write_guards_enabled`.
+   */
+  fileWriteGuardsEnabled?: boolean;
   /**
    * What this conversation's last request put in front of the model, and which
    * model sent it when. Absent until the first run. Per-conversation runtime
@@ -580,6 +584,11 @@ export interface ConversationToolLock {
   promptProfile: string | null;
   /** The host-message container the last request used, or `null` on an older lock. */
   hostMessageContainer: HostMessageContainer | null;
+  /**
+   * Whether the last request ran with the file write guards on (the `edit` and
+   * `write` descriptions carry their rules only then), or `null` on an older lock.
+   */
+  fileWriteGuards: boolean | null;
 }
 
 /** Which model a conversation's last request used, and when. */
@@ -621,6 +630,8 @@ export interface ConversationPresetSettings {
   mcpToolDiscoveryEnabled: boolean;
   /** Host-message container template copied into conversations; absent means `"user"`. */
   hostMessageContainer?: HostMessageContainer;
+  /** File-write-guards template copied into conversations; absent means on. */
+  fileWriteGuardsEnabled?: boolean;
 }
 
 /**
@@ -1361,9 +1372,8 @@ export type AgentModelSelection =
   | { kind: "explicit"; providerId: string; modelId: string }
   /**
    * No model to bind: an older build wrote this in place of a dead binding,
-   * keeping none of the old identifiers, and the host lists a built-in role
-   * whose provider family is missing this way. A role in this state is hidden
-   * from the model and fails with its own wording if named anyway.
+   * keeping none of the old identifiers. A role in this state is hidden from
+   * the model and fails with its own wording if named anyway.
    */
   | { kind: "unavailable" };
 
@@ -1371,21 +1381,21 @@ export type AgentModelSelection =
 export type CapabilityResourceKind = "skills" | "mcp" | "hooks" | "agents";
 
 /**
- * The body of one subagent role file — `~/.mewrk/agents/<file>.json`, a
- * workspace's `.mewrk/agents/<file>.json`, or a built-in the host computes.
- * Mirrors Rust `agent_roles::AgentRoleFile`.
+ * The body of one subagent role file — `~/.mewrk/agents/<file>.json` or a
+ * workspace's `.mewrk/agents/<file>.json`. Mirrors Rust `agent_roles::AgentRoleFile`.
  *
  * A role answers which model it runs on, which tools, skills, MCP servers and
  * hooks it may use, how its searches and fetches go, and what it tells the model
  * it is for. Every tool-like answer is the role's OWN: nothing here follows the
  * calling conversation's tools, selections or web backends. Only the model
- * (`modelSelection.kind = "inherit"`) and the reasoning effort (`effort: null`)
- * may still ride the caller at run time. The caller's web-access switch stays
- * the ceiling: a role can never put an offline conversation online.
+ * (`modelSelection.kind = "inherit"`), the reasoning effort (`effort: null`) and
+ * the tool-description file (`toolDescriptionFileId: null`) may still ride the
+ * caller at run time. The caller's web-access switch stays the ceiling: a role
+ * can never put an offline conversation online.
  *
- * It carries no system prompt of its own: a named child renders the
- * conversation's prompt through the subagent addendum, exactly like an ordinary
- * child.
+ * It carries no system prompt of its own: a named child renders the prompt
+ * through the subagent addendum, exactly like an ordinary child — in the
+ * caller's tool-description profile, unless the role picks a file of its own.
  */
 export interface AgentRole {
   /** Model-visible role name; the host falls back to the file stem when blank. */
@@ -1421,6 +1431,16 @@ export interface AgentRole {
    * the host's template store. May dangle; a deleted template seeds nothing.
    */
   templateId: string | null;
+  /**
+   * The tool-description file this role's child renders with — its tool
+   * schemas, system prompt wording and the notices inside its own run — or
+   * `null` to render with its caller's. Only ever an id: a built-in profile
+   * ("Mewrk guided", "Mewrk concise") or a `~/.mewrk/tool-descriptions` file.
+   * May dangle; the child then falls back to "Mewrk guided", as a conversation's
+   * choice does. What the caller's model reads about the child stays in the
+   * caller's profile.
+   */
+  toolDescriptionFileId: string | null;
 }
 
 /**
@@ -1895,8 +1915,10 @@ export interface SshMachineConfig {
 /**
  * A shell Mewrk runs commands and its own scripts through. Mirrors the host's
  * `shell_backend::ShellBackend`; which ones a machine has is found by probing it.
+ * `pwsh` is PowerShell 7 and `powershell` is Windows PowerShell 5.1: two
+ * backends, two tools.
  */
-export type ShellBackend = "bash" | "zsh" | "sh" | "powershell";
+export type ShellBackend = "bash" | "zsh" | "sh" | "pwsh" | "powershell";
 
 /** A machine's operating system. WSL is one of them, not a kind of shell. */
 export type MachineOs = "windows" | "macos" | "linux" | "wsl";
@@ -2015,8 +2037,8 @@ export interface CapabilityCatalog {
   /** Tool-description JSON files discovered on disk, one descriptor per file. */
   toolDescriptionFiles: ResourceDescriptor[];
   /**
-   * Subagent roles: the built-ins first, then one entry per `agents/*.json`
-   * file at the global level and in each workspace.
+   * Subagent roles: one entry per `agents/*.json` file at the global level and
+   * in each workspace.
    */
   agents: AgentRoleResource[];
   /**

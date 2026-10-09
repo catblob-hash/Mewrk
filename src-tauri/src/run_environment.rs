@@ -1251,13 +1251,17 @@ fn well_known_bash_paths() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Local PowerShell interpreters, in Claude Code's exact preference order.
+/// Local interpreters of one PowerShell edition, best first: PowerShell 7 for
+/// [`ShellBackend::Pwsh`], Windows PowerShell 5.1 for
+/// [`ShellBackend::WindowsPowerShell`], nothing for any other backend.
 ///
-/// PowerShell 7 first and Windows PowerShell 5.1 last, because 5.1 is the one
-/// that decodes BOM-less files with the ANSI code page. The three fixed paths
-/// between them are the install locations `PATH` routinely fails to mention: the
-/// MSI's own directory, the Microsoft Store alias, and a per-user `dotnet tool`
-/// install.
+/// Each edition is its own backend and its own tool, so one never stands in
+/// for the other: a machine without PowerShell 7 has no `pwsh` tool rather
+/// than a `pwsh` tool that runs 5.1. The candidates within an edition are
+/// Claude Code's, in its order. For PowerShell 7 the three fixed paths after
+/// `PATH` are the install locations `PATH` routinely fails to mention: the
+/// MSI's own directory, the Microsoft Store alias, and a per-user
+/// `dotnet tool` install. For 5.1 it is the one place Windows puts it.
 ///
 /// A bare name is returned rather than an absolute path when `PATH` resolves it,
 /// matching Claude Code; unlike Bash there is no launcher-shaped impostor on
@@ -1267,15 +1271,19 @@ fn well_known_bash_paths() -> Vec<PathBuf> {
 /// Linux host is a POSIX workspace — [`crate::workspace_set::WorkspaceOs`] says
 /// so and the tool is withdrawn there — even when `pwsh` happens to be
 /// installed, so no candidate is offered off Windows.
-pub fn local_powershell_candidates() -> Vec<String> {
+///
+/// [`ShellBackend::Pwsh`]: crate::shell_backend::ShellBackend::Pwsh
+/// [`ShellBackend::WindowsPowerShell`]: crate::shell_backend::ShellBackend::WindowsPowerShell
+pub fn local_powershell_candidates(edition: crate::shell_backend::ShellBackend) -> Vec<String> {
     #[cfg(windows)]
     {
-        select_local_powershell(&|path: &Path| path.is_file(), &|name: &str| {
+        select_local_powershell(edition, &|path: &Path| path.is_file(), &|name: &str| {
             path_lookup(name).is_some()
         })
     }
     #[cfg(not(windows))]
     {
+        let _ = edition;
         Vec::new()
     }
 }
@@ -1298,13 +1306,49 @@ fn path_lookup(name: &str) -> Option<PathBuf> {
 /// branch above calls it.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn select_local_powershell(
+    edition: crate::shell_backend::ShellBackend,
     is_file: &dyn Fn(&Path) -> bool,
     on_path: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
+    use crate::shell_backend::ShellBackend;
     let mut candidates: Vec<String> = Vec::new();
-    if on_path("pwsh") {
-        candidates.push("pwsh".into());
+    match edition {
+        ShellBackend::Pwsh => {
+            if on_path("pwsh") {
+                candidates.push("pwsh".into());
+            }
+            candidates.extend(
+                pwsh_install_locations()
+                    .into_iter()
+                    .filter(|candidate| is_file(candidate))
+                    .map(|candidate| candidate.to_string_lossy().into_owned()),
+            );
+        }
+        ShellBackend::WindowsPowerShell => {
+            if on_path("powershell") {
+                candidates.push("powershell".into());
+            }
+            let system_root = std::env::var_os("SystemRoot")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+            let windows_powershell = system_root
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe");
+            if is_file(&windows_powershell) {
+                candidates.push(windows_powershell.to_string_lossy().into_owned());
+            }
+        }
+        ShellBackend::Bash | ShellBackend::Zsh | ShellBackend::Sh => {}
     }
+    candidates.dedup();
+    candidates
+}
+
+/// Where PowerShell 7 installs itself when `PATH` does not say.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pwsh_install_locations() -> Vec<PathBuf> {
     let mut fixed: Vec<PathBuf> = Vec::new();
     for variable in ["ProgramFiles", "ProgramW6432"] {
         if let Some(value) = std::env::var_os(variable) {
@@ -1332,27 +1376,7 @@ fn select_local_powershell(
                 .join("pwsh.exe"),
         );
     }
-    for candidate in fixed {
-        if is_file(&candidate) {
-            candidates.push(candidate.to_string_lossy().into_owned());
-        }
-    }
-    if on_path("powershell") {
-        candidates.push("powershell".into());
-    }
-    let system_root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    let windows_powershell = system_root
-        .join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
-    if is_file(&windows_powershell) {
-        candidates.push(windows_powershell.to_string_lossy().into_owned());
-    }
-    candidates.dedup();
-    candidates
+    fixed
 }
 
 /// An installed WSL distribution from one `wsl.exe --list --verbose` row.

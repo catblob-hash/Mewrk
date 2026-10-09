@@ -328,23 +328,24 @@ pub(crate) fn find(target: &Target<'_>, path: &str, name_filter: Option<&str>, l
 /// are the ones `git ls-files` shows; otherwise the walk skips what
 /// `Collapsed` names. A bad pattern exits 2 with .NET's complaint on stderr;
 /// an unreadable file is reported on stderr and skipped.
-pub(crate) fn grep(
-    target: &Target<'_>,
-    path: &str,
-    pattern: &str,
-    case_sensitive: bool,
-    limit: usize,
-) -> String {
-    let options = if case_sensitive {
-        "CultureInvariant"
-    } else {
-        "CultureInvariant, IgnoreCase"
-    };
+///
+/// `pattern` is .NET's translation of the model's Rust pattern
+/// (`remote_regex`), folded for case already, so it is matched without
+/// `IgnoreCase`: .NET's own case folding is not Rust's.
+pub(crate) fn grep(target: &Target<'_>, path: &str, pattern: &str, limit: usize) -> String {
+    let options = "CultureInvariant";
     let mut script = prologue(target, path, Mode::Existing);
     script.push_str(&format!(
         r#"$Pattern = {pattern}
 $Options = [System.Text.RegularExpressions.RegexOptions]'{options}'
-try {{ $Rx = [System.Text.RegularExpressions.Regex]::new($Pattern, $Options) }} catch {{
+# A match that runs past its time limit counts as a hit: the host matches
+# every line again with the pattern itself, so a slow line costs a candidate,
+# never a missed match.
+$Limit = [TimeSpan]::FromSeconds(5)
+function Hit($Matcher, [string]$Subject) {{
+  try {{ return $Matcher.IsMatch($Subject) }} catch [System.Text.RegularExpressions.RegexMatchTimeoutException] {{ return $true }}
+}}
+try {{ $Rx = [System.Text.RegularExpressions.Regex]::new($Pattern, $Options, $Limit) }} catch {{
   $why = $_.Exception
   if ($why.InnerException) {{ $why = $why.InnerException }}
   Out-Err $why.Message
@@ -353,17 +354,17 @@ try {{ $Rx = [System.Text.RegularExpressions.Regex]::new($Pattern, $Options) }} 
 # A whole-file test first, so files with no match cost one regex pass. It is
 # skipped for anchors that mean something different in a whole file.
 $Prefilter = $null
-if ($Pattern -notmatch '\\[AzZG]|\(\?<[=!]') {{ $Prefilter = [System.Text.RegularExpressions.Regex]::new($Pattern, $Options -bor [System.Text.RegularExpressions.RegexOptions]::Multiline) }}
+if ($Pattern -notmatch '\\[AzZG]|\(\?<[=!]') {{ $Prefilter = [System.Text.RegularExpressions.Regex]::new($Pattern, $Options -bor [System.Text.RegularExpressions.RegexOptions]::Multiline, $Limit) }}
 $Utf8 = [System.Text.UTF8Encoding]::new($false, $false)
 $global:MewrkLeft = {limit}
 function Scan([string]$File, [string]$Shown, [bool]$SkipBinary) {{
   try {{ $bytes = [System.IO.File]::ReadAllBytes($File) }} catch {{ Out-Err ('grep: ' + $Shown + ': ' + $_.Exception.Message); return }}
   if ($SkipBinary -and [Array]::IndexOf($bytes, [byte]0, 0, [Math]::Min($bytes.Length, 8000)) -ge 0) {{ return }}
   $text = $Utf8.GetString($bytes).Replace("`r`n", "`n")
-  if ($null -ne $Prefilter -and -not $Prefilter.IsMatch($text)) {{ return }}
+  if ($null -ne $Prefilter -and -not (Hit $Prefilter $text)) {{ return }}
   $lines = $text.Split("`n")
   for ($n = 0; $n -lt $lines.Length; $n++) {{
-    if ($Rx.IsMatch($lines[$n])) {{
+    if (Hit $Rx $lines[$n]) {{
       Out-Line ($Shown + ':' + ($n + 1) + ':' + $lines[$n])
       $global:MewrkLeft--
       if ($global:MewrkLeft -le 0) {{ Quit 0 }}
@@ -1415,7 +1416,7 @@ mod tests {
         assert!(script.contains("Inside $C $ROOT"), "confinement is compiled in");
         assert!(!listing(&target(false), ".", 2, 11).contains("Inside $C $ROOT"));
         // PowerShell's typographic quotes delimit strings too.
-        let script = grep(&target(true), ".", "a\u{2019}b", true, 5);
+        let script = grep(&target(true), ".", "a\u{2019}b", 5);
         assert!(script.contains("'a\u{2019}\u{2019}b'"), "{script}");
     }
 
@@ -1429,7 +1430,7 @@ mod tests {
         for code in ["Quit 69", "Quit 70"] {
             assert!(write.contains(code), "{code}");
         }
-        assert!(grep(&target(true), ".", "(", false, 5).contains("Quit 2"));
+        assert!(grep(&target(true), ".", "(", 5).contains("Quit 2"));
         assert!(lsp_launch("C:/w", "gopls", &[], &[]).contains("exit 127"));
     }
 
@@ -1457,7 +1458,7 @@ mod tests {
         let scripts = [
             listing(&target(true), ".", 2, 11),
             find(&target(true), ".", Some("*.rs"), 10),
-            grep(&target(true), ".", "x", false, 10),
+            grep(&target(true), ".", "x", 10),
             read(&target(true), "a", 10),
             probe(&target(true), "a", 10),
             cas_write(&target(true), "a", "absent"),

@@ -3865,6 +3865,15 @@ pub(crate) fn preview_page_session_id(conversation_id: &str) -> Result<String, S
     Ok(conversation_id.to_owned())
 }
 
+/// Whether `tool_name` acts on the conversation's browser session: every `preview_*` tool, the
+/// [`PreviewTool`] page tools and the dev-server ones alike, since `preview_start` points that
+/// session's page at the server it starts. Mirrors the `preview_*` arms of
+/// `tool_executor::run_tool` and the browser-admission check in
+/// `api::execute_model_tool_with_scope`, which key on the same prefix.
+pub(crate) fn is_browser_session_tool(tool_name: &str) -> bool {
+    tool_name.starts_with("preview_")
+}
+
 fn browser_space_digest(value: &str) -> String {
     Sha256::digest([b"mewrk-browser-space-v1\0".as_slice(), value.as_bytes()].concat())
         .iter()

@@ -23,7 +23,7 @@ members = [
 
 [package]
 name = "mewrk"
-version = "1.0.0"
+version = "1.0.1"
 description = "Mewrk — Mew. Work."
 authors = ["Mewrk contributors"]
 license = "GPL-3.0-or-later"
@@ -90,6 +90,7 @@ mewrk-remote-agent = { path = "remote-agent", default-features = false, features
 # same crate to serve checkouts on other machines (`mewrk-remote git`).
 mewrk-git-core = { path = "git-core" }
 regex = "1"
+regex-syntax = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 # npm's registry signatures (ECDSA P-256) on the Claude Agent SDK and CLI
 # versions Mewrk installs (`components::claude_agent`). Already built for

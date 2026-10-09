@@ -612,6 +612,7 @@ mod tests {
             native_fetch_call: None,
             run_environment: Default::default(),
             prompt_profile: Default::default(),
+            caller_prompt_profile: None,
             global_memory_enabled: false,
             project_memory_enabled: false,
             skills: Vec::new(),

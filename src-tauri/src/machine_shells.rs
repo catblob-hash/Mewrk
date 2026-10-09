@@ -87,6 +87,27 @@ impl MachineShells {
             probed_at: chrono::Utc::now().to_rfc3339(),
         }
     }
+
+    /// A kept answer as this build reads it. One written before the two
+    /// PowerShell editions were told apart lists PowerShell 7 under the old
+    /// shared id; its path says which edition it found
+    /// ([`ShellBackend::of_recorded_program`]). The edition it did not list
+    /// stays unknown until the machine is probed again, which happens once per
+    /// session.
+    fn as_recorded_now(mut self) -> Self {
+        for shell in &mut self.shells {
+            shell.backend = shell.backend.of_recorded_program(&shell.path);
+        }
+        let order = backends_for(self.os);
+        self.shells.sort_by_key(|shell| {
+            order
+                .iter()
+                .position(|backend| *backend == shell.backend)
+                .unwrap_or(order.len())
+        });
+        self.shells.dedup_by_key(|shell| shell.backend);
+        self
+    }
 }
 
 /// The account and address an SSH machine's answer came from: what the probe
@@ -177,8 +198,12 @@ pub fn install(app_data: &Path, observer: Option<Observer>) {
     {
         let mut store = store();
         store.file = Some(file);
-        for (key, shells) in entries {
-            store.entries.entry(key).or_insert(shells);
+        for (key, recorded) in entries {
+            let recorded = Recorded {
+                shells: recorded.shells.as_recorded_now(),
+                endpoint: recorded.endpoint,
+            };
+            store.entries.entry(key).or_insert(recorded);
         }
     }
     if let Some(observer) = observer {
@@ -354,13 +379,17 @@ pub fn probe_local() -> MachineShells {
 
 fn local_program(os: MachineOs, name: &str) -> Option<String> {
     match (os, name) {
-        (MachineOs::Windows, "pwsh" | "powershell") => {
-            // One answer for both names: the tool's own resolver already
-            // prefers PowerShell 7 and falls back to 5.1.
-            if name == "powershell" {
-                return None;
-            }
-            run_environment::local_powershell_candidates().into_iter().next()
+        // Each edition answers for its own name only, from the resolver the
+        // tool itself launches with.
+        (MachineOs::Windows, "pwsh") => {
+            run_environment::local_powershell_candidates(ShellBackend::Pwsh)
+                .into_iter()
+                .next()
+        }
+        (MachineOs::Windows, "powershell") => {
+            run_environment::local_powershell_candidates(ShellBackend::WindowsPowerShell)
+                .into_iter()
+                .next()
         }
         (MachineOs::Windows, "bash") => run_environment::local_bash_candidates().into_iter().next(),
         (MachineOs::Windows, _) => None,
@@ -525,19 +554,65 @@ mod tests {
         assert_eq!(shells.get(ShellBackend::Sh).unwrap().path, "/bin/sh");
     }
 
+    /// A Windows machine with both editions has both backends, each at its own
+    /// program; one with only 5.1 has no PowerShell 7 standing in for it.
     #[test]
-    fn powershell_on_windows_prefers_pwsh() {
-        let found: BTreeMap<&str, &str> = [
+    fn each_powershell_edition_on_windows_is_found_on_its_own() {
+        let both: BTreeMap<&str, &str> = [
             ("powershell", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
             ("pwsh", r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            ("bash", r"C:\Program Files\Git\bin\bash.exe"),
         ]
         .into_iter()
         .collect();
         let shells = MachineShells::from_found(MachineOs::Windows, |name| {
-            found.get(name).map(|path| (*path).to_owned())
+            both.get(name).map(|path| (*path).to_owned())
         });
-        assert_eq!(shells.backends(), vec![ShellBackend::PowerShell]);
-        assert!(shells.get(ShellBackend::PowerShell).unwrap().path.ends_with("pwsh.exe"));
+        assert_eq!(
+            shells.backends(),
+            vec![ShellBackend::Pwsh, ShellBackend::WindowsPowerShell, ShellBackend::Bash]
+        );
+        assert!(shells.get(ShellBackend::Pwsh).unwrap().path.ends_with("pwsh.exe"));
+        assert!(shells
+            .get(ShellBackend::WindowsPowerShell)
+            .unwrap()
+            .path
+            .ends_with("powershell.exe"));
+
+        let shells = MachineShells::from_found(MachineOs::Windows, |name| {
+            (name == "powershell").then(|| "powershell.exe".to_owned())
+        });
+        assert_eq!(shells.backends(), vec![ShellBackend::WindowsPowerShell]);
+    }
+
+    /// `machine-shells.json` written before the split lists PowerShell 7 under
+    /// the old shared id; it loads as PowerShell 7, in table order.
+    #[test]
+    fn a_kept_answer_from_before_the_split_reads_pwsh_by_its_path() {
+        let file: BTreeMap<String, Recorded> = serde_json::from_str(
+            r#"{
+                "local": {"os": "windows", "shells": [
+                    {"backend": "bash", "path": "C:\\Program Files\\Git\\bin\\bash.exe"},
+                    {"backend": "powershell", "path": "C:\\Program Files\\PowerShell\\7\\pwsh.exe"}
+                ], "probedAt": "2026-10-01T00:00:00Z"},
+                "wsl:Ubuntu": {"os": "wsl", "shells": [{"backend": "bash", "path": "/usr/bin/bash"}], "probedAt": "2026-10-01T00:00:00Z"}
+            }"#,
+        )
+        .unwrap();
+        let local = file["local"].shells.clone().as_recorded_now();
+        assert_eq!(local.backends(), vec![ShellBackend::Pwsh, ShellBackend::Bash]);
+        let ubuntu = file["wsl:Ubuntu"].shells.clone();
+        assert_eq!(ubuntu.clone().as_recorded_now(), ubuntu);
+
+        let old_windows_powershell = MachineShells {
+            os: MachineOs::Windows,
+            shells: vec![DetectedShell {
+                backend: ShellBackend::WindowsPowerShell,
+                path: "powershell.exe".into(),
+            }],
+            probed_at: String::new(),
+        };
+        assert_eq!(old_windows_powershell.clone().as_recorded_now(), old_windows_powershell);
     }
 
     #[test]
@@ -674,13 +749,15 @@ mod tests {
         let shells = probe_remote(&runner, &CancelSignal::default()).unwrap();
         eprintln!("[e2e] probed: {shells:?}");
         assert_eq!(shells.os, MachineOs::Windows);
-        let powershell = shells.get(ShellBackend::PowerShell).expect("PowerShell is on every Windows");
+        let powershell = shells
+            .get(ShellBackend::WindowsPowerShell)
+            .expect("Windows PowerShell is on every Windows");
         assert!(powershell.path.to_ascii_lowercase().ends_with(".exe"), "{}", powershell.path);
 
         // The tool: Chinese output survives, the variable table arrives, and the
         // exit status is the command's.
         let argv = crate::shell_backend::remote_command_argv(
-            ShellBackend::PowerShell,
+            ShellBackend::WindowsPowerShell,
             &powershell.path,
             "Write-Output \"中文 $env:MEWRK_E2E_VALUE\"; cmd /c exit 3",
         );
@@ -713,7 +790,7 @@ mod tests {
             &["mewrk".to_owned()],
             &[("MEWRK_LSP".to_owned(), "1".to_owned())],
         );
-        let argv = crate::shell_backend::script_argv(ShellBackend::PowerShell, &powershell.path, &script);
+        let argv = crate::shell_backend::script_argv(ShellBackend::WindowsPowerShell, &powershell.path, &script);
         let child = crate::remote_link::spawn(
             &runner,
             argv,
@@ -739,7 +816,7 @@ mod tests {
         let script = crate::remote_powershell::lsp_launch("~", "no-such-language-server", &[], &[]);
         let output = crate::remote_link::run_script(
             &runner,
-            crate::shell_backend::script_argv(ShellBackend::PowerShell, &powershell.path, &script),
+            crate::shell_backend::script_argv(ShellBackend::WindowsPowerShell, &powershell.path, &script),
             None,
             Duration::from_secs(60),
             &CancelSignal::default(),

@@ -100,12 +100,13 @@ const TASK_COLLECTION_TOOL_NAMES: [&str; 2] = ["task_wait", "task_list"];
 /// the server process, not a task of its own: it has no address, it cannot be
 /// waited on, and it dies with the server. A conversation that can only drive a
 /// page has nothing in the task list and needs no task-runtime tools.
-pub const TASK_PRODUCING_TOOL_NAMES: [&str; 7] = [
+pub const TASK_PRODUCING_TOOL_NAMES: [&str; 8] = [
     "agent_spawn",
     "workflow",
     "bash",
     "zsh",
     "sh",
+    "pwsh",
     "powershell",
     "preview_start",
 ];
@@ -724,6 +725,18 @@ impl AgentShared {
         self.lock_core().result.clone()
     }
 
+    /// The profile every text this task hands its caller is worded in: its
+    /// result, and the notes on how it failed or stopped. The caller's model
+    /// reads them, so they are the caller's wording, even when the role this
+    /// task runs gave its own run another profile (`template.prompt_profile`,
+    /// which words everything the task itself reads).
+    pub(crate) fn caller_prompt_profile(&self) -> &crate::prompt_profile::PromptProfile {
+        self.template
+            .caller_prompt_profile
+            .as_deref()
+            .unwrap_or(&self.template.prompt_profile)
+    }
+
     /// Forces an agent that ignored its cancel flag to a terminal state,
     /// preserving its transcript and emitting a result envelope so the parent
     /// learns why it stopped. Never drops the record — a settled agent must
@@ -749,8 +762,7 @@ impl AgentShared {
             core.status = AgentLiveStatus::Stopped;
             let identity = core.identity;
             let reason = self
-                .template
-                .prompt_profile
+                .caller_prompt_profile()
                 .render(PromptKey::SubagentForcedStop, &[("name", &self.name)]);
             core.result = reason.clone();
             core.outbox.push(AgentEnvelope {
@@ -1070,8 +1082,7 @@ impl Drop for RunningTurnGuard {
                     let persisted = AgentLiveStatus::Failed.persisted();
                     let content = self
                         .shared
-                        .template
-                        .prompt_profile
+                        .caller_prompt_profile()
                         .text(PromptKey::SubagentWorkerPanic)
                         .to_owned();
                     core.result = content.clone();
@@ -1515,10 +1526,11 @@ impl AgentPool {
     /// `wait_results_until`, which blocks through progress to the result.
     ///
     /// The retired `agent_wait` tool was the last production consumer; every
-    /// caller that remains loops, and a loop must hold one absolute deadline
-    /// rather than restart a `Duration` budget per iteration, so it calls the
-    /// `_until` forms directly. Tests keep this form for the single-shot
-    /// waits where a relative timeout reads better.
+    /// caller that remains loops, and a loop must either hold one absolute
+    /// deadline rather than restart a `Duration` budget per iteration (the
+    /// `_until` forms) or have none at all (`wait_activity_unbounded`). Tests
+    /// keep this form for the single-shot waits where a relative timeout reads
+    /// better.
     #[cfg(test)]
     pub fn wait_activity(
         &self,
@@ -1544,17 +1556,28 @@ impl AgentPool {
     /// Absolute-deadline form. A caller that loops must use this: passing a
     /// fresh `Duration` on each iteration restarts the budget, so a child
     /// emitting a steady trickle of updates could hold the parent forever.
-    ///
-    /// `WaitMode::AnyActivity` returns for any envelope. Its only production
-    /// consumer is the workflow driver: envelopes wake it while the authoritative
-    /// result remains in the record.
+    #[cfg(test)]
     pub(crate) fn wait_activity_until(
         &self,
         watched: &[Arc<AgentShared>],
         deadline: Instant,
         heartbeat: &dyn Fn() -> Result<(), String>,
     ) -> Result<WaitOutcome, String> {
-        self.wait_until(watched, deadline, WaitMode::AnyActivity, heartbeat)
+        self.wait_until(watched, Some(deadline), WaitMode::AnyActivity, heartbeat)
+    }
+
+    /// The activity wait with no deadline: it returns for any envelope, once
+    /// every watched agent is non-running, or with the heartbeat's error.
+    ///
+    /// Its only consumer is the workflow driver, which has no time budget:
+    /// envelopes wake it while the authoritative result remains in the record,
+    /// and the heartbeat is how it observes being stopped.
+    pub(crate) fn wait_activity_unbounded(
+        &self,
+        watched: &[Arc<AgentShared>],
+        heartbeat: &dyn Fn() -> Result<(), String>,
+    ) -> Result<WaitOutcome, String> {
+        self.wait_until(watched, None, WaitMode::AnyActivity, heartbeat)
     }
 
     /// `task_wait` blocks until every observed task supplies a terminal result.
@@ -1571,13 +1594,13 @@ impl AgentPool {
         deadline: Instant,
         heartbeat: &dyn Fn() -> Result<(), String>,
     ) -> Result<WaitOutcome, String> {
-        self.wait_until(watched, deadline, WaitMode::TerminalResult, heartbeat)
+        self.wait_until(watched, Some(deadline), WaitMode::TerminalResult, heartbeat)
     }
 
     fn wait_until(
         &self,
         watched: &[Arc<AgentShared>],
-        deadline: Instant,
+        deadline: Option<Instant>,
         mode: WaitMode,
         heartbeat: &dyn Fn() -> Result<(), String>,
     ) -> Result<WaitOutcome, String> {
@@ -1645,7 +1668,7 @@ impl AgentPool {
                     timed_out: false,
                 });
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 // On expiry, return every envelope already collected. Results
                 // and expiry may both be true, allowing the renderer to separate
                 // delivered addresses from still-running ones.
@@ -1972,6 +1995,7 @@ pub(crate) mod tests {
             native_fetch_call: None,
             run_environment: Default::default(),
             prompt_profile: Default::default(),
+            caller_prompt_profile: None,
             global_memory_enabled: false,
             project_memory_enabled: false,
             skills: Vec::new(),

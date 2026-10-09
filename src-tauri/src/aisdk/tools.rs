@@ -77,15 +77,53 @@ pub(crate) fn is_usable_without_vision(tool_name: &str) -> bool {
         .is_none_or(|tool| !tool.requires_image_capability())
 }
 
+/// The schema a tool carries on the wire in `request`: [`tool_schema`] for
+/// the variant the run's [`ToolSurface`](crate::tool_surface::ToolSurface)
+/// selects, with every sentence about a tool `offered` lacks taken out
+/// ([`crate::tool_mentions`]) and every empty description dropped from a
+/// built-in one.
+///
+/// The one assembly both the step's tool set and `tool_search`'s
+/// `<functions>` block use, so a tool reads the same wherever it reaches the
+/// model. `offered` is [`OfferedTools::of`](crate::tool_mentions::OfferedTools::of)
+/// the same request, computed once by the caller for all its tools.
+pub(crate) fn wire_tool_schema(
+    tool: &ToolDescriptor,
+    surface: &crate::tool_surface::ToolSurface,
+    offered: &crate::tool_mentions::OfferedTools,
+    request: &RunModelRequest,
+) -> Value {
+    let mut schema = tool_schema(
+        tool,
+        surface.variant_of(&tool.name),
+        &request.prompt_profile,
+        &request.workspaces,
+    );
+    // A description the profile leaves empty is not sent at all. A
+    // descriptor's own schema (MCP, `structured_output`) is passed through as
+    // its owner wrote it; the role-specialised schema of `agent_spawn` or
+    // `workflow` is the profile's, as any built-in's is.
+    if tool.input_schema.is_none() || crate::api::carries_role_schema(&tool.name) {
+        crate::tool_mentions::resolve_schema(&mut schema, offered);
+        crate::builtin_schemas::without_empty_descriptions(schema)
+    } else {
+        schema
+    }
+}
+
+/// `tool`'s schema in `variant`, the variant the run's surface selects for it
+/// (a tool without variants takes the standard one).
 pub(crate) fn tool_schema(
     tool: &ToolDescriptor,
+    variant: crate::tool_surface::ToolVariant,
     profile: &PromptProfile,
     workspaces: &crate::workspace_set::WorkspaceSet,
 ) -> Value {
     // Schema-source precedence:
-    // 1. Pass descriptor-provided `input_schema` through verbatim.
+    // 1. Pass descriptor-provided `input_schema` through verbatim. The role
+    //    injection built `agent_spawn`'s and `workflow`'s in the run's variant.
     // 2. Built-in catalog tools use authoritative hand-written schemas, whose
-    //    root description is the run profile's text for that tool.
+    //    root description is the run profile's text for that tool's variant.
     // 3. Legacy `memory_*` aliases retain their original schemas.
     // 4. Derive schemas from typed parameters for remaining internal descriptors.
     //
@@ -98,10 +136,16 @@ pub(crate) fn tool_schema(
             schema.clone(),
             &tool.name,
             workspaces,
+            profile,
         );
     }
-    if let Some(schema) = crate::builtin_schemas::builtin_tool_schema(&tool.name, profile) {
-        return crate::builtin_schemas::with_workspace_parameter(schema, &tool.name, workspaces);
+    if let Some(schema) = crate::builtin_schemas::builtin_tool_schema(&tool.name, variant, profile) {
+        return crate::builtin_schemas::with_workspace_parameter(
+            schema,
+            &tool.name,
+            workspaces,
+            profile,
+        );
     }
     if let Some(schema) = memory_tool_schema(&tool.name) {
         return schema;
@@ -241,6 +285,7 @@ mod tests {
         for name in removed {
             assert!(crate::builtin_schemas::builtin_tool_schema(
                 name,
+                crate::tool_surface::ToolVariant::Standard,
                 &PromptProfile::builtin_english()
             )
             .is_some());
@@ -275,7 +320,8 @@ mod tests {
 
         // An unprobed SSH machine has bash and nothing else.
         let set = WorkspaceSet::resolve(&assets, &remote, &[]).unwrap();
-        assert!(!runs_backend(&set, ShellBackend::PowerShell));
+        assert!(!runs_backend(&set, ShellBackend::WindowsPowerShell));
+        assert!(!runs_backend(&set, ShellBackend::Pwsh));
         assert!(runs_backend(&set, ShellBackend::Bash));
         // A host workspace brings back exactly the host's own shells.
         let local = crate::machine_shells::local();
@@ -293,8 +339,10 @@ mod tests {
                 "{backend}"
             );
         }
+        // Every Windows has Windows PowerShell; PowerShell 7 only where it was
+        // installed.
         assert_eq!(
-            runs_backend(&WorkspaceSet::default(), ShellBackend::PowerShell),
+            runs_backend(&WorkspaceSet::default(), ShellBackend::WindowsPowerShell),
             crate::host_platform::host_platform().is_windows()
         );
     }

@@ -570,7 +570,7 @@ mod tests {
         let app_data = tempfile::tempdir().unwrap();
         crate::remote_link::install(app_data.path(), Vec::new(), None);
         let runner = ShellRunner::Ssh {
-            agent_shell: AgentShell::new(ShellBackend::PowerShell, "powershell"),
+            agent_shell: AgentShell::new(ShellBackend::WindowsPowerShell, "powershell"),
             host,
             port: 0,
             identity_file: String::new(),

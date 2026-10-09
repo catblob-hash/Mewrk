@@ -120,6 +120,7 @@ mod remote_link;
 mod remote_lsp;
 mod remote_memory;
 mod remote_powershell;
+mod remote_regex;
 mod remote_shell;
 mod remote_terminal;
 mod reveal_path;
@@ -150,8 +151,10 @@ mod system_append;
 mod tool_append;
 mod tool_attestation;
 mod tool_executor;
+mod tool_mentions;
 mod tool_output;
 mod tool_prompt;
+mod tool_surface;
 mod ui_text;
 mod web_search;
 mod wire_history;
@@ -231,8 +234,6 @@ struct LoadedDocument {
     #[serde(flatten)]
     document: std::sync::Arc<crate::model::AppDocument>,
     unloaded_conversation_ids: Vec<String>,
-    /// This process started on a brand-new install (`DocumentStore::fresh_install`).
-    fresh_install: bool,
 }
 
 #[cfg(not(test))]
@@ -269,7 +270,6 @@ fn load_document(app: AppHandle, state: State<'_, AppState>) -> Result<LoadedDoc
     Ok(LoadedDocument {
         document,
         unloaded_conversation_ids,
-        fresh_install: state.document_store.fresh_install(),
     })
 }
 
@@ -1342,9 +1342,9 @@ async fn discover_capabilities(
 
 /// Writes a subagent role file and returns its id: over the file of the role
 /// `target.id` names, as a fresh scan finds it, or as a new file in the level
-/// `target.workspace_key` names (`None`: `~/.mewrk/agents`). A built-in role
-/// is never written. The scan, and anything else that waits on another
-/// machine, happens before the named-agent write fence is taken; under it the
+/// `target.workspace_key` names (`None`: `~/.mewrk/agents`). The scan, and
+/// anything else that waits on another machine, happens before the
+/// named-agent write fence is taken; under it the
 /// file is written and the registry spawns resolve against takes the role at
 /// once, so no child validates against a half-published role
 /// (`agent_roles::save_role_fenced`). The caller rescans the catalog.
@@ -1376,8 +1376,8 @@ async fn save_agent_role(
 /// Deletes a subagent role file, found by a fresh scan, and takes it out of
 /// the registry spawns resolve against under the named-agent write fence: a
 /// child bound to it is refused at its next fence. The scan happens before
-/// the fence is taken (`agent_roles::delete_role_fenced`). A built-in role is
-/// never deleted. The caller rescans the catalog.
+/// the fence is taken (`agent_roles::delete_role_fenced`). The caller rescans
+/// the catalog.
 #[cfg(not(test))]
 #[tauri::command]
 async fn delete_agent_role(
@@ -7022,6 +7022,28 @@ fn assemble_system_prompt(environment: &str, runtime_addendum: &str) -> String {
     prompt
 }
 
+/// A run's environment block: the `# Environment` section, and the section
+/// saying the host's own messages come as user messages when they do.
+///
+/// What the host's own messages are travels with the environment, so every
+/// run's prompt says it — a child's and a role's included, which are built
+/// from this part. Only user messages need saying: in `box`, the tool's own
+/// description says what its results are.
+fn run_environment_block(
+    profile: &prompt_profile::PromptProfile,
+    facts: &environment_prompt::EnvironmentFacts,
+    host_messages_in_user: bool,
+) -> String {
+    let mut environment = environment_prompt::environment_section(profile, facts);
+    if host_messages_in_user {
+        append_system_prompt_section(
+            &mut environment,
+            profile.text(prompt_profile::PromptKey::SystemHostMessages),
+        );
+    }
+    environment
+}
+
 fn append_system_prompt_section(prompt: &mut String, section: &str) {
     if section.trim().is_empty() {
         return;
@@ -7093,7 +7115,12 @@ mod prompt_tests {
     fn wire_description(profile: &PromptProfile, name: &str) -> String {
         let tools = crate::catalog::tool_catalog_for_language(profile.language);
         let descriptor = tools.iter().find(|tool| tool.name == name).unwrap();
-        crate::aisdk::tools::tool_schema(descriptor, profile, &Default::default())["description"]
+        crate::aisdk::tools::tool_schema(
+            descriptor,
+            crate::tool_surface::ToolVariant::Standard,
+            profile,
+            &Default::default(),
+        )["description"]
             .as_str()
             .unwrap_or_default()
             .to_owned()
@@ -7110,6 +7137,7 @@ mod prompt_tests {
             .unwrap();
         let entries = [ToolDescriptionEntry {
             tool_name: " read ".into(),
+            variant: String::new(),
             description: "CUSTOM MODEL DESCRIPTION".into(),
         }];
         let profile = profile_with(entries.to_vec(), crate::model::ResolvedLanguage::ZhCn);
@@ -7145,10 +7173,12 @@ mod prompt_tests {
         let entries = [
             ToolDescriptionEntry {
                 tool_name: "read".into(),
+                variant: String::new(),
                 description: "  ".into(),
             },
             ToolDescriptionEntry {
                 tool_name: "write".into(),
+                variant: String::new(),
                 description: "SCHEMA ONLY".into(),
             },
         ];
@@ -7175,8 +7205,11 @@ mod prompt_tests {
         let overrides = crate::catalog::tool_catalog()
             .iter()
             .map(|tool| {
-                let key = crate::prompt_profile::PromptKey::for_tool_description(&tool.name)
-                    .unwrap_or_else(|| panic!("{} has no description key", tool.name));
+                let key = crate::prompt_profile::PromptKey::for_tool_description(
+                    &tool.name,
+                    crate::tool_surface::ToolVariant::Standard,
+                )
+                .unwrap_or_else(|| panic!("{} has no description key", tool.name));
                 (key, format!("FILE {}", tool.name))
             })
             .collect();
@@ -7218,6 +7251,7 @@ mod prompt_tests {
 
         let entries = [ToolDescriptionEntry {
             tool_name: "read".into(),
+            variant: String::new(),
             description: "CUSTOM ENGLISH DEFAULT".into(),
         }];
         let profile = profile_with(entries.to_vec(), crate::model::ResolvedLanguage::EnUs);
@@ -7553,23 +7587,19 @@ fn trusted_run_request(
     // persisted snapshot as provider/model/workspace policy, rather than renderer-supplied data.
     // Host-rendered sections are stable for the run; timeline system cards are
     // appended separately by the wire layer as dynamic context.
-    // What the host's own messages are travels with the environment, so every
-    // run's prompt says it — a child's and a role's included, which are built
-    // from this part. Only user messages need saying: in `box`, the tool's own
-    // description says what its results are.
-    let mut environment =
-        environment_prompt::environment_section(&profile, &environment_facts(&request));
-    if conversation.settings.host_message_container == model::HostMessageContainer::User {
-        append_system_prompt_section(
-            &mut environment,
-            profile.text(prompt_profile::PromptKey::SystemHostMessages),
-        );
-    }
+    let environment_facts = environment_facts(&request);
+    let host_messages_in_user =
+        conversation.settings.host_message_container == model::HostMessageContainer::User;
+    let environment = run_environment_block(&profile, &environment_facts, host_messages_in_user);
     request.assembled_system_prompt = assemble_system_prompt(&environment, &runtime.addendum);
     // A role with skills, servers or hooks of its own is resolved when it is
-    // spawned, against this run's half of them.
+    // spawned, against this run's half of them; one with a tool-description
+    // file of its own words this run's facts in it.
     request.role_basis = std::sync::Arc::new(capabilities::RoleBasis {
         environment,
+        prompt_profile_id: profile.id.clone(),
+        environment_facts,
+        host_messages_in_user,
         skill_ids: conversation.settings.skill_ids.clone(),
         mcp_ids: conversation.settings.mcp_ids.clone(),
         hook_ids: conversation.settings.hook_ids.clone(),
@@ -7697,10 +7727,10 @@ fn trusted_run_request(
     // declared up front there instead.
     request.mcp_tool_discovery = conversation.settings.mcp_tool_discovery_enabled
         && crate::tool_append::appends_tools(&request.provider, &request.model);
-    // The file write guards are unconditional, so nothing is read from the
-    // settings for them. What a run still resolves here is the read record it
-    // consults: a top-level run's is the conversation's own scope.
+    // The file write guards follow the conversation's switch; the read record
+    // a top-level run consults is the conversation's own scope.
     request.file_guard = model::FileGuard {
+        enabled: conversation.settings.file_write_guards_enabled,
         scope: String::new(),
         parent_scope: None,
     };

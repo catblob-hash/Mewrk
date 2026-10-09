@@ -98,11 +98,16 @@ pub fn posix_line(script: &str) -> String {
 /// single quotes the login shell sees; `\` is an escape inside fish's single
 /// quotes; `!` and a newline are history and end-of-command to csh even there;
 /// `$`, `` ` `` and `"` are live inside the double quotes `sh` reads the format
-/// through; `%` and `\` are `printf`'s own; control bytes belong on no command
-/// line.
+/// through; `{` and `}` are too, to the bash 3.2 that is macOS's `/bin/sh`,
+/// which brace-expands a double-quoted word inside `"$(…)"` — a script's
+/// `awk '{ a, b }'` would arrive as two words; `%` and `\` are `printf`'s own;
+/// control bytes belong on no command line.
 fn is_literal(byte: u8) -> bool {
     (0x20..=0x7e).contains(&byte)
-        && !matches!(byte, b'\'' | b'\\' | b'!' | b'$' | b'`' | b'"' | b'%')
+        && !matches!(
+            byte,
+            b'\'' | b'\\' | b'!' | b'$' | b'`' | b'"' | b'%' | b'{' | b'}'
+        )
 }
 
 /// Spells `script` as a `printf` format that reproduces it byte for byte.
@@ -153,6 +158,20 @@ fn printf_payload(script: &str) -> String {
 /// characters; the callers here send scripts a small fraction of that.
 pub fn powershell_line(script: &str) -> String {
     powershell_argv(script).join(" ")
+}
+
+/// [`powershell_line`] in a chosen edition: what a `pwsh` or `powershell`
+/// tool call runs on a machine the agent does not serve.
+///
+/// The edition is named by its bare program name, never by the path its
+/// probe found: either login shell runs a bare name, while a quoted path
+/// with spaces is an expression PowerShell would not call without `&`. The
+/// probe looked the name up on the machine's `PATH`, so the name finds the
+/// same program.
+pub fn powershell_line_in(edition: crate::shell_backend::ShellBackend, script: &str) -> String {
+    let mut argv = powershell_argv(script);
+    argv[0] = edition.default_program().to_owned();
+    argv.join(" ")
 }
 
 /// [`powershell_line`] as the program and arguments it names, for a caller
@@ -336,6 +355,7 @@ pub(crate) mod tests {
             "pwd",
             "cd -- '/srv/it'\\''s here' && pwd",
             "printf '%s\\n' \"$HOME\" `date` !! 100% \\\\",
+            "awk '{ n = gsub(/\\//, \"/\"); print n }' {a,b} ${x}",
             "cat <<'EOF'\nline one\n\tline two\r\nEOF\n",
             "echo 中文路径 ✓ émoji 🎉 \"引号\"",
             "",
@@ -354,13 +374,14 @@ pub(crate) mod tests {
     fn every_login_shell_on_this_machine_runs_the_line_as_sh_would() {
         use std::process::{Command, Stdio};
         let script = concat!(
-            "printf '%s|' \"it's\" 'say \"hi\"' 'bang!' '$HOME' 'back\\slash' '100%' '中文 ✓'\n",
+            "printf '%s|' \"it's\" 'say \"hi\"' 'bang!' '$HOME' 'back\\slash' '100%' '中文 ✓' '{ a, b }'\n",
             "cat <<'EOF'\n",
             "  kept $AS `IS` !\n",
             "EOF\n",
             "exit 7\n",
         );
-        let expected = "it's|say \"hi\"|bang!|$HOME|back\\slash|100%|中文 ✓|  kept $AS `IS` !\n";
+        let expected =
+            "it's|say \"hi\"|bang!|$HOME|back\\slash|100%|中文 ✓|{ a, b }|  kept $AS `IS` !\n";
         let line = posix_line(script);
         let mut ran = Vec::new();
         for shell in [
@@ -389,15 +410,19 @@ pub(crate) mod tests {
     }
 
     /// The whole point of the payload: nothing in it means anything to the
-    /// login shell inside single quotes, to `sh` inside double quotes, or to
-    /// `printf` except the escapes themselves.
+    /// login shell inside single quotes, to `sh` inside double quotes — bash
+    /// 3.2's brace expansion there included — or to `printf` except the
+    /// escapes themselves.
     #[test]
     fn the_payload_alphabet_is_inert_in_every_shell() {
-        let line = posix_line("echo 'a' \"b\" $c `d` !e %f \\g\nh\ti\r中\"文");
+        let line = posix_line("echo 'a' \"b\" $c `d` !e %f \\g\nh\ti\r中\"文 '{ j, k }'");
         let payload = &line["exec /bin/sh -c 'eval \"$(printf \"".len()..line.len() - "\")\"'".len()];
         for (index, byte) in payload.bytes().enumerate() {
             assert!(
-                !matches!(byte, b'\'' | b'!' | b'$' | b'`' | b'"' | b'%' | b'\n' | b'\r' | b'\t'),
+                !matches!(
+                    byte,
+                    b'\'' | b'!' | b'$' | b'`' | b'"' | b'%' | b'{' | b'}' | b'\n' | b'\r' | b'\t'
+                ),
                 "byte {byte:#x} at {index} in {payload}"
             );
             if byte == b'\\' {
@@ -449,6 +474,26 @@ pub(crate) mod tests {
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
         assert_eq!(String::from_utf16(&units).unwrap(), script);
+    }
+
+    /// A tool call names its own edition; Mewrk's own scripts keep 5.1, which
+    /// every Windows has.
+    #[test]
+    fn a_tool_line_runs_in_the_edition_it_names() {
+        use crate::shell_backend::ShellBackend;
+        let script = "Get-Date";
+        let tail = powershell_line(script)
+            .strip_prefix("powershell ")
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            powershell_line_in(ShellBackend::Pwsh, script),
+            format!("pwsh {tail}")
+        );
+        assert_eq!(
+            powershell_line_in(ShellBackend::WindowsPowerShell, script),
+            powershell_line(script)
+        );
     }
 
     #[test]

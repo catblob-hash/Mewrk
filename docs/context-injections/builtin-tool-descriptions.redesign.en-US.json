@@ -2,7 +2,7 @@
   "name": "Mewrk built-in tool context redesign baseline",
   "note": "Each entry's description replaces the built-in tool description. Copy this file to ~/.mewrk/tool-descriptions only when you want Mewrk to discover it (only the global folder is read, never a workspace's), then explicitly select it in the conversation preset.",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
-  "toolCount": 49,
+  "toolCount": 50,
   "tools": [
     {
       "toolName": "ls",
@@ -10,6 +10,10 @@
     },
     {
       "toolName": "grep",
+      "description": ""
+    },
+    {
+      "toolName": "pwsh",
       "description": ""
     },
     {

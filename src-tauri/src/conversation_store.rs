@@ -2466,6 +2466,18 @@ impl ConversationStore {
         })
     }
 
+    /// Deletes every saved file read of the conversation.
+    pub fn delete_file_read_records(&self, conversation_id: &str) -> Result<(), String> {
+        self.with_write_tx(|tx| {
+            tx.execute(
+                "DELETE FROM file_read_record WHERE conversation_id = ?1",
+                rusqlite::params![conversation_id],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+    }
+
     pub fn delete_file_read_record(&self, conversation_id: &str, path: &Path) -> Result<(), String> {
         let Some(path) = path.to_str() else {
             return Ok(());

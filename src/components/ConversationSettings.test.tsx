@@ -229,6 +229,7 @@ const TOOLS_PAGE = /^工具(?!描述)/;
 const TOOL_DESCRIPTIONS_PAGE = /^工具描述/;
 /** The prompt profile every fixture conversation's lock is worded with unless it says otherwise. */
 const BUILTIN_PROFILE = "tooldesc_builtin_en_us";
+const CONCISE_PROFILE = "tooldesc_builtin_concise_en_us";
 const MAIN_PROFILE = "tooldesc_user_main_0f0f0f0f";
 const ALT_PROFILE = "tooldesc_user_alt_1a1a1a1a";
 /** An id a conversation still names though the catalog has lost the file. */
@@ -279,6 +280,7 @@ function roleBody(name: string, patch: Partial<AgentRole> = {}): AgentRole {
     hookIds: [],
     webSearch: defaultConversationWebSearchSettings(),
     templateId: null,
+    toolDescriptionFileId: null,
     ...patch
   };
 }
@@ -301,12 +303,12 @@ function roleResource(
   };
 }
 
-/* The roles a catalog lists, one of each kind a page has to draw: a built-in, a
-   global file, a file in `WORKSPACE_A`, and one whose body could not be read.
+/* The roles a catalog lists, one of each kind a page has to draw: two global
+   files, a file in `WORKSPACE_A`, and one whose body could not be read.
    Fresh on every call, so no test sees another's edits. */
 function listedRoles(): AgentRoleResource[] {
   return [
-    roleResource("agent_builtin_opus", "Opus", { source: "builtin", location: "builtin:agents/opus" }),
+    roleResource("agent_user_opus", "Opus", { location: "/home/me/.mewrk/agents/opus.json" }),
     roleResource("agent_user_reviewer", "reviewer", { location: "/home/me/.mewrk/agents/reviewer.json" }),
     roleResource("agent_ws_planner", "planner", {
       source: "workspace",
@@ -897,6 +899,11 @@ describe("ConversationSettings", () => {
     expect(blurb).not.toHaveTextContent(/工具描述/);
     expect(backendTrigger("搜索提供商")).toBeEnabled();
     expect(screen.getByRole("radiogroup", { name: "宿主消息容器" })).toBeInTheDocument();
+    // The five write guards are one switch, on when the settings say nothing,
+    // and the page's blurb names it.
+    expect(blurb).toHaveTextContent(/文件防误写保护/);
+    expect(screen.getByRole("switch", { name: "文件防误写保护已开启" })).toBeChecked();
+    expect(screen.getByText("启用文件防误写保护")).toBeInTheDocument();
     expect(screen.queryByRole("combobox", { name: "工具描述" })).toBeNull();
     expect(screen.queryByRole("option", { name: "Mewrk 内置" })).toBeNull();
     // Executor limits and the web-search heading stay gone; the identically named tool row remains.
@@ -948,6 +955,129 @@ describe("ConversationSettings", () => {
     await user.click(box);
     expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ hostMessageContainer: "box" }));
     expect(box).toBeChecked();
+  });
+
+  it("switches the file write guards on the advanced tools page, on until it is told otherwise", async () => {
+    const seed = createSeedDocument();
+    const onSettingsChange = vi.fn();
+    const onConversationOnlyChange = vi.fn();
+    const user = userEvent.setup();
+    const conversation = seed.workspaces[0].conversations[0];
+    // A conversation from before the switch says nothing about the guards.
+    expect(conversation.settings.fileWriteGuardsEnabled).toBeUndefined();
+    render(
+      <SettingsHarness
+        initialConversation={conversation}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+        onConversationOnlyChange={onConversationOnlyChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+
+    const guards = screen.getByRole("switch", { name: "文件防误写保护已开启" });
+    expect(guards).toBeChecked();
+    const row = guards.closest(".tool-toggle-row") as HTMLElement;
+    expect(row).toHaveTextContent("启用文件防误写保护");
+    expect(row).toHaveTextContent(/修改或覆盖已有文件前必须先读过它/);
+    expect(row).toHaveTextContent(/子代理与工作流跟随本对话/);
+    // Its own section, apart from the memory tiers and the host-message container.
+    expect(row.closest("section")).not.toBe(
+      screen.getByRole("switch", { name: "全局记忆已关闭" }).closest("section")
+    );
+    expect(row.closest("section")).not.toBe(
+      screen.getByRole("radiogroup", { name: "宿主消息容器" }).closest("section")
+    );
+
+    // A preset component, so it goes through `onChange` rather than a conversation-only patch.
+    await user.click(guards);
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ fileWriteGuardsEnabled: false }));
+    expect(onConversationOnlyChange).not.toHaveBeenCalled();
+    const off = screen.getByRole("switch", { name: "文件防误写保护已关闭" });
+    expect(off).not.toBeChecked();
+    await user.click(off);
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ fileWriteGuardsEnabled: true }));
+    expect(screen.getByRole("switch", { name: "文件防误写保护已开启" })).toBeChecked();
+  });
+
+  it("reads a conversation that saved the guards off as off", async () => {
+    const seed = createSeedDocument();
+    const conversation = seed.workspaces[0].conversations[0];
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={{ ...conversation, settings: { ...conversation.settings, fileWriteGuardsEnabled: false } }}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    expect(screen.getByRole("switch", { name: "文件防误写保护已关闭" })).not.toBeChecked();
+    expect(screen.queryByRole("switch", { name: "文件防误写保护已开启" })).toBeNull();
+  });
+
+  it("draws the file write guards orange while the cache is warm, and asks before either way of switching them", async () => {
+    const seed = createSeedDocument();
+    const warm = withWarmModel(seed.globalSettings);
+    const conversation = seed.workspaces[0].conversations[0];
+    const onSettingsChange = vi.fn();
+    const user = userEvent.setup();
+    const { unmount } = render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: { ...conversation.settings, toolLock: lockFor(warm, { fileWriteGuards: true }) }
+        }}
+        globalSettings={warm}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    // The `edit` and `write` descriptions carry the guard rules, so the switch
+    // rewrites the cached prefix whichever way it goes.
+    const guards = screen.getByRole("switch", { name: "文件防误写保护已开启" });
+    const row = guards.closest(".tool-toggle-row") as HTMLElement;
+    expect(row).toHaveClass("tool-toggle-row--cache");
+    expect(row.querySelector(".lock-mark--cache")).not.toBeNull();
+    expect(row).toHaveTextContent("缓存还热");
+
+    await user.click(guards);
+    const warning = screen.getByRole("dialog", { name: "这样改会让缓存失效" });
+    expect(onSettingsChange).not.toHaveBeenCalled();
+    await user.click(within(warning).getByRole("button", { name: "仍然更改" }));
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ fileWriteGuardsEnabled: false }));
+    // Moved away from what the last request had, the cache is already lost for it.
+    const moved = screen.getByRole("switch", { name: "文件防误写保护已关闭" });
+    expect(moved.closest(".tool-toggle-row")).not.toHaveClass("tool-toggle-row--cache");
+    unmount();
+
+    // A lock from before the switch knows nothing of it: plain, and no question.
+    resetCacheBreakWarnings();
+    const onOlderChange = vi.fn();
+    render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: { ...conversation.settings, toolLock: lockFor(warm) }
+        }}
+        globalSettings={warm}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onOlderChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    const older = screen.getByRole("switch", { name: "文件防误写保护已开启" });
+    expect(older.closest(".tool-toggle-row")).not.toHaveClass("tool-toggle-row--cache");
+    await user.click(older);
+    expect(screen.queryByRole("dialog", { name: "这样改会让缓存失效" })).toBeNull();
+    expect(onOlderChange).toHaveBeenLastCalledWith(expect.objectContaining({ fileWriteGuardsEnabled: false }));
   });
 
   it("draws the host-message container orange while the cache is warm on a model that cannot append tools, and asks before it switches", async () => {
@@ -1232,7 +1362,8 @@ describe("ConversationSettings", () => {
               modelRequests: [],
               hookIds: null,
               promptProfile: null,
-              hostMessageContainer: null
+              hostMessageContainer: null,
+              fileWriteGuards: null
             }
           }
         }}
@@ -1331,20 +1462,89 @@ describe("ConversationSettings", () => {
     const global = screen.getByRole("region", { name: "全局" });
     expect(within(global).queryByRole("textbox")).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
-    // The conversation selects nothing, which the host renders with the
-    // built-in. The built-in is no row of the list — selecting none IS it — so
-    // the one row there is is the user's file, and it is not on.
-    expect(screen.queryByRole("button", { name: "Mewrk built-in" })).toBeNull();
+    // The conversation selects nothing, which the host renders with Mewrk
+    // guided. That one is no row of the list — selecting none IS it — so the
+    // rows there are the concise built-in and the user's file, neither on.
+    expect(screen.queryByRole("button", { name: "Mewrk guided" })).toBeNull();
     const main = within(global).getByRole("button", { name: "main" });
     expect(main).toHaveAttribute("aria-pressed", "false");
-    expect(global.querySelectorAll(".catalog-row")).toHaveLength(1);
-    expect(screen.getByText("0 / 1 个已选")).toBeInTheDocument();
+    expect(within(global).getByRole("button", { name: "Mewrk concise" })).toHaveAttribute("aria-pressed", "false");
+    expect(global.querySelectorAll(".catalog-row")).toHaveLength(2);
+    expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
 
     await user.click(main);
     expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({
       toolDescriptionFileId: MAIN_PROFILE
     }));
     expect(screen.getByRole("button", { name: "main" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("offers Mewrk concise as a selectable built-in row, and leaves Mewrk guided to selecting none", async () => {
+    const user = userEvent.setup();
+    const seed = createSeedDocument();
+    const onSettingsChange = vi.fn();
+    render(
+      <SettingsHarness
+        initialConversation={seed.workspaces[0].conversations[0]}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+      />
+    );
+    await openPage(user, TOOL_DESCRIPTIONS_PAGE);
+
+    const global = screen.getByRole("region", { name: "全局" });
+    // In the host's order, the built-in before the user's files; the guided one is not drawn.
+    expect([...global.querySelectorAll(".catalog-row__toggle")].map((row) => row.getAttribute("aria-label")))
+      .toEqual(["Mewrk concise", "main"]);
+    expect(screen.queryByRole("button", { name: "Mewrk guided" })).toBeNull();
+    // It says it is built in, and the user's file does not.
+    const concise = screen.getByRole("button", { name: "Mewrk concise" }).closest(".catalog-row") as HTMLElement;
+    expect(within(concise).getByText("内置")).toBeInTheDocument();
+    expect(concise).toHaveAttribute("title", expect.stringContaining("builtin:en-US/concise"));
+    const main = screen.getByRole("button", { name: "main" }).closest(".catalog-row") as HTMLElement;
+    expect(within(main).queryByText("内置")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Mewrk concise" }));
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({
+      toolDescriptionFileId: CONCISE_PROFILE
+    }));
+    expect(screen.getByRole("button", { name: "Mewrk concise" })).toHaveAttribute("aria-pressed", "true");
+    expect(concise).toHaveClass("catalog-row--on");
+    expect(screen.getByText("1 / 2 个已选")).toBeInTheDocument();
+    expect(within(navigation()).getByRole("button", { name: TOOL_DESCRIPTIONS_PAGE })).toHaveTextContent(/^工具描述1$/);
+
+    // Another row replaces it, and unticking it goes back to selecting none: null, not the guided id.
+    await user.click(screen.getByRole("button", { name: "main" }));
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ toolDescriptionFileId: MAIN_PROFILE }));
+    expect(screen.getByRole("button", { name: "Mewrk concise" })).toHaveAttribute("aria-pressed", "false");
+    await user.click(screen.getByRole("button", { name: "main" }));
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ toolDescriptionFileId: null }));
+    expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
+  });
+
+  it("reads a conversation naming Mewrk concise as having picked its row", async () => {
+    const user = userEvent.setup();
+    const seed = createSeedDocument();
+    const conversation = seed.workspaces[0].conversations[0];
+    render(
+      <SettingsHarness
+        initialConversation={{ ...conversation, settings: { ...conversation.settings, toolDescriptionFileId: CONCISE_PROFILE } }}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+      />
+    );
+    expect(within(navigation()).getByRole("button", { name: TOOL_DESCRIPTIONS_PAGE })).toHaveTextContent(/^工具描述1$/);
+    await openPage(user, TOOL_DESCRIPTIONS_PAGE);
+    const concise = screen.getByRole("button", { name: "Mewrk concise" });
+    expect(concise).toHaveAttribute("aria-pressed", "true");
+    expect(concise.closest(".catalog-row")).toHaveClass("catalog-row--on");
+    // A listed built-in is no dangling id.
+    expect(screen.queryByText("悬空")).toBeNull();
+    expect(screen.getByText("1 / 2 个已选")).toBeInTheDocument();
   });
 
   it("puts the tool-descriptions page right after the hooks and counts the one file a conversation uses", async () => {
@@ -1378,7 +1578,7 @@ describe("ConversationSettings", () => {
     expect(within(nav).getByRole("button", { name: TOOLS_PAGE })).not.toHaveAttribute("aria-current");
     first.unmount();
 
-    // A file picked counts one; the built-in's own id is no pick at all.
+    // A file picked counts one; Mewrk guided's own id is no pick at all.
     const picked = mount(MAIN_PROFILE);
     expect(within(navigation()).getByRole("button", { name: TOOL_DESCRIPTIONS_PAGE })).toHaveTextContent(/^工具描述1$/);
     picked.unmount();
@@ -1428,17 +1628,19 @@ describe("ConversationSettings", () => {
     expect(screen.getByRole("button", { name: "打开全局配置目录" })).toBeInTheDocument();
     const global = screen.getByRole("region", { name: "全局" });
     expect(within(global).getByText("~/.mewrk")).toBeInTheDocument();
-    // The user's file is drawn; the built-in and the workspace's stray are not.
+    // The user's file and the concise built-in are drawn; Mewrk guided and the
+    // workspace's stray are not.
     expect(within(global).getByRole("button", { name: "main" })).toBeInTheDocument();
-    expect(screen.queryByText("Mewrk built-in")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Mewrk built-in" })).toBeNull();
+    expect(within(global).getByRole("button", { name: "Mewrk concise" })).toBeInTheDocument();
+    expect(screen.queryByText("Mewrk guided")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Mewrk guided" })).toBeNull();
     expect(screen.queryByRole("button", { name: "stray" })).toBeNull();
-    expect(global.querySelectorAll(".catalog-row")).toHaveLength(1);
+    expect(global.querySelectorAll(".catalog-row")).toHaveLength(2);
     // The counter divides what is drawn, so it too leaves both out.
-    expect(screen.getByText("0 / 1 个已选")).toBeInTheDocument();
+    expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
   });
 
-  it("picks one tool-description file at a time: another row replaces it, and unticking goes back to the built-in", async () => {
+  it("picks one tool-description file at a time: another row replaces it, and unticking goes back to Mewrk guided", async () => {
     const seed = createSeedDocument();
     withAltToolDescription(seed.capabilities);
     const conversation = seed.workspaces[0].conversations[0];
@@ -1462,7 +1664,7 @@ describe("ConversationSettings", () => {
     expect(row("main")).toHaveClass("catalog-row--pick", "catalog-row--on");
     expect(screen.getByRole("button", { name: "alt" })).toHaveAttribute("aria-pressed", "false");
     expect(row("alt")).not.toHaveClass("catalog-row--on");
-    expect(screen.getByText("1 / 2 个已选")).toBeInTheDocument();
+    expect(screen.getByText("1 / 3 个已选")).toBeInTheDocument();
     // Plain rows: the conversation has no lock, so nothing here is orange.
     expect(document.querySelectorAll(".catalog-row--cache")).toHaveLength(0);
 
@@ -1473,20 +1675,20 @@ describe("ConversationSettings", () => {
     expect(screen.getByRole("button", { name: "main" })).toHaveAttribute("aria-pressed", "false");
     expect(row("alt")).toHaveClass("catalog-row--on");
     expect(row("main")).not.toHaveClass("catalog-row--on");
-    expect(screen.getByText("1 / 2 个已选")).toBeInTheDocument();
+    expect(screen.getByText("1 / 3 个已选")).toBeInTheDocument();
     expect(count()).toHaveTextContent(/^工具描述1$/);
 
-    // Unticking the one picked selects nothing, which is the built-in: null, not "".
+    // Unticking the one picked selects nothing, which is Mewrk guided: null, not "".
     await user.click(screen.getByRole("button", { name: "alt" }));
     expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ toolDescriptionFileId: null }));
     expect(screen.getByRole("button", { name: "alt" })).toHaveAttribute("aria-pressed", "false");
     expect(screen.getByRole("button", { name: "main" })).toHaveAttribute("aria-pressed", "false");
-    expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
+    expect(screen.getByText("0 / 3 个已选")).toBeInTheDocument();
     expect(count()).toHaveTextContent(/^工具描述0$/);
     expect(onSettingsChange).toHaveBeenCalledTimes(2);
     unmount();
 
-    // A conversation that names the built-in reads as selecting nothing: no row
+    // A conversation that names Mewrk guided reads as selecting nothing: no row
     // is on, no dangling row appears for an id the list deliberately leaves out,
     // and the first file clicked is a plain pick.
     resetCacheBreakWarnings();
@@ -1505,7 +1707,7 @@ describe("ConversationSettings", () => {
     expect(document.querySelectorAll(".catalog-row--on")).toHaveLength(0);
     expect(screen.queryByText("悬空")).toBeNull();
     expect(screen.queryByRole("button", { name: BUILTIN_PROFILE })).toBeNull();
-    expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
+    expect(screen.getByText("0 / 3 个已选")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "main" }));
     expect(onBuiltinChange).toHaveBeenLastCalledWith(expect.objectContaining({ toolDescriptionFileId: MAIN_PROFILE }));
   });
@@ -1537,8 +1739,9 @@ describe("ConversationSettings", () => {
     await openPage(user, TOOL_DESCRIPTIONS_PAGE);
 
     // Whichever row is clicked, the words the cached prefix was written in
-    // change, so the picked row and the one beside it are orange alike.
-    for (const name of ["main", "alt"]) {
+    // change, so the picked row and the ones beside it, the concise built-in
+    // included, are orange alike.
+    for (const name of ["main", "alt", "Mewrk concise"]) {
       const box = screen.getByRole("button", { name }).closest(".catalog-row") as HTMLElement;
       expect(box).toHaveClass("catalog-row--cache");
       expect(box.querySelector(".catalog-row__sign.lock-mark--cache")).not.toBeNull();
@@ -1566,7 +1769,7 @@ describe("ConversationSettings", () => {
     expect(document.querySelectorAll(".catalog-row--cache")).toHaveLength(0);
     unmount();
 
-    // Going back to the built-in by unticking asks as well: it moves the same profile.
+    // Going back to Mewrk guided by unticking asks as well: it moves the same profile.
     resetCacheBreakWarnings();
     const onUntick = vi.fn();
     const untick = render(
@@ -1649,12 +1852,12 @@ describe("ConversationSettings", () => {
     expect(box).toHaveClass("catalog-row--on");
     expect(within(box).getByText("悬空")).toBeInTheDocument();
     // The host words the run with the built-in instead of failing it, and says so.
-    expect(box).toHaveAttribute("title", expect.stringContaining("目录中已不存在；运行时用的是 Mewrk 内置的工具描述"));
+    expect(box).toHaveAttribute("title", expect.stringContaining("目录中已不存在；运行时用的是 Mewrk guided（内置引导版）"));
     expect(box).not.toHaveTextContent("每次运行都会失败");
     expect(box).not.toHaveClass("catalog-row--cache");
     expect(box.querySelector(".lock-mark")).toBeNull();
     // The counter is over the catalog, which the dangling row is no part of.
-    expect(screen.getByText("0 / 1 个已选")).toBeInTheDocument();
+    expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
 
     await user.click(dangling);
     expect(screen.queryByRole("dialog")).toBeNull();
@@ -1688,7 +1891,7 @@ describe("ConversationSettings", () => {
     await openPage(user, TOOL_DESCRIPTIONS_PAGE);
 
     const box = () => screen.getByRole("button", { name: "broken" }).closest(".catalog-row") as HTMLElement;
-    const fallback = "已选择，但文件里没有可用条目；运行时用的是 Mewrk 内置的工具描述";
+    const fallback = "已选择，但文件里没有可用条目；运行时用的是 Mewrk guided（内置引导版）";
     // Not picked, it says only that it is unavailable.
     expect(within(box()).getByText("不可用")).toBeInTheDocument();
     expect(box()).toHaveAttribute("title", expect.stringContaining("当前不可用"));
@@ -1733,7 +1936,7 @@ describe("ConversationSettings", () => {
 
     expect(screen.getByRole("link", { name: "配置说明文档" }))
       .toHaveAttribute("href", "https://mewrk.dev/zh-CN/prompt-profiles.html");
-    expect(screen.getByText("一次只用一份：选另一份会替换当前这份。都不选时，用 Mewrk 内置的工具描述。"))
+    expect(screen.getByText("一次只用一份：选另一份会替换当前这份。都不选时，用 Mewrk guided（内置引导版）。"))
       .toBeInTheDocument();
 
     const search = screen.getByRole("textbox", { name: "搜索工具描述" });
@@ -1745,10 +1948,10 @@ describe("ConversationSettings", () => {
     expect(screen.getByText("没有匹配的条目")).toBeInTheDocument();
   });
 
-  it("says no tool-description file was found when only the built-in exists, and still states the rule", async () => {
+  it("says no tool-description file was found when only Mewrk guided exists, and still states the rule", async () => {
     const seed = createSeedDocument();
     seed.capabilities.toolDescriptionFiles = seed.capabilities.toolDescriptionFiles
-      .filter((resource) => resource.source === "builtin");
+      .filter((resource) => resource.id === BUILTIN_PROFILE);
     const user = userEvent.setup();
     render(
       <SettingsHarness
@@ -1761,16 +1964,16 @@ describe("ConversationSettings", () => {
     );
     await openPage(user, TOOL_DESCRIPTIONS_PAGE);
 
-    // The built-in is not a row, so a catalog of nothing but it is an empty one.
+    // Mewrk guided is not a row, so a catalog of nothing but it is an empty one.
     expect(screen.getByText("尚未发现工具描述文件")).toBeInTheDocument();
     expect(screen.getByText("把 JSON 文件放在 ~/.mewrk/tool-descriptions/ 下，列表很快会自动刷新。"))
       .toBeInTheDocument();
     expect(screen.getByText("0 / 0 个已选")).toBeInTheDocument();
-    expect(screen.queryByText("Mewrk built-in")).toBeNull();
+    expect(screen.queryByText("Mewrk guided")).toBeNull();
     expect(document.querySelectorAll(".catalog-row")).toHaveLength(0);
     // The rule is drawn with or without rows: how nothing selected behaves is
     // worth knowing before the first file is written.
-    expect(screen.getByText(/都不选时，用 Mewrk 内置的工具描述/)).toBeInTheDocument();
+    expect(screen.getByText(/都不选时，用 Mewrk guided（内置引导版）/)).toBeInTheDocument();
   });
 
   it("words the tool-descriptions page in English", async () => {
@@ -1792,7 +1995,7 @@ describe("ConversationSettings", () => {
     expect(screen.getByRole("region", { name: "Global" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "main" })).toBeInTheDocument();
     expect(screen.getByText(
-      "One at a time: picking another replaces the current one. With none picked, Mewrk's built-in descriptions are used."
+      "One at a time: picking another replaces the current one. With none picked, Mewrk guided (built-in) is used."
     )).toBeInTheDocument();
   });
 
@@ -2596,7 +2799,7 @@ describe("ConversationSettings", () => {
     const { seed, user, onSettingsChange } = await openRolesPage({ workspaces: WORKSPACE_A });
 
     const global = screen.getByRole("region", { name: "全局" });
-    expect(within(global).getByRole("button", { name: "Opus（内置）" })).toHaveAttribute("aria-pressed", "false");
+    expect(within(global).getByRole("button", { name: "Opus" })).toHaveAttribute("aria-pressed", "false");
     expect(within(global).getByRole("button", { name: "reviewer" })).toHaveAttribute("aria-pressed", "false");
     expect(within(global).queryByRole("button", { name: "planner" })).toBeNull();
     const workspace = screen.getByRole("region", { name: "/work/a" });
@@ -2680,10 +2883,8 @@ describe("ConversationSettings", () => {
     await openRolesPage({
       globalSettings: withWarmModel,
       agents: [
-        // What the host lists a built-in as when its provider has no row.
-        roleResource("agent_builtin_opus", "Opus", {
-          source: "builtin",
-          location: "builtin:agents/opus",
+        // What an older build wrote in place of a binding it had found dead.
+        roleResource("agent_user_opus", "Opus", {
           role: roleBody("Opus", { modelSelection: { kind: "unavailable" } })
         }),
         roleResource("agent_user_pinned", "pinned", { role: bound("pinned", "claude-opus-5-5") }),
@@ -2703,10 +2904,10 @@ describe("ConversationSettings", () => {
     expect(roleRow("stale")).toHaveAttribute("title", expect.stringContaining("claude-gone"));
     expect(roleRow("stale")).toHaveAttribute("title", expect.stringContaining("模型看不到这个角色"));
     expect(within(roleRow("stale")).getByText("模型不可用")).toBeInTheDocument();
-    expect(roleRow("Opus（内置）")).toHaveAttribute("title", expect.stringContaining("没有可用的模型"));
-    expect(within(roleRow("Opus（内置）")).getByText("模型不可用")).toBeInTheDocument();
-    // The built-in's own badge shares the slot with the warning, not instead of it.
-    expect(within(roleRow("Opus（内置）")).getByText("内置")).toBeInTheDocument();
+    expect(roleRow("Opus")).toHaveAttribute("title", expect.stringContaining("没有可用的模型"));
+    expect(within(roleRow("Opus")).getByText("模型不可用")).toBeInTheDocument();
+    // No role is built in, so the warning is the only badge a row can carry.
+    expect(within(roleRow("Opus")).queryByText("内置")).toBeNull();
   });
 
   it("opens a role in its own window from its row, and deletes the user's files in two clicks", async () => {
@@ -2728,11 +2929,6 @@ describe("ConversationSettings", () => {
       expect.objectContaining({ id: "agent_ws_planner", workspaceKey: WORKSPACE_A[0].key })
     );
     expect(onDeleteCapability).toHaveBeenCalledTimes(2);
-
-    // A built-in has no file of the user's to remove, but it can be opened to
-    // be saved as a copy.
-    expect(within(roleRow("Opus（内置）")).queryByRole("button", { name: /^删除/ })).toBeNull();
-    expect(within(roleRow("Opus（内置）")).getByRole("button", { name: "设置内置角色 Opus" })).toBeInTheDocument();
 
     // A file whose body could not be read has nothing to open: the row says why,
     // and the file can still be removed.
@@ -2763,7 +2959,7 @@ describe("ConversationSettings", () => {
     await user.click(within(rail).getByRole("button", { name: /^工具/ }));
     const rows = Array.from(dialog.querySelectorAll<HTMLElement>("[data-tool-name]"))
       .map((row) => row.dataset.toolName);
-    expect(rows).toEqual(expect.arrayContaining(["powershell", "bash", "zsh", "sh"]));
+    expect(rows).toEqual(expect.arrayContaining(["pwsh", "powershell", "bash", "zsh", "sh"]));
     // Ticked, as every row a new role starts with is.
     expect(within(dialog).getByRole("button", { name: "zsh已启用" })).toBeInTheDocument();
 
@@ -2787,6 +2983,7 @@ describe("ConversationSettings", () => {
     await openPage(user, TOOLS_PAGE);
     expect(document.querySelector('[data-tool-name="zsh"]')).toBeNull();
     expect(document.querySelector('[data-tool-name="powershell"]')).not.toBeNull();
+    expect(document.querySelector('[data-tool-name="pwsh"]')).not.toBeNull();
   });
 
   it("writes a new role at the global level and selects it on the conversation", async () => {
@@ -2896,30 +3093,6 @@ describe("ConversationSettings", () => {
     onSaveAgentRole.mockResolvedValue("agent_user_unsaved");
     await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "新建角色" })).toBeNull());
-  });
-
-  it("saves a built-in role as a global copy that takes its place in the selection", async () => {
-    const onSaveAgentRole = savesRoleAs("agent_user_opus");
-    const { user, onSettingsChange } = await openRolesPage({
-      selected: ["agent_user_reviewer", "agent_builtin_opus"],
-      onSaveAgentRole
-    });
-
-    await user.click(screen.getByRole("button", { name: "设置内置角色 Opus" }));
-    const dialog = screen.getByRole("dialog", { name: "Opus" });
-    // A built-in is never written in place, so the window offers a copy instead.
-    expect(within(dialog).queryByRole("button", { name: "保存角色" })).toBeNull();
-    await user.click(within(dialog).getByRole("button", { name: "另存为全局角色" }));
-
-    await waitFor(() => expect(onSaveAgentRole).toHaveBeenCalledWith(
-      { workspaceKey: null },
-      expect.objectContaining({ name: "Opus" })
-    ));
-    // The copy takes the built-in's slot, so the conversation does not end up
-    // offering both under one name.
-    await waitFor(() => expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({
-      agentIds: ["agent_user_reviewer", "agent_user_opus"]
-    })));
   });
 
   it("draws the role-less switch even with no usable role, and writes it onto the conversation", async () => {
@@ -3289,6 +3462,8 @@ describe("ConversationSettings", () => {
     expect(within(nestedNav).queryByRole("button", { name: /对话预设/ })).toBeNull();
     await user.click(within(nestedNav).getByRole("button", { name: /^高级工具/ }));
     expect(within(dialog).getByRole("switch", { name: /^联网搜索已/ })).toBeInTheDocument();
+    // The file write guards are part of a preset, on in a fresh one.
+    expect(within(dialog).getByRole("switch", { name: "文件防误写保护已开启" })).toBeChecked();
     // Plan mode is not part of a preset.
     expect(within(dialog).queryByRole("switch", { name: /^计划模式已/ })).toBeNull();
     expect(within(dialog).getByRole("link", { name: "配置说明文档" }).parentElement)
@@ -3309,7 +3484,7 @@ describe("ConversationSettings", () => {
     // Saving narrows the pane's whole body back down to exactly what a preset owns.
     expect(Object.keys(onSavePreset.mock.calls.at(-1)![1]).sort()).toEqual([
       "agentIds", "allowRolelessSubagents",
-      "enabledTools",
+      "enabledTools", "fileWriteGuardsEnabled",
       "globalMemoryEnabled",
       "hookIds", "hostMessageContainer", "mcpIds", "mcpToolDiscoveryEnabled", "projectMemoryEnabled",
       "securityLevel", "skillIds",
@@ -3357,7 +3532,8 @@ describe("ConversationSettings", () => {
     expect([...dialog.querySelectorAll(".capability-section")].map((section) => section.getAttribute("aria-label")))
       .toEqual(["全局"]);
     expect(within(dialog).queryByRole("button", { name: "stray" })).toBeNull();
-    expect(within(dialog).queryByRole("button", { name: "Mewrk built-in" })).toBeNull();
+    expect(within(dialog).queryByRole("button", { name: "Mewrk guided" })).toBeNull();
+    expect(within(dialog).getByRole("button", { name: "Mewrk concise" })).toBeInTheDocument();
     // A preset has run nothing, so nothing here is toned.
     expect(dialog.querySelectorAll(".catalog-row--cache")).toHaveLength(0);
 

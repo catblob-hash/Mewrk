@@ -8,6 +8,15 @@
 //! in description prose. Numeric bounds must match host validation, not UI help text.
 //! Description prose remains English regardless of UI locale.
 //!
+//! Descriptions are not authored in this module: root descriptions and every
+//! parameter, nested item and `$defs` description are keys of the prompt-profile
+//! registry (`tool.<name>.description`, `tool.<name>.param.<path>`,
+//! `tool.<name>.defs.*`, the shared `tool.shell.*`, `tool.memory.*` and
+//! `tool.preview.*`, and the dynamic `workspace` parameter's `tool.param.*`), so a
+//! profile can reword any of them. The only prose left in code is a value handed to
+//! a template as a placeholder, such as the lead phrase of a preview `serverId`.
+//! `every_model_visible_description_comes_from_the_prompt_profile` pins this.
+//!
 //! `api.rs::tool_schema` checks descriptor-provided `input_schema` (MCP and
 //! `structured_output`), this module, legacy `memory_*` schemas, then generic parameter
 //! derivation.
@@ -19,23 +28,44 @@ use crate::agents::{
     WAIT_MIN_TIMEOUT_SECONDS,
 };
 use crate::prompt_profile::{PromptKey, PromptProfile};
+use crate::tool_surface::ToolVariant;
 use crate::workspace_set::WorkspaceSet;
 use workflow_core::MAX_SCRIPT_BYTES;
 
-/// The `description` parameter text shared by the shell tools.
-///
-/// It is worded at the model rather than at the schema on purpose: the value is
-/// what a person reads in the approval card and the task row, so a description
-/// that hedges ("possibly risky…") is worse than none.
-const SHELL_DESCRIPTION_PARAMETER: &str = "One short sentence, in active voice, saying what this command does. Name the action itself; do not hedge with words such as \"complex\" or \"risky\".\n\nFor ordinary commands (git, npm, everyday CLI tools) keep it to five to ten words:\n- ls → \"List files in current directory\"\n- git status → \"Show working tree status\"\n- npm install → \"Install project dependencies\"\n\nFor commands that are hard to read at a glance (pipelines, unusual flags, find/xargs) add just enough context to make the effect clear:\n- find . -name \"*.tmp\" -exec rm {} \\; → \"Delete every .tmp file under the current directory\"\n- git reset --hard origin/main → \"Discard local changes and match remote main\"\n- curl -s url | jq '.data[]' → \"Fetch JSON from a URL and print its data entries\"";
+/// The `timeout` parameter text (`tool.shell.param.timeout`), rendered from the
+/// constants that actually bound it so the schema cannot drift from the clamp.
+/// The root description of `variant` of the built-in tool `tool`: that
+/// variant's own key ([`PromptKey::for_tool_description`]).
+fn root_description<'p>(tool: &str, variant: ToolVariant, profile: &'p PromptProfile) -> &'p str {
+    let key = PromptKey::for_tool_description(tool, variant)
+        .or_else(|| PromptKey::for_tool_description(tool, ToolVariant::Standard))
+        .unwrap_or_else(|| panic!("{tool} is a built-in tool without a description key"));
+    profile.text(key)
+}
 
-/// The `timeout` parameter text, built from the constants that actually bound it
-/// so the schema cannot drift from the clamp.
-fn shell_timeout_parameter_description() -> String {
-    format!(
-        "Optional timeout in milliseconds (default {}, max {}). On expiry the command is moved to the background rather than stopped, and the receipt carries its shell:<id> address.",
-        crate::tool_executor::SHELL_DEFAULT_TIMEOUT.as_millis(),
-        crate::tool_executor::SHELL_MAX_TIMEOUT.as_millis()
+/// `run_in_background`'s description, shared by every shell tool: a child
+/// agent's background command ends with its final reply, a top-level one
+/// outlives the turn.
+fn shell_run_in_background_description(variant: ToolVariant, profile: &PromptProfile) -> &str {
+    profile.text(match variant {
+        ToolVariant::Child => PromptKey::ToolShellChildParamRunInBackground,
+        _ => PromptKey::ToolShellParamRunInBackground,
+    })
+}
+
+fn shell_timeout_parameter_description(profile: &PromptProfile) -> String {
+    profile.render(
+        PromptKey::ToolShellParamTimeout,
+        &[
+            (
+                "default_ms",
+                &crate::tool_executor::SHELL_DEFAULT_TIMEOUT.as_millis().to_string(),
+            ),
+            (
+                "max_ms",
+                &crate::tool_executor::SHELL_MAX_TIMEOUT.as_millis().to_string(),
+            ),
+        ],
     )
 }
 
@@ -63,8 +93,8 @@ fn string_prop(description: &str, max_length: usize) -> Value {
 /// running server for the worktree, else the session's preview page. In Mewrk the
 /// preview page can exist with no dev server behind it, so a required parameter with
 /// a documented absent case would be a lie.
-fn server_id_prop() -> Value {
-    string_prop("Server ID", 256)
+fn server_id_prop(profile: &PromptProfile) -> Value {
+    string_prop(profile.text(PromptKey::ToolPreviewParamServerId), 256)
 }
 
 /// The element a click or fill acts on, named by the uid `preview_snapshot` printed for it. The
@@ -79,14 +109,33 @@ fn snapshot_uid_prop(description: &str) -> Value {
 
 /// The `serverId` of a tool that acts on one server. It says what the id is, because
 /// `preview_start` does not hand it back: it is the name the model started the server by.
-fn named_server_id_prop(description: &str) -> Value {
+fn named_server_id_prop(description: &str, profile: &PromptProfile) -> Value {
     string_prop(
-        &format!("{description}: the server's name in .mewrk/launch.json, numbered (e.g. dev-2) when the file repeats that name"),
+        &profile.render(
+            PromptKey::ToolPreviewParamNamedServerId,
+            &[("description", description)],
+        ),
         256,
     )
 }
 
-pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option<Value> {
+/// The model-visible schema of `variant` of the built-in tool `name`, or `None`
+/// for a name that is no built-in tool.
+///
+/// A tool whose contract a run property changes is a different tool in each
+/// variant (see `crate::tool_surface`), so its arm branches on `variant`
+/// wherever a description or a parameter differs, and every variant's text is
+/// its own key. A variant the tool does not have is a caller's bug; it renders
+/// the standard one.
+pub(crate) fn builtin_tool_schema(
+    name: &str,
+    variant: ToolVariant,
+    profile: &PromptProfile,
+) -> Option<Value> {
+    debug_assert!(
+        crate::tool_surface::variants_of(name).contains(&variant),
+        "{name} has no {variant:?} variant"
+    );
     let schema = match name {
         // ---------------------------------------------------------------- Files
         "ls" => json!({
@@ -98,14 +147,14 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                     "minLength": 1,
                     "maxLength": 4096,
                     "default": ".",
-                    "description": "Directory to list, relative to the workspace."
+                    "description": profile.text(PromptKey::ToolLsParamPath)
                 },
                 "depth": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 8,
                     "default": 1,
-                    "description": "Recursion depth; 0 lists only the directory itself."
+                    "description": profile.text(PromptKey::ToolLsParamDepth)
                 }
             },
             "required": ["path"],
@@ -119,33 +168,33 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 4096,
-                    "description": "Regular expression to match against each line."
+                    "description": profile.text(PromptKey::ToolGrepParamPattern)
                 },
                 "path": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 4096,
                     "default": ".",
-                    "description": "File or directory to search, relative to the workspace."
+                    "description": profile.text(PromptKey::ToolGrepParamPath)
                 },
                 "case_sensitive": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Match case-sensitively."
+                    "description": profile.text(PromptKey::ToolGrepParamCaseSensitive)
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 1000,
                     "default": 250,
-                    "description": "Most matching lines to return."
+                    "description": profile.text(PromptKey::ToolGrepParamLimit)
                 },
                 "offset": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 100000,
                     "default": 0,
-                    "description": "Matching lines to skip first, to fetch the next page."
+                    "description": profile.text(PromptKey::ToolGrepParamOffset)
                 }
             },
             "required": ["pattern"],
@@ -159,14 +208,14 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 1024,
-                    "description": "Glob pattern matched against relative paths and basenames."
+                    "description": profile.text(PromptKey::ToolFindParamQuery)
                 },
                 "path": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 4096,
                     "default": ".",
-                    "description": "Directory to search, relative to the workspace."
+                    "description": profile.text(PromptKey::ToolFindParamPath)
                 }
             },
             "required": ["query"],
@@ -174,24 +223,30 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
         }),
         "read" => json!({
             "type": "object",
-            "description": profile.text(PromptKey::ToolReadDescription),
+            "description": root_description(name, variant, profile),
             "properties": {
                 "path": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 4096,
-                    "description": "File to read, relative to the workspace."
+                    "description": profile.text(PromptKey::ToolReadParamPath)
                 },
                 "start_line": {
                     "type": "integer",
                     "minimum": 1,
                     "default": 1,
-                    "description": "First line to return, 1-based. Ignored for images."
+                    "description": profile.text(match variant {
+                        ToolVariant::TextOnly => PromptKey::ToolReadTextOnlyParamStartLine,
+                        _ => PromptKey::ToolReadParamStartLine,
+                    })
                 },
                 "end_line": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Last line to return, inclusive; must not be smaller than start_line. Without it a read returns 2,000 lines. Ignored for images."
+                    "description": profile.text(match variant {
+                        ToolVariant::TextOnly => PromptKey::ToolReadTextOnlyParamEndLine,
+                        _ => PromptKey::ToolReadParamEndLine,
+                    })
                 }
             },
             "required": ["path"],
@@ -214,28 +269,28 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                         "incomingCalls",
                         "outgoingCalls"
                     ],
-                    "description": "The LSP operation to perform"
+                    "description": profile.text(PromptKey::ToolLspParamOperation)
                 },
                 "filePath": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 4096,
-                    "description": "The absolute or relative path to the file"
+                    "description": profile.text(PromptKey::ToolLspParamFilePath)
                 },
                 "line": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "The line number (1-based, as shown in editors)"
+                    "description": profile.text(PromptKey::ToolLspParamLine)
                 },
                 "character": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "The character offset (1-based, as shown in editors)"
+                    "description": profile.text(PromptKey::ToolLspParamCharacter)
                 },
                 "query": {
                     "type": "string",
                     "maxLength": 1024,
-                    "description": "The symbol name or partial name to search for (workspaceSymbol only). Most language servers return no results for an empty query, so always provide it when using workspaceSymbol."
+                    "description": profile.text(PromptKey::ToolLspParamQuery)
                 }
             },
             "required": ["operation", "filePath", "line", "character"],
@@ -243,17 +298,17 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
         }),
         "write" => json!({
             "type": "object",
-            "description": profile.text(PromptKey::ToolWriteDescription),
+            "description": root_description(name, variant, profile),
             "properties": {
                 "path": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 4096,
-                    "description": "Target file, relative to the workspace."
+                    "description": profile.text(PromptKey::ToolWriteParamPath)
                 },
                 "content": {
                     "type": "string",
-                    "description": "The complete new file content; an empty string is allowed."
+                    "description": profile.text(PromptKey::ToolWriteParamContent)
                 }
             },
             "required": ["path", "content"],
@@ -261,86 +316,82 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
         }),
         "edit" => json!({
             "type": "object",
-            "description": profile.text(PromptKey::ToolEditDescription),
+            "description": root_description(name, variant, profile),
             "properties": {
                 "path": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 4096,
-                    "description": "Existing file to modify, relative to the workspace."
+                    "description": profile.text(PromptKey::ToolEditParamPath)
                 },
                 "find": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Exact text to replace; must match exactly once unless replace_all is true."
+                    "description": profile.text(PromptKey::ToolEditParamFind)
                 },
                 "replace": {
                     "type": "string",
-                    "description": "Replacement text; an empty string deletes the passage."
+                    "description": profile.text(PromptKey::ToolEditParamReplace)
                 },
                 "replace_all": {
                     "type": "boolean",
-                    "description": "Replace every occurrence of find instead of requiring exactly one (default false)."
+                    "description": profile.text(PromptKey::ToolEditParamReplaceAll)
                 }
             },
             "required": ["path", "find", "replace"],
             "additionalProperties": false
         }),
         // ---------------------------------------------------------------- Commands
-        "powershell" => json!({
-            "type": "object",
-            "description": profile.text(PromptKey::ToolPowershellDescription),
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 65536,
-                    "description": "The PowerShell command line."
-                },
-                "description": {
-                    "type": "string",
-                    "description": SHELL_DESCRIPTION_PARAMETER
-                },
-                "timeout": {
-                    "type": "number",
-                    "description": shell_timeout_parameter_description()
-                },
-                "run_in_background": {
-                    "type": "boolean",
-                    "description": "Run the command as a background task instead of blocking this call. The receipt carries its shell:<id> address."
-                }
-            },
-            "required": ["command"],
-            "additionalProperties": false
-        }),
+        "pwsh" => shell_command_schema(
+            root_description(name, variant, profile),
+            profile.text(PromptKey::ToolPwshParamCommand),
+            variant,
+            profile,
+        ),
+        "powershell" => shell_command_schema(
+            root_description(name, variant, profile),
+            profile.text(PromptKey::ToolPowershellParamCommand),
+            variant,
+            profile,
+        ),
         "bash" => json!({
             "type": "object",
-            "description": profile.text(PromptKey::ToolBashDescription),
+            "description": root_description(name, variant, profile),
             "properties": {
                 "command": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 65536,
-                    "description": "The Bash command line."
+                    "description": profile.text(PromptKey::ToolBashParamCommand)
                 },
                 "description": {
                     "type": "string",
-                    "description": SHELL_DESCRIPTION_PARAMETER
+                    "description": profile.text(PromptKey::ToolShellParamDescription)
                 },
                 "timeout": {
                     "type": "number",
-                    "description": shell_timeout_parameter_description()
+                    "description": shell_timeout_parameter_description(profile)
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Run the command as a background task instead of blocking this call. The receipt carries its shell:<id> address."
+                    "description": shell_run_in_background_description(variant, profile)
                 }
             },
             "required": ["command"],
             "additionalProperties": false
         }),
-        "zsh" => shell_command_schema(profile.text(PromptKey::ToolZshDescription), "The zsh command line."),
-        "sh" => shell_command_schema(profile.text(PromptKey::ToolShDescription), "The POSIX sh command line."),
+        "zsh" => shell_command_schema(
+            root_description(name, variant, profile),
+            profile.text(PromptKey::ToolZshParamCommand),
+            variant,
+            profile,
+        ),
+        "sh" => shell_command_schema(
+            root_description(name, variant, profile),
+            profile.text(PromptKey::ToolShParamCommand),
+            variant,
+            profile,
+        ),
 
         //
         // The schemas mirror Cherry Studio's `shared/ai/builtinTools.ts`: `web_search`
@@ -348,13 +399,13 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
         // return a result list with per-call IDs usable as `[cite:id]` references.
         "web_search" => json!({
             "type": "object",
-            "description": profile.text(PromptKey::ToolWebSearchDescription),
+            "description": root_description(name, variant, profile),
             "properties": {
                 "query": {
                     "type": "string",
                     "minLength": crate::api::WEB_SEARCH_MIN_QUERY,
                     "maxLength": crate::api::WEB_SEARCH_MAX_QUERY,
-                    "description": "Self-contained search query. MUST NOT use pronouns or context-dependent references; expand the topic from earlier messages when the user asks a follow-up. Break a long question into several searches rather than one long sentence."
+                    "description": profile.text(PromptKey::ToolWebSearchParamQuery)
                 }
             },
             "required": ["query"],
@@ -373,9 +424,9 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                         "minLength": 1,
                         // Do not use `format: "uri"`: strict OpenAI-compatible upstreams
                         // reject the whole request. The host validates absolute http(s) URLs.
-                        "description": "An absolute http(s) page URL."
+                        "description": profile.text(PromptKey::ToolWebFetchParamUrlsItem)
                     },
-                    "description": "Absolute http(s) page URLs to fetch. Use web_search first when you do not know the URL."
+                    "description": profile.text(PromptKey::ToolWebFetchParamUrls)
                 }
             },
             "required": ["urls"],
@@ -394,7 +445,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewStartDescription),
             "properties": {
-                "name": string_prop("Server name from .mewrk/launch.json.", 256)
+                "name": string_prop(profile.text(PromptKey::ToolPreviewStartParamName), 256)
             },
             "required": ["name"],
             "additionalProperties": false
@@ -403,7 +454,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewStopDescription),
             "properties": {
-                "serverId": named_server_id_prop("Server ID to stop")
+                "serverId": named_server_id_prop("Server ID to stop", profile)
             },
             "required": ["serverId"],
             "additionalProperties": false
@@ -418,20 +469,20 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewLogsDescription),
             "properties": {
-                "serverId": named_server_id_prop("Server ID"),
+                "serverId": named_server_id_prop("Server ID", profile),
                 "level": {
                     "type": "string",
                     "enum": ["all", "error"],
-                    "description": "Filter by level: 'all' (default) shows all output, 'error' shows only lines containing error/exception/failed/fatal"
+                    "description": profile.text(PromptKey::ToolPreviewLogsParamLevel)
                 },
                 "lines": {
                     "type": "number",
                     "minimum": 1,
                     "maximum": PREVIEW_MAX_LOG_LINES,
-                    "description": "Max lines to return (default: 50)"
+                    "description": profile.text(PromptKey::ToolPreviewLogsParamLines)
                 },
                 "search": string_prop(
-                    "Filter to lines containing this text (e.g., '[DEBUG]', 'POST /api')",
+                    profile.text(PromptKey::ToolPreviewLogsParamSearch),
                     512
                 )
             },
@@ -442,17 +493,17 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewConsoleLogsDescription),
             "properties": {
-                "serverId": server_id_prop(),
+                "serverId": server_id_prop(profile),
                 "level": {
                     "type": "string",
                     "enum": ["all", "error", "warn"],
-                    "description": "Filter by level: 'all' (default), 'error' (errors only), 'warn' (warnings + errors)"
+                    "description": profile.text(PromptKey::ToolPreviewConsoleLogsParamLevel)
                 },
                 "lines": {
                     "type": "number",
                     "minimum": 1,
                     "maximum": PREVIEW_MAX_LOG_LINES,
-                    "description": "Max lines to return (default: 50, max: 200)"
+                    "description": profile.text(PromptKey::ToolPreviewConsoleLogsParamLines)
                 }
             },
             "required": [],
@@ -462,12 +513,12 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewScreenshotDescription),
             "properties": {
-                "serverId": server_id_prop(),
+                "serverId": server_id_prop(profile),
                 "scale": {
                     "type": "number",
                     "minimum": 0.1,
                     "maximum": 1,
-                    "description": "Scale factor in [0.1, 1] for the returned image; smaller images use fewer tokens. preview_click and preview_fill find elements by CSS selector or by a uid from preview_snapshot, not by pixel coordinates."
+                    "description": profile.text(PromptKey::ToolPreviewScreenshotParamScale)
                 }
             },
             "required": [],
@@ -477,7 +528,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewSnapshotDescription),
             "properties": {
-                "serverId": server_id_prop()
+                "serverId": server_id_prop(profile)
             },
             "required": [],
             "additionalProperties": false
@@ -486,13 +537,13 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewInspectDescription),
             "properties": {
-                "serverId": server_id_prop(),
-                "selector": string_prop("CSS selector (e.g., '.button', '#header')", 2048),
+                "serverId": server_id_prop(profile),
+                "selector": string_prop(profile.text(PromptKey::ToolPreviewInspectParamSelector), 2048),
                 "styles": {
                     "type": "array",
                     "maxItems": 64,
                     "items": {"type": "string", "minLength": 1, "maxLength": 128},
-                    "description": "CSS properties to return (e.g., ['padding', 'color']). Defaults to common properties."
+                    "description": profile.text(PromptKey::ToolPreviewInspectParamStyles)
                 }
             },
             "required": ["selector"],
@@ -502,14 +553,14 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewClickDescription),
             "properties": {
-                "serverId": server_id_prop(),
-                "selector": string_prop("CSS selector for the element to click. Give this or uid.", 2048),
+                "serverId": server_id_prop(profile),
+                "selector": string_prop(profile.text(PromptKey::ToolPreviewClickParamSelector), 2048),
                 "uid": snapshot_uid_prop(
-                    "The uid preview_snapshot printed for the element to click, the number in brackets at the start of its line. Give this or selector."
+                    profile.text(PromptKey::ToolPreviewClickParamUid)
                 ),
                 "doubleClick": {
                     "type": "boolean",
-                    "description": "Perform a double-click"
+                    "description": profile.text(PromptKey::ToolPreviewClickParamDoubleClick)
                 }
             },
             "required": [],
@@ -519,16 +570,16 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewFillDescription),
             "properties": {
-                "serverId": server_id_prop(),
-                "selector": string_prop("CSS selector for the input element. Give this or uid.", 2048),
+                "serverId": server_id_prop(profile),
+                "selector": string_prop(profile.text(PromptKey::ToolPreviewFillParamSelector), 2048),
                 "uid": snapshot_uid_prop(
-                    "The uid preview_snapshot printed for the input element, the number in brackets at the start of its line. Give this or selector."
+                    profile.text(PromptKey::ToolPreviewFillParamUid)
                 ),
                 // No `minLength`: filling with the empty string is how a field is cleared.
                 "value": {
                     "type": "string",
                     "maxLength": 32768,
-                    "description": "Value to fill"
+                    "description": profile.text(PromptKey::ToolPreviewFillParamValue)
                 }
             },
             "required": ["value"],
@@ -538,9 +589,9 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewEvalDescription),
             "properties": {
-                "serverId": server_id_prop(),
+                "serverId": server_id_prop(profile),
                 "expression": string_prop(
-                    "JavaScript expression to evaluate in the page context. Return values are serialized as JSON.",
+                    profile.text(PromptKey::ToolPreviewEvalParamExpression),
                     65536
                 )
             },
@@ -551,14 +602,14 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewNetworkDescription),
             "properties": {
-                "serverId": server_id_prop(),
+                "serverId": server_id_prop(profile),
                 "filter": {
                     "type": "string",
                     "enum": ["all", "failed"],
-                    "description": "Filter: 'all' (default) shows all requests, 'failed' shows only 4xx/5xx and network errors. Ignored when requestId is provided."
+                    "description": profile.text(PromptKey::ToolPreviewNetworkParamFilter)
                 },
                 "requestId": string_prop(
-                    "If provided, returns the response body for this specific request instead of listing all requests. Get requestIds from the listing output.",
+                    profile.text(PromptKey::ToolPreviewNetworkParamRequestId),
                     256
                 )
             },
@@ -569,28 +620,28 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewResizeDescription),
             "properties": {
-                "serverId": server_id_prop(),
+                "serverId": server_id_prop(profile),
                 "preset": {
                     "type": "string",
                     "enum": ["mobile", "tablet", "desktop"],
-                    "description": "Device preset. Overrides width/height if provided. \"desktop\" clears the size emulation (back to the pane's responsive size)."
+                    "description": profile.text(PromptKey::ToolPreviewResizeParamPreset)
                 },
                 "width": {
                     "type": "number",
                     "minimum": 1,
                     "maximum": PREVIEW_MAX_VIEWPORT,
-                    "description": "Viewport width in CSS pixels (requires height)"
+                    "description": profile.text(PromptKey::ToolPreviewResizeParamWidth)
                 },
                 "height": {
                     "type": "number",
                     "minimum": 1,
                     "maximum": PREVIEW_MAX_VIEWPORT,
-                    "description": "Viewport height in CSS pixels (requires width)"
+                    "description": profile.text(PromptKey::ToolPreviewResizeParamHeight)
                 },
                 "colorScheme": {
                     "type": "string",
                     "enum": ["light", "dark"],
-                    "description": "Emulate prefers-color-scheme media feature for dark/light mode testing."
+                    "description": profile.text(PromptKey::ToolPreviewResizeParamColorScheme)
                 }
             },
             "required": [],
@@ -600,17 +651,17 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewUploadImageDescription),
             "properties": {
-                "serverId": server_id_prop(),
+                "serverId": server_id_prop(profile),
                 "image_id": string_prop(
-                    "The conversation image number, e.g. 3, #3, or [Image #3]. A 64-character hex digest also resolves.",
+                    profile.text(PromptKey::ToolPreviewUploadImageParamImageId),
                     128
                 ),
                 "selector": string_prop(
-                    "CSS selector of the target file input. Omitted, the image goes into the file chooser the page has open, or else into the first file input on the page, hidden or not.",
+                    profile.text(PromptKey::ToolPreviewUploadImageParamSelector),
                     2048
                 ),
                 "filename": string_prop(
-                    "The file name the page sees. Defaults to the attachment's own name.",
+                    profile.text(PromptKey::ToolPreviewUploadImageParamFilename),
                     128
                 )
             },
@@ -621,25 +672,25 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolPreviewDialogDescription),
             "properties": {
-                "serverId": server_id_prop(),
+                "serverId": server_id_prop(profile),
                 "accept": {
                     "type": "boolean",
-                    "description": "true accepts the open dialog, false dismisses it (default true)."
+                    "description": profile.text(PromptKey::ToolPreviewDialogParamAccept)
                 },
                 // No `minLength`: an empty answer is what a prompt dialog's own default is.
                 "prompt_text": {
                     "type": "string",
                     "maxLength": 4096,
-                    "description": "The answer for an open prompt dialog, used only when accepting."
+                    "description": profile.text(PromptKey::ToolPreviewDialogParamPromptText)
                 }
             },
             "required": [],
             "additionalProperties": false
         }),
-        "agent_spawn" => agent_spawn_schema(None, false, profile),
+        "agent_spawn" => agent_spawn_schema(None, false, variant, profile),
         "task_wait" => json!({
             "type": "object",
-            "description": profile.text(PromptKey::ToolTaskWaitDescription),
+            "description": root_description(name, variant, profile),
             "properties": {
                 "tasks": {
                     "type": "array",
@@ -648,16 +699,22 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 320,
-                        "description": "A child agent name, a workflow run name (also accepted as workflow:<name>), shell:<id>, terminal:<id>, or preview:<serverId> for a dev server (preview:<serverId>@<workspace> when the conversation has several workspaces)."
+                        "description": profile.text(PromptKey::ToolTaskWaitParamTasksItem)
                     },
-                    "description": "Task addresses to wait on; omitted waits for every child agent, workflow run and background shell command in this conversation (terminals excluded)."
+                    "description": profile.text(match variant {
+                        ToolVariant::Child => PromptKey::ToolTaskWaitChildParamTasks,
+                        _ => PromptKey::ToolTaskWaitParamTasks,
+                    })
                 },
                 "timeout_seconds": {
                     "type": "integer",
                     "minimum": WAIT_MIN_TIMEOUT_SECONDS,
                     "maximum": WAIT_MAX_TIMEOUT_SECONDS,
                     "default": WAIT_DEFAULT_TIMEOUT_SECONDS,
-                    "description": "Wait deadline in seconds. Set it to match how long the work should take — a child agent's turn can run for many minutes. Reaching the deadline is not a failure: the tasks keep running and nothing is lost. Wait again, or end the round and the host delivers the result on its own."
+                    "description": profile.text(match variant {
+                        ToolVariant::Child => PromptKey::ToolTaskWaitChildParamTimeoutSeconds,
+                        _ => PromptKey::ToolTaskWaitParamTimeoutSeconds,
+                    })
                 }
             },
             "required": [],
@@ -680,31 +737,37 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                     "type": "array",
                     "items": { "type": "string" },
                     "maxItems": 0,
-                    "description": "Always an empty list."
+                    "description": profile.text(PromptKey::ToolBoxParamNone)
                 }
             },
             "required": [crate::wire_history::BOX_INPUT_KEY],
             "additionalProperties": false
         }),
         // ---------------------------------------------------------- Long-term memory
-        "read_global_memory" => {
-            memory_read_schema(profile.text(PromptKey::ToolReadGlobalMemoryDescription))
-        }
-        "read_project_memory" => {
-            memory_read_schema(profile.text(PromptKey::ToolReadProjectMemoryDescription))
-        }
-        "create_global_memory" => {
-            memory_create_schema(profile.text(PromptKey::ToolCreateGlobalMemoryDescription))
-        }
-        "create_project_memory" => {
-            memory_create_schema(profile.text(PromptKey::ToolCreateProjectMemoryDescription))
-        }
-        "edit_global_memory" => {
-            memory_edit_schema(profile.text(PromptKey::ToolEditGlobalMemoryDescription))
-        }
-        "edit_project_memory" => {
-            memory_edit_schema(profile.text(PromptKey::ToolEditProjectMemoryDescription))
-        }
+        "read_global_memory" => memory_read_schema(
+            profile.text(PromptKey::ToolReadGlobalMemoryDescription),
+            profile,
+        ),
+        "read_project_memory" => memory_read_schema(
+            profile.text(PromptKey::ToolReadProjectMemoryDescription),
+            profile,
+        ),
+        "create_global_memory" => memory_create_schema(
+            profile.text(PromptKey::ToolCreateGlobalMemoryDescription),
+            profile,
+        ),
+        "create_project_memory" => memory_create_schema(
+            profile.text(PromptKey::ToolCreateProjectMemoryDescription),
+            profile,
+        ),
+        "edit_global_memory" => memory_edit_schema(
+            profile.text(PromptKey::ToolEditGlobalMemoryDescription),
+            profile,
+        ),
+        "edit_project_memory" => memory_edit_schema(
+            profile.text(PromptKey::ToolEditProjectMemoryDescription),
+            profile,
+        ),
         // ------------------------------------------------------------ User interaction
         "ask_user" => json!({
             "type": "object",
@@ -715,37 +778,37 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 4,
-                    "description": "Questions to ask the user (1-4 questions)",
+                    "description": profile.text(PromptKey::ToolAskUserParamQuestions),
                     "items": {
                         "type": "object",
                         "properties": {
                             "question": {
                                 "type": "string",
-                                "description": "The complete question to ask the user. Should be clear, specific, and end with a question mark. Example: \"Which library should we use for date formatting?\" If multiSelect is true, phrase it accordingly, e.g. \"Which features do you want to enable?\""
+                                "description": profile.text(PromptKey::ToolAskUserParamQuestionsQuestion)
                             },
                             "header": {
                                 "type": "string",
-                                "description": "Very short label displayed as a chip/tag (max 12 chars). Examples: \"Auth method\", \"Library\", \"Approach\"."
+                                "description": profile.text(PromptKey::ToolAskUserParamQuestionsHeader)
                             },
                             "options": {
                                 "type": "array",
                                 "minItems": 2,
                                 "maxItems": 4,
-                                "description": "The available choices for this question. Must have 2-4 options. Each option should be a distinct, mutually exclusive choice (unless multiSelect is enabled). There should be no 'Other' option, that will be provided automatically.",
+                                "description": profile.text(PromptKey::ToolAskUserParamQuestionsOptions),
                                 "items": {
                                     "type": "object",
                                     "properties": {
                                         "label": {
                                             "type": "string",
-                                            "description": "The display text for this option that the user will see and select. Should be concise (1-5 words) and clearly describe the choice."
+                                            "description": profile.text(PromptKey::ToolAskUserParamQuestionsOptionsLabel)
                                         },
                                         "description": {
                                             "type": "string",
-                                            "description": "Explanation of what this option means or what will happen if chosen. Useful for providing context about trade-offs or implications."
+                                            "description": profile.text(PromptKey::ToolAskUserParamQuestionsOptionsDescription)
                                         },
                                         "preview": {
                                             "type": "string",
-                                            "description": "Optional preview content rendered when this option is focused. Use for mockups, code snippets, or visual comparisons that help users compare options. See the tool description for the expected content format."
+                                            "description": profile.text(PromptKey::ToolAskUserParamQuestionsOptionsPreview)
                                         }
                                     },
                                     "required": ["label", "description"],
@@ -755,7 +818,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                             "multiSelect": {
                                 "type": "boolean",
                                 "default": false,
-                                "description": "Set to true to allow the user to select multiple options instead of just one. Use when choices are not mutually exclusive."
+                                "description": profile.text(PromptKey::ToolAskUserParamQuestionsMultiSelect)
                             }
                         },
                         "required": ["question", "header", "options", "multiSelect"],
@@ -764,22 +827,22 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                 },
                 "answers": {
                     "type": "object",
-                    "description": "User answers collected by the permission component",
+                    "description": profile.text(PromptKey::ToolAskUserParamAnswers),
                     "additionalProperties": {"type": "string"}
                 },
                 "annotations": {
                     "type": "object",
-                    "description": "Optional per-question annotations from the user (e.g., notes on preview selections). Keyed by question text.",
+                    "description": profile.text(PromptKey::ToolAskUserParamAnnotations),
                     "additionalProperties": {
                         "type": "object",
                         "properties": {
                             "preview": {
                                 "type": "string",
-                                "description": "The preview content of the selected option, if the question used previews."
+                                "description": profile.text(PromptKey::ToolAskUserParamAnnotationsPreview)
                             },
                             "notes": {
                                 "type": "string",
-                                "description": "Free-text notes the user added to their selection."
+                                "description": profile.text(PromptKey::ToolAskUserParamAnnotationsNotes)
                             }
                         },
                         "additionalProperties": false
@@ -787,11 +850,11 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                 },
                 "metadata": {
                     "type": "object",
-                    "description": "Optional metadata for tracking and analytics purposes. Not displayed to user.",
+                    "description": profile.text(PromptKey::ToolAskUserParamMetadata),
                     "properties": {
                         "source": {
                             "type": "string",
-                            "description": "Optional identifier for the source of this question (e.g., \"remember\" for /remember command). Used for analytics tracking."
+                            "description": profile.text(PromptKey::ToolAskUserParamMetadataSource)
                         }
                     },
                     "additionalProperties": false
@@ -808,7 +871,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 32768,
-                    "description": "First user message of the forked conversation, and the only instruction you will ever give it — there is no channel for a correction afterwards. State the task and every piece of background it needs: the child sees nothing else."
+                    "description": profile.text(PromptKey::ToolForkParamPrompt)
                 }
             },
             "required": ["prompt"],
@@ -824,13 +887,13 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
                 "action": {
                     "type": "string",
                     "enum": ["write", "read"],
-                    "description": "`write` stores or replaces this conversation's plan document with `content`; `read` returns the document currently stored."
+                    "description": profile.text(PromptKey::ToolPlanParamAction)
                 },
                 "content": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 200000,
-                    "description": "Required for `write`. The plan's Markdown body: context, the recommended approach, the critical files, the utilities to reuse, and how the work will be verified. The whole document is replaced, so send the complete plan every time."
+                    "description": profile.text(PromptKey::ToolPlanParamContent)
                 }
             },
             "required": ["action"],
@@ -852,7 +915,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "description": profile.text(PromptKey::ToolReadHandoffNoteDescription),
             "properties": {
                 "name": memory_document_name(
-                    "Note name from the handoff index; the .md suffix is optional."
+                    profile.text(PromptKey::ToolReadHandoffNoteParamName)
                 )
             },
             "required": ["name"],
@@ -863,18 +926,18 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "description": profile.text(PromptKey::ToolCreateHandoffNoteDescription),
             "properties": {
                 "name": memory_document_name(
-                    "New note name; no path separators, the .md suffix is optional."
+                    profile.text(PromptKey::ToolCreateHandoffNoteParamName)
                 ),
                 "content": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "The note's complete Markdown body, up to 256 KiB of UTF-8."
+                    "description": profile.text(PromptKey::ToolCreateHandoffNoteParamContent)
                 },
                 "description": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 300,
-                    "description": "One sentence saying what the note holds; it becomes the note's line in the handoff index."
+                    "description": profile.text(PromptKey::ToolCreateHandoffNoteParamDescription)
                 }
             },
             "required": ["name", "content", "description"],
@@ -884,21 +947,21 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
             "type": "object",
             "description": profile.text(PromptKey::ToolEditHandoffNoteDescription),
             "properties": {
-                "name": memory_document_name("Existing note name; the .md suffix is optional."),
+                "name": memory_document_name(profile.text(PromptKey::ToolEditHandoffNoteParamName)),
                 "old_text": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Passage to replace; must occur exactly once in the note."
+                    "description": profile.text(PromptKey::ToolEditHandoffNoteParamOldText)
                 },
                 "new_text": {
                     "type": "string",
-                    "description": "Replacement text; an empty string deletes the passage."
+                    "description": profile.text(PromptKey::ToolEditHandoffNoteParamNewText)
                 },
                 "description": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 300,
-                    "description": "One sentence describing the note after the change, for its line in the handoff index."
+                    "description": profile.text(PromptKey::ToolEditHandoffNoteParamDescription)
                 }
             },
             "required": ["name", "old_text", "new_text", "description"],
@@ -914,7 +977,7 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
         // ------------------------------------------------------------ Workflow
         // The static baseline is the permissive form used for golden-file and catalog
         // comparisons; host-generated per-run schemas apply any narrowing.
-        "workflow" => workflow_schema(None, false, profile),
+        "workflow" => workflow_schema(None, false, variant, profile),
         // ------------------------------------------------------------ Skills
         // The static baseline has no `enum`: no available skills and unknown available
         // skills are different claims, and unavailable documentation yields this schema.
@@ -925,9 +988,14 @@ pub(crate) fn builtin_tool_schema(name: &str, profile: &PromptProfile) -> Option
     Some(schema)
 }
 
-/// The schema of a shell backend's command tool: the shape `bash` and
-/// `powershell` spell out in full, for the backends added after them.
-fn shell_command_schema(description: &str, command_description: &str) -> Value {
+/// The schema of a shell backend's command tool: the shape `bash` spells out
+/// in full, for every other backend.
+fn shell_command_schema(
+    description: &str,
+    command_description: &str,
+    variant: ToolVariant,
+    profile: &PromptProfile,
+) -> Value {
     json!({
         "type": "object",
         "description": description,
@@ -940,15 +1008,15 @@ fn shell_command_schema(description: &str, command_description: &str) -> Value {
             },
             "description": {
                 "type": "string",
-                "description": SHELL_DESCRIPTION_PARAMETER
+                "description": profile.text(PromptKey::ToolShellParamDescription)
             },
             "timeout": {
                 "type": "number",
-                "description": shell_timeout_parameter_description()
+                "description": shell_timeout_parameter_description(profile)
             },
             "run_in_background": {
                 "type": "boolean",
-                "description": "Run the command as a background task instead of blocking this call. The receipt carries its shell:<id> address."
+                "description": shell_run_in_background_description(variant, profile)
             }
         },
         "required": ["command"],
@@ -1002,10 +1070,14 @@ pub(crate) fn addresses_a_preview_server(tool_name: &str) -> bool {
 /// have its shell; a `zsh` call naming a Windows workspace is not a call the
 /// host could honour, and refusing it in the schema is cheaper than refusing it
 /// in a tool result.
+///
+/// The parameter's prose comes from the run's prompt profile
+/// (`tool.param.workspace*`).
 pub(crate) fn with_workspace_parameter(
     mut schema: Value,
     tool_name: &str,
     workspaces: &WorkspaceSet,
+    profile: &PromptProfile,
 ) -> Value {
     if workspaces.len() < 2 {
         return schema;
@@ -1019,7 +1091,7 @@ pub(crate) fn with_workspace_parameter(
                     "type": "integer",
                     "enum": workspaces.addresses(),
                     "default": 1,
-                    "description": "Whose project memory this is: each workspace keeps its own, named by the number the Environment section gives it and listed under its own heading in the memory block. Defaults to 1."
+                    "description": profile.text(PromptKey::ToolParamWorkspaceProjectMemory)
                 }),
             );
         }
@@ -1044,16 +1116,17 @@ pub(crate) fn with_workspace_parameter(
     let default = workspaces.default_address(tool_name);
     let addresses_a_server = addresses_a_preview_server(tool_name);
     let mut description = if addresses_a_server {
-        "Which workspace the server runs in, by the number preview_list gives it. Needed only when servers with this serverId run in more than one workspace.".to_owned()
+        profile.text(PromptKey::ToolParamWorkspaceServer).to_owned()
     } else {
-        format!(
-            "Which of this conversation's workspaces this call acts in, named by the number the Environment section gives it. Defaults to {default}."
+        profile.render(
+            PromptKey::ToolParamWorkspace,
+            &[("default", &default.to_string())],
         )
     };
     if let Some(backend) = backend.filter(|_| addresses.len() < workspaces.len()) {
-        description.push_str(&format!(
-            " Only workspaces whose machine has {} are listed; use another shell tool for the others.",
-            backend.display_name()
+        description.push_str(&profile.render(
+            PromptKey::ToolParamWorkspaceShellSuffix,
+            &[("shell", backend.display_name())],
         ));
     }
     let Some(properties) = schema
@@ -1088,13 +1161,13 @@ fn memory_document_name(description: &str) -> Value {
     })
 }
 
-fn memory_read_schema(description: &str) -> Value {
+fn memory_read_schema(description: &str, profile: &PromptProfile) -> Value {
     json!({
         "type": "object",
         "description": description,
         "properties": {
             "name": memory_document_name(
-                "Document name from the memory index; the .md suffix is optional."
+                profile.text(PromptKey::ToolMemoryParamReadName)
             )
         },
         "required": ["name"],
@@ -1102,24 +1175,24 @@ fn memory_read_schema(description: &str) -> Value {
     })
 }
 
-fn memory_create_schema(description: &str) -> Value {
+fn memory_create_schema(description: &str, profile: &PromptProfile) -> Value {
     json!({
         "type": "object",
         "description": description,
         "properties": {
             "name": memory_document_name(
-                "New document name inside the memory directory; no path separators, the .md suffix is optional."
+                profile.text(PromptKey::ToolMemoryParamCreateName)
             ),
             "content": {
                 "type": "string",
                 "minLength": 1,
-                "description": "The document's complete Markdown body, up to 256 KiB of UTF-8."
+                "description": profile.text(PromptKey::ToolMemoryParamCreateContent)
             },
             "description": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 300,
-                "description": "One-sentence index entry written into MEMORY.md."
+                "description": profile.text(PromptKey::ToolMemoryParamCreateDescription)
             }
         },
         "required": ["name", "content", "description"],
@@ -1127,28 +1200,28 @@ fn memory_create_schema(description: &str) -> Value {
     })
 }
 
-fn memory_edit_schema(description: &str) -> Value {
+fn memory_edit_schema(description: &str, profile: &PromptProfile) -> Value {
     json!({
         "type": "object",
         "description": description,
         "properties": {
             "name": memory_document_name(
-                "Existing document name; the .md suffix is optional."
+                profile.text(PromptKey::ToolMemoryParamEditName)
             ),
             "old_text": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Passage to replace; must occur exactly once in the document."
+                "description": profile.text(PromptKey::ToolMemoryParamEditOldText)
             },
             "new_text": {
                 "type": "string",
-                "description": "Replacement text; an empty string deletes the passage."
+                "description": profile.text(PromptKey::ToolMemoryParamEditNewText)
             },
             "description": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 300,
-                "description": "One-sentence index entry describing the document after the change."
+                "description": profile.text(PromptKey::ToolMemoryParamEditDescription)
             }
         },
         "required": ["name", "old_text", "new_text", "description"],
@@ -1173,37 +1246,38 @@ fn memory_edit_schema(description: &str) -> Value {
 fn workflow_schema(
     roles: Option<&[String]>,
     role_required: bool,
+    variant: ToolVariant,
     profile: &PromptProfile,
 ) -> Value {
     let mut schema = json!({
         "type": "object",
-        "description": profile.text(PromptKey::ToolWorkflowDescription),
+        "description": root_description("workflow", variant, profile),
         "properties": {
             "script": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": MAX_SCRIPT_BYTES,
-                "description": workflow_script_description(roles, role_required)
+                "description": workflow_script_description(roles, role_required, profile)
             },
             "name": {
                 "type": "string",
                 "pattern": "^[a-z][a-z0-9_-]{0,31}$",
-                "description": "Required. Name this run yourself: the name is this run's id and its address, in the same namespace agents are named in, and the title the task is listed under. Say what the run is for (review-sweep, migrate-callsites). A name is reserved for the whole conversation branch tree; reuse one and this run is numbered instead (review-sweep-2), and the receipt reports the id it got. A resume still needs a name of its own."
+                "description": profile.text(PromptKey::ToolWorkflowParamName)
             },
             "args": {
-                "description": "JSON value exposed to the script as the global `args`. Pass arrays and objects directly (at most 4,096 items per array), not as encoded strings."
+                "description": profile.text(PromptKey::ToolWorkflowParamArgs)
             },
             "token_budget": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Optional hard token ceiling for this run, surfaced to the script as budget.total. Once step usage reaches it, further agent() calls throw."
+                "description": profile.text(PromptKey::ToolWorkflowParamTokenBudget)
             },
             "resume_run_id": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 128,
                 "pattern": "^[A-Za-z0-9_-]+$",
-                "description": "Run id of a previous run: the name you gave it, or the id its dispatch receipt reported when the host had to number it. A step whose prompt and options are unchanged replays instantly from the journal; a step the last attempt left running when it stopped re-runs on its own; a changed, failed or skipped step re-runs together with everything after it. script and args may be omitted — the host reuses the ones this run last ran with. Pass an edited script to change later steps or post-processing while unchanged steps still replay; it is approved again."
+                "description": profile.text(PromptKey::ToolWorkflowParamResumeRunId)
             }
         },
         "required": ["name"],
@@ -1212,7 +1286,7 @@ fn workflow_schema(
     if let Some(names) = roles.filter(|names| !names.is_empty()) {
         schema["$defs"] = json!({
             "agentType": {
-                "description": "Legal values for the agentType option of agent() inside the script. A role name is the whole model-facing surface; which provider and model it runs on is the user's configuration.",
+                "description": profile.text(PromptKey::ToolWorkflowDefsAgentType),
                 "enum": names
             }
         });
@@ -1225,36 +1299,31 @@ fn workflow_schema(
 ///
 /// Required-role prose must state that invalid `agentType` values throw synchronously,
 /// because the value appears in JavaScript source beyond JSON Schema enforcement.
-fn workflow_script_description(roles: Option<&[String]>, role_required: bool) -> String {
-    let agent_type_clause = match (roles, role_required) {
+fn workflow_script_description(
+    roles: Option<&[String]>,
+    role_required: bool,
+    profile: &PromptProfile,
+) -> String {
+    let agent_type_clause = profile.text(match (roles, role_required) {
         // The static baseline has no run-specific `$defs`.
-        (None, _) => "agentType (a configured role name; when this conversation has roles configured, the schema carries their legal values under $defs.agentType)",
+        (None, _) => PromptKey::ToolWorkflowParamScriptAgentTypeUnresolved,
         // With no legal values, `agentType` remains optional.
-        (Some([]), _) => "agentType (this conversation has no named agent configured, so this option has no legal value)",
-        (Some(_), false) => "agentType (one of the names under $defs.agentType below — a bare model is rejected, because a role name is the whole model-facing surface and which provider/model it runs on is the user's configuration)",
-        (Some(_), true) => "agentType (REQUIRED on every agent() call — one of the names under $defs.agentType below. A bare model is rejected: a role name is the whole model-facing surface, and which provider/model it runs on is the user's configuration. Omitting it, or naming a value outside that list, throws synchronously at the agent() call and fails the whole script — it is NOT a step that resolves to null)",
-    };
+        (Some([]), _) => PromptKey::ToolWorkflowParamScriptAgentTypeNone,
+        (Some(_), false) => PromptKey::ToolWorkflowParamScriptAgentTypeOptional,
+        (Some(_), true) => PromptKey::ToolWorkflowParamScriptAgentTypeRequired,
+    });
+    // The signature is an API shape, not prose, so it stays in code.
     let signature = if role_required {
         "- agent(prompt, opts) -> Promise<any>"
     } else {
         "- agent(prompt, opts?) -> Promise<any>"
     };
-    format!(
-        concat!(
-            "Plain JavaScript (not TypeScript), starting with `export const meta = {{ name, description, phases?: [{{title, detail?}}] }}` — a pure literal. The body runs as an async function: top-level await and return work, and the return value becomes the workflow result.\n",
-            "Available globals:\n",
-            "{signature}: spawn one step subagent. It inherits no conversation history — the prompt must be self-contained. opts: label (display name), phase (progress group; defaults to the last phase() call), schema (JSON Schema the step must satisfy; the promise then resolves to validated structured data, otherwise to the step's final text), effort (low|medium|high|extra|max), {agent_type_clause}, isolation. A failed or skipped step resolves to null.\n",
-            "- isolation: \"worktree\" gives that one step its own git worktree, checked out from HEAD on a fresh branch, so parallel steps can edit files without colliding. It sees the committed tree only — your uncommitted changes are NOT in it. A step that leaves changes or commits keeps its worktree and reports the path and branch; one that changes nothing has it removed. Requires the workspace to be a git repository root; the step fails on its own if it is not. EXPENSIVE (a full checkout per step) — use it only when steps really would conflict.\n",
-            "- parallel(thunks) -> Promise<any[]>: run () => agent(...) thunks concurrently and wait for all; a throwing thunk yields null. This is a barrier — use it only when the next stage needs every result.\n",
-            "- pipeline(items, ...stages) -> Promise<any[]>: stream each item through the stages independently with no barrier between stages; stage callbacks receive (prev, originalItem, index), and a throwing stage drops that item to null. Default to pipeline over parallel.\n",
-            "- phase(title): start a progress group; declare titles in meta.phases to pin their order. log(message): emit one narration line to the progress card.\n",
-            "- args: the args input, verbatim. budget: {{ total, spent(), remaining() }} for the token_budget cap; once exhausted, further agent() calls throw.\n",
-            "Date.now(), argless new Date() and Math.random() throw — they would break resume replay; pass timestamps and seeds in via args. No filesystem, network, module or timer access. At most 1000 steps per run and 4096 items per boundary array.
-",
-            "Required on a fresh run. Optional when resume_run_id is set — the host reloads the script that run last ran from its directory."
-        ),
-        signature = signature,
-        agent_type_clause = agent_type_clause
+    profile.render(
+        PromptKey::ToolWorkflowParamScript,
+        &[
+            ("signature", signature),
+            ("agent_type_clause", agent_type_clause),
+        ],
     )
 }
 
@@ -1270,44 +1339,45 @@ fn workflow_script_description(roles: Option<&[String]>, role_required: bool) ->
 fn agent_spawn_schema(
     roles: Option<&[String]>,
     role_required: bool,
+    variant: ToolVariant,
     profile: &PromptProfile,
 ) -> Value {
     let mut schema = json!({
         "type": "object",
-        "description": profile.text(PromptKey::ToolAgentSpawnDescription),
+        "description": root_description("agent_spawn", variant, profile),
         "properties": {
             "prompt": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 32768,
-                "description": "The child's entire task; it sees nothing else of this conversation by default."
+                "description": profile.text(PromptKey::ToolAgentSpawnParamPrompt)
             },
             "agent_type": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 64,
-                "description": "Name of a host-resolved trusted agent definition. The schema you actually receive lists this conversation's names as an enum here. The definition's prompt, model and memory identity are not model-writable."
+                "description": profile.text(PromptKey::ToolAgentSpawnParamAgentType)
             },
             "name": {
                 "type": "string",
                 "pattern": "^[a-z][a-z0-9_-]{0,31}$",
-                "description": "Required. Name this child yourself: it is both the address task_wait takes and the title the task is listed under. Say what the child is for (researcher, review-api), not what you are asking it right now. The name is reserved for the whole conversation branch tree, so it must not repeat one already used here."
+                "description": profile.text(PromptKey::ToolAgentSpawnParamName)
             },
             "label": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 80,
-                "description": "Short display name shown on the timeline."
+                "description": profile.text(PromptKey::ToolAgentSpawnParamLabel)
             },
             "context": {
                 "type": "string",
                 "enum": ["none", "conversation"],
                 "default": "none",
-                "description": "none: the child sees only the task. conversation: a filtered copy of this conversation's history is attached."
+                "description": profile.text(PromptKey::ToolAgentSpawnParamContext)
             },
             "schema": {
                 "type": "object",
-                "description": "JSON Schema subset the child must satisfy via structured_output; the validated value returns with task_wait. Top level must be an object schema; supported keywords: type, properties, required, items, enum, const, additionalProperties, minItems/maxItems, minLength/maxLength, minimum/maximum. Others are rejected."
+                "description": profile.text(PromptKey::ToolAgentSpawnParamSchema)
             }
         },
         "required": ["prompt", "name"],
@@ -1336,7 +1406,7 @@ fn agent_spawn_schema(
             schema["properties"]["agent_type"] = json!({
                 "type": "string",
                 "enum": names,
-                "description": "Name of a host-resolved trusted agent definition. A role name is the whole model-facing surface; which provider and model it runs on is the user's configuration, and the definition's prompt and memory identity are not model-writable."
+                "description": profile.text(PromptKey::ToolAgentSpawnParamAgentTypeRoles)
             });
             if role_required {
                 schema["required"] = json!(["prompt", "name", "agent_type"]);
@@ -1360,18 +1430,52 @@ fn agent_spawn_schema(
 pub(crate) fn agent_spawn_schema_for_roles(
     names: &[String],
     role_required: bool,
+    variant: ToolVariant,
     profile: &PromptProfile,
 ) -> Value {
-    agent_spawn_schema(Some(names), role_required, profile)
+    agent_spawn_schema(Some(names), role_required, variant, profile)
 }
 
 /// Run-specific `workflow` schema. See [`workflow_schema`].
 pub(crate) fn workflow_schema_for_roles(
     names: &[String],
     role_required: bool,
+    variant: ToolVariant,
     profile: &PromptProfile,
 ) -> Value {
-    workflow_schema(Some(names), role_required, profile)
+    workflow_schema(Some(names), role_required, variant, profile)
+}
+
+/// Removes every empty `description` string from a built-in tool's schema,
+/// root included.
+///
+/// A profile says nothing about a tool or a parameter by giving it an empty
+/// text; on the wire that is no `description` key at all rather than an empty
+/// one, so a concise schema costs only what it says. Applied after every
+/// rule the host appends to a description, so a description that only gained
+/// a rule keeps it. Only string values are touched: a parameter that is itself
+/// named `description` is an object schema and stays.
+pub(crate) fn without_empty_descriptions(mut schema: Value) -> Value {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if matches!(map.get("description"), Some(Value::String(text)) if text.is_empty()) {
+                    map.remove("description");
+                }
+                for child in map.values_mut() {
+                    strip(child);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    strip(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    strip(&mut schema);
+    schema
 }
 
 /// Model-visible name and user-provided description of an available role.
@@ -1422,9 +1526,11 @@ pub(crate) fn append_role_descriptions(
 }
 
 /// Schema of the child-only `subagent_update` tool, with its prose from the
-/// run's prompt profile.
+/// run's prompt profile. It reaches the wire as a descriptor's own schema,
+/// which the step builder passes through untouched, so a description the
+/// profile leaves empty is dropped here instead.
 pub(crate) fn subagent_update_schema(profile: &PromptProfile) -> Value {
-    json!({
+    without_empty_descriptions(json!({
         "type": "object",
         "description": profile.text(PromptKey::SubagentUpdateToolDescription),
         "properties": {
@@ -1437,7 +1543,7 @@ pub(crate) fn subagent_update_schema(profile: &PromptProfile) -> Value {
         },
         "required": ["message"],
         "additionalProperties": false
-    })
+    }))
 }
 
 /// Model-visible `skill` schema.
@@ -1536,9 +1642,9 @@ mod tests {
     }
 
     fn schema_with_workspaces(name: &str, workspaces: &WorkspaceSet) -> Value {
-        let schema = builtin_tool_schema(name, &PromptProfile::builtin_english())
+        let schema = builtin_tool_schema(name, ToolVariant::Standard, &PromptProfile::builtin_english())
             .unwrap_or_else(|| panic!("no schema for {name}"));
-        with_workspace_parameter(schema, name, workspaces)
+        with_workspace_parameter(schema, name, workspaces, &PromptProfile::builtin_english())
     }
 
     /// One workspace is not a choice, so the parameter is not a question worth
@@ -1626,7 +1732,7 @@ mod tests {
         let workspaces = mixed_workspaces();
         let schema = schema_with_workspaces("powershell", &workspaces);
         let host_has_powershell = crate::machine_shells::local()
-            .get(crate::shell_backend::ShellBackend::PowerShell)
+            .get(crate::shell_backend::ShellBackend::WindowsPowerShell)
             .is_some();
         if host_has_powershell {
             assert_eq!(schema["properties"]["workspace"]["enum"], json!([1]));
@@ -1686,7 +1792,10 @@ mod tests {
             Some(Endpoint::of_machine(&assets.ssh_machines[1])),
             probed(
                 MachineOs::Windows,
-                &[(ShellBackend::PowerShell, "powershell.exe"), (ShellBackend::Bash, "bash.exe")],
+                &[
+                    (ShellBackend::WindowsPowerShell, "powershell.exe"),
+                    (ShellBackend::Bash, "bash.exe"),
+                ],
             ),
         );
         let on = |id: &str, path: &str| AttachedWorkspace {
@@ -1710,6 +1819,12 @@ mod tests {
         let bash = &schema_with_workspaces("bash", &workspaces)["properties"]["workspace"];
         assert_eq!(bash["enum"], json!([1, 2]));
         assert_eq!(bash["default"], json!(1));
+
+        // That Windows machine has no PowerShell 7, so `pwsh` has nowhere to
+        // run: 5.1 does not stand in for it.
+        let pwsh = &schema_with_workspaces("pwsh", &workspaces)["properties"];
+        assert!(pwsh.get("workspace").is_none(), "{pwsh}");
+        assert!(workspaces.shell_addresses(ShellBackend::Pwsh).is_empty());
     }
 
     fn properties(schema: &Value) -> BTreeSet<String> {
@@ -1728,7 +1843,7 @@ mod tests {
     fn configured_role_names_become_enum_values_in_both_role_naming_tools() {
         let names = vec!["alpha".to_owned(), "zeta".to_owned()];
 
-        let spawn = agent_spawn_schema_for_roles(&names, false, &PromptProfile::builtin_english());
+        let spawn = agent_spawn_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin_english());
         assert_eq!(
             spawn["properties"]["agent_type"]["enum"],
             json!(["alpha", "zeta"])
@@ -1736,7 +1851,7 @@ mod tests {
         // The `not` guard references `agent_type` and must remain with roles.
         assert!(spawn.get("not").is_some());
 
-        let workflow = workflow_schema_for_roles(&names, false, &PromptProfile::builtin_english());
+        let workflow = workflow_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin_english());
         assert_eq!(
             workflow["$defs"]["agentType"]["enum"],
             json!(["alpha", "zeta"])
@@ -1756,20 +1871,20 @@ mod tests {
     /// value.
     #[test]
     fn a_conversation_without_roles_loses_the_agent_type_field_entirely() {
-        let spawn = agent_spawn_schema_for_roles(&[], false, &PromptProfile::builtin_english());
+        let spawn = agent_spawn_schema_for_roles(&[], false, ToolVariant::Standard, &PromptProfile::builtin_english());
         assert!(spawn["properties"].get("agent_type").is_none(), "{spawn}");
         assert!(spawn.get("not").is_none(), "{spawn}");
         // Only the role selector is removed; other tool properties remain.
         assert!(spawn["properties"].get("prompt").is_some());
         assert!(spawn["properties"].get("schema").is_some());
 
-        let workflow = workflow_schema_for_roles(&[], false, &PromptProfile::builtin_english());
+        let workflow = workflow_schema_for_roles(&[], false, ToolVariant::Standard, &PromptProfile::builtin_english());
         assert!(workflow.get("$defs").is_none(), "{workflow}");
         let description = workflow["properties"]["script"]["description"]
             .as_str()
             .expect("script description");
         assert!(
-            description.contains("no named agent configured"),
+            description.contains("no role is available to this conversation"),
             "没有角色时要说清楚，而不是继续描述一个用不了的选项：{description}"
         );
     }
@@ -1778,7 +1893,7 @@ mod tests {
     /// selecting another skill mid-conversation leaves the tool set untouched.
     #[test]
     fn the_skill_schema_names_no_skill_and_lists_no_trigger() {
-        let schema = builtin_tool_schema("skill", &PromptProfile::builtin_english())
+        let schema = builtin_tool_schema("skill", ToolVariant::Standard, &PromptProfile::builtin_english())
             .expect("skill has a static schema");
 
         assert!(
@@ -1809,7 +1924,7 @@ mod tests {
         let names = vec!["alpha".to_owned()];
 
         let required =
-            agent_spawn_schema_for_roles(&names, true, &PromptProfile::builtin_english());
+            agent_spawn_schema_for_roles(&names, true, ToolVariant::Standard, &PromptProfile::builtin_english());
         assert_eq!(
             required["required"],
             json!(["prompt", "name", "agent_type"])
@@ -1833,7 +1948,7 @@ mod tests {
         }
 
         let fallback =
-            agent_spawn_schema_for_roles(&names, false, &PromptProfile::builtin_english());
+            agent_spawn_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin_english());
         // Fallback relaxes only role selection; `prompt` and generated task address
         // `name` are required in both modes.
         assert_eq!(fallback["required"], json!(["prompt", "name"]));
@@ -1847,7 +1962,7 @@ mod tests {
     fn requiring_a_role_states_both_the_rule_and_its_enforcement_in_the_script_prose() {
         let names = vec!["alpha".to_owned()];
         let script_prose = |required: bool| {
-            workflow_schema_for_roles(&names, required, &PromptProfile::builtin_english())
+            workflow_schema_for_roles(&names, required, ToolVariant::Standard, &PromptProfile::builtin_english())
                 ["properties"]["script"]["description"]
                 .as_str()
                 .expect("script description")
@@ -1954,7 +2069,7 @@ mod tests {
         let roles = vec![role("reviewer", "证伪既有结论。")];
 
         let mut spawn =
-            agent_spawn_schema_for_roles(&names, false, &PromptProfile::builtin_english());
+            agent_spawn_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin_english());
         let spawn_base = spawn["description"]
             .as_str()
             .expect("spawn description")
@@ -1968,7 +2083,7 @@ mod tests {
             .to_owned();
 
         let mut workflow =
-            workflow_schema_for_roles(&names, false, &PromptProfile::builtin_english());
+            workflow_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin_english());
         let workflow_base = workflow["description"]
             .as_str()
             .expect("workflow description")
@@ -2005,7 +2120,7 @@ mod tests {
     /// committed-tree boundary, retention rule, and cost.
     #[test]
     fn the_script_description_states_what_isolation_actually_does() {
-        let description = workflow_schema(None, false, &PromptProfile::builtin_english())
+        let description = workflow_schema(None, false, ToolVariant::Standard, &PromptProfile::builtin_english())
             ["properties"]["script"]["description"]
             .as_str()
             .expect("script description")
@@ -2026,7 +2141,7 @@ mod tests {
     fn every_public_tool_has_a_builtin_schema() {
         for tool in tool_catalog() {
             assert!(
-                builtin_tool_schema(&tool.name, &PromptProfile::builtin_english()).is_some(),
+                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin_english()).is_some(),
                 "{} lacks a hand-authored schema",
                 tool.name
             );
@@ -2037,7 +2152,7 @@ mod tests {
     fn every_builtin_schema_is_a_closed_object_with_a_factual_description() {
         for tool in tool_catalog() {
             let schema =
-                builtin_tool_schema(&tool.name, &PromptProfile::builtin_english()).unwrap();
+                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
             assert_eq!(schema["type"], "object", "{}", tool.name);
             let description = schema["description"].as_str().unwrap_or_default();
             assert!(
@@ -2053,7 +2168,7 @@ mod tests {
     fn schema_properties_match_catalog_parameters() {
         for tool in tool_catalog() {
             let schema =
-                builtin_tool_schema(&tool.name, &PromptProfile::builtin_english()).unwrap();
+                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
             let schema_properties = properties(&schema);
             let parameters: BTreeSet<String> = tool
                 .parameters
@@ -2109,7 +2224,7 @@ mod tests {
         );
         assert!(!tool_catalog().iter().any(|tool| tool.name == "playwright"));
         for name in &names {
-            let schema = builtin_tool_schema(name, &PromptProfile::builtin_english()).unwrap();
+            let schema = builtin_tool_schema(name, ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
             assert!(
                 schema.get("oneOf").is_none(),
                 "{name} must be a flat tool, not a discriminated union"
@@ -2127,7 +2242,7 @@ mod tests {
                 continue;
             }
             let schema =
-                builtin_tool_schema(&tool.name, &PromptProfile::builtin_english()).unwrap();
+                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
             if schema["properties"].get("serverId").is_none() {
                 assert!(
                     tool.name == "preview_start" || tool.name == "preview_list",
@@ -2158,7 +2273,7 @@ mod tests {
     #[test]
     fn preview_start_descriptions_quote_the_launch_json_format_verbatim() {
         let english = format!(
-            "Start a dev server by name from .mewrk/launch.json. If .mewrk/launch.json doesn't exist, create it first with this format:\n{}\n{} Reuses the server if already running. ALWAYS use this instead of Bash for running servers. If the deliverable is already published as an Artifact, update the Artifact instead of starting a server to show it.",
+            "Start a dev server by name from .mewrk/launch.json. If .mewrk/launch.json doesn't exist, create it first with this format:\n{}\n{} Reuses the server if already running.{{?@shell}} ALWAYS use this instead of a shell command for running servers.{{/}} If the deliverable is already published as an Artifact, update the Artifact instead of starting a server to show it.",
             crate::preview_launch_config::LAUNCH_JSON_FORMAT,
             crate::preview_launch_config::LAUNCH_JSON_FORMAT_NOTES
         );
@@ -2172,7 +2287,7 @@ mod tests {
     fn required_entries_reference_declared_properties() {
         for tool in tool_catalog() {
             let schema =
-                builtin_tool_schema(&tool.name, &PromptProfile::builtin_english()).unwrap();
+                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
             let schema_properties = properties(&schema);
             if let Some(required) = schema["required"].as_array() {
                 for entry in required {
@@ -2190,24 +2305,43 @@ mod tests {
     /// Sole authoritative generator for `docs/context-injections/builtin-tool-schemas.json`.
     ///
     /// Golden-file comparison keeps the design baseline current without parsing `json!`.
-    fn baseline_document() -> String {
-        let tools: Vec<Value> = tool_catalog()
+    ///
+    /// Every variant of every tool is in it (`crate::tool_surface`): a tool a
+    /// run property turns into another tool has one entry per variant, each
+    /// naming its `variant`, the standard one first.
+    fn baseline_document(profile: &PromptProfile) -> String {
+        let catalog = tool_catalog();
+        // Rendered as a run offering every tool sees it, so each sentence about
+        // a sibling is in the baseline; the markers themselves are in the
+        // prompt-profile export.
+        let offered = crate::tool_mentions::OfferedTools::everything();
+        let tools: Vec<Value> = catalog
             .iter()
-            .map(|tool| {
-                json!({
-                    "name": tool.name,
-                    "schema": builtin_tool_schema(&tool.name, &PromptProfile::builtin_english()).expect("public tool schema"),
+            .flat_map(|tool| {
+                let variants = crate::tool_surface::variants_of(&tool.name);
+                let offered = &offered;
+                variants.iter().map(move |variant| {
+                    let mut schema =
+                        builtin_tool_schema(&tool.name, *variant, profile).expect("public tool schema");
+                    crate::tool_mentions::resolve_schema(&mut schema, offered);
+                    let schema = without_empty_descriptions(schema);
+                    if variants.len() == 1 {
+                        json!({ "name": tool.name, "schema": schema })
+                    } else {
+                        json!({ "name": tool.name, "variant": variant.id(), "schema": schema })
+                    }
                 })
             })
             .collect();
         let document = json!({
             "kind": "mewrk-builtin-tool-schema-baseline",
-            "note": "Model-visible parameter schemas (context layer 2: what things are, with every boundary as a JSON Schema keyword). Generated by builtin_schemas.rs tests; regenerate with: cargo test --lib -- builtin_schemas::tests::regenerate_builtin_schema_baseline --ignored",
+            "note": "Model-visible parameter schemas (context layer 2: what things are, with every boundary as a JSON Schema keyword), one entry per variant of a tool whose contract a run property changes (src-tauri/src/tool_surface.rs), rendered as a run that offers every tool sees them (sentences about a sibling a run lacks are dropped there: src-tauri/src/tool_mentions.rs). Generated by builtin_schemas.rs tests; regenerate with: cargo test --lib -- builtin_schemas::tests::regenerate_builtin_schema_baseline --ignored",
             "source": "src-tauri/src/builtin_schemas.rs::builtin_tool_schema",
-            "toolCount": tools.len(),
+            "toolCount": catalog.len(),
+            "variantCount": tools.len(),
             "tools": tools,
             "internalTools": {
-                "subagent_update": subagent_update_schema(&PromptProfile::builtin_english()),
+                "subagent_update": without_empty_descriptions(subagent_update_schema(profile)),
             },
         });
         let mut rendered = serde_json::to_string_pretty(&document).expect("baseline JSON");
@@ -2215,30 +2349,67 @@ mod tests {
         rendered
     }
 
-    fn baseline_path() -> std::path::PathBuf {
+    /// One baseline per built-in profile: the guided one, which every user
+    /// file falls back to, and the concise one.
+    fn baselines() -> [(&'static str, String); 2] {
+        [
+            ("builtin-tool-schemas.json", baseline_document(&PromptProfile::builtin_english())),
+            ("builtin-tool-schemas.concise.json", baseline_document(&PromptProfile::builtin_concise())),
+        ]
+    }
+
+    fn baseline_path(name: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../docs/context-injections/builtin-tool-schemas.json")
+            .join("../docs/context-injections")
+            .join(name)
     }
 
     #[test]
     fn builtin_schema_baseline_is_current() {
-        let expected = baseline_document();
-        let current = std::fs::read_to_string(baseline_path()).unwrap_or_default();
-        assert!(
-            current == expected,
-            "docs/context-injections/builtin-tool-schemas.json 已过期；运行\n  cargo test --lib -- builtin_schemas::tests::regenerate_builtin_schema_baseline --ignored\n重新生成后一并提交"
+        for (name, expected) in baselines() {
+            let current = std::fs::read_to_string(baseline_path(name)).unwrap_or_default();
+            assert!(
+                current == expected,
+                "docs/context-injections/{name} 已过期；运行\n  cargo test --lib -- builtin_schemas::tests::regenerate_builtin_schema_baseline --ignored\n重新生成后一并提交"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "writes the design baselines under docs/; run explicitly to regenerate"]
+    fn regenerate_builtin_schema_baseline() {
+        for (name, contents) in baselines() {
+            std::fs::write(baseline_path(name), contents).expect("write baseline");
+        }
+    }
+
+    #[test]
+    fn empty_descriptions_leave_the_wire_but_a_parameter_named_description_stays() {
+        let schema = without_empty_descriptions(json!({
+            "type": "object",
+            "description": "",
+            "properties": {
+                "description": { "type": "string", "description": "" },
+                "path": { "type": "string", "description": "kept" },
+                "items": { "type": "array", "items": { "type": "string", "description": "" } }
+            }
+        }));
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "description": { "type": "string" },
+                    "path": { "type": "string", "description": "kept" },
+                    "items": { "type": "array", "items": { "type": "string" } }
+                }
+            })
         );
     }
 
     #[test]
-    #[ignore = "writes the design baseline under docs/; run explicitly to regenerate"]
-    fn regenerate_builtin_schema_baseline() {
-        std::fs::write(baseline_path(), baseline_document()).expect("write baseline");
-    }
-
-    #[test]
     fn task_wait_bounds_track_agents_constants() {
-        let schema = builtin_tool_schema("task_wait", &PromptProfile::builtin_english()).unwrap();
+        let schema = builtin_tool_schema("task_wait", ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
         let timeout = &schema["properties"]["timeout_seconds"];
         assert_eq!(timeout["minimum"], json!(WAIT_MIN_TIMEOUT_SECONDS));
         assert_eq!(timeout["maximum"], json!(WAIT_MAX_TIMEOUT_SECONDS));
@@ -2247,5 +2418,141 @@ mod tests {
             schema["properties"]["tasks"]["maxItems"],
             json!(MAX_WAIT_AGENT_NAMES)
         );
+    }
+
+    /// Every description a built-in schema shows the model — root, parameter, nested
+    /// item and `$defs` alike, and the `workspace` parameter — is a key of the prompt
+    /// profile, so a profile can reword any of them. Overriding every key with its own
+    /// id proves no hard-coded English literal is left behind: a description that is
+    /// not one of those markers is prose the registry cannot reach. The reverse holds
+    /// too: every parameter or `$defs` key is reached by some schema, so none is dead.
+    #[test]
+    fn every_model_visible_description_comes_from_the_prompt_profile() {
+        // A text keeps its placeholders, so a key rendered into another (the workflow
+        // script into its `agentType` clause) leaves both markers in the output.
+        let overrides = PromptKey::ALL
+            .iter()
+            .map(|key| {
+                let placeholders = key
+                    .placeholders()
+                    .iter()
+                    .map(|placeholder| format!("{{{placeholder}}}"))
+                    .collect::<String>();
+                (*key, format!("[profile:{}]{placeholders}", key.id()))
+            })
+            .collect();
+        let profile = PromptProfile::from_file(
+            "marked".into(),
+            "Marked".into(),
+            crate::model::ResolvedLanguage::EnUs,
+            overrides,
+            Vec::new(),
+        );
+
+        fn visit(
+            value: &Value,
+            path: &str,
+            reached: &mut BTreeSet<String>,
+            unmarked: &mut Vec<String>,
+        ) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(description) = map.get("description").and_then(Value::as_str) {
+                        if description.starts_with("[profile:") {
+                            for (start, marker) in description.match_indices("[profile:") {
+                                let rest = &description[start + marker.len()..];
+                                if let Some(end) = rest.find(']') {
+                                    reached.insert(rest[..end].to_owned());
+                                }
+                            }
+                        } else {
+                            unmarked.push(format!("{path}: {description}"));
+                        }
+                    }
+                    for (key, child) in map {
+                        visit(child, &format!("{path}.{key}"), reached, unmarked);
+                    }
+                }
+                Value::Array(items) => {
+                    for (index, child) in items.iter().enumerate() {
+                        visit(child, &format!("{path}[{index}]"), reached, unmarked);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mixed = mixed_workspaces();
+        let roles = vec!["alpha".to_owned()];
+        let mut schemas: Vec<(String, Value)> = Vec::new();
+        for tool in tool_catalog() {
+            // Every variant: a variant's text is a key of its own, which only
+            // that variant's schema reaches.
+            for variant in crate::tool_surface::variants_of(&tool.name) {
+                let schema = builtin_tool_schema(&tool.name, *variant, &profile).unwrap();
+                schemas.push((
+                    format!("{}[{}]+workspaces", tool.name, variant.id()),
+                    with_workspace_parameter(schema.clone(), &tool.name, &mixed, &profile),
+                ));
+                schemas.push((format!("{}[{}]", tool.name, variant.id()), schema));
+            }
+        }
+        for name in crate::mewrk_memory::PROJECT_MEMORY_TOOL_NAMES {
+            let schema = builtin_tool_schema(name, ToolVariant::Standard, &profile).unwrap();
+            schemas.push((
+                format!("{name}+workspaces"),
+                with_workspace_parameter(schema, name, &mixed, &profile),
+            ));
+        }
+        for name in ["skill", "tool_search"] {
+            schemas.push((name.to_owned(), builtin_tool_schema(name, ToolVariant::Standard, &profile).unwrap()));
+        }
+        for variant in [ToolVariant::Standard, ToolVariant::Async] {
+            for required in [false, true] {
+                schemas.push((
+                    format!("agent_spawn[{}](roles, required={required})", variant.id()),
+                    agent_spawn_schema_for_roles(&roles, required, variant, &profile),
+                ));
+                schemas.push((
+                    format!("workflow[{}](roles, required={required})", variant.id()),
+                    workflow_schema_for_roles(&roles, required, variant, &profile),
+                ));
+            }
+            schemas.push((
+                format!("agent_spawn[{}](no roles)", variant.id()),
+                agent_spawn_schema_for_roles(&[], false, variant, &profile),
+            ));
+            schemas.push((
+                format!("workflow[{}](no roles)", variant.id()),
+                workflow_schema_for_roles(&[], false, variant, &profile),
+            ));
+        }
+        schemas.push(("subagent_update".to_owned(), subagent_update_schema(&profile)));
+
+        let mut reached = BTreeSet::new();
+        let mut unmarked = Vec::new();
+        for (name, schema) in &schemas {
+            visit(schema, name, &mut reached, &mut unmarked);
+        }
+        assert!(
+            unmarked.is_empty(),
+            "descriptions the prompt profile cannot reach:\n{}",
+            unmarked.join("\n")
+        );
+        // The shell suffix only appears where a machine lacks the shell, which depends
+        // on what this host has installed; the other `workspace` keys do not.
+        let reached_only_on_some_hosts = ["tool.param.workspace_shell_suffix"];
+        // Root descriptions count too, every variant's included: a variant key
+        // no schema reaches is a variant the code forgot to branch to.
+        let dead: Vec<&str> = PromptKey::ALL
+            .iter()
+            .map(|key| key.id())
+            .filter(|id| {
+                id.starts_with("tool.")
+                    && (id.contains(".param.") || id.contains(".defs.") || id.ends_with(".description"))
+            })
+            .filter(|id| !reached_only_on_some_hosts.contains(id) && !reached.contains(*id))
+            .collect();
+        assert!(dead.is_empty(), "schema keys no built-in schema uses: {dead:?}");
     }
 }

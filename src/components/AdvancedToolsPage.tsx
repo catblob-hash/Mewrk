@@ -31,6 +31,16 @@ interface AdvancedToolsPageProps {
     onChangeProject: (enabled: boolean) => void;
   };
   /**
+   * The file write guards, one switch for all of them. Omitted where the
+   * surface does not decide it: a role's runs follow the conversation that
+   * spawns them.
+   */
+  fileWriteGuards?: {
+    enabled: boolean;
+    tone?: LockTone | null;
+    onChange: (enabled: boolean) => void;
+  };
+  /**
    * What the host's messages to the model come in. Omitted where the surface
    * does not decide it: a role's runs follow the conversation that spawns them.
    */
@@ -57,6 +67,7 @@ export function AdvancedToolsPage({
   web,
   webAccess,
   memory,
+  fileWriteGuards,
   hostMessages,
   lockHints
 }: AdvancedToolsPageProps) {
@@ -127,10 +138,28 @@ export function AdvancedToolsPage({
         </section>
       )}
 
-      {/* The five race-safe write guards used to be five switches
-          here. They are unconditional now — every conversation runs
-          with all five — so the section is gone rather than drawn as
-          a row of controls nothing can move. */}
+      {/* The five race-safe write guards — read-before-write, the stale-write
+          refusal, external-change notices, hook re-sync and the formatter
+          hint — are one switch: they stand or fall together with the rules
+          the edit and write descriptions carry for them. */}
+      {fileWriteGuards && (
+        <section className="conversation-settings__field">
+          <LockableSwitchRow
+            title={t("启用文件防误写保护", "Enable file write guards")}
+            description={t(
+              "开启后，修改或覆盖已有文件前必须先读过它；读过之后在磁盘上被改动的文件拒绝直接写入，并把改动告诉模型；钩子或格式化命令改写文件后也会提示重读。关闭后这些检查与通知全部停止，文件工具说明里的相关规则也一并去掉。子代理与工作流跟随本对话。",
+              "When enabled, an existing file must be read before it is edited or overwritten; a file that changed on disk since it was read is refused and the model is told what changed; a hook or formatter rewriting a file prompts a re-read. When disabled, every one of these checks and notices stops, and the file tools' descriptions drop the rules too. Subagents and workflows follow this conversation."
+            )}
+            checked={fileWriteGuards.enabled}
+            tone={fileWriteGuards.tone}
+            hints={lockHints}
+            onChange={fileWriteGuards.onChange}
+            label={fileWriteGuards.enabled
+              ? t("文件防误写保护已开启", "File write guards enabled")
+              : t("文件防误写保护已关闭", "File write guards disabled")}
+          />
+        </section>
+      )}
 
       {hostMessages && (
         <section className="conversation-settings__field">

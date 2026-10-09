@@ -66,10 +66,6 @@ pub(crate) struct LoadedDocument {
     pub refs: crate::attachment_refs::AttachmentRefs,
     /// Conversations whose main timeline ends in a user message.
     unanswered: Vec<String>,
-    /// Whether this load wrote the seed for a brand-new install: no anchor and
-    /// no stored conversations. A rebuilt anchor (missing or unreadable, with
-    /// history in the store) is a recovery, not a first launch.
-    pub fresh_install: bool,
 }
 
 impl LoadedDocument {
@@ -132,9 +128,7 @@ fn load_or_initialize_with(path: &Path, bodies: Bodies) -> Result<LoadedDocument
         seed_conversations(&store, &document)?;
         install_builtin_preset(path, &mut document)?;
         save_unchecked(path, &document)?;
-        let mut loaded = read_document_with(path, bodies)?;
-        loaded.fresh_install = !has_existing_conversations;
-        return Ok(loaded);
+        return read_document_with(path, bodies);
     }
     read_document_with(path, bodies).map_err(|load_error| {
         // No document is read yet, so this follows the system language.
@@ -545,7 +539,9 @@ fn read_document_with(path: &Path, bodies: Bodies) -> Result<LoadedDocument, Str
 /// written with into what this build reads — hook ids that hashed a
 /// handler's position (`capabilities::migrate_legacy_hook_ids`), roles kept in
 /// settings before roles were files
-/// (`agent_roles::migrate_legacy_agent_definitions`) — and returns each
+/// (`agent_roles::migrate_legacy_agent_definitions`), the built-in roles
+/// earlier builds shipped (`agent_roles::drop_retired_builtin_roles`) — and
+/// returns each
 /// conversation whose settings changed, by id, with its settings as they are
 /// now, for [`persist_migrated_settings`].
 fn migrate_loaded_settings(
@@ -574,6 +570,7 @@ fn migrate_loaded_settings(
         app_data,
         crate::agent_roles::user_agents_dir(app_data).as_deref(),
     );
+    crate::agent_roles::drop_retired_builtin_roles(document);
     document
         .workspaces
         .iter()
@@ -1821,7 +1818,6 @@ fn assemble_layout(
         document,
         refs,
         unanswered,
-        fresh_install: false,
     })
 }
 
@@ -3102,12 +3098,38 @@ fn validate_search_result_shaping(
     Ok(())
 }
 
+/// The longest tool-description id a selection may name, in bytes.
+pub(crate) const MAX_TOOL_DESCRIPTION_ID_BYTES: usize = 256;
+
+/// What is wrong with a tool-description selection, if anything — the same
+/// rule for a conversation's (`validate_tool_description_selection`) and a
+/// role file's (`agent_roles::validate_role`), each saying it in its own
+/// words. Whether the id names a file is not asked: a dangling one is allowed,
+/// and reads as the guided built-in when a run resolves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolDescriptionSelectionProblem {
+    Blank,
+    TooLong,
+}
+
+pub(crate) fn tool_description_selection_problem(
+    selection: Option<&str>,
+) -> Option<ToolDescriptionSelectionProblem> {
+    match selection {
+        Some(id) if id.trim().is_empty() => Some(ToolDescriptionSelectionProblem::Blank),
+        Some(id) if id.len() > MAX_TOOL_DESCRIPTION_ID_BYTES => {
+            Some(ToolDescriptionSelectionProblem::TooLong)
+        }
+        _ => None,
+    }
+}
+
 /// Validates inline tool-description selections.
 fn validate_tool_description_selection(label: &str, selection: Option<&str>) -> Result<(), String> {
-    match selection {
-        Some(id) if id.trim().is_empty() => Err(format!("{label}的工具描述选择不能为空串")),
-        Some(id) if id.len() > 256 => Err(format!("{label}的工具描述 ID 过长")),
-        _ => Ok(()),
+    match tool_description_selection_problem(selection) {
+        Some(ToolDescriptionSelectionProblem::Blank) => Err(format!("{label}的工具描述选择不能为空串")),
+        Some(ToolDescriptionSelectionProblem::TooLong) => Err(format!("{label}的工具描述 ID 过长")),
+        None => Ok(()),
     }
 }
 
@@ -4967,6 +4989,35 @@ mod tests {
         assert!(refreshed.workspaces[0].conversations[0].settings.agent_ids.is_empty());
     }
 
+    /// A conversation that selected a built-in role an earlier build shipped
+    /// loads without it, and the store's row loses it too, so a re-read of
+    /// the workspace cannot bring it back.
+    #[test]
+    fn a_load_drops_retired_built_in_roles_from_the_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.v1.json");
+        let mut document = default_document();
+        document.workspaces[0].conversations[0].settings.agent_ids =
+            vec!["agent_builtin_sol".into(), "agent_user_reviewer_00000001".into()];
+        let workspace_id = document.workspaces[0].id.clone();
+        let conversation_id = document.workspaces[0].conversations[0].id.clone();
+        save_all(&path, &document).unwrap();
+
+        let loaded = read_document(&path).unwrap();
+        assert_eq!(
+            loaded.workspaces[0].conversations[0].settings.agent_ids,
+            ["agent_user_reviewer_00000001"]
+        );
+        let store = crate::conversation_store::store_for(&path).unwrap();
+        let shell = store
+            .workspace_conversation_shells(&workspace_id)
+            .unwrap()
+            .into_iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .unwrap();
+        assert_eq!(shell.settings.agent_ids, ["agent_user_reviewer_00000001"]);
+    }
+
     /// The anchor keeps no role rows: they are a scan the renderer repeats at
     /// every start, of files that may be large. A document whose catalog the
     /// renderer filled — even with one id twice — saves and loads.
@@ -4975,9 +5026,19 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("document.v1.json");
         let mut document = default_document();
-        let mut rows = crate::agent_roles::builtin_descriptors(&document);
-        rows.push(rows[0].clone());
-        document.capabilities.agents = rows;
+        let row = crate::agent_roles::AgentRoleDescriptor {
+            descriptor: crate::model::ResourceDescriptor {
+                id: "agent_user_reviewer_00000001".into(),
+                name: "reviewer".into(),
+                description: String::new(),
+                location: "/home/.mewrk/agents/reviewer.json".into(),
+                source: crate::model::ResourceSource::User,
+                available: true,
+                workspace_key: None,
+            },
+            role: Some(serde_json::from_str(r#"{"name":"reviewer"}"#).unwrap()),
+        };
+        document.capabilities.agents = vec![row.clone(), row];
         validate_shape(&document).expect("role rows are no reason to refuse a save");
         save_all(&path, &document).unwrap();
         let anchor: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -5055,6 +5116,7 @@ mod tests {
             native_search_tool: None,
             native_fetch_tool: None,
             template_id: None,
+            tool_description_file_id: None,
         }
     }
 
@@ -6246,9 +6308,17 @@ b"
         assert_eq!(
             seeded_shell(
                 MachineOs::Windows,
-                &[ShellBackend::Bash, ShellBackend::PowerShell]
+                &[ShellBackend::Bash, ShellBackend::WindowsPowerShell]
             ),
-            Some(ShellBackend::PowerShell)
+            Some(ShellBackend::WindowsPowerShell)
+        );
+        // PowerShell 7 comes first where it is installed.
+        assert_eq!(
+            seeded_shell(
+                MachineOs::Windows,
+                &[ShellBackend::Bash, ShellBackend::WindowsPowerShell, ShellBackend::Pwsh]
+            ),
+            Some(ShellBackend::Pwsh)
         );
         assert_eq!(
             seeded_shell(MachineOs::Linux, &[ShellBackend::Zsh, ShellBackend::Sh]),
@@ -6260,7 +6330,7 @@ b"
         let every = builtin_preset_of(&product);
         assert_eq!(
             shells_of(every).len(),
-            4,
+            5,
             "without a probe the preset lists every backend's command tool"
         );
         let mut narrowed = product.clone();
@@ -6269,7 +6339,7 @@ b"
         assert_eq!(shells_of(narrowed), vec!["bash"]);
         assert_eq!(
             narrowed.settings.enabled_tools.len(),
-            every.settings.enabled_tools.len() - 3
+            every.settings.enabled_tools.len() - 4
         );
     }
 
@@ -6360,7 +6430,8 @@ b"
         let mut document = product.clone();
         let mut older = builtin_preset_of(&product).clone();
         older.name = "旧名字".into();
-        older.settings.agent_ids.truncate(1);
+        older.settings.agent_ids = vec!["agent_builtin_opus".into()];
+        older.settings.tool_description_file_id = None;
         older.settings.web_search_enabled = false;
         let mut own = older.clone();
         own.id = "preset_own".into();
@@ -6408,7 +6479,11 @@ b"
         assert_eq!(document.presets.conversation_presets[0], own);
         let installed = builtin_preset_of(&document);
         assert_eq!(installed.name, "mewrk");
-        assert_eq!(installed.settings.agent_ids, crate::agent_roles::BUILTIN_ROLE_IDS);
+        assert!(installed.settings.agent_ids.is_empty());
+        assert_eq!(
+            installed.settings.tool_description_file_id.as_deref(),
+            Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID)
+        );
         assert!(installed.settings.web_search_enabled);
         assert_eq!(
             document.presets.default_conversation_preset_id,
@@ -6453,27 +6528,6 @@ b"
         assert!(installed.settings.skill_ids.is_empty());
         assert!(installed.settings.mcp_ids.is_empty());
         assert!(installed.settings.hook_ids.is_empty());
-    }
-
-    /// A built-in role whose provider row is missing stays selected: it is
-    /// resolved against the providers when asked for, so it reads as a role
-    /// with its model unavailable until the row is back.
-    #[test]
-    fn a_builtin_role_without_its_provider_row_is_left_out() {
-        let mut document = crate::catalog::product_default_document();
-        document
-            .assets
-            .api_providers
-            .retain(|provider| provider.family != crate::model::ProviderFamily::OpenaiCodex);
-        put_builtin_preset(&mut document, None);
-        assert_eq!(
-            builtin_preset_of(&document).settings.agent_ids,
-            crate::agent_roles::BUILTIN_ROLE_IDS
-        );
-        let sol = crate::agent_roles::builtin_definition(&document, crate::agent_roles::BUILTIN_SOL_ID)
-            .unwrap();
-        assert_eq!(sol.model_selection, AgentModelSelection::Unavailable);
-        validate_shape(&document).unwrap();
     }
 
     /// The renderer can neither edit nor delete the built-in preset: a save
@@ -6530,11 +6584,12 @@ b"
         assert_eq!(shells_of(builtin_preset_of(&saved)), vec!["zsh"]);
     }
 
-    /// The built-in preset survives the real save boundary with its role
-    /// bindings intact — including the Codex ones, whose models cannot exist
-    /// until the user signs in.
+    /// The built-in preset survives the real save boundary as the build
+    /// defines it, beside the two built-in provider rows — neither of which
+    /// lists a model yet: Codex lists nothing until the user signs in, and
+    /// Claude Agent until its models are fetched.
     #[test]
-    fn product_default_document_ships_the_builtin_preset_whose_bindings_survive() {
+    fn product_default_document_ships_the_builtin_preset() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("document.seed-presets.json");
         let document = crate::catalog::product_default_document();
@@ -6568,33 +6623,28 @@ b"
             .find(|provider| provider.family == crate::model::ProviderFamily::ClaudeAgent)
             .expect("内置 Claude Agent 行必须在种子里");
 
-        // Signed out, so it has no catalog yet — and that is exactly the case
-        // the retained binding has to survive.
+        // Neither ships a catalog.
         assert!(codex_provider.models.is_empty());
         assert!(!codex_provider.enabled);
         assert!(claude_provider.enabled);
         assert!(
-            !claude_provider.models.is_empty(),
-            "Claude Agent 的模型是本地内置表，种子阶段就该装好"
+            claude_provider.models.is_empty(),
+            "Claude Agent 的模型从 CLI 拉取，种子里没有内置表"
         );
-        assert!(
-            claude_provider
-                .models
-                .iter()
-                .all(|model| !model.id.contains("[1m]")),
-            "1M 上下文的孪生行不入种子"
-        );
-        assert_eq!(
-            claude_provider.active_model_id.as_deref(),
-            claude_provider
-                .models
-                .first()
-                .map(|model| model.id.as_str())
-        );
+        assert_eq!(claude_provider.active_model_id, None);
 
         let preset = builtin_preset_of(&restored);
         assert_eq!(preset.name, "mewrk");
-        assert!(!preset.settings.allow_roleless_subagents);
+        // It renders with the concise built-in tool descriptions.
+        assert_eq!(
+            preset.settings.tool_description_file_id.as_deref(),
+            Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID)
+        );
+        // No role ships, so it selects none, and its children are anonymous
+        // ones on the conversation's model.
+        assert!(preset.settings.agent_ids.is_empty());
+        assert!(preset.settings.agent_definitions.is_empty());
+        assert!(preset.settings.allow_roleless_subagents);
         // Everything on except the names the host derives for itself. The
         // preview tools and `workflow` are on too.
         let withheld = |name: &str| {
@@ -6650,77 +6700,6 @@ b"
         // survives the save boundary either way.
         assert_eq!(preset.template_id, crate::catalog::BUILTIN_PRESET_TEMPLATE_ID);
 
-        assert_eq!(preset.settings.agent_ids, crate::agent_roles::BUILTIN_ROLE_IDS);
-        assert!(preset.settings.agent_definitions.is_empty());
-        let roles = preset
-            .settings
-            .agent_ids
-            .iter()
-            .map(|id| crate::agent_roles::builtin_definition(&restored, id).expect("内置角色"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            roles
-                .iter()
-                .map(|role| role.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Opus", "Sonnet", "Sol", "Luna"]
-        );
-        for role in &roles {
-            // Every role holds every tool a role can hold, and says what it is
-            // for: the listing is how the model picks one.
-            assert_eq!(role.tools, Some(crate::agent_roles::all_role_tool_names()));
-            assert!(!role.description.trim().is_empty(), "{} 缺少说明", role.name);
-        }
-        let binding = |name: &str| {
-            roles
-                .iter()
-                .find(|role| role.name == name)
-                .map(|role| role.model_selection.clone())
-                .expect("角色必须在")
-        };
-        assert_eq!(
-            binding("Opus"),
-            AgentModelSelection::Explicit {
-                provider_id: claude_provider.id.clone(),
-                model_id: "claude-opus-5-5".into(),
-            }
-        );
-        assert!(
-            claude_provider
-                .models
-                .iter()
-                .any(|model| model.id == "claude-opus-5-5"),
-            "Opus 绑定的模型要在种子表里，新装即可用"
-        );
-        assert_eq!(
-            binding("Sonnet"),
-            AgentModelSelection::Explicit {
-                provider_id: claude_provider.id.clone(),
-                model_id: "claude-sonnet-5-5".into(),
-            }
-        );
-        assert!(
-            claude_provider
-                .models
-                .iter()
-                .any(|model| model.id == "claude-sonnet-5-5"),
-            "Sonnet 绑定的模型要在种子表里，新装即可用"
-        );
-        assert_eq!(
-            binding("Sol"),
-            AgentModelSelection::Explicit {
-                provider_id: codex_provider.id.clone(),
-                model_id: "gpt-6.1-sol".into(),
-            },
-            "未登录的 Codex 绑定必须原样活过一次存取"
-        );
-        assert_eq!(
-            binding("Luna"),
-            AgentModelSelection::Explicit {
-                provider_id: codex_provider.id.clone(),
-                model_id: "gpt-6-luna".into(),
-            }
-        );
     }
 
     #[test]
@@ -7352,28 +7331,6 @@ b"
         assert!(has_notice);
     }
 
-    /// Only the start that writes the seed for a brand-new install is a first
-    /// launch; the renderer runs its first-launch setup on that answer alone.
-    #[test]
-    fn only_seeding_a_brand_new_install_is_a_fresh_install() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("document.v1.json");
-        assert!(load_or_recover_scanned(&path).unwrap().fresh_install);
-        // The next start reads the anchor the first one wrote.
-        assert!(!load_or_recover_scanned(&path).unwrap().fresh_install);
-
-        // An anchor lost while the store still holds conversations is a recovery.
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("document.v1.json");
-        save_all(&path, &default_document()).unwrap();
-        fs::remove_file(&path).unwrap();
-        assert!(!load_or_recover_scanned(&path).unwrap().fresh_install);
-
-        // So is an anchor that no longer loads.
-        fs::write(&path, b"{ definitely broken").unwrap();
-        assert!(!load_or_recover_scanned(&path).unwrap().fresh_install);
-    }
-
     #[test]
     fn current_schema_empty_provider_catalog_is_not_reseeded() {
         let directory = tempfile::tempdir().unwrap();
@@ -7592,7 +7549,7 @@ b"
         let previous = default_document();
         let mut dangling = previous.clone();
         dangling.presets.conversation_presets[0].settings.agent_ids =
-            vec!["agent_user_gone_00000000".into(), crate::agent_roles::BUILTIN_OPUS_ID.into()];
+            vec!["agent_user_gone_00000000".into(), "agent_user_opus_00000003".into()];
         assert!(validate_save_transition(&previous, &dangling, &state).is_ok());
         for ids in [vec![" ".to_owned()], vec!["a".to_owned(), "a".to_owned()]] {
             let mut invalid = previous.clone();
@@ -7617,11 +7574,11 @@ b"
         assert!(!agent_ids_differ(&previous, &previous.clone()));
         let mut selected = previous.clone();
         selected.presets.conversation_presets[0].settings.agent_ids =
-            vec![crate::agent_roles::BUILTIN_LUNA_ID.into()];
+            vec!["agent_user_luna_00000004".into()];
         assert!(agent_ids_differ(&previous, &selected));
         let mut conversation = previous.workspaces[0].conversations[0].clone();
         assert!(!conversation_agent_ids_differ(Some(&previous.workspaces[0].conversations[0]), &conversation));
-        conversation.settings.agent_ids.push(crate::agent_roles::BUILTIN_LUNA_ID.into());
+        conversation.settings.agent_ids.push("agent_user_luna_00000004".into());
         assert!(conversation_agent_ids_differ(Some(&previous.workspaces[0].conversations[0]), &conversation));
         // A project's new-task draft is a place a selection lives too.
         let mut drafted = previous.clone();
@@ -7632,7 +7589,7 @@ b"
         assert!(agent_ids_differ(&previous, &drafted));
         let mut reselected = drafted.clone();
         reselected.workspaces[0].draft_conversation.as_mut().unwrap().settings.agent_ids =
-            vec![crate::agent_roles::BUILTIN_LUNA_ID.into()];
+            vec!["agent_user_luna_00000004".into()];
         assert!(agent_ids_differ(&drafted, &reselected));
     }
 

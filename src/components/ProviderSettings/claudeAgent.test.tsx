@@ -4,11 +4,7 @@ import type { ComponentProps, ReactNode } from "react";
 import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestDocument } from "../../test/fixtures";
-import {
-  CLAUDE_AGENT_LEGAL_URL,
-  CLAUDE_AGENT_REGISTRY,
-  ensureClaudeAgentProvider
-} from "../../lib/claudeAgentProvider";
+import { CLAUDE_AGENT_LEGAL_URL, ensureClaudeAgentProvider } from "../../lib/claudeAgentProvider";
 import { normalizeDocument } from "../../lib/runtime";
 import type {
   ApiProvider,
@@ -304,28 +300,23 @@ describe("Claude Agent provider", () => {
     expect(runtimeMocks.claudeAgentComponentStatus).not.toHaveBeenCalled();
   });
 
-  it("discovers the seed rows in the browser preview", async () => {
+  it("discovers placeholder rows in the browser preview", async () => {
     const user = userEvent.setup();
     const { getSettings } = renderProviders();
 
     await user.click(screen.getByRole("button", { name: "Claude Agent" }));
     await user.click(screen.getByRole("button", { name: "拉取模型" }));
 
-    // The preview has no CLI to ask, so its discovery page lists the seed rows;
-    // installing all of them is what turns the list into the provider's models.
-    expect(await screen.findByRole("button", { name: "添加到提供商 claude-opus-5" })).toBeInTheDocument();
+    // The preview has no CLI to ask, so its discovery page lists placeholder
+    // rows; installing all of them is what turns the list into the provider's models.
+    expect(await screen.findByRole("button", { name: "添加到提供商 claude-opus-preview" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "添加全部结果" }));
 
     await waitFor(() => expect(
       getSettings().apiProviders.find((provider) => provider.family === "claude_agent")!.models
-    ).toHaveLength(CLAUDE_AGENT_REGISTRY.length));
-
-    const models = getSettings().apiProviders.find((provider) => provider.family === "claude_agent")!.models;
-    expect(models.map((model) => model.id).sort()).toEqual(CLAUDE_AGENT_REGISTRY.map((entry) => entry.id).sort());
-    // The window, not a `[1m]` id, states the budget.
-    expect(models.some((model) => model.id.includes("[1m]"))).toBe(false);
-    expect(models.find((model) => model.id === "claude-opus-5")).toMatchObject({ contextWindow: 200000 });
-    expect(models.find((model) => model.id === "claude-sonnet-5")).toMatchObject({ contextWindow: 1000000 });
+        .map((model) => model.id)
+        .sort()
+    ).toEqual(["claude-opus-preview", "claude-sonnet-preview"]));
   });
 });
 

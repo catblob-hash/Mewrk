@@ -10,7 +10,7 @@ describe("canRerunTool", () => {
   });
 
   it("refuses every tool that mutates something outside the conversation record", () => {
-    for (const name of ["write", "edit", "bash", "powershell", "preview_click", "preview_fill", "preview_eval", "preview_start", "preview_stop", "preview_resize", "preview_dialog"]) {
+    for (const name of ["write", "edit", "bash", "pwsh", "powershell", "preview_click", "preview_fill", "preview_eval", "preview_start", "preview_stop", "preview_resize", "preview_dialog"]) {
       expect(canRerunTool(name), name).toBe(false);
     }
   });

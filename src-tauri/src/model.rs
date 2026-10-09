@@ -900,11 +900,9 @@ pub struct AgentDefinition {
     /// same shape as `tools`: `None` follows the calling conversation's
     /// selection, and `Some` is the role's own selection out of the catalog
     /// the conversation can reach — the global level and its workspaces.
-    /// For skills and servers an empty list is a real "none": they replace
-    /// the caller's. Hooks only ever add: the child always runs the guards it
-    /// inherited from its caller (`api::hook_runs_in_subagent`), and the
-    /// role's own hooks on top of them, so an empty `hook_ids` means "no
-    /// hooks of its own", never "no guards".
+    /// An empty list is a real "none": a role's own selection replaces the
+    /// caller's, hooks included, so a role with an empty `hook_ids` runs none
+    /// of the calling conversation's guards.
     ///
     /// Resolved when the child is configured
     /// (`api::apply_role_capabilities`), from the files, never from the
@@ -1005,6 +1003,20 @@ pub struct AgentDefinition {
     /// May dangle. A deleted template leaves the id in place and seeds nothing.
     #[serde(default)]
     pub template_id: Option<String>,
+    /// The tool-description file this role's child renders with — its tool
+    /// schemas, its system prompt and every text of its own run — or `None` to
+    /// render with its caller's. Resolved at spawn and at every resume
+    /// (`api::apply_role_prompt_profile`) the way a conversation's selection
+    /// is, so a dangling id reads as the guided built-in. What the caller's
+    /// model reads about the child keeps the caller's wording whatever this
+    /// says.
+    ///
+    /// NOT capability-bearing, on the reading `template_id` is: it changes
+    /// wording, never a tool or a model, so it is absent from the frozen
+    /// binding projection and a change revokes no bound child — it applies
+    /// from the next spawn or resumed turn.
+    #[serde(default)]
+    pub tool_description_file_id: Option<String>,
 }
 
 /// Persisted host resolution for one trusted named-agent definition.
@@ -2807,6 +2819,12 @@ pub struct HookContextMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct ToolDescriptionEntry {
     pub tool_name: String,
+    /// Which variant of the tool the description is for
+    /// (`tool_surface::ToolVariant::id`): empty is the standard one. A tool
+    /// that a run property turns into a different tool — `edit` with and
+    /// without the file write guards — is described once per variant.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub variant: String,
     #[serde(default, alias = "schemaNotes")]
     pub description: String,
 }
@@ -2842,8 +2860,8 @@ pub struct ConversationPresetSettings {
     #[serde(default)]
     pub tool_description_file_id: Option<String>,
     /// Subagent roles copied into a new conversation, by catalog id, in the
-    /// same shape as `skill_ids`: each names one `agents/*.json` file or a
-    /// built-in role (`agent_roles`). A dangling id is skipped.
+    /// same shape as `skill_ids`: each names one `agents/*.json` file
+    /// (`agent_roles`). A dangling id is skipped.
     #[serde(default)]
     pub agent_ids: Vec<String>,
     /// Roles as presets stored them before roles were files. Read only as the
@@ -2890,12 +2908,14 @@ pub struct ConversationPresetSettings {
     /// missing key means `user`.
     #[serde(default)]
     pub host_message_container: HostMessageContainer,
+    /// File-write-guards template copied into a new conversation
+    /// ([`ConversationSettings::file_write_guards_enabled`]). A missing key
+    /// means ON.
+    #[serde(default = "default_true")]
+    pub file_write_guards_enabled: bool,
     // A sandbox template was copied into new conversations from here. The
     // sandbox is a setting of each workspace now, so a preset has none; an
     // old preset's key is read past and not written back.
-    // The five file write guards were preset templates here. They are
-    // unconditional in the host now, so there is nothing left to copy into a
-    // conversation. See [`FileGuard`].
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -3495,6 +3515,17 @@ pub struct ConversationSettings {
     /// ([`HostMessageContainer`]). A missing key means `user`.
     #[serde(default)]
     pub host_message_container: HostMessageContainer,
+    /// Whether this conversation, and every child agent and workflow step it
+    /// spawns, runs with the file write guards ([`FileGuard`]). A missing key
+    /// means ON: the guards were unconditional before the switch existed.
+    ///
+    /// Off is off throughout: no read-before-write or stale-write refusal, no
+    /// notice of a file changed on disk, no hook re-sync, no formatter hint,
+    /// and `edit`/`write` are described in their `unguarded` variant
+    /// (`tool_surface::Axis::FileWriteGuards`). The legacy per-mechanism keys
+    /// (`fileGuard*`) are a different shape and stay ignored.
+    #[serde(default = "default_true")]
+    pub file_write_guards_enabled: bool,
     /// How this conversation auto-compacts ([`CompactionMethod`]). `None` on a
     /// conversation from before the choice existed, which hands off as it
     /// always did, and on the new-task draft, which has not chosen yet: the
@@ -3521,27 +3552,43 @@ pub struct ConversationSettings {
     pub tool_lock: Option<ConversationToolLock>,
 }
 
-/// The file guard a run executes under: the read-record scope it consults.
-/// Host-only; never crosses IPC.
+/// The file guard a run executes under: whether it enforces the guards at all,
+/// and the read-record scope it consults. Host-only; never crosses IPC.
 ///
-/// There is no policy beside it any more. The five mechanisms ported from
-/// Claude Code's `readFileState` — read-before-write, the stale-write refusal,
-/// external-change notices, hook re-sync and the formatter hint — used to be
-/// five per-conversation switches. They are unconditional now: every run of
-/// every conversation, and every child of one, enforces all five, so the only
-/// thing left to resolve per run is WHICH record it reads.
+/// The five mechanisms ported from Claude Code's `readFileState` —
+/// read-before-write, the stale-write refusal, external-change notices, hook
+/// re-sync and the formatter hint — are one system behind one switch,
+/// [`ConversationSettings::file_write_guards_enabled`]: a run enforces all
+/// five or none. With the guards off nothing is recorded or checked, nothing
+/// is announced, and `edit`/`write` are offered as the unguarded tools they
+/// then are (`tool_surface::ToolVariant::Unguarded`). A child agent and a
+/// workflow step follow the run that spawned them.
 ///
 /// The scope is a key into [`crate::file_read_state::FileReadRegistry`]. A
 /// top-level run's scope is its conversation. A child agent gets a scope of its
 /// own, seeded from its parent's record the first time it is touched — Claude
 /// Code hands a subagent a clone of `readFileState`, and a child's later reads
 /// and writes must not count as the parent's: the parent never saw them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileGuard {
+    /// Whether the guards are on for this run.
+    pub enabled: bool,
     /// Empty means "the conversation id".
     pub scope: String,
     /// The scope to seed this one from on first use.
     pub parent_scope: Option<String>,
+}
+
+impl Default for FileGuard {
+    /// The guards on, over the conversation's own record: what a conversation
+    /// that never turned them off runs with.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scope: String::new(),
+            parent_scope: None,
+        }
+    }
 }
 
 /// The tool surface a conversation's last request went out with, and which
@@ -3626,6 +3673,10 @@ pub struct ConversationToolLock {
     /// messages in, on the same terms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_message_container: Option<HostMessageContainer>,
+    /// Whether the last request ran with the file write guards (they decide
+    /// how `edit` and `write` are described), on the same terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_write_guards: Option<bool>,
 }
 
 /// Which model a conversation's last request used, and when (RFC 3339).
@@ -3706,6 +3757,8 @@ impl<'de> Deserialize<'de> for ConversationToolLock {
             prompt_profile: Option<String>,
             #[serde(default)]
             host_message_container: Option<HostMessageContainer>,
+            #[serde(default)]
+            file_write_guards: Option<bool>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -3748,6 +3801,7 @@ impl<'de> Deserialize<'de> for ConversationToolLock {
             hook_ids: raw.hook_ids,
             prompt_profile: raw.prompt_profile,
             host_message_container: raw.host_message_container,
+            file_write_guards: raw.file_write_guards,
         })
     }
 }
@@ -3769,14 +3823,39 @@ pub struct ResolvedSkill {
 /// One skill that reaches the model as a host notice rather than through the
 /// opening prompt, already rendered in the conversation's prompt profile and
 /// its delivery mode.
+///
+/// Host-only and never persisted: it lives on [`RunModelRequest::added_skills`],
+/// which is skipped by serde, and is rebuilt from the conversation's selection
+/// at every turn. What persists is the card it becomes, so a field added here
+/// needs no default for old data — only the card ids do.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AddedSkill {
-    /// Catalog resource id. The context id is derived from it, which is what
-    /// keeps a second round from delivering the same skill again.
+    /// Catalog resource id. The context id is derived from it and from
+    /// [`Self::form`], which is what keeps a second round from delivering the
+    /// same skill again.
     pub resource_id: String,
     /// The skill's name, for the notice's summary line.
     pub name: String,
     pub content: String,
+    /// Which of the two notices `content` is. The two are delivered under
+    /// different ids, because the switch between them can be flipped after
+    /// one was sent: an announcement does not stand in for the instructions
+    /// once the `skill` tool that would have served them is gone.
+    pub form: AddedSkillForm,
+}
+
+/// The shape a mid-conversation skill reaches the model in, which follows
+/// the conversation's `skill_tool_enabled` at the turn it is delivered.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AddedSkillForm {
+    /// Its name and trigger: the instructions stay behind the `skill` tool.
+    #[default]
+    Trigger,
+    /// Its instructions. `body` is the skill's own text as the notice quotes
+    /// it, before the folder line — what tells a card that already carried it
+    /// apart from one that only announced the skill, for the cards older
+    /// builds wrote under one id for both (`api::added_skill_delivery_id`).
+    Body { body: String },
 }
 
 /// One message the host has for the model, waiting for the round loop to hand
@@ -4362,7 +4441,8 @@ impl<'a> From<&'a AgentDefinitionBinding> for AgentDefinitionBindingV1<'a> {
 /// CURRENT provider/model); `memoryLanguage` and `memoryToolNames`
 /// (`api::request_memory_language`, `api::enabled_memory_tool_names`);
 /// `systemPromptSnapshot`/`systemPromptReceipt` (the parent's assembled prompt
-/// plus `subagent_prompt::render(PromptVersion::current(..), ..)`); a named
+/// plus `subagent_prompt::render(PromptVersion::current(..), ..)`, whose notes
+/// follow whether the child holds a shell or a `preview_*` tool); a named
 /// binding's `source`/`sourceKey`/`name` (WHICH definition the model resolved,
 /// not just its content) together with `revision`, `memoryEpoch`,
 /// provider/model, `memory` and `scopeKey` (any definition edit); and
@@ -4768,10 +4848,11 @@ pub struct RunModelRequest {
     /// from the conversation's own settings.
     #[serde(skip)]
     pub host_message_container: HostMessageContainer,
-    /// The file write guards this run enforces and the read-record scope they
-    /// consult. Host-only like the switches above: `trusted_run_request` reads
-    /// the policy from the conversation's own settings, and the scope is a
-    /// process-local key the renderer has no business naming.
+    /// Whether this run enforces the file write guards, and the read-record
+    /// scope they consult. Host-only like the switches above:
+    /// `trusted_run_request` reads the switch from the conversation's own
+    /// settings, and the scope is a host key the renderer has no business
+    /// naming.
     #[serde(skip)]
     pub file_guard: FileGuard,
     /// The MCP tools whose schemas this run withheld, in discovery order.
@@ -4915,11 +4996,20 @@ pub struct RunModelRequest {
     /// tool-description overrides plus the wording of every fixed injection
     /// point. Resolved by `trusted_run_request` from the conversation's
     /// selection (a built-in or a discovered `~/.mewrk/tool-descriptions` file)
-    /// and inherited unchanged by child agents. Host-only for the same reason
-    /// as the fields above: neither the renderer nor the model may hand a run a
-    /// text the user never selected.
+    /// and inherited by child agents — unless the child's role names a file of
+    /// its own (`api::apply_role_prompt_profile`). Host-only for the same
+    /// reason as the fields above: neither the renderer nor the model may hand
+    /// a run a text the user never selected.
     #[serde(skip)]
     pub prompt_profile: std::sync::Arc<crate::prompt_profile::PromptProfile>,
+    /// The prompt profile of the run this one reports to, or `None` for a run
+    /// that reports to nobody. What the caller's model reads about a child —
+    /// its result, the notes on how it failed or stopped — is in the caller's
+    /// wording, whatever profile the child's role chose for the child's own
+    /// texts (`agents::AgentShared::caller_prompt_profile`). Set by
+    /// `agent_child_template`; host-only like `prompt_profile`.
+    #[serde(skip)]
+    pub caller_prompt_profile: Option<std::sync::Arc<crate::prompt_profile::PromptProfile>>,
     /// MCP transports dialed for this run. Host-owned; never accepted from renderer IPC.
     /// Filled by `trusted_run_request` from the document's enabled MCP servers that this
     /// conversation actually selected.

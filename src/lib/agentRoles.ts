@@ -33,8 +33,7 @@ export type AgentTypeNameError =
  *
  * `inherit` always resolves: it rides the caller's own provider and model.
  * `unavailable` never does — there is no pair left to re-check: an older build
- * wrote it in place of a binding it had found dead, and the host lists a
- * built-in role whose provider family is missing this way.
+ * wrote it in place of a binding it had found dead.
  *
  * This matters beyond the editor's own validation. The host hides a role whose
  * model does not resolve from the listing it sends the model, so such a role is
@@ -53,8 +52,8 @@ export function agentModelSelectionIsAvailable(
 }
 
 /**
- * The roles a conversation can reach: the global level and the built-ins, plus
- * the conversation's own workspaces. A role of a workspace the conversation does
+ * The roles a conversation can reach: the global level, plus the conversation's
+ * own workspaces. A role of a workspace the conversation does
  * not have is one no run of it can see — the page draws a selection of it as
  * dangling, and the host never offers it. `workspaceKeys` omitted narrows
  * nothing, which is a preset: it points at no workspace in particular.
@@ -101,8 +100,8 @@ export function hasUsableAgentRole(
  * Every surface that COUNTS roles uses this, the same population the roles page
  * divides by: a dangling id is still a row the user can untick, but counting it
  * would announce a role nothing can call. `workspaceKeys` narrows that population
- * the way the page does — the global level and the built-ins, plus the
- * conversation's own workspaces — so a role of a workspace this conversation
+ * the way the page does — the global level, plus the conversation's own
+ * workspaces — so a role of a workspace this conversation
  * does not have is dangling here too. Omitted, nothing is narrowed (a preset).
  */
 export function selectedAgentRoleCount(

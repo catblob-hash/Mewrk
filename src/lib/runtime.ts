@@ -13,6 +13,7 @@ import {
   emptyConversationPresetSettings
 } from "./conversationPresets";
 import { isHostDerivedToolName, isWebToolName } from "./taskTools";
+import { fileWriteGuardsEnabledOf } from "./fileWriteGuards";
 import { hostMessageContainerOf } from "./hostMessages";
 import type { HostMessageContainer, JsonValue, SandboxSettings, SandboxSupport, ShellBackend } from "../types";
 import type {
@@ -117,7 +118,7 @@ import {
 } from "./appearance";
 import { PRIMARY_MODIFIER, SHORTCUT_COMMANDS, concreteBinding, isValidBinding, orderBinding } from "./shortcuts";
 import { NATIVE_FETCH_TOOLS, NATIVE_SEARCH_TOOLS } from "../types";
-import { CLAUDE_AGENT_REGISTRY, ensureClaudeAgentProvider } from "./claudeAgentProvider";
+import { ensureClaudeAgentProvider } from "./claudeAgentProvider";
 import { ensureCodexProvider } from "./codexProvider";
 import { estimateTokens } from "./contextTokens";
 import { normalizeAutoCompactSettings } from "./autoCompact";
@@ -220,7 +221,9 @@ function normalizeConversationPresetSettings(
     skillToolEnabled: input.skillToolEnabled === true,
     mcpToolDiscoveryEnabled: input.mcpToolDiscoveryEnabled === true,
     // Absent on a preset written before the choice existed: Claude Code's form.
-    hostMessageContainer: hostMessageContainerOf(input as { hostMessageContainer?: HostMessageContainer })
+    hostMessageContainer: hostMessageContainerOf(input as { hostMessageContainer?: HostMessageContainer }),
+    // Absent on a preset written before the switch existed: guards on.
+    fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(input as { fileWriteGuardsEnabled?: boolean })
   };
 }
 
@@ -1103,6 +1106,9 @@ export function normalizeAgentRole(value: unknown): AgentRole | null {
     webSearch: normalizeConversationWebSearch(input.webSearch, DEFAULT_CONVERSATION_WEB_SEARCH),
     templateId: typeof input.templateId === "string" && input.templateId
       ? input.templateId
+      : null,
+    toolDescriptionFileId: typeof input.toolDescriptionFileId === "string" && input.toolDescriptionFileId
+      ? input.toolDescriptionFileId
       : null
   };
 }
@@ -1505,7 +1511,10 @@ export function normalizeDocument(value: unknown): AppDocument {
       promptProfile: typeof lockInput.promptProfile === "string" ? lockInput.promptProfile : null,
       hostMessageContainer: lockInput.hostMessageContainer === "box" || lockInput.hostMessageContainer === "user"
         ? lockInput.hostMessageContainer
-        : null
+        : null,
+      // Absent on a lock from before the switch: nothing is known of whether
+      // that request's tool descriptions carried the guard rules.
+      fileWriteGuards: typeof lockInput.fileWriteGuards === "boolean" ? lockInput.fileWriteGuards : null
     };
   };
   const normalizeConversationSettingsValue = (value: unknown): ConversationSettings => {
@@ -1557,6 +1566,8 @@ export function normalizeDocument(value: unknown): AppDocument {
       mcpToolDiscoveryEnabled: settingsInput.mcpToolDiscoveryEnabled === true,
       // Absent means user messages, the host's own default.
       hostMessageContainer: hostMessageContainerOf(settingsInput as { hostMessageContainer?: HostMessageContainer }),
+      // Absent means the guards are on, the host's own default.
+      fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(settingsInput as { fileWriteGuardsEnabled?: boolean }),
       // Absent on a conversation from before the choice (it hands off) and on
       // the draft, which settles it by the model when it becomes a conversation.
       ...(settingsInput.compactionMethod === "handoff" || settingsInput.compactionMethod === "native"
@@ -2024,24 +2035,12 @@ export async function deleteConversationTemplate(templateId: string): Promise<vo
   await invoke("delete_conversation_template", { templateId });
 }
 
-/** Whether the host's last `load_document` said this process started on a brand-new install. */
-let freshInstall = false;
-
 export async function loadDocument(): Promise<AppDocument> {
   if (hasBackendRuntime()) {
     const loaded = await invoke<unknown>("load_document");
-    freshInstall = record(loaded)?.freshInstall === true;
     return withUnloadedBodies(normalizeDocument(loaded), record(loaded)?.unloadedConversationIds);
   }
   return browserLoad();
-}
-
-/**
- * Whether the app started on a brand-new install, as the document load reported
- * it: the host seeded the document this process. The browser preview never does.
- */
-export function startedOnFreshInstall(): boolean {
-  return freshInstall;
 }
 
 /**
@@ -3399,8 +3398,7 @@ export interface SaveAgentRoleTarget {
  * written. A role is a JSON file the user owns — `<level>/.mewrk/agents/` —
  * like a skill folder or an `mcp.json`, so only the host can write one; it
  * validates the body the way discovery does and refuses rather than write a
- * file discovery would mark unavailable. A built-in role cannot be saved; the
- * editor saves a global copy instead. The caller rescans.
+ * file discovery would mark unavailable. The caller rescans.
  */
 export async function saveAgentRole(target: SaveAgentRoleTarget, role: AgentRole): Promise<string> {
   if (!hasBackendRuntime()) throw new Error("浏览器预览无法保存角色");
@@ -3415,8 +3413,7 @@ export async function saveAgentRole(target: SaveAgentRoleTarget, role: AgentRole
 
 /**
  * Deletes a discovered role's file, wherever the scan found it. The host
- * re-discovers before deleting and refuses a built-in, so the renderer passes
- * only the catalog id. Conversations that selected it keep a dangling id. The
+ * re-discovers before deleting, so the renderer passes only the catalog id. Conversations that selected it keep a dangling id. The
  * caller rescans.
  */
 export async function deleteAgentRole(roleId: string): Promise<void> {
@@ -3749,7 +3746,9 @@ function previewModels(provider: ApiProvider): ModelProfile[] {
     reasoningContent: normalizeReasoningContent(undefined, provider.family),
     promptCache: true
   };
-  if (provider.family === "anthropic") {
+  // A Claude Agent fetch asks the bundled CLI, which the preview does not have,
+  // so it gets the same placeholder rows as the Messages API.
+  if (provider.family === "anthropic" || provider.family === "claude_agent") {
     return [
       {
         id: "claude-sonnet-preview",
@@ -3770,19 +3769,6 @@ function previewModels(provider: ApiProvider): ModelProfile[] {
         ...common
       }
     ];
-  }
-  if (provider.family === "claude_agent") {
-    // The host asks the bundled CLI, which the preview does not have, so the
-    // preview serves the seed rows instead.
-    return CLAUDE_AGENT_REGISTRY.map(({ id, name, contextWindow, maxOutputTokens }) => ({
-      id,
-      name,
-      group: "claude",
-      contextWindow,
-      maxOutputTokens,
-      capabilities: ["image_recognition"],
-      ...common
-    }));
   }
   return [
     {

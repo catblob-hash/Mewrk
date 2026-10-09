@@ -209,8 +209,7 @@ export function CapabilitySelectionPage<
   onProbeMcpServer,
   rowActions,
   rowDetail: rowDetailOf,
-  rowBadge,
-  rowLabel
+  rowBadge
 }: {
   kind: Kind;
   /** Unique among the lists on screen: the preset editor mounts a second copy. */
@@ -290,11 +289,6 @@ export function CapabilitySelectionPage<
    * slot first: the badge is one slot with one meaning at a time.
    */
   rowBadge?: (resource: R) => ReactNode;
-  /**
-   * What the row's switch is called, where the name does not tell two rows
-   * apart. Defaults to the name.
-   */
-  rowLabel?: (resource: R) => string | undefined;
 }) {
   const { t } = useI18n();
   const [query, setQuery] = useState("");
@@ -462,7 +456,6 @@ export function CapabilitySelectionPage<
         id={resource.id}
         sort={sort}
         name={resource.name}
-        label={rowLabel?.(resource)}
         detail={rowDetail(
           resource.description,
           rowDetailOf?.(resource),
@@ -676,9 +669,9 @@ type OpenRoleEditor = { mode: "create" } | { mode: "edit"; resource: AgentRoleRe
 /**
  * The agent-roles page.
  *
- * A role is a file like a skill is — `~/.mewrk/agents/<file>.json`, a
- * workspace's `.mewrk/agents/<file>.json`, or one of the built-ins — so the page
- * is the same catalog page the skills are drawn on, and the row's switch means
+ * A role is a file like a skill is — `~/.mewrk/agents/<file>.json` or a
+ * workspace's `.mewrk/agents/<file>.json` — so the page is the same catalog
+ * page the skills are drawn on, and the row's switch means
  * the same thing there: this conversation offers that role to the model. What a
  * role page adds is the row's model, the button that opens the role in its own
  * window, and a way to write a new file without leaving the pane. The one policy
@@ -736,9 +729,9 @@ export function AgentRolesPage({
   onReveal?: (kind: CapabilityResourceKind, workspaceKey: string | null) => void;
   onProbeMcpServer?: (resource: ResourceDescriptor) => Promise<McpProbeReport>;
   /**
-   * Deletes a role's file. Never offered for a built-in. A promise resolving
-   * `false` says the file is still there, and the role's remembered draft is
-   * then kept; anything else counts as removed.
+   * Deletes a role's file. A promise resolving `false` says the file is still
+   * there, and the role's remembered draft is then kept; anything else counts
+   * as removed.
    */
   onDelete?: (resource: AgentRoleResource) => Promise<boolean> | undefined;
   /**
@@ -784,15 +777,10 @@ export function AgentRolesPage({
     return id;
   });
   /* A role written from here is meant to be used here: creating one also selects
-     it in this conversation — or in the preset this pane is a window onto. A copy
-     of a built-in takes the built-in's place when that was selected, so saving a
-     changed built-in does not leave both offered under one name. */
-  const selectCreated = (id: string, replaces: string | null) => {
+     it in this conversation — or in the preset this pane is a window onto. */
+  const selectCreated = (id: string) => {
     const { agentIds, onChange: write } = latest.current;
-    const next = replaces && agentIds.includes(replaces)
-      ? [...new Set(agentIds.map((existing) => (existing === replaces ? id : existing)))]
-      : [...agentIds.filter((existing) => existing !== id), id];
-    write({ agentIds: next });
+    write({ agentIds: [...agentIds.filter((existing) => existing !== id), id] });
   };
 
   return (
@@ -826,27 +814,16 @@ export function AgentRolesPage({
           ? agentRoleModelLabel(resource.role.modelSelection, providers, t)
           : null}
         rowBadge={(resource) => {
-          const builtin = resource.source === "builtin";
           const noModel = resource.role !== null
             && !agentModelSelectionIsAvailable(resource.role.modelSelection, providers);
-          if (!builtin && !noModel) return null;
-          return <>
-            {/* A copy of a built-in is a global role of the same name, so the
-                two rows have to be told apart by more than their position. */}
-            {builtin && <em className="catalog-row__badge">{t("内置", "Built-in")}</em>}
-            {noModel && <em className="catalog-row__badge catalog-row__badge--warning">{t("模型不可用", "No model")}</em>}
-          </>;
+          if (!noModel) return null;
+          return <em className="catalog-row__badge catalog-row__badge--warning">{t("模型不可用", "No model")}</em>;
         }}
-        rowLabel={(resource) => (resource.source === "builtin"
-          ? t("{name}（内置）", "{name} (built-in)", { name: resource.name })
-          : undefined)}
         /* An unreadable file has no body to open; its reason is in the tooltip,
            and the file is fixed where it lives. */
         rowActions={(resource) => resource.role && (
           <IconButton
-            label={resource.source === "builtin"
-              ? t("设置内置角色 {name}", "Configure built-in role {name}", { name: resource.name })
-              : t("设置角色 {name}", "Configure role {name}", { name: resource.name })}
+            label={t("设置角色 {name}", "Configure role {name}", { name: resource.name })}
             onClick={() => setEditor({ mode: "edit", resource })}
           ><Settings2 size={13} /></IconButton>
         )}

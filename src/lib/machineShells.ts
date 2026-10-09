@@ -19,14 +19,14 @@ import type { TerminalShell } from "./workspaces";
  * Mewrk's own and the only one: nothing asks the user to rank shells.
  */
 export const SHELL_BACKENDS_BY_OS: Record<MachineOs, readonly ShellBackend[]> = {
-  windows: ["powershell", "bash"],
+  windows: ["pwsh", "powershell", "bash"],
   macos: ["zsh", "bash", "sh"],
   linux: ["bash", "zsh", "sh"],
   wsl: ["bash", "zsh", "sh"]
 };
 
 /** Every backend, in the order its tools are listed. Mirrors `ShellBackend::ALL`. */
-const SHELL_BACKENDS: readonly ShellBackend[] = ["bash", "zsh", "sh", "powershell"];
+const SHELL_BACKENDS: readonly ShellBackend[] = ["bash", "zsh", "sh", "pwsh", "powershell"];
 
 export function isShellBackend(value: unknown): value is ShellBackend {
   return typeof value === "string" && (SHELL_BACKENDS as readonly string[]).includes(value);
@@ -37,7 +37,8 @@ export function shellBackendLabel(backend: ShellBackend): string {
     case "bash": return "Bash";
     case "zsh": return "zsh";
     case "sh": return "sh";
-    case "powershell": return "PowerShell";
+    case "pwsh": return "PowerShell 7";
+    case "powershell": return "Windows PowerShell";
   }
 }
 
@@ -123,23 +124,40 @@ export function availableShellBackends(
 }
 
 /**
- * Whether a terminal on `machine` can start `backend`. Mirrors the host's
+ * The terminal shell a backend's terminal starts. Terminals are not split the
+ * way the shell tools are: PowerShell is one terminal shell, which the host
+ * starts as `pwsh` where installed and as `powershell.exe` otherwise, so both
+ * PowerShell backends map to it.
+ */
+function terminalShellOf(backend: ShellBackend): TerminalShell {
+  switch (backend) {
+    case "pwsh":
+    case "powershell": return "powershell";
+    case "bash": return "bash";
+    case "zsh": return "zsh";
+    case "sh": return "sh";
+  }
+}
+
+/**
+ * Whether a terminal on `machine` can start `shell`. Mirrors the host's
  * `terminal::TerminalLaunch`: this machine refuses `sh`, whose line editor
  * cannot hold a line for the Git mutex; a WSL distribution has no PowerShell;
  * an SSH machine runs whatever it has, PowerShell being its agent's own default
  * on Windows.
  */
-function terminalCanStart(machine: RunTarget | null, backend: ShellBackend): boolean {
-  if (!machine) return backend !== "sh";
-  if (machine.kind === "wsl") return backend !== "powershell";
+function terminalCanStart(machine: RunTarget | null, shell: TerminalShell): boolean {
+  if (!machine) return shell !== "sh";
+  if (machine.kind === "wsl") return shell !== "powershell";
   return true;
 }
 
 /**
  * The shells a terminal in a workspace on `machine` can start, most preferred
  * first: the ones its probe found, in its OS's priority order, that a terminal
- * there can run. The first is the one a terminal nobody chose a shell for
- * starts. Empty when the probe found none of them.
+ * there can run. Both PowerShell editions are one terminal shell, listed once
+ * at the place of the more preferred. The first is the one a terminal nobody
+ * chose a shell for starts. Empty when the probe found none of them.
  */
 export function terminalShellsFor(
   machine: RunTarget | null | undefined,
@@ -149,7 +167,14 @@ export function terminalShellsFor(
   const target = machine ?? null;
   const { os, backends } = knownShells(target, probes, platform);
   const ranked = os ? SHELL_BACKENDS_BY_OS[os] : SHELL_BACKENDS;
-  return ranked.filter((backend) => backends.includes(backend) && terminalCanStart(target, backend));
+  const shells: TerminalShell[] = [];
+  for (const backend of ranked) {
+    if (!backends.includes(backend)) continue;
+    const shell = terminalShellOf(backend);
+    if (shells.includes(shell) || !terminalCanStart(target, shell)) continue;
+    shells.push(shell);
+  }
+  return shells;
 }
 
 /** The catalog with every shell tool whose backend is not in `backends` removed. */

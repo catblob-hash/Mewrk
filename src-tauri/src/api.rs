@@ -274,7 +274,10 @@ const SUBAGENT_DISABLED_TOOL_NAMES: &[&str] = &[
     // travel on the child's own request, already resolved by the host from the
     // parent conversation's selection, and the call is a lookup in memory. A
     // child doing work the user packaged a skill for should be able to read
-    // that skill; a role that disagrees can still exclude it by name.
+    // that skill. A role that disagrees can still exclude the tool by name in
+    // `disallowedTools`, which withholds the tool and not the skills: they
+    // reach that role's child as bodies in its prompt instead
+    // (`capabilities::role_refuses_skill_tool`).
 ];
 
 fn subagent_tool_is_disabled(name: &str) -> bool {
@@ -1664,7 +1667,7 @@ impl ProjectMemoryRunState {
         call: &ToolCall,
         result: &ToolResult,
         opened_file: Option<&tool_executor::VerifiedOpenedFile>,
-        file_touch: Option<&tool_executor::FileGuardTouch>,
+        file_touch: Option<&tool_executor::FileTouch>,
         instructions_loaded: Option<&InstructionsLoadedRunDispatcher>,
     ) -> Result<(), String> {
         if call.name != "read" || !result.success {
@@ -2891,6 +2894,13 @@ fn run_model_inner(
         ));
     }
     drop(initial_definition_authority);
+
+    // A conversation running without its file write guards keeps no record of
+    // what it reads; the one it kept while they were on is dropped, so turning
+    // them back on starts from nothing rather than from a stale record.
+    if !request.file_guard.enabled && request.subagent_depth == 0 {
+        state.file_read_state.forget_conversation(&request.conversation_id);
+    }
 
     // Advisory, so a document read failure must not fail the turn.
     if should_inject_agent_types(&request) {
@@ -5394,10 +5404,11 @@ fn apply_profile_tool_override(
     tool_name: &str,
     base: String,
 ) -> String {
+    // An MCP tool has one form, so only an entry naming no variant is its.
     match profile
         .tools
         .iter()
-        .find(|entry| entry.tool_name.trim() == tool_name)
+        .find(|entry| entry.tool_name.trim() == tool_name && entry.variant.trim().is_empty())
     {
         Some(entry) if !entry.description.trim().is_empty() => entry.description.clone(),
         _ => base,
@@ -5479,17 +5490,6 @@ fn attach_mcp_tools(request: &mut RunModelRequest, state: &AppState) -> Result<(
                 )
             })
             .unwrap_or_default();
-        let description = if binding.confirmation_required() {
-            format!(
-                "{}{}",
-                request
-                    .prompt_profile
-                    .text(PromptKey::McpMandatoryDescriptionPrefix),
-                binding.description
-            )
-        } else {
-            binding.description.clone()
-        };
         // MCP tools are discovered per run, so they miss the registry fold that
         // gives a built-in its description (`PromptProfile::from_file`) and have
         // no key of their own — their description belongs to the server that
@@ -5498,8 +5498,23 @@ fn attach_mcp_tools(request: &mut RunModelRequest, state: &AppState) -> Result<(
         let description = apply_profile_tool_override(
             &request.prompt_profile,
             &binding.exposed_name,
-            description,
+            binding.description.clone(),
         );
+        // A tool that needs the user's approval on every call says so whatever
+        // text describes it: the notice belongs to the approval, not to the
+        // server's wording or the profile's, so an override replaces the one
+        // and never removes the other.
+        let description = if binding.confirmation_required() {
+            format!(
+                "{}{}",
+                request
+                    .prompt_profile
+                    .text(PromptKey::McpMandatoryDescriptionPrefix),
+                description
+            )
+        } else {
+            description
+        };
         request.tools.push(ToolDescriptor {
             force_confirmation: false,
             approval_note: None,
@@ -5519,6 +5534,19 @@ fn attach_mcp_tools(request: &mut RunModelRequest, state: &AppState) -> Result<(
     request.enabled_tools.sort();
     request.enabled_tools.dedup();
     request.mcp_bindings = bindings;
+    // Last, once the role's policy and the name collisions have had their say:
+    // a server can come out of discovery with nothing to offer and still not
+    // have failed (an empty `tools/list`, every tool switched off, every tool
+    // filtered out), and its row would keep presenting it as usable. This
+    // precedes `defer_mcp_tools`, which keeps every binding whatever it does
+    // to the names, so a server whose tools are only withheld is not dropped.
+    request.assembled_system_prompt = prompt_without_toolless_mcp_servers(
+        &request.assembled_system_prompt,
+        &request.mcp_prompt_section,
+        &request.mcp_servers,
+        &request.mcp_bindings,
+        &request.prompt_profile,
+    );
     defer_mcp_tools(request);
     Ok(())
 }
@@ -5567,25 +5595,19 @@ fn add_mcp_workspace_parameter(binding: &mut crate::mcp::McpToolBinding) -> bool
 
 /// Tells the turn which selected servers could not be used and why — a
 /// connection that failed, the 60-second listing budget running out, a tool or
-/// schema limit — and takes them out of the system prompt's server list.
+/// schema limit.
 ///
 /// The other servers' tools are offered as usual; a failure here never fails
 /// the run. The notice goes to the model, which would otherwise look for tools
 /// that are not there, and to the timeline, where it is the user's only sign
-/// that a server they selected did nothing this turn.
+/// that a server they selected did nothing this turn. Taking the server out of
+/// the system prompt's list is not done here but once at the end of discovery
+/// ([`prompt_without_toolless_mcp_servers`]), which a failed server also
+/// satisfies by having no tool.
 fn report_unusable_mcp_servers(request: &mut RunModelRequest, failures: &[crate::mcp::McpDiscoveryFailure]) {
     if failures.is_empty() {
         return;
     }
-    let dropped = failures
-        .iter()
-        .map(|failure| failure.server_id.clone())
-        .collect::<HashSet<_>>();
-    request.assembled_system_prompt = request.mcp_prompt_section.without(
-        &request.assembled_system_prompt,
-        &dropped,
-        &request.prompt_profile,
-    );
     let profile = &request.prompt_profile;
     let rows = failures
         .iter()
@@ -5608,6 +5630,49 @@ fn report_unusable_mcp_servers(request: &mut RunModelRequest, failures: &[crate:
         id: None,
     };
     request.host_notices.push(notice);
+}
+
+/// `prompt` with the row of every selected server that holds no tool binding
+/// taken out of the `## Selected MCP servers` list; the whole section goes,
+/// separator included, when no server is left.
+///
+/// The list is written before any server is dialed, and a server can end up
+/// with nothing to offer without having failed: its `tools/list` came back
+/// empty, the user switched all its tools off, the role's policy filtered them
+/// all out, or every one collided with a tool already named. A failed server
+/// has no binding either, which is why failures need no separate pass. The row
+/// would go on presenting the server as usable, so it goes with them.
+///
+/// `bindings` is what the run holds once discovery and every filter are done.
+/// Discovery mode only takes the tools' names out of `enabled_tools`
+/// (`defer_mcp_tools` keeps the bindings), so a server whose tools are merely
+/// withheld still has a binding here and keeps its row: `tool_search` hands
+/// those tools out.
+///
+/// One call with every dropped server, never one per cause:
+/// `McpPromptSection::without` rewrites the section from its original
+/// rendering, so a second call on the first one's result finds nothing to
+/// replace.
+fn prompt_without_toolless_mcp_servers(
+    prompt: &str,
+    section: &crate::capabilities::McpPromptSection,
+    servers: &[crate::mcp::RuntimeMcpServer],
+    bindings: &[crate::mcp::McpToolBinding],
+    profile: &PromptProfile,
+) -> String {
+    let with_tools = bindings
+        .iter()
+        .map(|binding| binding.server.server_id.as_str())
+        .collect::<HashSet<_>>();
+    let toolless = servers
+        .iter()
+        .filter(|server| !with_tools.contains(server.server_id.as_str()))
+        .map(|server| server.server_id.clone())
+        .collect::<HashSet<_>>();
+    if toolless.is_empty() {
+        return prompt.to_owned();
+    }
+    section.without(prompt, &toolless, profile)
 }
 
 /// Withholds the MCP tools' schemas from the wire and announces their names.
@@ -6422,21 +6487,24 @@ fn execute_model_tool(
 #[derive(Default)]
 struct ToolFileIdentities {
     opened_read_file: Option<tool_executor::VerifiedOpenedFile>,
-    file_touch: Option<tool_executor::FileGuardTouch>,
+    file_touch: Option<tool_executor::FileTouch>,
 }
 
-/// The file guard this request executes under, as the executor wants it.
+/// The file guard this request executes under, as the executor wants it, or
+/// `None` when the conversation turned the file write guards off: then nothing
+/// is recorded, checked or announced, exactly as for a call no conversation
+/// owns.
 fn file_guard_context<'a>(
     request: &'a RunModelRequest,
     state: &'a AppState,
-) -> tool_executor::FileGuardContext<'a> {
-    tool_executor::FileGuardContext {
+) -> Option<tool_executor::FileGuardContext<'a>> {
+    request.file_guard.enabled.then(|| tool_executor::FileGuardContext {
         scope: crate::file_read_state::ScopeRef {
             id: request.file_guard_scope(),
             parent: request.file_guard.parent_scope.as_deref(),
         },
         registry: &state.file_read_state,
-    }
+    })
 }
 
 /// The sandbox's refusal of this call, if it has one
@@ -6537,7 +6605,7 @@ fn execute_model_tool_with_scope(
         &request.workspaces,
         handoff,
         &request.prompt_profile,
-        Some(file_guard_context(request, state)),
+        file_guard_context(request, state),
         Some(call_id),
     );
     (
@@ -7173,6 +7241,7 @@ fn web_search_request_template(
         run_environment: Default::default(),
         workspaces: Default::default(),
         prompt_profile: parent.prompt_profile.clone(),
+        caller_prompt_profile: Some(parent.prompt_profile.clone()),
         // An isolated search request has no reason to read or write the
         // user's memory, and must not be able to exfiltrate it to a page.
         global_memory_enabled: false,
@@ -8413,17 +8482,17 @@ fn conversation_allows_roleless_subagents(
 /// The returned names are also the injection targets: these are exactly the
 /// descriptors whose schema has to carry this conversation's role names.
 fn agent_type_selector_tools(enabled_tools: &[String]) -> Vec<&'static str> {
-    let mut selectors = Vec::new();
-    if enabled_tools.iter().any(|tool| tool == "agent_spawn") {
-        selectors.push("agent_spawn");
-    }
-    if enabled_tools
-        .iter()
-        .any(|tool| tool == workflow::WORKFLOW_TOOL)
-    {
-        selectors.push(workflow::WORKFLOW_TOOL);
-    }
-    selectors
+    ["agent_spawn", workflow::WORKFLOW_TOOL]
+        .into_iter()
+        .filter(|selector| enabled_tools.iter().any(|tool| tool == selector))
+        .collect()
+}
+
+/// Whether `name` is a tool [`inject_agent_type_schemas`] may give its own
+/// `input_schema`. That schema is built from the prompt profile like any
+/// built-in's, so it leaves the wire as one does (`aisdk::step::tool_specs`).
+pub(crate) fn carries_role_schema(name: &str) -> bool {
+    name == "agent_spawn" || name == workflow::WORKFLOW_TOOL
 }
 
 /// Top level only, and only when the model can actually act on it.
@@ -8488,17 +8557,24 @@ fn inject_agent_type_schemas(
         .map(|role| role.name.clone())
         .collect::<Vec<_>>();
     let carrier = role_description_carrier(&request.enabled_tools);
+    // The schema is built here, ahead of the step builder, so it is built in
+    // the variant the step builder would pick: on a model that takes
+    // asynchronous calls these are the `async` tools.
+    let surface = crate::tool_surface::ToolSurface::of(request);
     for tool in agent_type_selector_tools(&request.enabled_tools) {
+        let variant = surface.variant_of(tool);
         let mut schema = if tool == "agent_spawn" {
             crate::builtin_schemas::agent_spawn_schema_for_roles(
                 &names,
                 role_required,
+                variant,
                 &request.prompt_profile,
             )
         } else {
             crate::builtin_schemas::workflow_schema_for_roles(
                 &names,
                 role_required,
+                variant,
                 &request.prompt_profile,
             )
         };
@@ -8515,14 +8591,31 @@ fn inject_agent_type_schemas(
     }
 }
 
-/// Stable card id for a skill delivered as a host notice.
+/// Stable card id for a skill announced as a host notice: its name and
+/// trigger, for a conversation that loads skills with the `skill` tool.
 ///
 /// Derived from the skill's catalog id, which is the whole of the
 /// de-duplication: the next round finds the card already in the transcript and
 /// delivers nothing. It carries the delivery prefix, because the card is a
 /// host delivery like every other host notice.
+///
+/// Builds before the body had an id of its own delivered either form under
+/// this one, so a card found here may hold the instructions as well
+/// ([`added_skill_delivery_id`]).
 pub(crate) fn added_skill_context_id(resource_id: &str) -> String {
     format!("{AGENT_RESULT_CONTEXT_ID_PREFIX}skill_{resource_id}")
+}
+
+/// Stable card id for a skill whose instructions are delivered as a host
+/// notice, for a conversation that has skill bodies pasted rather than loaded.
+///
+/// Kept apart from the announcement's id because the switch between the two
+/// forms can be flipped after one was sent, and then the one sent is not the
+/// one the conversation needs: an announcement points at a `skill` tool the
+/// switch has just taken away. The two cannot collide, since a skill's
+/// catalog id begins with `skill_` and never with `body_`.
+pub(crate) fn added_skill_body_context_id(resource_id: &str) -> String {
+    format!("{AGENT_RESULT_CONTEXT_ID_PREFIX}skill_body_{resource_id}")
 }
 
 /// The id conversations recorded before skills arrived as host notices gave
@@ -8530,6 +8623,55 @@ pub(crate) fn added_skill_context_id(resource_id: &str) -> String {
 /// not handed the skill a second time.
 fn legacy_added_skill_context_id(resource_id: &str) -> String {
     format!("ctx_skill_{resource_id}")
+}
+
+/// The id `skill` is still owed under, or `None` when the transcript already
+/// tells the model what this notice would.
+///
+/// The announcement is owed only while nothing about the skill was delivered:
+/// instructions already in the transcript say more than a trigger would. The
+/// instructions are owed until they were delivered — under their own id, or
+/// as a legacy system card. The card under the announcement's id is read
+/// rather than trusted, because older builds used that id for both forms: if
+/// its text holds the skill's body, the model has read the instructions,
+/// whatever the card announced them as, and it is not handed them again.
+fn added_skill_delivery_id(
+    skill: &crate::model::AddedSkill,
+    delivered: &HashMap<&str, &ContextItem>,
+) -> Option<String> {
+    let announced = added_skill_context_id(&skill.resource_id);
+    let body_id = added_skill_body_context_id(&skill.resource_id);
+    let present = |id: &str| delivered.contains_key(id);
+    if present(&legacy_added_skill_context_id(&skill.resource_id)) || present(&body_id) {
+        return None;
+    }
+    match &skill.form {
+        crate::model::AddedSkillForm::Trigger => (!present(&announced)).then_some(announced),
+        crate::model::AddedSkillForm::Body { body } => {
+            // A reminder escapes a closing tag inside what it wraps, so the
+            // body is looked for in that form too.
+            let body = body.trim();
+            let carried = delivered
+                .get(announced.as_str())
+                .and_then(|card| delivered_text(card))
+                .is_some_and(|text| {
+                    text.contains(body)
+                        || text.contains(&crate::wire_history::escape_reminder_closer(body))
+                });
+            (!carried).then_some(body_id)
+        }
+    }
+}
+
+/// The text a card in the transcript put in front of the model, whichever
+/// carrier it took: a delivery card's result, or the message an older build
+/// recorded in its place.
+fn delivered_text(context: &ContextItem) -> Option<&str> {
+    match context {
+        ContextItem::Tool { result, .. } => Some(&result.output),
+        ContextItem::User { content, .. } | ContextItem::System { content, .. } => Some(content),
+        ContextItem::Assistant { .. } | ContextItem::Reasoning { .. } => None,
+    }
 }
 
 /// Puts each skill selected after this conversation opened in front of the
@@ -8541,28 +8683,33 @@ fn legacy_added_skill_context_id(resource_id: &str) -> String {
 /// dialects that pin their tool set it could not join the `skill` tool's schema
 /// either. So it arrives here instead: once, at the round it was added, at the
 /// end of the transcript, and carried by the history from then on.
+///
+/// The list is read, not taken. A child spawned later in this run starts from
+/// an empty history under the same opening prompt, so it is owed the same
+/// notices at its own first round, and it takes them from this request
+/// (`agent_child_template`). Nothing here runs twice in one run, and a second
+/// pass would find every card it queued by its id anyway.
 fn record_added_skill_contexts(request: &mut RunModelRequest) {
     if request.added_skills.is_empty() {
         return;
     }
-    let present = request
+    let delivered = request
         .contexts
         .iter()
-        .map(|context| context.id().to_owned())
-        .collect::<HashSet<_>>();
-    for skill in std::mem::take(&mut request.added_skills) {
-        let id = added_skill_context_id(&skill.resource_id);
-        if present.contains(&id)
-            || present.contains(&legacy_added_skill_context_id(&skill.resource_id))
-        {
-            continue;
-        }
-        request.host_notices.push(crate::model::HostNotice {
-            kind: crate::wire_history::notice_kind::SKILL_ADDED,
-            body: skill.content,
-            id: Some(id),
-        });
-    }
+        .map(|context| (context.id(), context))
+        .collect::<HashMap<_, _>>();
+    let notices = request
+        .added_skills
+        .iter()
+        .filter_map(|skill| {
+            Some(crate::model::HostNotice {
+                kind: crate::wire_history::notice_kind::SKILL_ADDED,
+                body: skill.content.clone(),
+                id: Some(added_skill_delivery_id(skill, &delivered)?),
+            })
+        })
+        .collect::<Vec<_>>();
+    request.host_notices.extend(notices);
 }
 
 /// Executes one `skill` call against the bodies the trusted request carries.
@@ -8789,6 +8936,8 @@ fn rank_deferred_tools(
 /// tool set would have carried. Anything else would teach the model a second
 /// shape for the same thing.
 fn render_tool_functions_block(request: &RunModelRequest, names: &[String]) -> String {
+    let surface = crate::tool_surface::ToolSurface::of(request);
+    let offered = crate::tool_mentions::OfferedTools::of(request);
     let mut lines = vec!["<functions>".to_owned()];
     for name in names {
         let Some(descriptor) = request.tools.iter().find(|tool| &tool.name == name) else {
@@ -8797,11 +8946,7 @@ fn render_tool_functions_block(request: &RunModelRequest, names: &[String]) -> S
         let entry = json!({
             "description": descriptor.description,
             "name": descriptor.name,
-            "parameters": crate::aisdk::tools::tool_schema(
-                descriptor,
-                &request.prompt_profile,
-                &request.workspaces,
-            ),
+            "parameters": crate::aisdk::tools::wire_tool_schema(descriptor, &surface, &offered, request),
         });
         lines.push(format!("<function>{entry}</function>"));
     }
@@ -9537,6 +9682,7 @@ pub(crate) fn apply_named_role_to_fresh_template(
     let (binding, provider, model) =
         initial_agent_definition_binding(parent, &document, &definition)?;
     let template_id = definition.template_id.clone();
+    apply_role_prompt_profile(parent, template, &document, &definition);
     configure_named_agent_template(
         parent,
         template,
@@ -9555,6 +9701,53 @@ pub(crate) fn apply_named_role_to_fresh_template(
     Ok(template_id)
 }
 
+/// Gives the child of a role that names a tool-description file of its own
+/// that file's profile, in place of the caller's its template inherited. The
+/// child's tool schemas, its prompt, its `subagent_update` and
+/// `structured_output` tools, the receipts and notices of its own run, and
+/// what its own tasks inherit are then all worded in it; what the caller's
+/// model reads about the child stays in the caller's wording
+/// (`AgentShared::caller_prompt_profile`). A role that names none, or the
+/// profile its caller already runs, leaves the caller's in place untouched.
+///
+/// Runs before anything words a text for the child —
+/// `configure_named_agent_template` and `apply_role_capabilities` word its
+/// prompt in `template.prompt_profile`, `install_structured_output` its
+/// result tool — at every spawn and every resume, resolved as a
+/// conversation's selection is: a dangling id reads as the guided built-in,
+/// and an edited file reaches the next child.
+fn apply_role_prompt_profile(
+    parent: &RunModelRequest,
+    template: &mut RunModelRequest,
+    document: &crate::model::AppDocument,
+    definition: &AgentDefinition,
+) {
+    let Some(id) = definition.tool_description_file_id.as_deref().map(str::trim) else {
+        return;
+    };
+    // The caller's own file is not read again, so the child words it exactly
+    // as the caller does.
+    if id == parent.prompt_profile.id {
+        return;
+    }
+    let profile = crate::capabilities::resolve_prompt_profile_id(document, Some(id));
+    // A dangling id lands on the guided built-in, which the caller may run.
+    if profile.id == parent.prompt_profile.id {
+        return;
+    }
+    template.prompt_profile = Arc::new(profile);
+    // `agent_child_template` worded the child's progress tool in the caller's
+    // profile, and the child is the one that reads it.
+    let update = subagent_update_descriptor(&template.prompt_profile);
+    if let Some(tool) = template
+        .tools
+        .iter_mut()
+        .find(|tool| tool.name == SUBAGENT_UPDATE_TOOL)
+    {
+        *tool = update;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn configure_named_agent_template(
     parent: &RunModelRequest,
@@ -9568,15 +9761,6 @@ fn configure_named_agent_template(
 ) -> Result<(), String> {
     template.provider = provider;
     template.model = model;
-    // A role carries no prompt of its own: a named child renders the PARENT's
-    // host-assembled prompt through the same addendum an ordinary child gets, so
-    // the two kinds of child cannot drift apart in what they were told about the
-    // task. The addendum's wording follows the parent's prompt profile.
-    template.assembled_system_prompt = subagent_prompt::render(
-        PromptVersion::current(),
-        &parent.assembled_system_prompt,
-        &parent.prompt_profile,
-    );
     template.agent_definition_binding = Some(binding.clone());
     template.inherits_parent_model_memory = false;
     template.fork_model_binding = None;
@@ -9743,11 +9927,90 @@ fn configure_named_agent_template(
     template.web_search.execution.fetch_compression_cutoff = definition
         .fetch_compression_cutoff
         .min(crate::model::MAX_SEARCH_CUTOFF_LIMIT);
+    // Before the overrides, so a role's policy is applied to the MCP names this
+    // may put back as it is to every other.
+    settle_child_mcp_tool_discovery(parent, template, &definition.disallowed_tools);
     // After the memory-tool surgery above: an allowlist computed before it
     // would be applied to a set this function then widens.
     let mut overrides = AgentRunOverrides::from_definition(definition);
     narrow_role_shells(&mut overrides, &template.workspaces);
-    overrides.apply(template, start)
+    overrides.apply(template, start)?;
+    // A role carries no prompt of its own: a named child renders the PARENT's
+    // host-assembled prompt through the same addendum an ordinary child gets, so
+    // the two kinds of child cannot drift apart in what they were told about the
+    // task. The addendum's wording follows the child's prompt profile — the
+    // parent's, unless the role chose a file of its own
+    // (`apply_role_prompt_profile`), in which case `apply_role_capabilities`
+    // words the parent's sections again in it too. Rendered last, because the
+    // addendum's notes follow the child's tools, and the memory surgery, the web
+    // re-derivation and the role's allowlist above all change them.
+    template.assembled_system_prompt = subagent_prompt::render(
+        PromptVersion::current(),
+        &parent.assembled_system_prompt,
+        &template.prompt_profile,
+        &template.enabled_tools,
+    );
+    Ok(())
+}
+
+/// Whether a child withholds its MCP tools' schemas behind `tool_search`.
+///
+/// Only when its parent does and the child can use it: the same rule the
+/// top-level run follows (`trusted_run_request`), asked again for the model the
+/// child actually runs on. A schema `tool_search` hands out joins the tool set
+/// mid-run, which a model that cannot append a tool
+/// (`tool_append::appends_tools`) would take as a rewrite of the tool list at
+/// the head of every later request — its whole prompt cache, once per fetch.
+/// And a role that lists `tool_search` among its `disallowedTools` has no way
+/// to fetch a withheld schema, so its child declares them all up front.
+///
+/// An AND with the parent's answer, never an upgrade: the conversation's switch
+/// is not kept on the request apart from it, so a parent that declares its
+/// schemas up front leaves its children no switch to read.
+fn child_mcp_tool_discovery(
+    parent_discovery: bool,
+    provider: &ApiProvider,
+    model: &ModelProfile,
+    disallowed_tools: &[String],
+) -> bool {
+    parent_discovery
+        && crate::tool_append::appends_tools(provider, model)
+        && !disallowed_tools
+            .iter()
+            .any(|name| name == crate::capabilities::TOOL_SEARCH_TOOL)
+}
+
+/// Re-asks [`child_mcp_tool_discovery`] for a template whose provider and
+/// model have just been bound, and keeps its MCP tools declared when the answer
+/// turns out to be no.
+///
+/// The template inherited its parent's `enabled_tools`, and a parent that
+/// withholds its schemas left every MCP name it had not fetched out of them.
+/// A child that no longer withholds has `defer_mcp_tools` strip only
+/// `tool_search`, so without the names put back here its inherited tools would
+/// be neither declared nor fetchable. They go back before the role's overrides
+/// run, which then allow or deny them like any other tool of the role. A
+/// template with no inherited bindings dials its own servers when it starts
+/// (`attach_mcp_tools`), which declares what it finds.
+fn settle_child_mcp_tool_discovery(
+    parent: &RunModelRequest,
+    template: &mut RunModelRequest,
+    disallowed_tools: &[String],
+) {
+    template.mcp_tool_discovery = child_mcp_tool_discovery(
+        parent.mcp_tool_discovery,
+        &template.provider,
+        &template.model,
+        disallowed_tools,
+    );
+    if !parent.mcp_tool_discovery || template.mcp_tool_discovery {
+        return;
+    }
+    for binding in &template.mcp_bindings {
+        if !template.enabled_tools.contains(&binding.exposed_name) {
+            template.enabled_tools.push(binding.exposed_name.clone());
+        }
+    }
 }
 
 /// Takes out of a role's tool list the shells none of the child's machines
@@ -9770,37 +10033,53 @@ fn narrow_role_shells(
     }
 }
 
-/// Gives a role that chooses its own skills or MCP servers its set, in place
-/// of the caller's it inherited, resolved now from the role and the files as
+/// Gives a role that chooses its own skills, MCP servers or hooks its set, in
+/// place of the caller's it inherited, resolved now from the role and the files as
 /// they are (`capabilities::resolve_role`, which reads nothing for a role that
 /// selects none). A role's settings take no part in the caller's prompt
 /// cache, so a change applies to the next child.
 ///
-/// Hooks are the exception: a role's own hooks run IN ADDITION to the guards
-/// the child inherited from its caller (`agent_child_template` keeps those
-/// that `hook_runs_in_subagent`), never instead of them, so a role — a
-/// built-in one with no hooks at all included — cannot take a child outside
-/// the PreToolUse / PermissionRequest / PostToolUse guards of the
-/// conversation that called it. A hook both lists is run once.
+/// Hooks are replaced like the rest: of the hooks a subagent runs
+/// (`hook_runs_in_subagent`), a role's child runs its role's own and none of
+/// the ones it inherited from its caller (`agent_child_template`), so a
+/// conversation's PreToolUse / PermissionRequest / PostToolUse guards reach a
+/// role's child only when the role selects them too.
 ///
 /// Runs after `configure_named_agent_template`. What it changes is no
 /// allowlist's to decide: the caller's MCP tools leave with the caller's
 /// servers, and `skill` follows the skills the role resolved — a host-derived
-/// name either way.
+/// name either way. A denial is the exception: a role that names `skill` in
+/// `disallowedTools` has its skills pasted as bodies, so none is left for the
+/// tool to serve and it is not put back.
 ///
 /// The one thing a change mid-turn cannot do at once is run a new hook: the
 /// turn's hook confirmation is what allows a hook command to run, so a role's
 /// hook it did not list waits for the next turn's, unless the turn needs no
 /// confirmation.
+///
+/// The child's prompt is worded in the child's profile, which is its caller's
+/// unless `apply_role_prompt_profile` gave it the role's file. A role that
+/// does that comes through here whatever it chooses, so the caller's
+/// environment and capability sections are worded again in that file — and
+/// only worded: for each kind the role leaves to its caller, the child keeps
+/// the caller's skills, servers and hooks exactly as it would otherwise.
 fn apply_role_capabilities(
     parent: &RunModelRequest,
     template: &mut RunModelRequest,
     definition: &AgentDefinition,
     document: &crate::model::AppDocument,
 ) -> Result<(), String> {
-    if !crate::capabilities::role_chooses_capabilities(definition) {
+    let reworded = template.prompt_profile.id != parent.prompt_profile.id;
+    // A role that refuses `skill` while its caller loads skills with it has
+    // nothing to load them with, so its skills — the caller's, when it chooses
+    // none — are resolved again, as bodies.
+    let skills_as_bodies =
+        parent.role_basis.skill_tool && crate::capabilities::role_refuses_skill_tool(definition);
+    if !crate::capabilities::role_chooses_capabilities(definition) && !reworded && !skills_as_bodies
+    {
         return Ok(());
     }
+    let profile = Arc::clone(&template.prompt_profile);
     let conversation = document
         .workspaces
         .iter()
@@ -9812,18 +10091,28 @@ fn apply_role_capabilities(
         conversation,
         &parent.role_basis,
         definition,
-        &parent.prompt_profile,
+        &profile,
     )?;
+    // `configure_named_agent_template` has settled the child's tools by now.
+    // What changes them below is `skill` and the MCP tools, neither of which
+    // the addendum's notes are about.
     template.assembled_system_prompt = subagent_prompt::render(
         PromptVersion::current(),
-        &crate::assemble_system_prompt(&parent.role_basis.environment, &role.addendum),
-        &parent.prompt_profile,
+        &crate::assemble_system_prompt(&parent.role_basis.environment_for(&profile), &role.addendum),
+        &profile,
+        &template.enabled_tools,
     );
     template.mcp_prompt_section = role.mcp_section.clone();
-    if definition.skill_ids.is_some() {
+    // Empty when the role refuses `skill`: its skills went into the prompt as
+    // bodies instead, so the tool `AgentRunOverrides::apply` removed stays out.
+    if definition.skill_ids.is_some() || skills_as_bodies {
         template.skills = role.skills;
         crate::capabilities::apply_skill_tool(&mut template.enabled_tools, template.skills.len());
     }
+    // The prompt was resolved again, with every skill the child has in it —
+    // the caller's selected since its own prompt opened included, when the
+    // role leaves skills to its caller — so none of them is owed as a notice.
+    template.added_skills.clear();
     if definition.hook_ids.is_some() {
         let own = role
             .hooks
@@ -9846,16 +10135,10 @@ fn apply_role_capabilities(
                 ));
             }
         }
-        // On top of the inherited guards, which stay first and stay whole.
-        for hook in own {
-            if !template
-                .active_hooks
-                .iter()
-                .any(|inherited| same_hook_command(inherited, &hook))
-            {
-                template.active_hooks.push(hook);
-            }
-        }
+        // In place of the caller's, like the role's skills and servers: a role
+        // is configured apart from the conversation that calls it, so the
+        // conversation's guards are its only if it selects them too.
+        template.active_hooks = own;
     }
     if definition.mcp_ids.is_some() {
         // The caller's servers go, with their connections and the tools they
@@ -9889,7 +10172,7 @@ fn apply_role_capabilities(
         template.assembled_system_prompt = role.mcp_section.without(
             &template.assembled_system_prompt,
             &dropped,
-            &parent.prompt_profile,
+            &profile,
         );
     }
     Ok(())
@@ -10067,6 +10350,10 @@ pub(crate) fn agent_child_template(parent: &RunModelRequest) -> RunModelRequest 
         // make derivation depth a way to widen the boundary.
         workspaces: parent.workspaces.clone(),
         prompt_profile: parent.prompt_profile.clone(),
+        // The child reports to `parent`, so what `parent`'s model reads about
+        // it is in `parent`'s wording even once a role gives the child a
+        // profile of its own.
+        caller_prompt_profile: Some(parent.prompt_profile.clone()),
         // An ordinary subagent works inside the same conversation's boundary,
         // so it follows that conversation's two memory switches.
         global_memory_enabled: parent.global_memory_enabled,
@@ -10076,29 +10363,39 @@ pub(crate) fn agent_child_template(parent: &RunModelRequest) -> RunModelRequest 
         // parent conversation's own selection, so a child loading one reaches
         // nothing the parent had not already chosen.
         skills: parent.skills.clone(),
-        // Deliberately empty: these are messages for the parent's transcript,
-        // and a child starts from an empty history. A child therefore reads the
-        // skill listing its inherited system prompt carries — the ones the
-        // conversation opened with — while a skill selected later is still
-        // loadable by name, just not advertised to it. The parent's task text
-        // is where a child is told to use one.
-        added_skills: Vec::new(),
+        // Inherited with the prompt they complete. The child's system prompt
+        // is the parent's, which carries only the skills the conversation
+        // opened with; the ones selected since reached the parent as notices
+        // in its transcript, and a child starts from a history of its own
+        // that has none of them — a fork's copy of the parent's drops them
+        // with every other host delivery (`sanitize_child_history`). So the
+        // child is handed the same notices at its own first round: without
+        // them it would hold a skill it was never told the name of, or, with
+        // bodies pasted, never get that skill's instructions at all. Each is
+        // still delivered once, by the same ids, against the child's own
+        // transcript. A role whose child's prompt is resolved again puts
+        // every skill in that prompt and clears these
+        // (`apply_role_capabilities`).
+        added_skills: parent.added_skills.clone(),
         // Inherited, because the servers are: a child dials the same MCP
         // transports through the parent's bindings, so it has to hold their
         // schemas back the same way. What it does NOT inherit is which of them
         // the parent already fetched — the child starts from an empty history
         // and never read those results, so `attach_mcp_tools` re-withholds
-        // every one of them and the child searches for its own.
+        // every one of them and the child searches for its own. A child that
+        // then binds a model of its own, or a role that bars `tool_search`,
+        // asks again (`settle_child_mcp_tool_discovery`).
         mcp_tool_discovery: parent.mcp_tool_discovery,
         // The conversation's container, like everything else about how the
         // host talks to the model: a child's host messages — its truncated
         // replies, a missing structured result, its hooks — come in it too.
         host_message_container: parent.host_message_container,
-        // The guards are inherited; the read record is not shared. A child gets
-        // a scope of its own, seeded from the parent's on first use — the
-        // parent's reads are what the child may edit, but what the child then
-        // reads and writes stays the child's: the parent never saw it.
+        // The guards are inherited, on or off; the read record is not shared. A
+        // child gets a scope of its own, seeded from the parent's on first use —
+        // the parent's reads are what the child may edit, but what the child
+        // then reads and writes stays the child's: the parent never saw it.
         file_guard: crate::model::FileGuard {
+            enabled: parent.file_guard.enabled,
             scope: crate::file_read_state::child_scope_id(&parent.conversation_id),
             parent_scope: Some(parent.file_guard_scope().to_owned()),
         },
@@ -10123,10 +10420,14 @@ pub(crate) fn agent_child_template(parent: &RunModelRequest) -> RunModelRequest 
         context_load_actor_name: None,
         workspace_path: parent.workspace_path.clone(),
         additional_directories: parent.additional_directories.clone(),
+        // From the tools above, which are final for an ordinary child and a
+        // conversation fork; a role's child is rendered again once its tools are
+        // (`configure_named_agent_template`).
         assembled_system_prompt: subagent_prompt::render(
             PromptVersion::current(),
             &parent.assembled_system_prompt,
             &parent.prompt_profile,
+            &child_enabled_tools,
         ),
         enabled_tools: child_enabled_tools,
         contexts: Vec::new(),
@@ -10604,6 +10905,9 @@ fn build_rehydrated_agent_template(
                 .clone();
         let (provider, model) =
             enabled_provider_model(&document, &binding.provider_id, &binding.model_id)?;
+        // From the role as it is now, like its skills: a file it chose since
+        // the child last ran words this turn.
+        apply_role_prompt_profile(parent, &mut template, &document, &definition);
         configure_named_agent_template(
             parent,
             &mut template,
@@ -10624,6 +10928,9 @@ fn build_rehydrated_agent_template(
             enabled_provider_model(&document, &binding.provider_id, &binding.model_id)?;
         template.provider = provider;
         template.model = model;
+        // The fork's model is the one it was created on, not necessarily the
+        // one its caller runs now.
+        settle_child_mcp_tool_discovery(parent, &mut template, &[]);
         restore_conversation_fork_binding(&mut template, binding)?;
         validate_current_fork_binding(&template)?;
     }
@@ -10933,17 +11240,21 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
             // Terminal request failures retain their cause only in
             // `response.error`. Propagate it so rate limits and empty responses
             // remain distinguishable and actionable.
+            //
+            // Everything settled here is what the parent's model reads, so it
+            // is in the parent's wording, not in the profile the child's role
+            // may have chosen for the child's own run.
             let output = match response.error.as_ref() {
                 Some(error) if reported == SubagentRunStatus::Failed => {
                     orchestration::subagent_failure_output(
                         final_text,
                         &error.message,
-                        &shared.template.prompt_profile,
+                        shared.caller_prompt_profile(),
                     )
                 }
                 _ => orchestration::subagent_result_output(
                     final_text,
-                    &shared.template.prompt_profile,
+                    shared.caller_prompt_profile(),
                 ),
             };
             let status = match reported {
@@ -10965,7 +11276,7 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
                     AgentLiveStatus::Failed,
                     orchestration::missing_structured_output_output(
                         &output,
-                        &shared.template.prompt_profile,
+                        shared.caller_prompt_profile(),
                     ),
                 )
             } else {
@@ -10974,7 +11285,7 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
             // The sidebar close is the one terminal cause the model cannot
             // infer from the partial text, so say it in the result itself.
             let output = if shared.stopped_by_user() {
-                orchestration::append_user_close_note(&output, &shared.template.prompt_profile)
+                orchestration::append_user_close_note(&output, shared.caller_prompt_profile())
             } else {
                 output
             };
@@ -10999,8 +11310,7 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
                     AgentLiveStatus::Interrupted,
                     if shared.stopped_by_user() {
                         shared
-                            .template
-                            .prompt_profile
+                            .caller_prompt_profile()
                             .text(PromptKey::TaskStoppedByUser)
                             .to_owned()
                     } else {
@@ -11072,7 +11382,7 @@ fn agent_worker_loop_scoped(
     round: usize,
 ) {
     // Bind the step's task signal into approvals. Skipping a step or stopping the
-    // workflow must release a pending card rather than holding the 30-minute budget.
+    // workflow must release a pending card rather than holding the run open.
     let flag_owner = Arc::clone(shared);
     let bound_approval = move |request: &ToolExecutionRequest,
                                descriptor: &ToolDescriptor,
@@ -11138,18 +11448,19 @@ fn agent_worker_loop_scoped(
             };
             // Terminal request failures retain their cause only in
             // `response.error`. Propagate it so rate limits and empty responses
-            // remain distinguishable and actionable.
+            // remain distinguishable and actionable. In the parent's wording,
+            // as in `agent_worker_loop`.
             let output = match response.error.as_ref() {
                 Some(error) if reported == SubagentRunStatus::Failed => {
                     orchestration::subagent_failure_output(
                         final_text,
                         &error.message,
-                        &shared.template.prompt_profile,
+                        shared.caller_prompt_profile(),
                     )
                 }
                 _ => orchestration::subagent_result_output(
                     final_text,
-                    &shared.template.prompt_profile,
+                    shared.caller_prompt_profile(),
                 ),
             };
             let status = match reported {
@@ -11167,7 +11478,7 @@ fn agent_worker_loop_scoped(
                     AgentLiveStatus::Failed,
                     orchestration::missing_structured_output_output(
                         &output,
-                        &shared.template.prompt_profile,
+                        shared.caller_prompt_profile(),
                     ),
                 )
             } else {
@@ -11371,10 +11682,11 @@ fn run_agent_spawn(
             "Subagents cannot spawn further subagents.".into(),
         ));
     }
-    let spec = match orchestration::parse_agent_spawn(
-        &call.input,
-        role_policy(parent, state).required(),
-    ) {
+    let policy = role_policy(parent, state);
+    let required_roles = policy
+        .required()
+        .then(|| policy.known_names().unwrap_or_default());
+    let spec = match orchestration::parse_agent_spawn(&call.input, required_roles.as_deref()) {
         Ok(spec) => spec,
         Err(error) => return Ok(failed_tool_execution(call, error)),
     };
@@ -11985,7 +12297,8 @@ fn drive_background_shell(
             .cancel
             .load(std::sync::atomic::Ordering::Acquire)
     };
-    let profile = &shared.template.prompt_profile;
+    // The command's result is its caller's to read, in the caller's wording.
+    let profile = shared.caller_prompt_profile();
     // An output too long to deliver is saved beside the conversation's other
     // spilled output and delivered as its path and start, as in the
     // foreground.
@@ -13169,7 +13482,9 @@ fn push_file_change_block(request: &mut RunModelRequest, content: String) {
 /// A file that disappeared is forgotten without a word, as the source does.
 fn inject_file_change_notices(request: &mut RunModelRequest, state: &AppState) {
     let notices = {
-        let guard = file_guard_context(request, state);
+        let Some(guard) = file_guard_context(request, state) else {
+            return;
+        };
         scan_changed_files(
             &guard,
             Path::new(&request.workspace_path),
@@ -13327,7 +13642,7 @@ fn changed_region_snippet(before: &str, after: &str) -> String {
 fn settle_file_guard_touch(
     request: &mut RunModelRequest,
     execution: &ToolExecution,
-    touch: Option<tool_executor::FileGuardTouch>,
+    touch: Option<tool_executor::FileTouch>,
     post_tool_hook_ran: bool,
     state: &AppState,
 ) {
@@ -13338,7 +13653,9 @@ fn settle_file_guard_touch(
         return;
     }
     let notice = {
-        let guard = file_guard_context(request, state);
+        let Some(guard) = file_guard_context(request, state) else {
+            return;
+        };
         match touch.read {
             Some(record) => {
                 guard.registry.record(guard.scope, touch.path, record);
@@ -13413,7 +13730,7 @@ fn resync_written_file(
 fn note_lsp_file_change(
     request: &RunModelRequest,
     execution: &ToolExecution,
-    touch: Option<&tool_executor::FileGuardTouch>,
+    touch: Option<&tool_executor::FileTouch>,
     state: &AppState,
 ) {
     if !execution.result.success
@@ -13714,11 +14031,20 @@ fn reconcile_plan_mode(
         request.contexts.iter().chain(generated.iter()),
     );
     let instruction = match (active, told) {
+        // The instructions name the tools that carry plan mode through, so
+        // they are said against the tools this request offers
+        // (`tool_mentions`): `plan_tools` is set above, so the plan pair is
+        // among them.
         (true, false) => Instruction {
             topic: crate::plan_mode::ENTER_TOPIC,
             notice_kind: crate::plan_mode::ENTER_NOTICE_KIND,
             notice_id: None,
-            content: request.prompt_profile.text(PromptKey::SystemPlanMode).trim().to_owned(),
+            content: crate::tool_mentions::resolve(
+                request.prompt_profile.text(PromptKey::SystemPlanMode),
+                &crate::tool_mentions::OfferedTools::of(request),
+            )
+            .trim()
+            .to_owned(),
         },
         (false, true) => Instruction {
             topic: crate::plan_mode::EXIT_TOPIC,
@@ -16291,6 +16617,38 @@ mod tests {
         serde_json::to_value(step_request(request)).unwrap()
     }
 
+    /// A tool's wire schema says nothing about a sibling the same request
+    /// does not offer (`tool_mentions`): `find` does not contrast itself with
+    /// an absent `grep`, and a guarded `edit` without `read` says what it can
+    /// still change rather than sending the model to a tool it lacks.
+    #[test]
+    fn a_wire_schema_names_only_the_siblings_its_request_offers() {
+        let mut request = run_request(ProviderFamily::OpenaiResponses);
+        request.tools = catalog::tool_catalog();
+        let description = |request: &RunModelRequest, name: &str| {
+            let surface = crate::tool_surface::ToolSurface::of(request);
+            let offered = crate::tool_mentions::OfferedTools::of(request);
+            let tool = request.tools.iter().find(|tool| tool.name == name).unwrap();
+            crate::aisdk::tools::wire_tool_schema(tool, &surface, &offered, request)["description"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        request.enabled_tools = vec!["find".into(), "edit".into()];
+        let find = description(&request, "find");
+        assert!(!find.contains("grep") && find.contains(" This includes paths Git ignores"), "{find}");
+        let edit = description(&request, "edit");
+        assert!(!edit.contains("use read") && edit.contains("no read tool here"), "{edit}");
+        assert!(!edit.contains("{?") && !edit.contains("{/}"), "{edit}");
+
+        request.enabled_tools.extend(["grep".into(), "read".into()]);
+        let find = description(&request, "find");
+        assert!(find.contains("Unlike grep, this includes paths Git ignores"), "{find}");
+        let edit = description(&request, "edit");
+        assert!(edit.contains("You must use read on the file"), "{edit}");
+    }
+
     fn run_request(format: ProviderFamily) -> RunModelRequest {
         let tool = catalog::tool_catalog()
             .into_iter()
@@ -16305,6 +16663,7 @@ mod tests {
             run_environment: Default::default(),
             workspaces: Default::default(),
             prompt_profile: Default::default(),
+            caller_prompt_profile: None,
             global_memory_enabled: false,
             project_memory_enabled: false,
             skills: Vec::new(),
@@ -16454,6 +16813,7 @@ mod tests {
             native_search_tool: None,
             native_fetch_tool: None,
             template_id: None,
+            tool_description_file_id: None,
         };
         let definitions = vec![definition.clone()];
         definition = definitions[0].clone();
@@ -16556,7 +16916,16 @@ mod tests {
         cell.set(true);
         reconcile_plan_mode(&mut request, &state, 1, &mut [], &mut generated);
         assert_eq!(topics(&request.contexts), ["plan-mode"]);
-        assert!(matches!(request.contexts.last(), Some(ContextItem::System { content, .. }) if content == guidance.trim()));
+        // Said against the tools this request offers: no `ask_user` here, so
+        // nothing tells the model to use it.
+        let said = crate::tool_mentions::resolve(
+            &guidance,
+            &crate::tool_mentions::OfferedTools::of(&request),
+        )
+        .trim()
+        .to_owned();
+        assert!(!said.contains("ask_user"), "{said}");
+        assert!(matches!(request.contexts.last(), Some(ContextItem::System { content, .. }) if *content == said));
         assert!(names(&request).contains(&crate::plan_mode::EXIT_PLAN_MODE_TOOL.to_owned()));
         assert_eq!(
             crate::aisdk::step::system_prompt_parts(&request),
@@ -19103,9 +19472,9 @@ mod tests {
     }
 
     /// A role file's own skills, MCP servers and hooks configure its child at
-    /// spawn, in place of the caller's: the caller's MCP tools and connections
-    /// leave, `skill` follows the role's skills, and only the hooks a subagent
-    /// runs are kept. The role is read as the latest scan found its file, so a
+    /// spawn, in place of the caller's: the caller's MCP tools, connections and
+    /// hooks leave, `skill` follows the role's skills, and of the role's hooks
+    /// only those a subagent runs are kept. The role is read as the latest scan found its file, so a
     /// change a rescan picked up mid-turn reaches the next child — except a
     /// hook the turn's confirmation never listed, which waits for the next turn
     /// unless the turn needs no confirmation.
@@ -19192,6 +19561,9 @@ mod tests {
         let runtime = rescan();
         parent.role_basis = Arc::new(crate::capabilities::RoleBasis {
             environment: "# Environment of the turn".into(),
+            prompt_profile_id: parent.prompt_profile.id.clone(),
+            environment_facts: Default::default(),
+            host_messages_in_user: false,
             skill_ids: Vec::new(),
             mcp_ids: Vec::new(),
             hook_ids: Vec::new(),
@@ -19199,8 +19571,8 @@ mod tests {
             confirmed_role_hooks: runtime.role_hooks,
         });
         parent.security_level = SecurityLevel::RequestApproval;
-        // The conversation's own guard, which every child runs under its
-        // role's hooks, and a stop hook, which no child runs.
+        // The conversation's own guard, which a role's child does not run —
+        // its hooks are its role's — and a stop hook, which no child runs.
         parent.active_hooks = vec![
             test_hook("conversation-guard", HookEvent::PreToolUse),
             test_hook("conversation-stop", HookEvent::Stop),
@@ -19228,7 +19600,7 @@ mod tests {
         assert!(child.enabled_tools.iter().any(|name| name == crate::capabilities::SKILL_TOOL));
         assert_eq!(
             child.active_hooks.iter().map(|hook| hook.name.as_str()).collect::<Vec<_>>(),
-            ["conversation-guard", "beta-hook"]
+            ["beta-hook"]
         );
         assert_eq!(
             child.mcp_servers.iter().map(|server| server.name.as_str()).collect::<Vec<_>>(),
@@ -19263,17 +19635,17 @@ mod tests {
         apply_named_role_to_fresh_template(&parent, &state, &mut child, "reviewer").unwrap();
         assert_eq!(
             child.active_hooks.iter().map(|hook| hook.name.as_str()).collect::<Vec<_>>(),
-            ["conversation-guard", "beta-hook", "gamma-hook"]
+            ["beta-hook", "gamma-hook"]
         );
-        // A hook the conversation runs and the role lists too is run once,
-        // where the conversation put it.
+        // A hook the conversation runs and the role lists too is the role's
+        // like any other: run once, where the role put it.
         let beta = crate::capabilities::discover_document(&document).hooks[&beta_hook].clone();
         parent.active_hooks.push(beta);
         let mut child = agent_child_template(&parent);
         apply_named_role_to_fresh_template(&parent, &state, &mut child, "reviewer").unwrap();
         assert_eq!(
             child.active_hooks.iter().map(|hook| hook.name.as_str()).collect::<Vec<_>>(),
-            ["conversation-guard", "beta-hook", "gamma-hook"]
+            ["beta-hook", "gamma-hook"]
         );
         state.document_store.flush(Duration::from_secs(10)).unwrap();
     }
@@ -19424,30 +19796,21 @@ mod tests {
         state.document_store.flush(Duration::from_secs(10)).unwrap();
     }
 
-    /// A built-in role has no hooks of its own, and its child still runs the
-    /// conversation's guards — no role can take a child outside them — while
-    /// the caller's skills and servers stay behind, with nothing read to
-    /// find that out. A hook the role lists that the conversation also runs
-    /// is run once.
+    /// A role file with no hooks of its own runs none in its child: the
+    /// conversation's guards stay behind with its skills and servers, with
+    /// nothing read to find that out. A child without a role keeps them.
     #[test]
-    fn a_built_in_roles_child_keeps_the_conversations_guard_hooks() {
+    fn a_roles_child_without_hooks_runs_none_of_the_conversations() {
         let (directory, state, mut parent, _) = named_agent_fixture(AgentDefinitionMemory::None);
         let anchor = directory.path().join("document.v1.json");
         let mut document = (*current_agent_document(&parent, &state).unwrap()).clone();
-        set_conversation_agent_definitions(&state, &mut document, Vec::new());
-        for conversation in &mut document.workspaces[0].conversations {
-            conversation.settings.agent_ids = vec![crate::agent_roles::BUILTIN_OPUS_ID.into()];
-        }
-        document.assets.api_providers.push(ApiProvider {
-            id: "claude_agent".into(),
-            family: ProviderFamily::ClaudeAgent,
-            models: vec![ModelProfile {
-                id: "claude-opus-5-5".into(),
-                ..parent.model.clone()
-            }],
-            active_model_id: Some("claude-opus-5-5".into()),
-            ..parent.provider.clone()
-        });
+        let file = crate::agent_roles::role_from_bytes(br#"{"name":"Opus"}"#, "opus").unwrap();
+        let role = crate::agent_roles::registered_definition(
+            &file,
+            &crate::agent_roles::RoleLevel::Global,
+            "agent_user_opus_0000000a",
+        );
+        set_conversation_agent_definitions(&state, &mut document, vec![role]);
         state.document_store.commit(&anchor, document).unwrap();
         parent.security_level = SecurityLevel::RequestApproval;
         parent.active_hooks = vec![
@@ -19475,12 +19838,13 @@ mod tests {
         });
         parent.enabled_tools.push("mcp__caller__lookup".into());
 
+        let names = |child: &RunModelRequest| {
+            child.active_hooks.iter().map(|hook| hook.name.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&agent_child_template(&parent)), ["guard", "permission", "after"]);
         let mut child = agent_child_template(&parent);
         apply_named_role_to_fresh_template(&parent, &state, &mut child, "Opus").unwrap();
-        assert_eq!(
-            child.active_hooks.iter().map(|hook| hook.name.as_str()).collect::<Vec<_>>(),
-            ["guard", "permission", "after"]
-        );
+        assert!(names(&child).is_empty(), "{:?}", names(&child));
         assert!(child.skills.is_empty());
         assert!(!child.enabled_tools.iter().any(|name| name == "mcp__caller__lookup"));
         assert!(!child.tools.iter().any(|tool| tool.category == ToolCategory::Mcp));
@@ -19526,80 +19890,6 @@ mod tests {
         state.document_store.commit(&anchor, changed).unwrap();
         let error = validate_current_agent_definition(&child, &state).unwrap_err();
         assert!(error.contains("does not exist"), "{error}");
-        state.document_store.flush(Duration::from_secs(10)).unwrap();
-    }
-
-    /// A selected built-in role resolves against the document's providers —
-    /// the first of its family — with its own source, so a binding names it
-    /// apart from any file; a user's own role of the same name shadows it.
-    #[test]
-    fn a_selected_builtin_role_resolves_against_the_documents_providers() {
-        let (directory, state, parent, user) = named_agent_fixture(AgentDefinitionMemory::None);
-        let anchor = directory.path().join("document.v1.json");
-        let mut changed = (*current_agent_document(&parent, &state).unwrap()).clone();
-        let select_builtin = |document: &mut crate::model::AppDocument| {
-            for conversation in &mut document.workspaces[0].conversations {
-                conversation
-                    .settings
-                    .agent_ids
-                    .push(crate::agent_roles::BUILTIN_OPUS_ID.into());
-            }
-        };
-        set_conversation_agent_definitions(&state, &mut changed, Vec::new());
-        select_builtin(&mut changed);
-        state.document_store.commit(&anchor, changed.clone()).unwrap();
-        // No provider of its family: hidden, and refused by name as a role
-        // whose model is gone.
-        let document = current_agent_document(&parent, &state).unwrap();
-        let definitions = request_agent_definitions(&state, &document, &parent);
-        assert!(available_agent_type_names(&document, &definitions, &parent.workspace_id).is_empty());
-        let refusal = resolve_agent_definition(&document, &definitions, &parent.workspace_id, "Opus")
-            .unwrap_err();
-        assert!(refusal.contains("model bound to named-agent definition"), "{refusal}");
-
-        let claude = ApiProvider {
-            id: "claude_agent".into(),
-            family: ProviderFamily::ClaudeAgent,
-            models: vec![ModelProfile {
-                id: "claude-opus-5-5".into(),
-                ..parent.model.clone()
-            }],
-            active_model_id: Some("claude-opus-5-5".into()),
-            ..parent.provider.clone()
-        };
-        changed.assets.api_providers.push(claude);
-        state.document_store.commit(&anchor, changed.clone()).unwrap();
-        let document = current_agent_document(&parent, &state).unwrap();
-        let definitions = request_agent_definitions(&state, &document, &parent);
-        assert_eq!(
-            available_agent_type_names(&document, &definitions, &parent.workspace_id),
-            ["Opus"]
-        );
-        let opus = resolve_agent_definition(&document, &definitions, &parent.workspace_id, "opus")
-            .unwrap()
-            .clone();
-        assert_eq!(opus.source, AgentDefinitionSource::Plugin);
-        let (binding, _, model) = initial_agent_definition_binding(&parent, &document, &opus).unwrap();
-        assert_eq!((binding.source_key.as_str(), binding.provider_id.as_str()), ("builtin", "claude_agent"));
-        assert_eq!(model.id, "claude-opus-5-5");
-
-        // The user's own `Opus` file shadows the built-in.
-        set_conversation_agent_definitions(
-            &state,
-            &mut changed,
-            vec![AgentDefinition {
-                name: "Opus".into(),
-                ..user
-            }],
-        );
-        select_builtin(&mut changed);
-        state.document_store.commit(&anchor, changed).unwrap();
-        let document = current_agent_document(&parent, &state).unwrap();
-        let definitions = request_agent_definitions(&state, &document, &parent);
-        assert_eq!(definitions.len(), 2);
-        let shadowing = resolve_agent_definition(&document, &definitions, &parent.workspace_id, "Opus")
-            .unwrap();
-        assert_eq!(shadowing.source, AgentDefinitionSource::User);
         state.document_store.flush(Duration::from_secs(10)).unwrap();
     }
 
@@ -21953,10 +22243,12 @@ mod tests {
             vec![
                 crate::model::ToolDescriptionEntry {
                     tool_name: " mcp__docs__search ".into(),
+                    variant: String::new(),
                     description: "PROFILE WORDING".into(),
                 },
                 crate::model::ToolDescriptionEntry {
                     tool_name: "mcp__docs__blank".into(),
+                    variant: String::new(),
                     description: "  ".into(),
                 },
             ],
@@ -24661,6 +24953,7 @@ mod tests {
             .unwrap();
         let schema = tool_schema(
             &descriptor,
+            crate::tool_surface::ToolVariant::Standard,
             &crate::prompt_profile::PromptProfile::builtin_english(),
             &crate::workspace_set::WorkspaceSet::default(),
         );
@@ -24679,6 +24972,7 @@ mod tests {
             let descriptor = catalog.iter().find(|tool| tool.name == name).unwrap();
             let schema = tool_schema(
                 descriptor,
+                crate::tool_surface::ToolVariant::Standard,
                 &crate::prompt_profile::PromptProfile::builtin_english(),
                 &crate::workspace_set::WorkspaceSet::default(),
             );
@@ -24716,6 +25010,7 @@ mod tests {
                 .map(|tool| {
                     tool_schema(
                         tool,
+                        crate::tool_surface::ToolVariant::Standard,
                         &crate::prompt_profile::PromptProfile::builtin_english(),
                         &crate::workspace_set::WorkspaceSet::default(),
                     )
@@ -28562,207 +28857,6 @@ mod tests {
         );
     }
 
-    /// A single absolute deadline cannot be extended by frequent `subagent_update`
-    /// activity; it fires from the original `Instant`.
-    #[test]
-    fn a_chatty_step_cannot_extend_the_single_run_deadline() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut first, _) = listener.accept().unwrap();
-            let _ = read_http_request_with_body(&mut first);
-            write_json_response(
-                &mut first,
-                "200 OK",
-                &json!({
-                    "model":"model-test",
-                    "status":"completed",
-                    "output":[{"type":"function_call","status":"completed","call_id":"noisy-1","name":"subagent_update",
-                        "arguments":json!({"message":"still working"}).to_string()}],
-                    "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
-                }),
-            );
-            drop(first);
-            listener.set_nonblocking(true).unwrap();
-            let accept_deadline = Instant::now() + Duration::from_secs(3);
-            while Instant::now() < accept_deadline {
-                match listener.accept() {
-                    Ok((mut second, _)) => {
-                        second.set_nonblocking(false).unwrap();
-                        let _ = read_http_request_with_body(&mut second);
-                        thread::sleep(Duration::from_secs(3));
-                        write_json_response(
-                            &mut second,
-                            "200 OK",
-                            &responses_text_output("too late"),
-                        );
-                        drop(second);
-                        break;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let workspace = tempfile::tempdir().unwrap();
-        let request = loop_request_for(address, workspace.path());
-        let call = ToolCall {
-            id: "wf-deadline".into(),
-            name: "workflow".into(),
-            input: json!({"script": "export const meta = { name: \"chat\", description: \"单步\" }\nreturn await agent(\"chatty\")", "name": "chatty-run"})
-                .as_object()
-                .unwrap()
-                .clone(),
-        };
-        let state = AppState::default();
-        let pool = AgentPool::new();
-        let shadow = test_kernel_shadow();
-        let started = Instant::now();
-        let execution = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
-                &pool,
-                &shadow,
-                &request,
-                call,
-                &state,
-                &discard_event,
-                &approve_tool,
-                false,
-                1,
-                4,
-                Duration::from_millis(700),
-            )
-        })
-        .unwrap();
-        server.join().unwrap();
-        assert!(execution.result.success, "{}", execution.result.output);
-        assert!(started.elapsed() < Duration::from_secs(6));
-        pool.wait_settled_for_tests(Duration::from_secs(30));
-        let envelopes = pool.take_undelivered_results();
-        assert_eq!(envelopes.len(), 1);
-        assert!(
-            envelopes[0].content.contains(
-                PromptKey::WorkflowTimeout
-                    .builtin_en()
-                    .split(" ({seconds}")
-                    .next()
-                    .unwrap()
-            ),
-            "{}",
-            envelopes[0].content
-        );
-        let driver = pool
-            .all()
-            .into_iter()
-            .find(|agent| agent.kind == SubagentRunKind::WorkflowStep)
-            .expect("驱动器已注册");
-        assert_eq!(driver.record().status, SubagentRunStatus::Failed);
-        assert_eq!(driver.record().contexts.len(), 1);
-    }
-
-    /// The run's budget is counted from when it actually starts, and the time a
-    /// person spends on approval cards does not count: neither the card that
-    /// approves the run itself nor one a step waits on. Here both cards take
-    /// longer than the whole budget, and the run still finishes.
-    #[test]
-    fn approval_cards_do_not_spend_the_workflows_time_budget() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = serve_json_sequence(
-            listener,
-            vec![
-                json!({
-                    "model":"model-test",
-                    "status":"completed",
-                    "output":[{"type":"function_call","status":"completed","call_id":"step-shell","name":"bash",
-                        "arguments":json!({"command":"printf STEP_RAN"}).to_string()}],
-                    "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
-                }),
-                responses_text_output("approved step done"),
-            ],
-        );
-        let workspace = tempfile::tempdir().unwrap();
-        let request = loop_request_for(address, workspace.path());
-        let state = AppState::default();
-        let step_cards = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let surface_cards = Arc::clone(&step_cards);
-        state.register_task_surface(
-            &request.conversation_id,
-            Arc::new(crate::state::TaskSurface {
-                sink: Arc::new(|_: ModelStreamEvent| Ok(())),
-                approve: Arc::new(
-                    move |_: &ToolExecutionRequest,
-                          _: &ToolDescriptor,
-                          _: ApprovalRequester<'_>,
-                          _: Option<&std::sync::atomic::AtomicBool>| {
-                        surface_cards.fetch_add(1, Ordering::SeqCst);
-                        thread::sleep(Duration::from_millis(1_200));
-                        Ok(true)
-                    },
-                ),
-            }),
-        );
-        let slow_run_card = |_: &ToolExecutionRequest,
-                             _: &ToolDescriptor,
-                             _: ApprovalRequester<'_>|
-         -> Result<bool, String> {
-            thread::sleep(Duration::from_millis(1_200));
-            Ok(true)
-        };
-        let call = ToolCall {
-            id: "wf-cards".into(),
-            name: "workflow".into(),
-            input: json!({"script": "export const meta = { name: \"cards\", description: \"单步\" }\nreturn await agent(\"run printf\")", "name": "cards-run"})
-                .as_object()
-                .unwrap()
-                .clone(),
-        };
-        let pool = AgentPool::new();
-        let shadow = test_kernel_shadow();
-        let execution = workflow::run_workflow_tool_with_deadline(
-            &pool,
-            &shadow,
-            &request,
-            call,
-            &state,
-            &discard_event,
-            &slow_run_card,
-            false,
-            1,
-            4,
-            Duration::from_millis(800),
-        )
-        .unwrap();
-        assert!(execution.result.success, "{}", execution.result.output);
-        pool.wait_settled_for_tests(Duration::from_secs(30));
-        server.join().unwrap();
-        assert_eq!(
-            step_cards.load(Ordering::SeqCst),
-            1,
-            "步骤的命令要等一张审批卡"
-        );
-        let envelopes = pool.take_undelivered_results();
-        assert_eq!(envelopes.len(), 1);
-        let timeout_marker = PromptKey::WorkflowTimeout
-            .builtin_en()
-            .split(" ({seconds}")
-            .next()
-            .unwrap();
-        assert!(
-            !envelopes[0].content.contains(timeout_marker),
-            "等审批卡的时间不算进期限：{}",
-            envelopes[0].content
-        );
-        assert!(
-            envelopes[0].content.contains("approved step done"),
-            "{}",
-            envelopes[0].content
-        );
-    }
-
     /// A workflow card keeps only the script's fingerprint, but the model is
     /// replayed the call it made: the history record still has the script. A
     /// card that no longer matches the record (edited by hand) replays as it
@@ -28923,7 +29017,7 @@ mod tests {
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
         let execution = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -28934,7 +29028,6 @@ mod tests {
                 false,
                 1,
                 2,
-                Duration::from_secs(60),
             )
         })
         .unwrap();
@@ -28961,14 +29054,16 @@ mod tests {
         )));
     }
 
-    /// Resume replays logged steps immediately and reruns the first unrecorded step
-    /// and every subsequent step. Replayed steps must not contact the model backend.
+    /// A run stopped part-way reports its run id. Resume replays logged steps
+    /// immediately and reruns the first unrecorded step and every subsequent step.
+    /// Replayed steps must not contact the model backend.
     #[test]
-    fn a_failed_run_reports_a_run_id_whose_resume_replays_the_journaled_steps() {
+    fn a_stopped_run_reports_a_run_id_whose_resume_replays_the_journaled_steps() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let stage_one_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let served = Arc::clone(&stage_one_calls);
+        let (stage_two_started, stage_two_arrived) = std::sync::mpsc::channel::<()>();
         let first_server = thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
             let body = read_http_request_with_body(&mut first);
@@ -28981,12 +29076,13 @@ mod tests {
             );
             drop(first);
             listener.set_nonblocking(true).unwrap();
-            let until = Instant::now() + Duration::from_secs(3);
+            let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
                 match listener.accept() {
                     Ok((mut step, _)) => {
                         step.set_nonblocking(false).unwrap();
                         let _ = read_http_request_with_body(&mut step);
+                        let _ = stage_two_started.send(());
                         thread::sleep(Duration::from_millis(2_500));
                         write_json_response(
                             &mut step,
@@ -29013,7 +29109,7 @@ mod tests {
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
         let first = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -29031,10 +29127,19 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_millis(1_200),
             )
         })
         .unwrap();
+        // Stop the run while the last stage is in flight, as the sidebar stop or the end of the
+        // round would: a run has no deadline, so being stopped is how it ends unfinished.
+        stage_two_arrived
+            .recv_timeout(Duration::from_secs(10))
+            .expect("阶段二起跑过");
+        pool.all()
+            .into_iter()
+            .find(|agent| agent.kind == SubagentRunKind::WorkflowStep)
+            .expect("第一次运行注册了驱动器")
+            .request_stop(crate::agents::StopOrigin::Host);
         let listener = first_server.join().unwrap();
 
         listener.set_nonblocking(true).unwrap();
@@ -29062,13 +29167,9 @@ mod tests {
         let first_envelopes = pool.take_undelivered_results();
         assert_eq!(first_envelopes.len(), 1);
         assert!(
-            first_envelopes[0].content.contains(
-                PromptKey::WorkflowTimeout
-                    .builtin_en()
-                    .split(" ({seconds}")
-                    .next()
-                    .unwrap()
-            ),
+            first_envelopes[0]
+                .content
+                .contains(PromptKey::WorkflowAbortedCancelled.builtin_en()),
             "{}",
             first_envelopes[0].content
         );
@@ -29122,7 +29223,7 @@ mod tests {
             }
         });
         let second = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -29141,7 +29242,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(60),
             )
         })
         .unwrap();
@@ -29225,7 +29325,7 @@ mod tests {
         install_collecting_surface(&state, &request.conversation_id, Arc::clone(&events));
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
-        let execution = workflow::run_workflow_tool_with_deadline(
+        let execution = workflow::run_workflow_tool_with_live_limit(
             &pool,
             &shadow,
             &request,
@@ -29243,7 +29343,6 @@ mod tests {
             false,
             7,
             1,
-            Duration::from_secs(60),
         )
         .unwrap();
         let bodies = server.join().unwrap();
@@ -29388,7 +29487,7 @@ mod tests {
         install_collecting_surface(&state, &request.conversation_id, Arc::clone(&events));
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
-        let execution = workflow::run_workflow_tool_with_deadline(
+        let execution = workflow::run_workflow_tool_with_live_limit(
             &pool,
             &shadow,
             &request,
@@ -29406,7 +29505,6 @@ mod tests {
             false,
             7,
             1,
-            Duration::from_secs(60),
         )
         .unwrap();
         let bodies = server.join().unwrap();
@@ -29567,7 +29665,7 @@ mod tests {
         install_collecting_surface(&state, &request.conversation_id, Arc::clone(&events));
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
-        let execution = workflow::run_workflow_tool_with_deadline(
+        let execution = workflow::run_workflow_tool_with_live_limit(
             &pool,
             &shadow,
             &request,
@@ -29588,7 +29686,6 @@ mod tests {
             false,
             1,
             2,
-            Duration::from_secs(60),
         )
         .unwrap();
         assert!(execution.result.success, "{}", execution.result.output);
@@ -29640,6 +29737,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let first_prompts = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen = Arc::clone(&first_prompts);
+        let (stage_three_started, stage_three_arrived) = std::sync::mpsc::channel::<()>();
         let first_server = thread::spawn(move || {
             for _ in 0..3 {
                 let Ok((mut step, _)) = listener.accept() else {
@@ -29664,6 +29762,7 @@ mod tests {
                         write_raw_response(&mut step, "400 Bad Request", "{\"error\":\"nope\"}")
                     }
                     _ => {
+                        let _ = stage_three_started.send(());
                         thread::sleep(Duration::from_millis(2_500));
                         write_json_response(
                             &mut step,
@@ -29684,7 +29783,7 @@ mod tests {
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
         let first = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -29702,10 +29801,19 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_millis(2_000),
             )
         })
         .unwrap();
+        // Stop the run while the last stage is in flight, as the sidebar stop or the end of the
+        // round would: a run has no deadline, so being stopped is how it ends unfinished.
+        stage_three_arrived
+            .recv_timeout(Duration::from_secs(10))
+            .expect("阶段三起跑过");
+        pool.all()
+            .into_iter()
+            .find(|agent| agent.kind == SubagentRunKind::WorkflowStep)
+            .expect("第一次运行注册了驱动器")
+            .request_stop(crate::agents::StopOrigin::Host);
         let listener = first_server.join().unwrap();
         listener.set_nonblocking(true).unwrap();
         let drain_until = Instant::now() + Duration::from_millis(300);
@@ -29772,7 +29880,7 @@ mod tests {
             }
         });
         let second = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -29791,7 +29899,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(60),
             )
         })
         .unwrap();
@@ -29814,7 +29921,7 @@ mod tests {
         assert_eq!(
             first_prompts.lock().unwrap().as_slice(),
             ["stage-one", "stage-two", "stage-three"],
-            "第一次运行三步都起跑过，只有阶段三没能在期限内回来"
+            "第一次运行三步都起跑过，只有阶段三在运行停止时还没回来"
         );
         assert_eq!(
             replayed.lock().unwrap().as_slice(),
@@ -29846,7 +29953,7 @@ mod tests {
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
         let first = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -29864,7 +29971,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(60),
             )
         })
         .unwrap();
@@ -29890,7 +29996,7 @@ mod tests {
             json!({"name": "scriptless-first", "script": script}),
         );
         let second = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &resume_request,
@@ -29908,7 +30014,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(60),
             )
         })
         .unwrap();
@@ -29976,7 +30081,7 @@ mod tests {
             created_at: Utc::now().to_rfc3339(),
         });
         let tampered = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &resume_request,
@@ -29994,7 +30099,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(5),
             )
         })
         .unwrap();
@@ -30010,7 +30114,7 @@ mod tests {
 
         // A call with neither `script` nor `resume_run_id` must fail explicitly.
         let neither = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -30028,7 +30132,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(5),
             )
         })
         .unwrap();
@@ -30078,7 +30181,7 @@ mod tests {
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
         let first = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -30096,7 +30199,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(60),
             )
         })
         .unwrap();
@@ -30131,7 +30233,7 @@ mod tests {
         let later_pool = AgentPool::new();
         let later_shadow = test_kernel_shadow();
         let second = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &later_pool,
                 &later_shadow,
                 &request,
@@ -30149,7 +30251,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(60),
             )
         })
         .unwrap();
@@ -30202,7 +30303,7 @@ mod tests {
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
         let execution = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -30220,7 +30321,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(60),
             )
         })
         .unwrap();
@@ -30703,7 +30803,7 @@ mod tests {
     ) -> ToolExecution {
         let shadow = test_kernel_shadow();
         std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 pool,
                 &shadow,
                 request,
@@ -30718,7 +30818,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(60),
             )
         })
         .unwrap()
@@ -31009,7 +31108,7 @@ mod tests {
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
         let execution = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -31020,7 +31119,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(5),
             )
         })
         .unwrap();
@@ -31050,7 +31148,7 @@ mod tests {
             "失败的恢复留下了空运行目录"
         );
         let retry = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -31072,7 +31170,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(5),
             )
         })
         .unwrap();
@@ -31116,7 +31213,7 @@ mod tests {
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
         let fresh = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -31134,7 +31231,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(60),
             )
         })
         .unwrap();
@@ -31738,7 +31834,7 @@ mod tests {
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
         let execution = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -31749,7 +31845,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(5),
             )
         })
         .unwrap();
@@ -31812,7 +31907,7 @@ mod tests {
         let pool = AgentPool::new();
         let shadow = test_kernel_shadow();
         let execution = std::thread::scope(|_scope| {
-            workflow::run_workflow_tool_with_deadline(
+            workflow::run_workflow_tool_with_live_limit(
                 &pool,
                 &shadow,
                 &request,
@@ -31823,7 +31918,6 @@ mod tests {
                 false,
                 1,
                 4,
-                Duration::from_secs(60),
             )
         })
         .unwrap();
@@ -31875,7 +31969,7 @@ mod tests {
             // Each call has its own scope, so the driver and step have reached a
             // terminal state before the next run starts.
             let execution = std::thread::scope(|_scope| {
-                workflow::run_workflow_tool_with_deadline(
+                workflow::run_workflow_tool_with_live_limit(
                     &pool,
                     &shadow,
                     &request,
@@ -31886,7 +31980,6 @@ mod tests {
                     false,
                     1,
                     4,
-                    Duration::from_secs(60),
                 )
             })
             .unwrap();
@@ -33900,6 +33993,7 @@ mod tests {
         assert_eq!(update.description, "");
         let schema = tool_schema(
             update,
+            crate::tool_surface::ToolVariant::Standard,
             &crate::prompt_profile::PromptProfile::builtin_english(),
             &crate::workspace_set::WorkspaceSet::default(),
         );
@@ -34017,7 +34111,9 @@ mod tests {
     }
 
     /// The child addendum follows the parent prompt profile, at both production
-    /// call sites. Tool-catalogue language does not control injected text.
+    /// call sites, for a role that names no tool-description file of its own —
+    /// the child then runs its caller's profile itself. Tool-catalogue language
+    /// does not control injected text.
     #[test]
     fn both_child_prompt_call_sites_take_the_addendum_from_the_parent_profile() {
         let file_profile = || {
@@ -34056,9 +34152,11 @@ mod tests {
         assert!(en_child.starts_with("Parent prompt.\n\n---\n\n"));
 
         // Call site 2: `configure_named_agent_template` uses the same parent
-        // profile rather than deriving text from the parent's tool catalogue.
+        // profile rather than deriving text from the parent's tool catalogue,
+        // when the role follows its caller's file.
         let (_directory, state, base_parent, definition) =
             named_agent_fixture(AgentDefinitionMemory::None);
+        assert_eq!(definition.tool_description_file_id, None);
         let document = current_agent_document(&base_parent, &state).unwrap();
         let named_prompt = |profile: Arc<PromptProfile>| {
             let mut parent = base_parent.clone();
@@ -34066,6 +34164,7 @@ mod tests {
             let (binding, provider, model) =
                 initial_agent_definition_binding(&parent, &document, &definition).unwrap();
             let mut child = agent_child_template(&parent);
+            apply_role_prompt_profile(&parent, &mut child, &document, &definition);
             configure_named_agent_template(
                 &parent,
                 &mut child,
@@ -34077,6 +34176,11 @@ mod tests {
                 AgentRunStart::Fresh,
             )
             .unwrap();
+            assert!(Arc::ptr_eq(&child.prompt_profile, &parent.prompt_profile));
+            let mut spawned = agent_child_template(&parent);
+            apply_named_role_to_fresh_template(&parent, &state, &mut spawned, "reviewer").unwrap();
+            assert!(Arc::ptr_eq(&spawned.prompt_profile, &parent.prompt_profile));
+            assert_eq!(spawned.assembled_system_prompt, child.assembled_system_prompt);
             child.assembled_system_prompt
         };
         let file_named = named_prompt(file_profile());
@@ -34089,6 +34193,328 @@ mod tests {
             en_named.contains("You are a child agent spawned by the main agent"),
             "{en_named}"
         );
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
+    }
+
+    /// The addendum's browser and shell notes follow the tools the child ends up
+    /// with, read after its role's allowlist, at a spawn and at a resume alike.
+    /// A role kept to `read` is told about neither, nor about a `task_wait` it
+    /// was never given, while an ordinary child of the same parent, holding
+    /// every tool, is told about both with the shell note last.
+    #[test]
+    fn a_child_is_told_only_about_the_tools_it_holds() {
+        let (directory, state, parent, mut definition) =
+            named_agent_fixture(AgentDefinitionMemory::None);
+        let profile = PromptProfile::builtin_english();
+        assert_eq!(*parent.prompt_profile, profile);
+        let browser = profile.text(PromptKey::SubagentAddendumBrowserNote);
+        let shell = profile.text(PromptKey::SubagentAddendumShellNote);
+        let holds_a_shell = |tools: &[String]| {
+            tools
+                .iter()
+                .any(|name| crate::shell_backend::ShellBackend::of_tool(name).is_some())
+        };
+
+        let ordinary = agent_child_template(&parent);
+        assert!(holds_a_shell(&ordinary.enabled_tools));
+        assert!(ordinary.enabled_tools.iter().any(|name| name.starts_with("preview_")));
+        let prompt = &ordinary.assembled_system_prompt;
+        assert!(prompt.ends_with(&format!("\n- {browser}\n- {shell}")), "{prompt}");
+
+        definition.tools = Some(vec!["read".into()]);
+        select_test_roles(&state, directory.path(), &parent, vec![definition.clone()]);
+        let mut child = agent_child_template(&parent);
+        apply_named_role_to_fresh_template(&parent, &state, &mut child, "reviewer").unwrap();
+        assert!(!holds_a_shell(&child.enabled_tools), "{:?}", child.enabled_tools);
+        assert!(!child.enabled_tools.iter().any(|name| name == "task_wait"));
+        let document = current_agent_document(&parent, &state).unwrap();
+        let (binding, _, _) =
+            initial_agent_definition_binding(&parent, &document, &definition).unwrap();
+        let record = sign_test_subagent_record(
+            &parent,
+            &state,
+            SubagentRunRecord {
+                kind: SubagentRunKind::General,
+                name: Some("a1".into()),
+                label: None,
+                inherits_model_memory: false,
+                fork_model_binding: None,
+                agent_definition: Some(binding),
+                execution_mode_receipt: String::new(),
+                task: "Review".into(),
+                status: SubagentRunStatus::Completed,
+                contexts: Vec::new(),
+                updates: Vec::new(),
+                structured_output: None,
+                output_schema: None,
+                usage: ModelUsage::default(),
+            },
+        );
+        let resumed = build_rehydrated_agent_template(&parent, &state, "a1", &record).unwrap();
+        let addendum = profile.text(PromptKey::SubagentAddendum);
+        for prompt in [&child.assembled_system_prompt, &resumed.assembled_system_prompt] {
+            assert!(!prompt.contains(shell), "{prompt}");
+            assert!(!prompt.contains("task_wait"), "{prompt}");
+            assert!(!prompt.contains(browser), "{prompt}");
+            assert!(prompt.ends_with(addendum), "{prompt}");
+        }
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
+    }
+
+    /// A caller's tool-description file that marks every text a child of its
+    /// could be handed, so a test can tell which profile worded what.
+    fn marked_caller_profile() -> PromptProfile {
+        PromptProfile::from_file(
+            "tooldesc_user_caller_00000000".into(),
+            "Caller".into(),
+            ResolvedLanguage::EnUs,
+            [
+                (PromptKey::SubagentAddendum, "MARKED child addendum."),
+                (PromptKey::ToolReadDescription, "MARKED read."),
+                (PromptKey::SubagentUpdateToolDescription, "MARKED progress."),
+                (PromptKey::SystemEnvironmentWorkingDirectory, "MARKED working directory: {path}"),
+                (PromptKey::TaskStoppedByUser, "MARKED closed by the user."),
+                (PromptKey::SubagentForcedStop, "MARKED {name} was stopped."),
+            ]
+            .map(|(key, text)| (key, text.to_owned()))
+            .into(),
+            Vec::new(),
+        )
+    }
+
+    /// Puts `parent` on [`marked_caller_profile`], with the prompt and the
+    /// role basis a run's start would word in it, and returns the facts its
+    /// environment block states.
+    fn run_parent_on_marked_profile(
+        parent: &mut RunModelRequest,
+    ) -> crate::environment_prompt::EnvironmentFacts {
+        let profile = Arc::new(marked_caller_profile());
+        let facts = crate::environment_prompt::EnvironmentFacts {
+            working_directory: "/work/repo".into(),
+            platform: "linux".into(),
+            date: "2026-10-08".into(),
+            ..Default::default()
+        };
+        let environment = crate::run_environment_block(&profile, &facts, false);
+        parent.assembled_system_prompt = crate::assemble_system_prompt(&environment, "");
+        parent.role_basis = Arc::new(crate::capabilities::RoleBasis {
+            environment,
+            prompt_profile_id: profile.id.clone(),
+            environment_facts: facts.clone(),
+            ..Default::default()
+        });
+        parent.prompt_profile = profile;
+        facts
+    }
+
+    /// Makes `definitions` the roles every conversation of the fixture selects.
+    fn select_test_roles(
+        state: &AppState,
+        directory: &Path,
+        parent: &RunModelRequest,
+        definitions: Vec<AgentDefinition>,
+    ) {
+        let mut document = (*current_agent_document(parent, state).unwrap()).clone();
+        set_conversation_agent_definitions(state, &mut document, definitions);
+        state
+            .document_store
+            .commit(&directory.join("document.v1.json"), document)
+            .unwrap();
+    }
+
+    /// A role that names a tool-description file words its child in it: the
+    /// schemas the child is sent, its prompt — its caller's environment and the
+    /// addendum alike — its progress tool, and what its own tasks inherit.
+    /// None of the caller's wording reaches what the child is sent, while the
+    /// child still knows whose wording its caller reads. Naming the guided
+    /// built-in is a choice of its own, not "follow the caller", and a
+    /// workflow step running the role is worded the same way.
+    #[test]
+    fn a_role_that_names_a_tool_description_file_words_its_child_in_it() {
+        use crate::prompt_profile::{BUILTIN_CONCISE_EN_US_ID, BUILTIN_EN_US_ID};
+        let (directory, state, mut parent, definition) =
+            named_agent_fixture(AgentDefinitionMemory::None);
+        let facts = run_parent_on_marked_profile(&mut parent);
+        for (chosen, expected) in [
+            (BUILTIN_CONCISE_EN_US_ID, PromptProfile::builtin_concise()),
+            (BUILTIN_EN_US_ID, PromptProfile::builtin_english()),
+        ] {
+            let mut role = definition.clone();
+            role.tool_description_file_id = Some(chosen.into());
+            select_test_roles(&state, directory.path(), &parent, vec![role]);
+            let mut child = agent_child_template(&parent);
+            apply_named_role_to_fresh_template(&parent, &state, &mut child, "reviewer").unwrap();
+
+            assert_eq!(*child.prompt_profile, expected);
+            assert_eq!(child.caller_prompt_profile.as_deref(), Some(&*parent.prompt_profile));
+            let read = child.tools.iter().find(|tool| tool.name == "read").unwrap();
+            assert_eq!(
+                tool_schema(read, crate::tool_surface::ToolVariant::Standard, &child.prompt_profile, &child.workspaces)["description"],
+                crate::builtin_schemas::builtin_tool_schema("read", crate::tool_surface::ToolVariant::Standard, &expected).unwrap()["description"]
+            );
+            let update = child
+                .tools
+                .iter()
+                .find(|tool| tool.name == SUBAGENT_UPDATE_TOOL)
+                .unwrap();
+            assert_eq!(
+                update.input_schema,
+                Some(crate::builtin_schemas::subagent_update_schema(&expected))
+            );
+            let prompt = &child.assembled_system_prompt;
+            assert!(
+                prompt.starts_with(&crate::environment_prompt::environment_section(&expected, &facts)),
+                "{prompt}"
+            );
+            // The addendum, with the notes the child's tools call for.
+            let addendum = subagent_prompt::render(
+                PromptVersion::current(),
+                "",
+                &expected,
+                &child.enabled_tools,
+            );
+            assert!(prompt.ends_with(&addendum), "{prompt}");
+            let mut sent = child.clone();
+            sent.contexts = parent.contexts.clone();
+            let sent = step_json(&sent).to_string();
+            assert!(!sent.contains("MARKED"), "{sent}");
+
+            // A task the child starts — a background command — reports to the
+            // child, in the child's wording.
+            let task = agent_child_template(&child);
+            assert_eq!(*task.prompt_profile, expected);
+            assert_eq!(task.caller_prompt_profile.as_deref(), Some(&expected));
+
+            let step = crate::workflow::role_step_template(&parent, &state, "reviewer");
+            assert_eq!(*step.prompt_profile, expected);
+            assert_eq!(step.assembled_system_prompt, child.assembled_system_prompt);
+        }
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
+    }
+
+    /// A role whose tool-description file is gone words its child in the
+    /// guided built-in, as a conversation whose selection dangles is worded.
+    #[test]
+    fn a_role_whose_tool_description_file_is_gone_words_its_child_in_the_guided_built_in() {
+        let (directory, state, mut parent, mut definition) =
+            named_agent_fixture(AgentDefinitionMemory::None);
+        run_parent_on_marked_profile(&mut parent);
+        definition.tool_description_file_id = Some("tooldesc_user_gone_00000000".into());
+        select_test_roles(&state, directory.path(), &parent, vec![definition]);
+        let mut child = agent_child_template(&parent);
+        apply_named_role_to_fresh_template(&parent, &state, &mut child, "reviewer").unwrap();
+        assert_eq!(*child.prompt_profile, PromptProfile::builtin_english());
+        assert!(
+            !child.assembled_system_prompt.contains("MARKED"),
+            "{}",
+            child.assembled_system_prompt
+        );
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
+    }
+
+    /// What a child on its role's file hands back is worded in its caller's
+    /// file, the one the caller's model reads: a close by the user before its
+    /// turn began, and the forced stop of a worker that never honoured a stop.
+    #[test]
+    fn a_child_on_its_roles_file_reports_to_its_caller_in_the_callers_wording() {
+        let (directory, state, mut parent, mut definition) =
+            named_agent_fixture(AgentDefinitionMemory::None);
+        run_parent_on_marked_profile(&mut parent);
+        definition.tool_description_file_id =
+            Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID.into());
+        select_test_roles(&state, directory.path(), &parent, vec![definition]);
+        let pool = AgentPool::new();
+        let register = |name: &str| {
+            let mut template = agent_child_template(&parent);
+            apply_named_role_to_fresh_template(&parent, &state, &mut template, "reviewer").unwrap();
+            assert_eq!(*template.prompt_profile, PromptProfile::builtin_concise());
+            pool.register(
+                name.into(),
+                name.into(),
+                "Review".into(),
+                template,
+                SubagentRunKind::General,
+                &state,
+                Vec::new(),
+                Vec::new(),
+                AgentLiveStatus::Running,
+                format!("call-{name}"),
+                None,
+            )
+            .unwrap()
+        };
+
+        let closed = register("a1");
+        assert_eq!(closed.caller_prompt_profile(), &*parent.prompt_profile);
+        closed.request_stop(crate::agents::StopOrigin::User);
+        agent_worker_loop(&closed, &state, 0);
+        let stuck = register("a2");
+        stuck.settle_after_cancel_timeout();
+
+        let envelopes = pool.take_undelivered_results();
+        let content = |name: &str| {
+            envelopes
+                .iter()
+                .find(|envelope| envelope.agent == name)
+                .map(|envelope| envelope.content.clone())
+                .unwrap_or_else(|| panic!("{name}: {envelopes:?}"))
+        };
+        assert_eq!(content("a1"), "MARKED closed by the user.");
+        assert_eq!(content("a2"), "MARKED a2 was stopped.");
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
+    }
+
+    /// A resumed child is configured from its role as it is now, its
+    /// tool-description file included: the file the role named at the spawn
+    /// words it again, and a role that has since gone back to following its
+    /// caller hands it its caller's — without revoking it, since the file
+    /// grants nothing.
+    #[test]
+    fn a_resumed_child_is_worded_in_its_roles_tool_description_file() {
+        let (directory, state, mut parent, mut definition) =
+            named_agent_fixture(AgentDefinitionMemory::None);
+        run_parent_on_marked_profile(&mut parent);
+        definition.tool_description_file_id =
+            Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID.into());
+        select_test_roles(&state, directory.path(), &parent, vec![definition.clone()]);
+        let document = current_agent_document(&parent, &state).unwrap();
+        let (binding, _, _) =
+            initial_agent_definition_binding(&parent, &document, &definition).unwrap();
+        let record = sign_test_subagent_record(
+            &parent,
+            &state,
+            SubagentRunRecord {
+                kind: SubagentRunKind::General,
+                name: Some("a1".into()),
+                label: None,
+                inherits_model_memory: false,
+                fork_model_binding: None,
+                agent_definition: Some(binding),
+                execution_mode_receipt: String::new(),
+                task: "Review".into(),
+                status: SubagentRunStatus::Completed,
+                contexts: Vec::new(),
+                updates: Vec::new(),
+                structured_output: None,
+                output_schema: None,
+                usage: ModelUsage::default(),
+            },
+        );
+
+        let restored = build_rehydrated_agent_template(&parent, &state, "a1", &record).unwrap();
+        assert_eq!(*restored.prompt_profile, PromptProfile::builtin_concise());
+        assert_eq!(restored.caller_prompt_profile.as_deref(), Some(&*parent.prompt_profile));
+        assert!(
+            !restored.assembled_system_prompt.contains("MARKED"),
+            "{}",
+            restored.assembled_system_prompt
+        );
+
+        definition.tool_description_file_id = None;
+        select_test_roles(&state, directory.path(), &parent, vec![definition]);
+        let restored = build_rehydrated_agent_template(&parent, &state, "a1", &record).unwrap();
+        assert!(Arc::ptr_eq(&restored.prompt_profile, &parent.prompt_profile));
+        assert!(restored.assembled_system_prompt.contains("MARKED child addendum."));
         state.document_store.flush(Duration::from_secs(10)).unwrap();
     }
 
@@ -34654,6 +35080,9 @@ mod tests {
                 resource_id: "skill_probe".into(),
                 name: "probe".into(),
                 content: "## Skill added: probe\n\nBODY".into(),
+                form: crate::model::AddedSkillForm::Body {
+                    body: "BODY".into(),
+                },
             }]
         };
         request.added_skills = added();
@@ -34672,7 +35101,7 @@ mod tests {
         else {
             panic!("the added skill is a delivery card");
         };
-        assert_eq!(id, "ctx_agent-result_skill_skill_probe");
+        assert_eq!(id, "ctx_agent-result_skill_body_skill_probe");
         assert_eq!(tool_name, crate::wire_history::HOST_CARD_TOOL);
         assert_eq!(
             crate::wire_history::host_notice_kind(&request.contexts[1]),
@@ -34699,7 +35128,8 @@ mod tests {
     }
 
     /// A conversation recorded before skills arrived as notices already holds
-    /// the skill as a system card; it is not handed the skill again.
+    /// the skill as a system card; it is not handed the skill again, in
+    /// either form.
     #[test]
     fn a_skill_delivered_as_a_legacy_system_card_is_not_delivered_again() {
         let mut request = run_request(ProviderFamily::Anthropic);
@@ -34712,13 +35142,336 @@ mod tests {
             native_compaction: None,
             created_at: "2026-09-16T00:00:00.000Z".into(),
         }];
-        request.added_skills = vec![crate::model::AddedSkill {
+        for form in [crate::model::AddedSkillForm::Trigger, probe_body_form()] {
+            request.added_skills = vec![probe_skill(form)];
+            record_added_skill_contexts(&mut request);
+            assert!(request.host_notices.is_empty());
+        }
+    }
+
+    /// The probe skill's body, as a turn with the skill switch off quotes it.
+    fn probe_body_form() -> crate::model::AddedSkillForm {
+        crate::model::AddedSkillForm::Body {
+            body: "PROBE-BODY\n\nRun the probe.".into(),
+        }
+    }
+
+    /// The probe skill as a turn hands it over: announced, for a conversation
+    /// that loads skills on demand, or with its body pasted.
+    fn probe_skill(form: crate::model::AddedSkillForm) -> crate::model::AddedSkill {
+        let content = match &form {
+            crate::model::AddedSkillForm::Trigger => {
+                "## Skill added: probe\n\nLoad it with the `skill` tool when it applies.\n\n- probe: Use when probing".to_owned()
+            }
+            crate::model::AddedSkillForm::Body { body } => {
+                format!("## Skill added: probe\n\nIn force from this point on.\n\n{body}\n\nThis skill's files are in C:/skills/probe.")
+            }
+        };
+        crate::model::AddedSkill {
             resource_id: "skill_probe".into(),
             name: "probe".into(),
-            content: "## Skill added: probe\n\nBODY".into(),
-        }];
-        record_added_skill_contexts(&mut request);
-        assert!(request.host_notices.is_empty());
+            content,
+            form,
+        }
+    }
+
+    /// One turn's delivery of `skills` over `request`'s transcript, as
+    /// `run_model` makes it: the ids of the cards it added.
+    fn deliver_added_skills(
+        request: &mut RunModelRequest,
+        state: &AppState,
+        skills: Vec<crate::model::AddedSkill>,
+    ) -> Vec<String> {
+        let before = request.contexts.len();
+        request.added_skills = skills;
+        record_added_skill_contexts(request);
+        let mut generated = GeneratedContexts::new(None, None);
+        deliver_host_notices(request, state, 1, &mut [], &mut generated);
+        request.contexts[before..]
+            .iter()
+            .map(|context| context.id().to_owned())
+            .collect()
+    }
+
+    fn delivered_card_text(request: &RunModelRequest, id: &str) -> String {
+        let card = request
+            .contexts
+            .iter()
+            .find(|context| context.id() == id)
+            .unwrap_or_else(|| panic!("no card {id}"));
+        crate::wire_history::host_delivery(card)
+            .expect("a host delivery")
+            .message
+    }
+
+    fn user_message(id: &str, content: &str) -> ContextItem {
+        ContextItem::User {
+            id: id.into(),
+            content: content.into(),
+            images: Vec::new(),
+            files: Vec::new(),
+            created_at: "2026-10-08T00:00:00.000Z".into(),
+        }
+    }
+
+    /// Announced while skills loaded on demand, a skill still gets its body
+    /// once the switch is turned off: the announcement pointed at a `skill`
+    /// tool the conversation no longer has. The body is a delivery of its
+    /// own, under its own id, and is made once.
+    #[test]
+    fn a_skill_announced_on_demand_gets_its_body_once_the_switch_turns_off() {
+        let state = AppState::default();
+        let mut request = run_request(ProviderFamily::Anthropic);
+        request.contexts = vec![user_message("ctx_u", "hi")];
+        let announced = added_skill_context_id("skill_probe");
+        let body = added_skill_body_context_id("skill_probe");
+        assert_ne!(announced, body);
+
+        assert_eq!(
+            deliver_added_skills(&mut request, &state, vec![probe_skill(crate::model::AddedSkillForm::Trigger)]),
+            [announced.clone()]
+        );
+        // The switch goes off: the next turn hands the body over.
+        assert_eq!(
+            deliver_added_skills(&mut request, &state, vec![probe_skill(probe_body_form())]),
+            [body.clone()]
+        );
+        assert!(delivered_card_text(&request, &body).contains("PROBE-BODY\n\nRun the probe."));
+        // And only once.
+        assert!(deliver_added_skills(&mut request, &state, vec![probe_skill(probe_body_form())]).is_empty());
+        // Turned on again, nothing more is owed: the instructions are there.
+        assert!(deliver_added_skills(&mut request, &state, vec![probe_skill(crate::model::AddedSkillForm::Trigger)])
+            .is_empty());
+        assert_eq!(request.contexts.len(), 3);
+    }
+
+    /// Pasted as a body while the switch was off, a skill is not announced
+    /// once the switch is turned on: the instructions it would point the
+    /// model at are already in its transcript.
+    #[test]
+    fn a_delivered_body_is_not_announced_once_the_switch_turns_on() {
+        let state = AppState::default();
+        let mut request = run_request(ProviderFamily::Anthropic);
+        request.contexts = vec![user_message("ctx_u", "hi")];
+
+        assert_eq!(
+            deliver_added_skills(&mut request, &state, vec![probe_skill(probe_body_form())]),
+            [added_skill_body_context_id("skill_probe")]
+        );
+        assert!(deliver_added_skills(&mut request, &state, vec![probe_skill(crate::model::AddedSkillForm::Trigger)])
+            .is_empty());
+        assert_eq!(request.contexts.len(), 2);
+    }
+
+    /// Older builds delivered the body under the id the announcement now
+    /// keeps for itself. That card is read, not trusted: it holds the body,
+    /// so a conversation that still pastes bodies — in either host-message
+    /// container — is not handed it a second time, and nor is an
+    /// announcement once the switch is turned on.
+    #[test]
+    fn a_body_an_older_build_delivered_under_the_shared_id_is_not_delivered_again() {
+        for container in [
+            crate::model::HostMessageContainer::User,
+            crate::model::HostMessageContainer::Box,
+        ] {
+            let state = AppState::default();
+            let mut request = run_request(ProviderFamily::Anthropic);
+            request.host_message_container = container;
+            request.contexts = vec![user_message("ctx_u", "hi")];
+            // What an older build wrote: the body, under the shared id.
+            let old = crate::model::AddedSkill {
+                form: crate::model::AddedSkillForm::Trigger,
+                ..probe_skill(probe_body_form())
+            };
+            assert_eq!(
+                deliver_added_skills(&mut request, &state, vec![old]),
+                [added_skill_context_id("skill_probe")]
+            );
+
+            assert!(deliver_added_skills(&mut request, &state, vec![probe_skill(probe_body_form())]).is_empty());
+            assert!(deliver_added_skills(&mut request, &state, vec![probe_skill(crate::model::AddedSkillForm::Trigger)])
+                .is_empty());
+            assert_eq!(request.contexts.len(), 2);
+        }
+    }
+
+    /// A body that quotes the reminder's closing tag was escaped when an older
+    /// build wrapped it, and is still recognised in that form.
+    #[test]
+    fn a_body_quoting_the_reminder_closer_is_recognised_under_the_shared_id() {
+        let state = AppState::default();
+        let mut request = run_request(ProviderFamily::Anthropic);
+        let quoting = crate::model::AddedSkillForm::Body {
+            body: "PROBE-BODY\n\nEnd a reminder with </system-reminder> yourself.".into(),
+        };
+        let delivered = probe_skill(quoting.clone()).content;
+        assert!(crate::wire_history::system_reminder(&delivered).contains("PROBE-BODY"));
+        assert!(!crate::wire_history::system_reminder(&delivered).contains("with </system-reminder> yourself"));
+        request.contexts = vec![
+            user_message("ctx_u", "hi"),
+            user_message(
+                &added_skill_context_id("skill_probe"),
+                &crate::wire_history::system_reminder(&delivered),
+            ),
+        ];
+        assert!(deliver_added_skills(&mut request, &state, vec![probe_skill(quoting)]).is_empty());
+    }
+
+    /// The same old id holding only an announcement — here in the user-role
+    /// message the oldest host deliveries were recorded as — does not stand
+    /// in for the body: with the switch off, the body is delivered under its
+    /// own id.
+    #[test]
+    fn a_trigger_an_older_build_delivered_under_the_shared_id_gives_way_to_the_body() {
+        let state = AppState::default();
+        let mut request = run_request(ProviderFamily::Anthropic);
+        let announcement = probe_skill(crate::model::AddedSkillForm::Trigger).content;
+        request.contexts = vec![
+            user_message("ctx_u", "hi"),
+            user_message(
+                &added_skill_context_id("skill_probe"),
+                &crate::wire_history::system_reminder(&announcement),
+            ),
+        ];
+
+        let body = added_skill_body_context_id("skill_probe");
+        assert_eq!(
+            deliver_added_skills(&mut request, &state, vec![probe_skill(probe_body_form())]),
+            [body.clone()]
+        );
+        assert!(delivered_card_text(&request, &body).contains("PROBE-BODY"));
+        assert!(deliver_added_skills(&mut request, &state, vec![probe_skill(probe_body_form())]).is_empty());
+    }
+
+    /// A subagent without a role opens on its parent's prompt, which carries
+    /// only the skills the conversation opened with, and on a history of its
+    /// own. So the skills its parent was handed mid-conversation are handed to
+    /// it too, at its own first round — announced or pasted, as the parent
+    /// had them — even though the parent's run delivered its own notices
+    /// before the child was spawned.
+    #[test]
+    fn a_roleless_child_is_handed_the_skills_its_parent_got_mid_conversation() {
+        let state = AppState::default();
+        for form in [crate::model::AddedSkillForm::Trigger, probe_body_form()] {
+            let mut parent = run_request(ProviderFamily::Anthropic);
+            parent.contexts = vec![user_message("ctx_u", "hi")];
+            let skill = probe_skill(form.clone());
+            let id = deliver_added_skills(&mut parent, &state, vec![skill.clone()]);
+            assert_eq!(id.len(), 1);
+
+            // Spawned later in the same run.
+            let mut child = agent_child_template(&parent);
+            assert_eq!(child.added_skills, [skill.clone()]);
+            child.contexts = vec![user_message("ctx_task", "probe the thing")];
+            record_added_skill_contexts(&mut child);
+            let mut generated = GeneratedContexts::new(None, None);
+            deliver_host_notices(&mut child, &state, 1, &mut [], &mut generated);
+            assert_eq!(child.contexts.len(), 2);
+            assert_eq!(child.contexts[1].id(), id[0]);
+            assert_eq!(
+                delivered_card_text(&child, &id[0]),
+                crate::wire_history::system_reminder(&skill.content)
+            );
+            // Its next turn, over its own transcript, is handed nothing more.
+            record_added_skill_contexts(&mut child);
+            assert!(child.host_notices.is_empty());
+        }
+    }
+
+    /// A role's child has its prompt resolved again, with every skill it
+    /// has in it, so the caller's mid-conversation notices are not handed
+    /// to it. A definition that resolves nothing again keeps its caller's
+    /// prompt, and with it those notices, as a child without a role does.
+    #[test]
+    fn a_roles_child_is_not_handed_its_callers_mid_conversation_skills() {
+        let (directory, state, mut parent, definition) =
+            named_agent_fixture(AgentDefinitionMemory::None);
+        let anchor = directory.path().join("document.v1.json");
+        let mut document = (*current_agent_document(&parent, &state).unwrap()).clone();
+        parent.added_skills = vec![probe_skill(crate::model::AddedSkillForm::Trigger)];
+
+        let own = AgentDefinition {
+            skill_ids: Some(Vec::new()),
+            ..definition.clone()
+        };
+        set_conversation_agent_definitions(&state, &mut document, vec![own]);
+        state.document_store.commit(&anchor, document.clone()).unwrap();
+        let mut child = agent_child_template(&parent);
+        apply_named_role_to_fresh_template(&parent, &state, &mut child, "reviewer").unwrap();
+        assert!(child.added_skills.is_empty());
+
+        set_conversation_agent_definitions(&state, &mut document, vec![definition]);
+        state.document_store.commit(&anchor, document).unwrap();
+        let mut child = agent_child_template(&parent);
+        apply_named_role_to_fresh_template(&parent, &state, &mut child, "reviewer").unwrap();
+        assert_eq!(child.added_skills, parent.added_skills);
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
+    }
+
+    /// A role that names `skill` in `disallowedTools` while its caller loads
+    /// skills on demand has its skills pasted as bodies: its child holds no
+    /// `skill` tool, reads no listing pointing at one, and has the
+    /// instructions in its prompt — whether the role chose the skills or left
+    /// them to its caller. The same role without the denial loads them.
+    #[test]
+    fn a_role_that_refuses_the_skill_tool_has_its_skills_pasted_as_bodies() {
+        let (directory, state, mut parent, definition) =
+            named_agent_fixture(AgentDefinitionMemory::None);
+        let folder = directory.path().join(".mewrk").join("skills").join("beta");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("SKILL.md"),
+            "---\nname: beta\ndescription: beta things\n---\n\nbeta-BODY\n",
+        )
+        .unwrap();
+        let anchor = directory.path().join("document.v1.json");
+        let mut document = (*current_agent_document(&parent, &state).unwrap()).clone();
+        document.workspaces[0].path = directory.path().to_string_lossy().into_owned();
+        let beta = crate::capabilities::discover(&document, directory.path())
+            .skills
+            .into_iter()
+            .find(|row| row.name == "beta")
+            .expect("the workspace's skill is listed")
+            .id;
+        // The caller loads skills on demand, `skill` among its tools.
+        parent.role_basis = Arc::new(crate::capabilities::RoleBasis {
+            skill_ids: vec![beta.clone()],
+            skill_tool: true,
+            ..Default::default()
+        });
+        if !parent.enabled_tools.iter().any(|name| name == SKILL_TOOL) {
+            parent.enabled_tools.push(SKILL_TOOL.into());
+        }
+        let listing = parent.prompt_profile.text(PromptKey::SkillListingHeading).to_owned();
+        let mut spawn = |role: AgentDefinition| {
+            set_conversation_agent_definitions(&state, &mut document, vec![role]);
+            state.document_store.commit(&anchor, document.clone()).unwrap();
+            let mut child = agent_child_template(&parent);
+            apply_named_role_to_fresh_template(&parent, &state, &mut child, "reviewer").unwrap();
+            child
+        };
+
+        let loading = spawn(AgentDefinition {
+            skill_ids: Some(vec![beta.clone()]),
+            ..definition.clone()
+        });
+        assert!(loading.enabled_tools.iter().any(|name| name == SKILL_TOOL));
+        assert!(loading.assembled_system_prompt.contains(&format!("{listing}\n- beta: beta things")));
+        assert!(!loading.assembled_system_prompt.contains("beta-BODY"));
+
+        for skill_ids in [Some(vec![beta.clone()]), None] {
+            let child = spawn(AgentDefinition {
+                skill_ids,
+                disallowed_tools: vec![SKILL_TOOL.into()],
+                ..definition.clone()
+            });
+            assert!(!child.enabled_tools.iter().any(|name| name == SKILL_TOOL));
+            assert!(child.skills.is_empty());
+            let prompt = &child.assembled_system_prompt;
+            assert!(prompt.contains("beta-BODY"), "{prompt}");
+            assert!(!prompt.contains(&listing), "{prompt}");
+        }
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
     }
 
     /// Skill invocation returns the catalog entry and body, which must come only from
@@ -35091,6 +35844,184 @@ mod tests {
         );
     }
 
+    /// A server that is listed but never answers: its command does not exist, so
+    /// a test that hands it to discovery sees it fail, and one that does not
+    /// never needs `node`.
+    fn offline_mcp_server(id: &str, name: &str) -> crate::mcp::RuntimeMcpServer {
+        crate::mcp::RuntimeMcpServer {
+            artifact_id: id.into(),
+            server_id: id.into(),
+            name: name.into(),
+            description: String::new(),
+            disabled_tools: Vec::new(),
+            confirm_every_call_tools: Vec::new(),
+            request_timeout: None,
+            declared_in: None,
+            workspace_folders: Vec::new(),
+            wants_workspace: false,
+            transport: crate::mcp::RuntimeMcpTransport::Stdio {
+                command: "/definitely/not/an/mcp-server-xyz".into(),
+                args: Vec::new(),
+                env: Default::default(),
+                cwd: None,
+                env_passthrough: Vec::new(),
+                on_machine: None,
+            },
+        }
+    }
+
+    /// One tool of `server`, as discovery would have bound it.
+    fn offline_mcp_binding(
+        server: &crate::mcp::RuntimeMcpServer,
+        tool: &str,
+    ) -> crate::mcp::McpToolBinding {
+        crate::mcp::McpToolBinding {
+            exposed_name: format!("mcp__{}__{tool}", server.name),
+            remote_name: tool.to_owned(),
+            title: tool.to_owned(),
+            description: String::new(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            output_schema: None,
+            annotations: None,
+            requires_user_interaction: false,
+            user_requires_confirmation: false,
+            negotiated_protocol_version: "2025-06-18".into(),
+            server: server.clone(),
+            workspace_parameter_added: false,
+        }
+    }
+
+    /// The prompt's server list for `(id, name)` servers, with the row each
+    /// contributed.
+    fn mcp_section_for(
+        profile: &PromptProfile,
+        servers: &[(&str, &str)],
+    ) -> crate::capabilities::McpPromptSection {
+        let rows = servers
+            .iter()
+            .map(|(id, name)| {
+                (
+                    (*id).to_owned(),
+                    profile.render(
+                        PromptKey::SystemCapabilityRow,
+                        &[("name", *name), ("description", "User MCP server")],
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let listed = rows.iter().map(|(_, row)| row.as_str()).collect::<Vec<_>>();
+        crate::capabilities::McpPromptSection {
+            rendered: profile.render(PromptKey::SystemMcpSection, &[("servers", &listed.join("\n"))]),
+            rows,
+        }
+    }
+
+    /// A server that answered with nothing to offer has not failed, so no
+    /// notice names it, but the prompt must stop presenting it as usable. The
+    /// server with tools keeps its row, a server that failed outright goes in
+    /// the same rewrite, and when none has a tool the whole section leaves with
+    /// its separator.
+    #[test]
+    fn a_selected_server_left_with_no_tool_loses_its_row_in_the_prompt() {
+        let profile = crate::prompt_profile::PromptProfile::builtin_english();
+        let section = mcp_section_for(
+            &profile,
+            &[("mcp_tools", "working"), ("mcp_empty", "empty"), ("mcp_down", "down")],
+        );
+        let working = offline_mcp_server("mcp_tools", "working");
+        let servers = vec![
+            working.clone(),
+            offline_mcp_server("mcp_empty", "empty"),
+            offline_mcp_server("mcp_down", "down"),
+        ];
+        let bindings = vec![
+            offline_mcp_binding(&working, "create_issue"),
+            offline_mcp_binding(&working, "list_issues"),
+        ];
+        let around = |section: &crate::capabilities::McpPromptSection| {
+            format!("ENVIRONMENT\n\n---\n\n{}\n\n---\n\nHOOKS", section.rendered)
+        };
+
+        // One tool-less and one failed server go together; the rewrite is
+        // exactly the section as it would have been written without them.
+        assert_eq!(
+            prompt_without_toolless_mcp_servers(&around(&section), &section, &servers, &bindings, &profile),
+            around(&mcp_section_for(&profile, &[("mcp_tools", "working")]))
+        );
+        // Nothing left to list: the section and its separator are gone.
+        assert_eq!(
+            prompt_without_toolless_mcp_servers(&around(&section), &section, &servers, &[], &profile),
+            "ENVIRONMENT\n\n---\n\nHOOKS"
+        );
+        // Every server holding a tool changes nothing.
+        let all_working = mcp_section_for(&profile, &[("mcp_tools", "working")]);
+        assert_eq!(
+            prompt_without_toolless_mcp_servers(
+                &around(&all_working),
+                &all_working,
+                &servers[..1],
+                &bindings,
+                &profile
+            ),
+            around(&all_working)
+        );
+    }
+
+    /// Discovery mode keeps a server's bindings and takes only the names out of
+    /// `enabled_tools`, so a server whose tools are merely withheld behind
+    /// `tool_search` is a server with tools: its row stays, and one with none
+    /// still loses it.
+    #[test]
+    fn a_server_whose_tools_are_only_withheld_keeps_its_row() {
+        let request = deferred_mcp_request(&[("github", "create_issue", "Open an issue.")]);
+        assert!(request.mcp_tool_discovery);
+        assert!(
+            !request
+                .enabled_tools
+                .contains(&"mcp__github__create_issue".to_owned()),
+            "the schema is withheld, not declared"
+        );
+        let profile = request.prompt_profile.clone();
+        let github = request.mcp_bindings[0].server.clone();
+        let servers = vec![github.clone(), offline_mcp_server("test:empty:s", "empty")];
+        let section = mcp_section_for(&profile, &[(&github.server_id, "github"), ("test:empty:s", "empty")]);
+        let prompt = format!("ENVIRONMENT\n\n---\n\n{}", section.rendered);
+
+        assert_eq!(
+            prompt_without_toolless_mcp_servers(&prompt, &section, &servers, &request.mcp_bindings, &profile),
+            format!(
+                "ENVIRONMENT\n\n---\n\n{}",
+                mcp_section_for(&profile, &[(&github.server_id, "github")]).rendered
+            )
+        );
+    }
+
+    /// Discovery end to end, without `node`: every selected server fails to
+    /// start, so none has a tool, and the one rewrite removes the section whole
+    /// while the run still carries one notice naming both.
+    #[test]
+    fn a_run_whose_every_server_failed_loses_the_whole_mcp_section() {
+        let state = AppState::default();
+        let mut request = run_request(ProviderFamily::Anthropic);
+        let profile = request.prompt_profile.clone();
+        let section = mcp_section_for(&profile, &[("mcp_a", "alpha"), ("mcp_b", "beta")]);
+        request.mcp_servers = vec![
+            offline_mcp_server("mcp_a", "alpha"),
+            offline_mcp_server("mcp_b", "beta"),
+        ];
+        request.assembled_system_prompt =
+            format!("ENVIRONMENT\n\n---\n\n{}\n\n---\n\nHOOKS", section.rendered);
+        request.mcp_prompt_section = section;
+
+        attach_mcp_tools(&mut request, &state).unwrap();
+
+        assert!(request.mcp_bindings.is_empty());
+        assert_eq!(request.assembled_system_prompt, "ENVIRONMENT\n\n---\n\nHOOKS");
+        assert_eq!(request.host_notices.len(), 1);
+        let body = &request.host_notices[0].body;
+        assert!(body.contains("- alpha:") && body.contains("- beta:"), "{body}");
+    }
+
     /// A run holding withheld MCP tools, built without dialing anything: the
     /// descriptors and bindings are what discovery would have produced.
     fn deferred_mcp_request(tools: &[(&str, &str, &str)]) -> RunModelRequest {
@@ -35422,6 +36353,234 @@ mod tests {
             .contains(&crate::capabilities::TOOL_SEARCH_TOOL.to_owned()));
     }
 
+    /// The named-agent fixture's parent on a model that can take a tool
+    /// mid-conversation, holding three MCP tools withheld behind `tool_search`:
+    /// what a top-level run on such a model is once discovery is done.
+    fn withholding_parent() -> (tempfile::TempDir, AppState, RunModelRequest, AgentDefinition) {
+        let (directory, state, mut parent, user) = named_agent_fixture(AgentDefinitionMemory::None);
+        parent
+            .model
+            .capabilities
+            .insert(crate::model::ModelCapability::ToolAppend);
+        let donor = deferred_mcp_request(&[
+            ("github", "create_issue", "Open an issue."),
+            ("github", "list_issues", "List issues."),
+            ("slack", "send_message", "Post a message."),
+        ]);
+        parent.tools.extend(
+            donor
+                .tools
+                .iter()
+                .filter(|tool| tool.category == ToolCategory::Mcp)
+                .cloned(),
+        );
+        parent.mcp_servers = vec![
+            donor.mcp_bindings[0].server.clone(),
+            donor.mcp_bindings[2].server.clone(),
+        ];
+        parent.mcp_bindings = donor.mcp_bindings;
+        parent.mcp_tool_discovery = true;
+        defer_mcp_tools(&mut parent);
+        assert_eq!(parent.deferred_tools.len(), 3);
+        (directory, state, parent, user)
+    }
+
+    /// The names of the MCP tools [`withholding_parent`] holds.
+    const WITHHELD_MCP_TOOLS: [&str; 3] = [
+        "mcp__github__create_issue",
+        "mcp__github__list_issues",
+        "mcp__slack__send_message",
+    ];
+
+    /// A role bound to another model asks again whether its child can withhold
+    /// MCP schemas: the parent's answer was about the parent's model, and a
+    /// model that cannot take a tool mid-conversation would have every fetch
+    /// rewrite the tool header at the head of its prompt, and its cache with it.
+    /// The child never turns the switch on by itself: a parent that declares
+    /// its schemas up front leaves it nothing to read.
+    #[test]
+    fn a_role_on_another_model_asks_again_whether_mcp_tools_can_be_withheld() {
+        let (directory, state, mut parent, user) = withholding_parent();
+        let plain = parent.provider.models[1].clone();
+        assert!(!plain.has(crate::model::ModelCapability::ToolAppend));
+        let mut appender = plain.clone();
+        appender.id = "role-appender".into();
+        appender
+            .capabilities
+            .insert(crate::model::ModelCapability::ToolAppend);
+        let bound_to = |name: &str, model: &ModelProfile| AgentDefinition {
+            name: name.into(),
+            model_selection: AgentModelSelection::Explicit {
+                provider_id: parent.provider.id.clone(),
+                model_id: model.id.clone(),
+            },
+            ..user.clone()
+        };
+        let definitions = vec![
+            AgentDefinition {
+                name: "inheriting".into(),
+                ..user.clone()
+            },
+            bound_to("cannot-append", &plain),
+            bound_to("can-append", &appender),
+        ];
+        let mut document = (*current_agent_document(&parent, &state).unwrap()).clone();
+        document.assets.api_providers[0].models =
+            vec![parent.provider.models[0].clone(), plain.clone(), appender.clone()];
+        set_conversation_agent_definitions(&state, &mut document, definitions);
+        state
+            .document_store
+            .commit(&directory.path().join("document.v1.json"), document)
+            .unwrap();
+        let child_of = |parent: &RunModelRequest, role: &str| {
+            let mut child = agent_child_template(parent);
+            apply_named_role_to_fresh_template(parent, &state, &mut child, role).unwrap();
+            child
+        };
+
+        // The parent withholds. Which of its children do depends on the model
+        // each one runs on; inheriting the parent's own changes nothing.
+        assert!(child_of(&parent, "inheriting").mcp_tool_discovery);
+        assert!(child_of(&parent, "can-append").mcp_tool_discovery);
+        let downgraded = child_of(&parent, "cannot-append");
+        assert!(!downgraded.mcp_tool_discovery);
+        // Its inherited tools are declared, since nothing could fetch them.
+        for name in WITHHELD_MCP_TOOLS {
+            assert!(downgraded.enabled_tools.iter().any(|enabled| enabled == name), "{name}");
+        }
+
+        // The parent declares everything up front: no child withholds, whatever
+        // model it is bound to.
+        parent.mcp_tool_discovery = false;
+        assert!(!child_of(&parent, "inheriting").mcp_tool_discovery);
+        assert!(!child_of(&parent, "can-append").mcp_tool_discovery);
+        assert!(!child_of(&parent, "cannot-append").mcp_tool_discovery);
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
+    }
+
+    /// A resumed child runs on the model it was created on, which is not
+    /// necessarily the one its caller runs now, so it settles the question for
+    /// that model and declares what the withholding parent had left out.
+    #[test]
+    fn a_resumed_child_settles_mcp_withholding_for_the_model_it_runs_on() {
+        let (_directory, state, mut parent, definition) = withholding_parent();
+        let document = current_agent_document(&parent, &state).unwrap();
+        let (binding, _, _) =
+            initial_agent_definition_binding(&parent, &document, &definition).unwrap();
+        // The caller has since moved to a model that takes a tool mid-run; the
+        // child's own, as the document holds it, does not.
+        let mut switched = parent.provider.models[1].clone();
+        switched
+            .capabilities
+            .insert(crate::model::ModelCapability::ToolAppend);
+        parent.model = switched;
+        assert!(parent.mcp_tool_discovery);
+        let record = sign_test_subagent_record(
+            &parent,
+            &state,
+            SubagentRunRecord {
+                kind: SubagentRunKind::General,
+                name: Some("a1".into()),
+                label: None,
+                inherits_model_memory: false,
+                fork_model_binding: None,
+                agent_definition: Some(binding),
+                execution_mode_receipt: String::new(),
+                task: "Review".into(),
+                status: SubagentRunStatus::Completed,
+                contexts: Vec::new(),
+                updates: Vec::new(),
+                structured_output: None,
+                output_schema: None,
+                usage: ModelUsage::default(),
+            },
+        );
+
+        let mut restored = build_rehydrated_agent_template(&parent, &state, "a1", &record).unwrap();
+        assert_eq!(restored.model.id, "kimi/k3:长思考");
+        assert!(!restored.mcp_tool_discovery);
+        attach_mcp_tools(&mut restored, &state).unwrap();
+        assert!(restored.deferred_tools.is_empty());
+        for name in WITHHELD_MCP_TOOLS {
+            assert!(restored.enabled_tools.iter().any(|enabled| enabled == name), "{name}");
+        }
+        assert!(!restored
+            .enabled_tools
+            .contains(&crate::capabilities::TOOL_SEARCH_TOOL.to_owned()));
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
+    }
+
+    /// A role that bars `tool_search` cannot fetch a withheld schema, and the
+    /// run used to hand the tool back anyway whenever discovery was on. Its
+    /// child declares every MCP schema up front instead, still subject to the
+    /// rest of the role's policy; nothing adds `tool_search` afterwards.
+    #[test]
+    fn a_role_that_bars_tool_search_declares_every_mcp_schema_up_front() {
+        let (directory, state, parent, user) = withholding_parent();
+        let tool_search = crate::capabilities::TOOL_SEARCH_TOOL.to_owned();
+        select_test_roles(
+            &state,
+            directory.path(),
+            &parent,
+            vec![
+                AgentDefinition {
+                    name: "plain".into(),
+                    ..user.clone()
+                },
+                AgentDefinition {
+                    name: "barred".into(),
+                    disallowed_tools: vec![tool_search.clone()],
+                    ..user.clone()
+                },
+                AgentDefinition {
+                    name: "barred-and-narrowed".into(),
+                    disallowed_tools: vec![tool_search.clone(), "mcp__slack__send_message".into()],
+                    ..user.clone()
+                },
+            ],
+        );
+        // As the run starts it: inherited bindings, so no server is dialed.
+        let child_of = |role: &str| {
+            let mut child = agent_child_template(&parent);
+            apply_named_role_to_fresh_template(&parent, &state, &mut child, role).unwrap();
+            attach_mcp_tools(&mut child, &state).unwrap();
+            child
+        };
+        let declared = |child: &RunModelRequest| {
+            crate::aisdk::tools::enabled_tools(child)
+                .into_iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let plain = child_of("plain");
+        assert!(plain.mcp_tool_discovery);
+        assert!(plain.enabled_tools.contains(&tool_search));
+        assert_eq!(plain.deferred_tools.len(), 3);
+        for name in WITHHELD_MCP_TOOLS {
+            assert!(!declared(&plain).iter().any(|declared| declared == name), "{name}");
+        }
+
+        let barred = child_of("barred");
+        assert!(!barred.mcp_tool_discovery);
+        assert!(!barred.enabled_tools.contains(&tool_search));
+        assert!(barred.deferred_tools.is_empty());
+        let wire = declared(&barred);
+        assert!(!wire.contains(&tool_search), "{wire:?}");
+        for name in WITHHELD_MCP_TOOLS {
+            assert!(wire.iter().any(|declared| declared == name), "{name}: {wire:?}");
+        }
+
+        // The role's other denials still apply to the names put back.
+        let narrowed = child_of("barred-and-narrowed");
+        let wire = declared(&narrowed);
+        assert!(!narrowed.mcp_tool_discovery);
+        assert!(!wire.contains(&tool_search), "{wire:?}");
+        assert!(!wire.iter().any(|name| name == "mcp__slack__send_message"), "{wire:?}");
+        assert!(wire.iter().any(|name| name == "mcp__github__create_issue"), "{wire:?}");
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
+    }
+
     /// Role names are injected into schemas as `enum` or `$defs`; unavailable roles
     /// never appear in the resolved set.
     /// Role names are injected into schemas as `enum` or `$defs`; unavailable roles
@@ -35696,6 +36855,54 @@ mod tests {
             // `ToolSpec.description` is user-overridable; schema injection must
             // leave it untouched.
             assert!(entry.description.is_empty(), "{format:?}: {entry:?}");
+        }
+
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
+        drop(directory);
+    }
+
+    /// A role-specialised schema is the profile's, so a description the
+    /// profile leaves empty leaves the wire as it does for every other
+    /// built-in — with roles and without, required or not.
+    #[test]
+    fn role_specialised_schemas_send_no_empty_description() {
+        let (directory, state, mut parent, _user) =
+            named_agent_fixture(AgentDefinitionMemory::None);
+        parent.prompt_profile = std::sync::Arc::new(crate::prompt_profile::PromptProfile::builtin_concise());
+        parent.tools = crate::catalog::tool_catalog();
+        parent.enabled_tools = vec!["agent_spawn".into(), workflow::WORKFLOW_TOOL.into()];
+        let alpha = vec![crate::builtin_schemas::AgentRoleSummary {
+            name: "alpha".into(),
+            description: "第一段说明。".into(),
+        }];
+        fn empty_descriptions(value: &Value, path: &str, found: &mut Vec<String>) {
+            match value {
+                Value::Object(map) => {
+                    if matches!(map.get("description"), Some(Value::String(text)) if text.is_empty()) {
+                        found.push(path.to_owned());
+                    }
+                    for (key, child) in map {
+                        empty_descriptions(child, &format!("{path}/{key}"), found);
+                    }
+                }
+                Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        empty_descriptions(item, &format!("{path}/{index}"), found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (roles, required) in [(Vec::new(), false), (alpha.clone(), false), (alpha, true)] {
+            let mut request = parent.clone();
+            inject_agent_type_schemas(&mut request, &roles, required);
+            let step = step_request(&request);
+            for name in ["agent_spawn", workflow::WORKFLOW_TOOL] {
+                let entry = step.tools.iter().find(|entry| entry.name == name).unwrap();
+                let mut found = Vec::new();
+                empty_descriptions(&entry.input_schema, "", &mut found);
+                assert!(found.is_empty(), "{name} ({} roles, required {required}): {found:?}", roles.len());
+            }
         }
 
         state.document_store.flush(Duration::from_secs(10)).unwrap();
@@ -36680,6 +37887,7 @@ mod tests {
         assert_eq!(descriptor.description, "");
         let wire = tool_schema(
             &descriptor,
+            crate::tool_surface::ToolVariant::Standard,
             &crate::prompt_profile::PromptProfile::builtin_english(),
             &crate::workspace_set::WorkspaceSet::default(),
         );
@@ -36744,6 +37952,7 @@ mod tests {
         for name in ["preview_screenshot", "preview_upload_image"] {
             assert!(crate::builtin_schemas::builtin_tool_schema(
                 name,
+                crate::tool_surface::ToolVariant::Standard,
                 &PromptProfile::builtin_english()
             )
             .is_some());
@@ -36767,6 +37976,7 @@ mod tests {
         let profile = PromptProfile::builtin_english();
         let wire = tool_schema(
             &structured_output_descriptor(&profile, &schema),
+            crate::tool_surface::ToolVariant::Standard,
             &profile,
             &crate::workspace_set::WorkspaceSet::default(),
         );
@@ -39697,6 +40907,7 @@ mod tests {
             .unwrap();
         let entry_schema = tool_schema(
             entry,
+            crate::tool_surface::ToolVariant::Standard,
             &crate::prompt_profile::PromptProfile::builtin_english(),
             &crate::workspace_set::WorkspaceSet::default(),
         );
@@ -41531,6 +42742,7 @@ mod tests {
             run_environment: Default::default(),
             workspaces: Default::default(),
             prompt_profile: Default::default(),
+            caller_prompt_profile: None,
             global_memory_enabled: false,
             project_memory_enabled: false,
             skills: Vec::new(),
@@ -41980,7 +43192,7 @@ mod tests {
     }
 
     #[test]
-    fn the_read_first_rule_joins_the_writers_descriptions() {
+    fn the_file_write_guards_choose_which_writers_the_step_offers() {
         let mut request = run_request(ProviderFamily::Anthropic);
         let catalog = catalog::tool_catalog();
         request.tools = catalog
@@ -41998,14 +43210,84 @@ mod tests {
                 .unwrap()
         };
         let profile = request.prompt_profile.clone();
-        let edit_rule = profile.text(PromptKey::ToolEditReadFirst);
-        let write_rule = profile.text(PromptKey::ToolWriteReadFirst);
+        // Each key as this request says it: `read` is offered, so its
+        // sentences stay (`tool_mentions`).
+        let said = |key: PromptKey, request: &RunModelRequest| {
+            crate::tool_mentions::resolve(
+                profile.text(key),
+                &crate::tool_mentions::OfferedTools::of(request),
+            )
+            .into_owned()
+        };
 
-        // The gate is unconditional, so the rule is on every run's writers and
-        // on no other tool.
+        // With the guards on, the writers are the guarded tools, described by
+        // their standard keys — the read-first rule is part of that text, not a
+        // sentence appended to it.
+        assert!(request.file_guard.enabled);
         let on = step_json(&request);
-        assert!(description(&on, "edit").ends_with(edit_rule), "{}", description(&on, "edit"));
-        assert!(description(&on, "write").ends_with(write_rule), "{}", description(&on, "write"));
-        assert!(!description(&on, "read").contains(edit_rule), "read carries no rule");
+        assert_eq!(description(&on, "edit"), said(PromptKey::ToolEditDescription, &request));
+        assert_eq!(description(&on, "write"), said(PromptKey::ToolWriteDescription, &request));
+        assert!(description(&on, "edit").contains("use read"), "the guarded edit says to read first");
+
+        // Off, they are the unguarded tools, and `read` does not change.
+        request.file_guard.enabled = false;
+        let off = step_json(&request);
+        assert_eq!(
+            description(&off, "edit"),
+            said(PromptKey::ToolEditUnguardedDescription, &request)
+        );
+        assert_eq!(
+            description(&off, "write"),
+            said(PromptKey::ToolWriteUnguardedDescription, &request)
+        );
+        assert_ne!(description(&on, "edit"), description(&off, "edit"));
+        assert_eq!(description(&on, "read"), description(&off, "read"));
+    }
+
+    #[test]
+    fn a_child_agent_is_offered_the_child_shell_and_wait_tools() {
+        let mut request = run_request(ProviderFamily::Anthropic);
+        let catalog = catalog::tool_catalog();
+        let shell = crate::machine_shells::local()
+            .backends()
+            .into_iter()
+            .next()
+            .expect("this machine has a shell")
+            .tool_name();
+        request.tools = catalog
+            .into_iter()
+            .filter(|tool| tool.name == shell || tool.name == "task_wait")
+            .collect();
+        request.enabled_tools = vec![shell.to_owned(), "task_wait".to_owned()];
+        let description = |step: &Value, name: &str| -> String {
+            step["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .map(|tool| tool["inputSchema"]["description"].as_str().unwrap_or_default().to_owned())
+                .unwrap()
+        };
+        let profile = request.prompt_profile.clone();
+        let top = step_json(&request);
+        request.subagent_depth = 1;
+        let child = step_json(&request);
+        let child_key = |name: &str| {
+            PromptKey::for_tool_description(name, crate::tool_surface::ToolVariant::Child).unwrap()
+        };
+        // As this request says it: the shell and `task_wait` alone are offered,
+        // so no dedicated file tool is named (`tool_mentions`).
+        let said = |key: PromptKey| {
+            crate::tool_mentions::resolve(
+                profile.text(key),
+                &crate::tool_mentions::OfferedTools::of(&request),
+            )
+            .into_owned()
+        };
+        assert_eq!(description(&child, shell), said(child_key(shell)));
+        assert_eq!(description(&child, "task_wait"), said(child_key("task_wait")));
+        assert!(!description(&child, shell).contains("grep tool"));
+        assert_ne!(description(&top, shell), description(&child, shell));
+        assert!(!description(&child, shell).contains("fresh turn"), "a child is never woken");
     }
 }

@@ -27,16 +27,17 @@
 //! with no additional commits are removed. Isolation is excluded from execution-mode payloads, so
 //! it does not require a separate namespace.
 //!
-//! # Deadline and cancellation
+//! # Cancellation
 //!
-//! Each run has one [`WORKFLOW_RUN_DEADLINE`] budget, kept by a [`RunClock`] that starts when the
-//! driver starts — after the run's own approval card has been answered — and stands still while a
-//! step waits on an approval card. Progress updates may wake the wait but never extend it; only a
-//! person's time on a card does. Round settlement cancels the outer pool; the
-//! shared cancellation flag makes heartbeats and event forwarding fail immediately, ending the
-//! driver as Interrupted within one `WAIT_POLL_INTERVAL`. Interrupted results retain step logs for
-//! resume and are delivered like any other terminal result; when the user closed the run, the body
-//! says so.
+//! A run has no time budget. How long it takes depends on the upstream, the machine's concurrency
+//! limit and the people answering its cards, none of which the script controls, so a wall-clock
+//! limit would end runs that were still making progress. A run ends when its script returns or
+//! throws, when the plan deadlocks or exceeds `MAX_LIFETIME_STEPS`, or when it is stopped. Round
+//! settlement cancels the outer pool, and the sidebar stop cancels the driver; the shared
+//! cancellation flag makes heartbeats and event forwarding fail immediately, ending the driver as
+//! Interrupted within one `WAIT_POLL_INTERVAL`. Interrupted results retain step logs for resume
+//! and are delivered like any other terminal result; when the user closed the run, the body says
+//! so.
 //!
 //! # Records
 //!
@@ -50,7 +51,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -77,109 +78,6 @@ pub(crate) const WORKFLOW_TOOL: &str = "workflow";
 /// Tool name for synthesized step contexts. It has no catalog descriptor or schema and cannot
 /// be called by the model; it exists only as a workflow-record transcript anchor.
 pub(crate) const WORKFLOW_STEP_TOOL: &str = "workflow_step";
-
-/// The time budget for an entire run, counted by its [`RunClock`].
-///
-/// This is not a step stall window: no step is timed, and silence never ends one. It bounds the
-/// run as a whole.
-pub(crate) const WORKFLOW_RUN_DEADLINE: Duration = Duration::from_secs(1_800);
-
-/// A run's budget, counted only while the run is actually running.
-///
-/// The clock starts when the driver does, so the time the run's own approval card waited is not
-/// spent; and it stands still whenever a step is waiting on an approval card, because the time a
-/// person takes to answer is not time the run spent working. Several steps can wait at once; the
-/// clock stands still while any of them does.
-pub(crate) struct RunClock {
-    budget: Duration,
-    state: std::sync::Mutex<RunClockState>,
-}
-
-struct RunClockState {
-    started: Instant,
-    /// Time already spent standing still, not counting a pause still under way.
-    paused: Duration,
-    /// Approval cards waiting right now.
-    waiting: usize,
-    /// When the pause under way began; `Some` exactly while `waiting > 0`.
-    paused_since: Option<Instant>,
-}
-
-/// Holds the clock still until dropped.
-pub(crate) struct RunClockPause<'a>(&'a RunClock);
-
-impl Drop for RunClockPause<'_> {
-    fn drop(&mut self) {
-        let mut state = self.0.lock();
-        state.waiting = state.waiting.saturating_sub(1);
-        if state.waiting == 0 {
-            if let Some(since) = state.paused_since.take() {
-                state.paused += since.elapsed();
-            }
-        }
-    }
-}
-
-impl RunClock {
-    pub(crate) fn start(budget: Duration) -> Self {
-        Self {
-            budget,
-            state: std::sync::Mutex::new(RunClockState {
-                started: Instant::now(),
-                paused: Duration::ZERO,
-                waiting: 0,
-                paused_since: None,
-            }),
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, RunClockState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Stops the clock while one approval card waits.
-    pub(crate) fn pause(&self) -> RunClockPause<'_> {
-        let mut state = self.lock();
-        state.waiting += 1;
-        if state.paused_since.is_none() {
-            state.paused_since = Some(Instant::now());
-        }
-        RunClockPause(self)
-    }
-
-    /// Budget left, and whether the clock is standing still.
-    fn remaining(&self) -> (Duration, bool) {
-        let state = self.lock();
-        let now = Instant::now();
-        let standing = state
-            .paused_since
-            .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
-        let spent = now
-            .saturating_duration_since(state.started)
-            .saturating_sub(state.paused + standing);
-        (self.budget.saturating_sub(spent), state.paused_since.is_some())
-    }
-
-    pub(crate) fn expired(&self) -> bool {
-        self.remaining().0.is_zero()
-    }
-
-    /// The instant the budget runs out if the clock keeps running from now. A wait bounded by it
-    /// re-checks [`Self::expired`] on waking, because a card answered meanwhile moved it later.
-    /// While the clock stands still the budget cannot run out, so a wait wakes at least once a
-    /// second rather than spinning on a nearly spent budget.
-    fn deadline(&self) -> Instant {
-        let (remaining, standing) = self.remaining();
-        Instant::now()
-            + if standing {
-                remaining.max(Duration::from_secs(1))
-            } else {
-                remaining
-            }
-    }
-}
 
 /// Private-pool concurrency limit: `min(16, max(2, available_parallelism - 2))`.
 fn workflow_live_limit() -> usize {
@@ -362,7 +260,7 @@ pub(crate) fn run_workflow_tool(
     hook_allows_permission: bool,
     round: usize,
 ) -> Result<ToolExecution, String> {
-    run_workflow_tool_with_deadline(
+    run_workflow_tool_with_live_limit(
         outer_pool,
         shadow,
         request,
@@ -373,7 +271,6 @@ pub(crate) fn run_workflow_tool(
         hook_allows_permission,
         round,
         workflow_live_limit(),
-        WORKFLOW_RUN_DEADLINE,
     )
 }
 
@@ -497,10 +394,9 @@ fn approved_fingerprint(
     }
 }
 
-/// Internal entry point with an injectable time budget and live limit for testing deadline and
-/// backpressure semantics. The budget is counted by a [`RunClock`] the driver starts.
+/// Internal entry point with an injectable live limit for testing backpressure semantics.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_workflow_tool_with_deadline(
+pub(crate) fn run_workflow_tool_with_live_limit(
     outer_pool: &AgentPool,
     shadow: &crate::kernel_shadow::KernelShadow,
     request: &RunModelRequest,
@@ -511,7 +407,6 @@ pub(crate) fn run_workflow_tool_with_deadline(
     hook_allows_permission: bool,
     round: usize,
     live_limit: usize,
-    budget: Duration,
 ) -> Result<ToolExecution, String> {
     dispatch_workflow(
         outer_pool,
@@ -526,7 +421,6 @@ pub(crate) fn run_workflow_tool_with_deadline(
         },
         round,
         live_limit,
-        budget,
     )
 }
 
@@ -570,7 +464,6 @@ pub(crate) fn resume_interrupted_run(
         WorkflowDispatch::Restart { card },
         round,
         workflow_live_limit(),
-        WORKFLOW_RUN_DEADLINE,
     )
 }
 
@@ -596,7 +489,6 @@ fn dispatch_workflow(
     dispatch: WorkflowDispatch<'_>,
     round: usize,
     live_limit: usize,
-    budget: Duration,
 ) -> Result<ToolExecution, String> {
     let started = Instant::now();
     let restart_card = match &dispatch {
@@ -1155,7 +1047,6 @@ fn dispatch_workflow(
                 plan_name,
                 resume_named,
                 live_limit,
-                budget,
             );
         },
     )?;
@@ -1192,21 +1083,8 @@ fn drive_workflow_task(
     plan_name: String,
     resume_named: bool,
     live_limit: usize,
-    budget: Duration,
 ) {
     let run_started = Instant::now();
-    // The run starts now, its own approval card long answered; from here on only the time steps
-    // spend waiting on cards is not counted.
-    let clock = RunClock::start(budget);
-    let clocked_approval = |request: &ToolExecutionRequest,
-                            descriptor: &crate::model::ToolDescriptor,
-                            requester: crate::api::ApprovalRequester<'_>,
-                            stop: Option<&std::sync::atomic::AtomicBool>|
-     -> Result<bool, String> {
-        let _paused = clock.pause();
-        approve_dangerous_tool(request, descriptor, requester, stop)
-    };
-    let approve_dangerous_tool: &TaskApproval<'_> = &clocked_approval;
     // Bind output accounting to this worker incarnation so the current-incarnation guard rejects
     // stale writes.
     let incarnation = shared.identity();
@@ -1276,7 +1154,6 @@ fn drive_workflow_task(
                 approve_dangerous_tool,
                 round,
                 &mut source,
-                &clock,
                 live_limit,
                 &mut slots,
                 &mut chain,
@@ -1749,7 +1626,6 @@ fn drive<'scope, 'env>(
     approve_dangerous_tool: &'env TaskApproval<'env>,
     round: usize,
     source: &mut dyn StepSource,
-    clock: &RunClock,
     live_limit: usize,
     slots: &'env mut Vec<StepSlot>,
     chain: &mut workflow_core::chain::CacheKeyChain,
@@ -1779,12 +1655,6 @@ fn drive<'scope, 'env>(
         reason
     };
     loop {
-        if clock.expired() {
-            return Err(abort(
-                pool,
-                DriveAbort::Run(timeout_message(&parent.prompt_profile, slots)),
-            ));
-        }
         let progress = match source.advance(&outcomes) {
             Ok(progress) => progress,
             Err(error) => return Err(abort(pool, DriveAbort::Run(error.to_string()))),
@@ -1798,8 +1668,8 @@ fn drive<'scope, 'env>(
             StepProgress::Done(value) => {
                 // Once the plan returns, running steps cannot affect its result. Cancel them
                 // before returning because `scope` joins workers on return; otherwise a losing
-                // `Promise.race` branch can outlive the deadline and make a completed run appear
-                // interrupted. Final harvesting records their real terminal states.
+                // `Promise.race` branch that never finishes would hold a completed run open for
+                // good. Final harvesting records their real terminal states.
                 let abandoned = pool
                     .all()
                     .into_iter()
@@ -1899,15 +1769,8 @@ fn drive<'scope, 'env>(
                 }
             }
         }
-        // Start queued steps in dispatch order while capacity permits. Check the deadline inside
-        // the pump so a large batch cannot issue new steps after expiry.
+        // Start queued steps in dispatch order while capacity permits.
         while in_flight.len() < live_limit {
-            if clock.expired() {
-                return Err(abort(
-                    pool,
-                    DriveAbort::Run(timeout_message(&parent.prompt_profile, slots)),
-                ));
-            }
             let Some(index) = queued.pop_front() else {
                 break;
             };
@@ -2032,7 +1895,7 @@ fn drive<'scope, 'env>(
             .collect::<Vec<_>>();
         // Heartbeats make cancellation observable. The renderer ignores empty status deltas, but
         // a dead sink aborts the wait within one poll interval. In-flight skips use this same
-        // observation point because the driver otherwise blocks in `wait_activity_until`.
+        // observation point because the driver otherwise blocks in `wait_activity_unbounded`.
         let heartbeat = || {
             if let Some(control) = step_control {
                 for (name, index) in in_flight.iter() {
@@ -2067,17 +1930,10 @@ fn drive<'scope, 'env>(
                 delta: String::new(),
             })
         };
-        let wait = match pool.wait_activity_until(&watched, clock.deadline(), &heartbeat) {
-            Ok(wait) => wait,
-            Err(error) => return Err(abort(pool, DriveAbort::SinkDead(error))),
-        };
-        // A card answered during the wait moved the deadline on: waking at the old one is not
-        // running out.
-        if wait.timed_out && clock.expired() {
-            return Err(abort(
-                pool,
-                DriveAbort::Run(timeout_message(&parent.prompt_profile, slots)),
-            ));
+        // The wait has no deadline: it returns when a step reports or settles, or when a heartbeat
+        // fails, so a step that is slow, or waiting on a person, is simply waited for.
+        if let Err(error) = pool.wait_activity_unbounded(&watched, &heartbeat) {
+            return Err(abort(pool, DriveAbort::SinkDead(error)));
         }
         // Use envelopes only as wake-up signals; the record is the authoritative result.
         let mut finished = in_flight
@@ -2279,17 +2135,6 @@ fn abandoned_tokens(slot: &StepSlot) -> Option<u64> {
                 })
         })
         .reduce(|total, tokens| total + tokens)
-}
-
-fn timeout_message(profile: &PromptProfile, slots: &[StepSlot]) -> String {
-    let unfinished = slots.iter().filter(|slot| slot.outcome.is_none()).count();
-    profile.render(
-        PromptKey::WorkflowTimeout,
-        &[
-            ("seconds", &WORKFLOW_RUN_DEADLINE.as_secs().to_string()),
-            ("unfinished", &unfinished.to_string()),
-        ],
-    )
 }
 
 /// Converts a completed step's pool state into a result consumable by the plan source.
@@ -2538,6 +2383,14 @@ pub(crate) fn isolated_step_template(
     };
     let template = workflow_step_template(parent, state, &step, Some(&worktree)).unwrap();
     (template, matches!(StepRepository::of(parent), StepRepository::Remote(_)))
+}
+
+/// The template a step whose `agentType` is `role` runs with.
+#[cfg(test)]
+pub(crate) fn role_step_template(parent: &RunModelRequest, state: &AppState, role: &str) -> RunModelRequest {
+    let mut step = WorkflowStepRequest::from_prompt("review");
+    step.agent_type = Some(role.into());
+    workflow_step_template(parent, state, &step, None).unwrap()
 }
 
 #[cfg(test)]

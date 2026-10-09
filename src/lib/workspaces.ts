@@ -316,7 +316,7 @@ const WORKSPACE_SCOPED_TOOLS: ReadonlySet<string> = new Set([
 
 /** The backend a shell tool runs in. Mirrors `ShellBackend::of_tool`. */
 function shellOfTool(toolName: string): string | null {
-  const match = /^(bash|zsh|sh|powershell)$/.exec(toolName);
+  const match = /^(bash|zsh|sh|pwsh|powershell)$/.exec(toolName);
   return match ? match[1]! : null;
 }
 

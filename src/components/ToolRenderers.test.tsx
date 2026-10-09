@@ -148,7 +148,43 @@ describe("shell command explanations", () => {
     expect(getToolPresentation(item, undefined, en, "List directory contents").title).toBe("Bash: List directory contents");
     expect(getToolPresentation(item, undefined, zh, "列出文件详细信息").title).toBe("Bash：列出文件详细信息");
     expect(getToolPresentation(tool("powershell", { command: "Get-Process" }, ""), undefined, en, "List processes").title)
-      .toBe("PowerShell: List processes");
+      .toBe("Windows PowerShell: List processes");
+    expect(getToolPresentation(tool("pwsh", { command: "Get-Process" }, ""), undefined, en, "List processes").title)
+      .toBe("PowerShell 7: List processes");
+    expect(getToolPresentation(tool("pwsh", { command: "Get-Process" }, ""), undefined, zh, "列出进程").title)
+      .toBe("PowerShell 7：列出进程");
+    expect(getToolPresentation(tool("powershell", { command: "Get-Process" }, ""), undefined, zh, "列出进程").title)
+      .toBe("Windows PowerShell：列出进程");
+  });
+
+  it("renders PowerShell 7 exactly as Windows PowerShell, under its own name", () => {
+    const command = { command: "Get-ChildItem -Force" };
+    const done = (name: string, t: typeof en) => getToolPresentation(tool(name, command, "a.txt"), undefined, t);
+    const failed = (name: string, t: typeof en) => getToolPresentation(
+      tool(name, command, "", { success: false }),
+      undefined,
+      t
+    );
+    expect(done("pwsh", en).title).toBe("Ran PowerShell 7 command");
+    expect(done("powershell", en).title).toBe("Ran Windows PowerShell command");
+    expect(done("pwsh", zh).title).toBe("运行了 PowerShell 7 命令");
+    expect(done("powershell", zh).title).toBe("运行了 Windows PowerShell 命令");
+    expect(failed("pwsh", en).title).toBe("PowerShell 7 command failed");
+    expect(failed("powershell", en).title).toBe("Windows PowerShell command failed");
+    // Everything but the name is shared: surface, family, target and summary bucket.
+    const pwsh = done("pwsh", en);
+    const powershell = done("powershell", en);
+    expect(pwsh).toMatchObject({
+      surface: "group",
+      family: "terminal",
+      target: "Get-ChildItem -Force",
+      icon: powershell.icon
+    });
+    expect(pwsh.surface).toBe(powershell.surface);
+    expect(pwsh.family).toBe(powershell.family);
+    expect(pwsh.target).toBe(powershell.target);
+    expect(toolSummaryKind(tool("pwsh", command, "a.txt"))).toBe("commands");
+    expect(toolSurfaceForName("pwsh")).toBe(toolSurfaceForName("powershell"));
   });
 
   it("keeps the original title without an explanation, and marks failures", () => {
@@ -382,6 +418,7 @@ describe("tool view registry", () => {
   it("buckets every row by what it changed, not by which family renders it", () => {
     const buckets: ReadonlyArray<readonly [string, ToolContext["input"], string]> = [
       ["powershell", { command: "npm test" }, "commands"],
+      ["pwsh", { command: "npm test" }, "commands"],
       ["bash", { command: "ls" }, "commands"],
       ["write", { path: "a.ts", content: "x" }, "fileChanges"],
       ["edit", { path: "a.ts", find: "x", replace: "y" }, "fileChanges"],

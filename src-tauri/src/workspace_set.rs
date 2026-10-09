@@ -820,8 +820,10 @@ mod tests {
         let entry = set.get(1).unwrap();
         assert_eq!(entry.os, None);
         assert!(entry.runs(ShellBackend::Bash));
-        assert!(!entry.runs(ShellBackend::PowerShell));
-        assert!(set.shell_addresses(ShellBackend::PowerShell).is_empty());
+        for edition in [ShellBackend::Pwsh, ShellBackend::WindowsPowerShell] {
+            assert!(!entry.runs(edition));
+            assert!(set.shell_addresses(edition).is_empty());
+        }
     }
 
     /// A probed machine lists exactly what the probe found, and each shell's
@@ -834,7 +836,7 @@ mod tests {
                 id: "winbox".into(),
                 name: "winbox".into(),
                 host: "user@winbox".into(),
-                agent_shell: Some(ShellBackend::PowerShell),
+                agent_shell: Some(ShellBackend::Pwsh),
                 ..Default::default()
             }],
             ..Default::default()
@@ -845,7 +847,7 @@ mod tests {
             MachineShells {
                 os: MachineOs::Windows,
                 shells: vec![DetectedShell {
-                    backend: ShellBackend::PowerShell,
+                    backend: ShellBackend::Pwsh,
                     path: r"C:\Program Files\PowerShell\7\pwsh.exe".into(),
                 }],
                 probed_at: String::new(),
@@ -859,18 +861,20 @@ mod tests {
         };
         let set = WorkspaceSet::resolve(&assets, &local("/work/app"), &[windows]).unwrap();
         assert_eq!(set.get(2).unwrap().os, Some(MachineOs::Windows));
-        assert_eq!(set.shell_addresses(ShellBackend::PowerShell), {
+        assert_eq!(set.shell_addresses(ShellBackend::Pwsh), {
             let mut expected = Vec::new();
-            if set.get(1).unwrap().runs(ShellBackend::PowerShell) {
+            if set.get(1).unwrap().runs(ShellBackend::Pwsh) {
                 expected.push(1);
             }
             expected.push(2);
             expected
         });
         assert!(!set.get(2).unwrap().runs(ShellBackend::Bash));
+        // The probe found PowerShell 7 alone, so 5.1 is not assumed there.
+        assert!(!set.get(2).unwrap().runs(ShellBackend::WindowsPowerShell));
         // The agent shell follows the machine's settings once the machine has it.
         let shell = set.get(2).unwrap().runner.agent_shell().unwrap().clone();
-        assert_eq!(shell.backend, ShellBackend::PowerShell);
+        assert_eq!(shell.backend, ShellBackend::Pwsh);
         assert!(shell.program.ends_with("pwsh.exe"));
     }
 
@@ -903,7 +907,7 @@ mod tests {
         seed_for_test(
             "ssh:default-windows",
             Some(Endpoint::of_machine(&assets.ssh_machines[1])),
-            probed(MachineOs::Windows, ShellBackend::PowerShell, "powershell.exe"),
+            probed(MachineOs::Windows, ShellBackend::WindowsPowerShell, "powershell.exe"),
         );
         let on = |id: &str, path: &str| AttachedWorkspace {
             machine: Some(RunTarget::Ssh { machine_id: id.into() }),

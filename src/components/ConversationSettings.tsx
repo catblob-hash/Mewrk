@@ -39,6 +39,7 @@ import { isImeKeyEvent } from "../lib/shortcuts";
 import { selectedAgentRoleCount } from "../lib/agentRoles";
 import type { SaveAgentRoleTarget } from "../lib/runtime";
 import { isHostDerivedToolName, isPreviewLifecycleToolName } from "../lib/taskTools";
+import { fileWriteGuardsEnabledOf } from "../lib/fileWriteGuards";
 import { hostMessageContainerOf } from "../lib/hostMessages";
 import { familySelectsNativeToolType, familySupportsNativeFetch } from "../lib/webSearch";
 import {
@@ -46,6 +47,7 @@ import {
   backendPinned,
   backendTone,
   lockTone,
+  fileWriteGuardsTone,
   hostMessageContainerTone,
   lockTouch,
   promptProfileTone,
@@ -386,12 +388,13 @@ export function ConversationSettings({
     ),
     [capabilities.agents, settings.agentIds, workspaces]
   );
-  /* The tool-description page lists the files alone. The built-in is what
-   * selecting none means rather than an entry beside them — it lives in no
-   * folder a section could name — so its row is left out and its id reads as
-   * no selection. */
+  /* The tool-description page lists every profile but the guided built-in. That
+   * one is what selecting none means rather than an entry beside the others, so
+   * its row is left out and its id reads as no selection. "Mewrk concise" is a
+   * real choice and keeps its row, marked built-in because it lives in no folder
+   * the section could name. */
   const toolDescriptionFiles = useMemo(
-    () => capabilities.toolDescriptionFiles.filter((resource) => resource.source !== "builtin"),
+    () => capabilities.toolDescriptionFiles.filter((resource) => resource.id !== BUILTIN_PROMPT_PROFILE_ID),
     [capabilities.toolDescriptionFiles]
   );
   const toolDescriptionIds = settings.toolDescriptionFileId
@@ -586,8 +589,8 @@ export function ConversationSettings({
       "The tools this conversation hands the model."
     ),
     advanced: t(
-      "不在工具列表里逐个挑、而由开关派生的那几件事：联网、记忆与宿主消息的容器。",
-      "What is derived from a switch rather than picked from the tool list: web access, memory and the container for host messages."
+      "不在工具列表里逐个挑、而由开关派生的那几件事：联网、记忆、文件防误写保护与宿主消息的容器。",
+      "What is derived from a switch rather than picked from the tool list: web access, memory, file write guards and the container for host messages."
     ),
     skills: t(
       "技能从 ~/.mewrk/skills/ 与工作区的 .mewrk/skills/ 扫描而来；这里挑给本对话用的，并决定正文怎么送到模型面前。",
@@ -664,6 +667,11 @@ export function ConversationSettings({
             projectTone: toneOf("memory", lock.projectMemory, settings.projectMemoryEnabled),
             onChangeGlobal: (globalMemoryEnabled) => update({ globalMemoryEnabled }),
             onChangeProject: (projectMemoryEnabled) => update({ projectMemoryEnabled })
+          }}
+          fileWriteGuards={{
+            enabled: fileWriteGuardsEnabledOf(settings),
+            tone: fileWriteGuardsTone(lockState, settings),
+            onChange: (fileWriteGuardsEnabled) => update({ fileWriteGuardsEnabled })
           }}
           hostMessages={{
             value: hostMessageContainerOf(settings),
@@ -806,7 +814,7 @@ export function ConversationSettings({
       )}
 
       {/* One file words the whole run, so the page picks one: another row
-          replaces it, and unticking it goes back to the built-in. There is no
+          replaces it, and unticking it goes back to Mewrk guided. There is no
           workspace level — the files are read from ~/.mewrk alone. */}
       {view === "toolDescriptions" && (
         <CapabilitySelectionPage
@@ -824,16 +832,19 @@ export function ConversationSettings({
           onReveal={onRevealCapabilityLocation}
           onChange={(ids) => update({ toolDescriptionFileId: ids[0] ?? null })}
           /* A dangling file was never read: the host already worded the run with
-             the built-in, so going back to it rewrites nothing. */
+             Mewrk guided, so going back to it rewrites nothing. */
           onUntickDangling={() => onChange({ ...settings, toolDescriptionFileId: null })}
           danglingDetail={t(
-            "目录中已不存在；运行时用的是 Mewrk 内置的工具描述",
-            "No longer in the catalog. Runs use Mewrk's built-in descriptions instead."
+            "目录中已不存在；运行时用的是 Mewrk guided（内置引导版）",
+            "No longer in the catalog. Runs use Mewrk guided (built-in) instead."
           )}
           selectedUnavailableDetail={t(
-            "已选择，但文件里没有可用条目；运行时用的是 Mewrk 内置的工具描述",
-            "Selected, but the file has no usable entries. Runs use Mewrk's built-in descriptions instead."
+            "已选择，但文件里没有可用条目；运行时用的是 Mewrk guided（内置引导版）",
+            "Selected, but the file has no usable entries. Runs use Mewrk guided (built-in) instead."
           )}
+          rowBadge={(resource) => (resource.source === "builtin"
+            ? <em className="catalog-row__badge">{t("内置", "Built-in")}</em>
+            : null)}
           searchLabel={t("搜索工具描述", "Search tool descriptions")}
           emptyTitle={t("尚未发现工具描述文件", "No tool-description files discovered")}
           emptyDescription={t(
@@ -842,8 +853,8 @@ export function ConversationSettings({
           )}
           footer={(
             <p className="capability-page__hint">{t(
-              "一次只用一份：选另一份会替换当前这份。都不选时，用 Mewrk 内置的工具描述。",
-              "One at a time: picking another replaces the current one. With none picked, Mewrk's built-in descriptions are used."
+              "一次只用一份：选另一份会替换当前这份。都不选时，用 Mewrk guided（内置引导版）。",
+              "One at a time: picking another replaces the current one. With none picked, Mewrk guided (built-in) is used."
             )}</p>
           )}
         />

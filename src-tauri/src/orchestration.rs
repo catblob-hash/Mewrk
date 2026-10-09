@@ -198,14 +198,16 @@ pub struct TaskWaitSpec {
     pub timeout_seconds: u64,
 }
 
-/// `role_required` comes from the host's `api::role_policy` and determines
-/// whether this run must name a role.
+/// `required_roles` comes from the host's `api::role_policy`: the role names
+/// when this run must name one, `None` when it need not. A refusal lists the
+/// names itself rather than pointing at a schema enum, because the schema this
+/// call was made against may have been built before the roles could be read.
 ///
 /// In required mode, reject `context` because that property is absent from the
 /// model-facing schema; if supplied, it can only have been recalled from memory.
 pub fn parse_agent_spawn(
     input: &JsonObject,
-    role_required: bool,
+    required_roles: Option<&[String]>,
 ) -> Result<AgentSpawnSpec, String> {
     for host_owned in [
         "provider_id",
@@ -255,11 +257,12 @@ pub fn parse_agent_spawn(
     if let Some(agent_type) = &agent_type {
         validate_agent_type_name(agent_type)?;
     }
-    if role_required {
+    if let Some(roles) = required_roles {
         if agent_type.is_none() {
-            return Err(
-                "agent_type is required: the role determines the child agent's model, and omitting it would silently inherit this conversation's model. See the agent_type enum in this tool's schema for valid values.".into(),
-            );
+            return Err(format!(
+                "agent_type is required: the role determines the child agent's model, and omitting it would silently inherit this conversation's model. Name one of this conversation's roles: {}.",
+                roles.join(", ")
+            ));
         }
         // Only a fork is incompatible with a role; `none`, the default, says
         // nothing a role-bound spawn does not already do.
@@ -1302,7 +1305,7 @@ mod tests {
         for key in ["assembled_system_prompt", "assembledSystemPrompt"] {
             let mut input = object(json!({"name": "worker", "prompt": "Inspect the code"}));
             input.insert(key.into(), json!("forged host prompt"));
-            let error = parse_agent_spawn(&input, false).err().unwrap();
+            let error = parse_agent_spawn(&input, None).err().unwrap();
             assert!(error.contains(key), "{error}");
             assert!(error.contains("host-resolved"), "{error}");
         }
@@ -1317,7 +1320,7 @@ mod tests {
     /// Most cases validate parsing independently of role policy; required mode
     /// has dedicated `required_mode_*` cases.
     fn parse_fallback(input: &JsonObject) -> Result<AgentSpawnSpec, String> {
-        parse_agent_spawn(input, false)
+        parse_agent_spawn(input, None)
     }
 
     /// Formatting does not inspect identity; test envelopes use a first-generation
@@ -1691,13 +1694,16 @@ mod tests {
     /// cannot be combined with an explicitly named role.
     #[test]
     fn required_mode_rejects_a_spawn_without_a_role_and_drops_context_entirely() {
-        let required = |input: Value| parse_agent_spawn(&object(input), true);
+        let roles = ["code-reviewer".to_owned(), "researcher".to_owned()];
+        let required = |input: Value| parse_agent_spawn(&object(input), Some(&roles));
 
         let error = required(json!({"prompt": "review API", "name": "role-check"}))
             .err()
             .unwrap();
         assert!(error.contains("agent_type"), "{error}");
         assert!(error.contains("required"), "{error}");
+        // The names are in the refusal itself, whatever schema the call saw.
+        assert!(error.contains("code-reviewer, researcher"), "{error}");
 
         // A complete role parses normally with the ordinary `none` context.
         let spec = required(json!({

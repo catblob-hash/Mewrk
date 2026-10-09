@@ -2,7 +2,6 @@ import type {
   ApiProvider,
   AppDocument,
   ConversationPreset,
-  ModelProfile,
   ShellBackend,
   ToolDescriptor
 } from "./types";
@@ -14,16 +13,12 @@ import {
 } from "./lib/searchProviders";
 import { defaultAppearancePreferences } from "./lib/appearance";
 import { defaultAutoCompactSettings } from "./lib/autoCompact";
-import { knownProtocolCapabilities, normalizeCapabilities } from "./lib/modelCapabilities";
-import {
-  CLAUDE_AGENT_PROVIDER_FAMILY,
-  CLAUDE_AGENT_PROVIDER_NAME,
-  CLAUDE_AGENT_REGISTRY
-} from "./lib/claudeAgentProvider";
+import { CLAUDE_AGENT_PROVIDER_FAMILY, CLAUDE_AGENT_PROVIDER_NAME } from "./lib/claudeAgentProvider";
 import { CODEX_PROVIDER_FAMILY, CODEX_PROVIDER_NAME } from "./lib/codexProvider";
 import { backendOfTool, knownShells, preferredBackend } from "./lib/machineShells";
 import { isHostDerivedToolName } from "./lib/taskTools";
 import { createId } from "./lib/id";
+import { BUILTIN_CONCISE_PROMPT_PROFILE_ID } from "./lib/toolLock";
 
 export const toolCatalog: ToolDescriptor[] = [
   {
@@ -52,8 +47,21 @@ export const toolCatalog: ToolDescriptor[] = [
     ]
   },
   {
+    name: "pwsh",
+    label: "PowerShell 7",
+    description: "",
+    category: "shell",
+    dangerous: true,
+    parameters: [
+      { name: "command", label: "命令", type: "multiline", required: true, placeholder: "Get-ChildItem -Force" },
+      { name: "description", label: "说明", type: "string", required: false, placeholder: "列出当前目录的文件" },
+      { name: "timeout", label: "超时（毫秒）", type: "number", required: false, placeholder: "120000" },
+      { name: "run_in_background", label: "后台运行", type: "boolean", required: false, defaultValue: false }
+    ]
+  },
+  {
     name: "powershell",
-    label: "PowerShell",
+    label: "Windows PowerShell",
     description: "",
     category: "shell",
     dangerous: true,
@@ -653,24 +661,6 @@ export const BUILTIN_PRESET_ID = "preset_mewrk";
  * and in vitest this id dangles — which every reader treats as "no template". */
 export const BUILTIN_PRESET_TEMPLATE_ID = "template_preset_mewrk";
 
-/** Mirrors `catalog.rs::builtin_claude_agent_provider`: the whole seed table. */
-function claudeAgentSeedModels(): ModelProfile[] {
-  return CLAUDE_AGENT_REGISTRY
-    .map(({ id, name, contextWindow, maxOutputTokens }) => ({
-      id,
-      name,
-      group: "claude",
-      contextWindow,
-      maxOutputTokens,
-      capabilities: normalizeCapabilities([
-        "image_recognition",
-        ...knownProtocolCapabilities({ family: "claude_agent", baseUrl: "" }, id)
-      ]),
-      reasoningContent: "plaintext",
-      promptCache: true
-    }));
-}
-
 /** Keep in sync with `src-tauri/src/catalog.rs::product_default_api_providers`.
  * IDs stay random per installation because they key credential storage; the
  * renderer's `ensureCodexProvider` / `ensureClaudeAgentProvider` claim these
@@ -681,7 +671,6 @@ function seedProviders(): ApiProvider[] {
     familySettings: {},
     notes: ""
   } as const;
-  const claudeAgentModels = claudeAgentSeedModels();
   return [
     {
       id: createId("provider"),
@@ -700,25 +689,13 @@ function seedProviders(): ApiProvider[] {
       enabled: true,
       family: CLAUDE_AGENT_PROVIDER_FAMILY,
       ...blank,
-      models: claudeAgentModels,
-      activeModelId: claudeAgentModels[0]?.id ?? null
+      // Its models are whatever the installed CLI lists under the user's
+      // login, fetched from the provider page, so it ships none either.
+      models: [],
+      activeModelId: null
     }
   ];
 }
-
-/**
- * The built-in roles' catalog ids, in the order the built-in preset selects
- * them. Mirrors the `agent_builtin_*` constants in
- * `src-tauri/src/agent_roles.rs`, which owns the roles themselves — their names,
- * models and descriptions are computed by the host against the document's
- * providers and listed in `CapabilityCatalog.agents`, never stored here.
- */
-export const BUILTIN_AGENT_ROLE_IDS: readonly string[] = [
-  "agent_builtin_opus",
-  "agent_builtin_sonnet",
-  "agent_builtin_sol",
-  "agent_builtin_luna"
-];
 
 /**
  * The one shell the built-in preset turns on: this machine's most preferred.
@@ -750,11 +727,9 @@ function seedPresetEnabledTools(tools: readonly ToolDescriptor[], shell: ShellBa
     });
 }
 
-/** Keep in sync with `src-tauri/src/catalog.rs::builtin_preset`. It selects the
- * four built-in roles by id; the host lists each of them whether or not its
- * provider row exists, bound to `unavailable` when it does not, and the Codex
- * roles name models that do not exist until the user signs in and fetches the
- * catalog — the binding waits rather than being discarded. */
+/** Keep in sync with `src-tauri/src/catalog.rs::builtin_preset`. It renders
+ * with the concise built-in tool descriptions and selects no role: none ships,
+ * so its children are anonymous ones on the conversation's model. */
 function builtinPreset(
   tools: readonly ToolDescriptor[],
   platform: string
@@ -768,11 +743,11 @@ function builtinPreset(
     templateId: BUILTIN_PRESET_TEMPLATE_ID,
     settings: {
       enabledTools: seedPresetEnabledTools(tools, seedShellBackend(platform)),
-      toolDescriptionFileId: null,
-      agentIds: [...BUILTIN_AGENT_ROLE_IDS],
-      // Every child is one of the named roles, so the model cannot route around
-      // them by spawning an anonymous one.
-      allowRolelessSubagents: false,
+      toolDescriptionFileId: BUILTIN_CONCISE_PROMPT_PROFILE_ID,
+      agentIds: [],
+      // With no role selected, an anonymous child is the only kind `agent_spawn`
+      // and `workflow` can start.
+      allowRolelessSubagents: true,
       // The host mints these from the absolute paths of the capability files it
       // writes at first launch, so the renderer seed cannot know them and ships
       // none. Hooks stay unselected even there: a dangling hook id fails every
@@ -861,8 +836,8 @@ export const createSeedDocument = (
       skills: [],
       mcps: [],
       toolDescriptionFiles: [],
-      // The built-in roles are computed by the host against the document's
-      // providers, so the browser preview, which has no host, lists none.
+      // Roles are files under `.mewrk/agents/` that the host lists; the browser
+      // preview has no host and reads none, so it lists none.
       agents: []
     },
     workspaces: [

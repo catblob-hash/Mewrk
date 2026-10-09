@@ -20,7 +20,7 @@ use crate::history::{
 
 use super::project::project_messages;
 use super::protocol::{Family, NativeFetch, NativeSearch, StepRequest, ToolSpec};
-use super::tools::{enabled_tools, tool_schema};
+use super::tools::{enabled_tools, wire_tool_schema};
 
 /// Separator between the stable system prompt and its per-step tail; the
 /// sidecar joins the two halves with the same bytes.
@@ -163,6 +163,10 @@ fn live_tool_image_bridge(executions: &[crate::api::ToolExecution]) -> Vec<Value
 }
 
 fn tool_specs(request: &RunModelRequest) -> Vec<ToolSpec> {
+    // Each tool's variant is decided once for the run (`tool_surface`): a
+    // description is never amended after the schema is built.
+    let surface = crate::tool_surface::ToolSurface::of(request);
+    let offered = crate::tool_mentions::OfferedTools::of(request);
     enabled_tools(request)
         .into_iter()
         .map(|tool| ToolSpec {
@@ -173,19 +177,17 @@ fn tool_specs(request: &RunModelRequest) -> Vec<ToolSpec> {
             // owns. An MCP tool's is the server's text, or the profile's
             // `description` in its place.
             description: tool.description.clone(),
-            input_schema: with_tool_rule(
-                tool_schema(tool, &request.prompt_profile, &request.workspaces),
-                &tool.name,
-                request,
-            ),
+            input_schema: wire_tool_schema(tool, &surface, &offered, request),
         })
         .collect()
 }
 
 /// The offered tools this request declares asynchronous: [`crate::async_tools::ASYNC_DECLARED_TOOLS`]
-/// where the model takes asynchronous calls, none elsewhere.
+/// where the model takes asynchronous calls, none elsewhere. The same decision
+/// selects their `async` variant ([`crate::tool_surface::Axis::AsyncResults`]),
+/// so a tool declared asynchronous is always described as one.
 fn async_declared_tools(request: &RunModelRequest) -> Vec<String> {
-    if !crate::async_tools::takes_async_tools(&request.provider, &request.model) {
+    if !crate::tool_surface::ToolSurface::of(request).async_results {
         return Vec::new();
     }
     enabled_tools(request)
@@ -193,39 +195,6 @@ fn async_declared_tools(request: &RunModelRequest) -> Vec<String> {
         .filter(|tool| crate::async_tools::ASYNC_DECLARED_TOOLS.contains(&tool.name.as_str()))
         .map(|tool| tool.name.clone())
         .collect()
-}
-
-/// Appends a rule the host enforces to the description of the tool it binds.
-///
-/// The read-before-write gate in the two writers' descriptions: the gate is
-/// unconditional, so the rule is stated on every run — Claude Code's prompt
-/// carries it because its Edit and Write enforce it, and so do ours. And on a
-/// model that takes asynchronous calls, the tools declared asynchronous say
-/// so: their call returns nothing at first and the result comes later on it.
-fn with_tool_rule(mut schema: Value, tool_name: &str, request: &RunModelRequest) -> Value {
-    let key = match tool_name {
-        "edit" => crate::prompt_profile::PromptKey::ToolEditReadFirst,
-        "write" => crate::prompt_profile::PromptKey::ToolWriteReadFirst,
-        name if crate::async_tools::ASYNC_DECLARED_TOOLS.contains(&name)
-            && crate::async_tools::takes_async_tools(&request.provider, &request.model) =>
-        {
-            crate::prompt_profile::PromptKey::ToolAsyncResult
-        }
-        _ => return schema,
-    };
-    let rule = request.prompt_profile.text(key);
-    if rule.is_empty() {
-        return schema;
-    }
-    if let Some(Value::String(description)) = schema.get_mut("description") {
-        if description.is_empty() {
-            *description = rule.to_owned();
-        } else {
-            description.push(' ');
-            description.push_str(rule);
-        }
-    }
-    schema
 }
 
 /// Hydrate image placeholders, once the model is known to take images.

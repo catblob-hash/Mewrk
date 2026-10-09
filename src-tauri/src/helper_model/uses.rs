@@ -294,7 +294,7 @@ pub(crate) fn on_tool_started(
         &request.conversation_id,
         &context_id,
         call_id,
-        kind.display_name(),
+        kind.language(),
         command,
         lane,
         &document.global_settings,
@@ -335,7 +335,8 @@ fn step_card_ids(conversation_id: &str, round: usize, step_call_id: &str) -> [St
 }
 
 /// Called when a run starts executing a shell tool call. `shell` is the
-/// shell's display name ("Bash", "zsh", "PowerShell").
+/// language its command is written in, the tag of the fence the local model
+/// reads it in ("bash", "zsh", "sh", "powershell" for either edition).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn on_shell_started(
     state: &AppState,
@@ -421,7 +422,7 @@ pub(crate) fn on_agent_spawned(
 /// wire name.
 fn failed_tool_tag(tool_name: &str) -> String {
     if let Some(shell) = crate::shell_backend::ShellBackend::of_tool(tool_name) {
-        return shell.display_name().to_lowercase();
+        return shell.language().to_owned();
     }
     let mut parts = tool_name.split("__");
     match (parts.next(), parts.next(), parts.next()) {
@@ -540,6 +541,10 @@ mod tests {
     #[test]
     fn names_the_failed_tool() {
         assert_eq!(failed_tool_tag("edit"), "edit");
+        // A fence tag is a language: both PowerShell editions write PowerShell.
+        assert_eq!(failed_tool_tag("pwsh"), "powershell");
+        assert_eq!(failed_tool_tag("powershell"), "powershell");
+        assert_eq!(failed_tool_tag("bash"), "bash");
         assert_eq!(failed_tool_tag("mcp__github_0123456789__create_issue__ab12"), "create_issue");
         assert_eq!(failed_tool_tag("mcp__broken"), "mcp__broken");
     }

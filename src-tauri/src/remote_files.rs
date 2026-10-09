@@ -44,7 +44,7 @@ use crate::{
     tool_executor::{
         apply_edit, edit_receipt, edit_replace_all, optional_bool, optional_string, optional_u64,
         parse_read_range, required_string, slice_text_lines, truncate_chars, unified_diff,
-        write_receipt_note, EditSpec, FileGuardContext, FileGuardTouch, EDIT_FIND_EQUALS_REPLACE,
+        write_receipt_note, EditSpec, FileGuardContext, FileTouch, EDIT_FIND_EQUALS_REPLACE,
         FILE_MODIFIED_SINCE_READ, FILE_NOT_READ, MAX_PATH_CHARS, MAX_TEXT_FILE, MAX_WRITE_BYTES,
     },
     workspace_set::ResolvedWorkspace,
@@ -90,7 +90,7 @@ pub(crate) struct RemoteOutcome {
     pub images: Vec<ImageAttachment>,
     /// The record the run loop commits once the result is final. Never carries
     /// an opened file: there is no local path for the renderer to open.
-    pub file_touch: Option<FileGuardTouch>,
+    pub file_touch: Option<FileTouch>,
 }
 
 /// The transport one call dispatches through.
@@ -694,12 +694,17 @@ fn ls_with(
     )?;
     let (header, rest) = take_header(&output.stdout)?;
     let (rules, rest) = search_scope::take_remote_rules(rest)?;
-    Ok(render_listing(
-        target.profile,
-        &header,
-        &rules,
-        &String::from_utf8_lossy(rest),
-    ))
+    let payload = String::from_utf8_lossy(rest);
+    // The listing is a pipeline whose exit status is `head`'s, so a stage
+    // that died upstream leaves nothing and still exits 0. An empty listing
+    // the machine said something about is that, not an empty directory.
+    let said = output.stderr.trim();
+    if payload.lines().all(str::is_empty) && !said.is_empty() {
+        return Err(format!(
+            "The listing of {path} came back empty, and the remote machine said: {said}"
+        ));
+    }
+    Ok(render_listing(target.profile, &header, &rules, &payload))
 }
 
 /// Shared rendering for `ls`: the remote's entries in breadth-first order,
@@ -816,33 +821,57 @@ fi
 // grep
 // ---------------------------------------------------------------------------
 
+/// How many times [`grep_with`] asks the machine again, each time for eight
+/// times the lines, when the remote engine's over-approximations crowd the
+/// page out of its cap.
+const GREP_ATTEMPTS: usize = 3;
+
+/// Succeeds only where `grep -P` works on bytes with lookarounds and
+/// subroutines, everything the PCRE rendering uses (`remote_regex`): GNU grep
+/// under the C locale. A grep without `-P`, or one whose PCRE refuses any of
+/// it, falls to the ERE rendering.
+const PCRE_PROBE: &str = r"printf 'a\303\251b\n' | grep -qP '^(?<![^\n])a\xc3(?1)(?<=\xa9)b(?![^\n])(?(DEFINE)(\xa9))' 2>/dev/null";
+
+/// The script that runs `pattern` on the machine: its [`RemotePattern`] in the
+/// dialect the machine's engine reads, never the model's pattern itself.
+///
+/// [`RemotePattern`]: crate::remote_regex::RemotePattern
 fn grep_script(
     target: &RemoteWorkspace<'_>,
     path: &str,
-    pattern: &str,
-    case_sensitive: bool,
+    pattern: &crate::remote_regex::RemotePattern,
     wanted: usize,
+    ere_only: bool,
 ) -> Result<String, String> {
     if let Some(ps) = powershell(target)? {
         check_operand(path, "path")?;
-        quote_search_operand(pattern, "pattern")?;
-        return Ok(crate::remote_powershell::grep(
-            &ps,
-            path,
-            pattern,
-            case_sensitive,
-            wanted,
+        quote_search_operand(&pattern.dotnet, "pattern")?;
+        return Ok(crate::remote_powershell::grep(&ps, path, &pattern.dotnet, wanted));
+    }
+    let pcre = quote_search_operand(&pattern.pcre, "pattern")?;
+    let ere = crate::remote_regex::ere_printf_argument(&pattern.ere);
+    let mut script = prologue(target, path, TargetMode::Existing)?;
+    // The model writes Rust regex syntax on every machine; the host translated
+    // it into PCRE for a grep that has `-P` and into POSIX ERE for one that
+    // does not (macOS, BusyBox, a grep built without PCRE), each byte-oriented
+    // under the C locale so neither the machine's locale nor its case folding
+    // changes what matches. The translation is folded for case already, so no
+    // `-i`. `-U` keeps a Windows build of GNU grep from stripping the CR the
+    // rendering's end anchor allows for. The ERE travels as `printf` octal
+    // escapes, since its bytes need not be text. `ere_only` is the retry for a
+    // PCRE that ran out of backtracking on some line: ERE engines do not
+    // backtrack.
+    script.push_str("LC_ALL=C\nexport LC_ALL\n");
+    let ere = format!("GP=-E; MEWRK_RX=$(printf {ere})");
+    if ere_only {
+        script.push_str(&format!("{ere}\n"));
+    } else {
+        script.push_str(&format!(
+            "if {PCRE_PROBE}; then GP='-P -U'; MEWRK_RX={pcre}; else {ere}; fi\n"
         ));
     }
-    let pattern = quote_search_operand(pattern, "pattern")?;
-    let case = if case_sensitive { "" } else { " -i" };
-    let mut script = prologue(target, path, TargetMode::Existing)?;
-    // The host leg matches with Rust's `regex`, whose syntax is Perl-shaped, so
-    // a remote grep that speaks PCRE is preferred; exit 2 from the probe means
-    // the option is unknown and the extended dialect is the closest match left.
-    script.push_str("grep -qP x /dev/null 2>/dev/null\nif [ $? -ne 2 ]; then GP=-P; else GP=-E; fi\n");
     script.push_str(&format!(
-        "VERR=$(grep $GP{case} -q -e {pattern} /dev/null 2>&1)\nif [ $? -eq {EXIT_BAD_PATTERN} ]; then printf '%s\\n' \"$VERR\" >&2; exit {EXIT_BAD_PATTERN}; fi\n"
+        "VERR=$(grep $GP -q -e \"$MEWRK_RX\" /dev/null 2>&1)\nif [ $? -eq {EXIT_BAD_PATTERN} ]; then printf '%s\\n' \"$VERR\" >&2; exit {EXIT_BAD_PATTERN}; fi\n"
     ));
     // The files Git lists reach `grep` through `xargs`, whose child shell
     // prefixes each with the target — dropping any whose directory has become
@@ -852,17 +881,20 @@ fn grep_script(
     // nothing past 2 MiB (2049 one-kilobyte blocks once `find` has rounded
     // up). The pattern travels in the environment, never through a second
     // round of quoting.
-    script.push_str(&format!(
-        "MEWRK_RX={pattern}\nMEWRK_GF=\"$GP{case} -I -n\"\nexport MEWRK_RX MEWRK_GF\n"
-    ));
+    // `find` never sees the pattern: it starts `MEWRK_GREP`, which reads it
+    // from the environment. In an argument, any `{}` a pattern holds would be
+    // taken for `find`'s own placeholder.
+    script.push_str(
+        "MEWRK_GF=\"$GP -I -n\"\nMEWRK_GREP='exec grep $MEWRK_GF -e \"$MEWRK_RX\" /dev/null \"$@\"'\nexport MEWRK_RX MEWRK_GF MEWRK_GREP\n",
+    );
     script.push_str("IGNORED=\nif [ -d \"$C\" ]; then\n");
     script.push_str(IGNORE_PROBE);
     script.push_str(&collapse_condition(true));
     script.push_str(
         r#"if [ "$IGN" = git ]; then
-( cd -- "$C" && GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false -c core.quotepath=false ls-files --cached --others --exclude-standard -- . 2>/dev/null ) | sed '/^"/d' | uniq | tr '\n' '\000' | xargs -0 sh -c 'd=${1%/}; shift; for f do shift; p=$f; ok=1; while :; do case $p in */*) p=${p%/*} ;; *) break ;; esac; if [ -L "$d/$p" ]; then ok=; break; fi; done; if [ -n "$ok" ]; then set -- "$@" "$d/$f"; fi; done; [ $# -gt 0 ] || exit 0; exec find "$@" -prune -type f -size -2049k -exec grep $MEWRK_GF -e "$MEWRK_RX" /dev/null {} +' sh "$C"
+( cd -- "$C" && GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false -c core.quotepath=false ls-files --cached --others --exclude-standard -- . 2>/dev/null ) | sed '/^"/d' | uniq | tr '\n' '\000' | xargs -0 sh -c 'd=${1%/}; shift; for f do shift; p=$f; ok=1; while :; do case $p in */*) p=${p%/*} ;; *) break ;; esac; if [ -L "$d/$p" ]; then ok=; break; fi; done; if [ -n "$ok" ]; then set -- "$@" "$d/$f"; fi; done; [ $# -gt 0 ] || exit 0; exec find "$@" -prune -type f -size -2049k -exec sh -c "$MEWRK_GREP" sh {} +' sh "$C"
 else
-find "$C" -mindepth 1 \( -type d \( "$@" \) -prune \) -o -type f -size -2049k -exec grep $MEWRK_GF -e "$MEWRK_RX" /dev/null {} +
+find "$C" -mindepth 1 \( -type d \( "$@" \) -prune \) -o -type f -size -2049k -exec sh -c "$MEWRK_GREP" sh {} +
 fi
 else
 grep $MEWRK_GF -e "$MEWRK_RX" /dev/null "$C"
@@ -881,51 +913,112 @@ fn grep_with(
     let path = optional_string(input, "path", ".", MAX_PATH_CHARS, false)?;
     let case_sensitive = optional_bool(input, "case_sensitive", false)?;
     let page = search_scope::GrepPage::from_input(input)?;
+    // The host parses the pattern itself, exactly as its own leg does: a bad
+    // one is refused in the same words, and a good one is translated for the
+    // machine's engine (`remote_regex`).
+    let pattern = crate::remote_regex::translate(&pattern, case_sensitive)
+        .map_err(|error| format!("Invalid regular expression: {error}"))?;
     let wording = ExitWording::new(&path).grep();
-    let output = run_script(
-        shell,
-        target,
-        &grep_script(target, &path, &pattern, case_sensitive, page.wanted())?,
-        None,
-        SEARCH_TIMEOUT,
-        &wording,
-    )?;
-    let (header, rest) = take_header(&output.stdout)?;
+    let wanted = page.wanted();
+    // The machine's engine reads a translation that may match more than the
+    // pattern does, never less, so every line it returns is matched again
+    // here with the pattern itself. When the extra lines fill the machine's
+    // cap before the page is full, there may be real matches past it: ask
+    // again with more room. An exact translation never comes back short.
+    let mut cap = wanted;
+    let mut attempt = 1;
+    let mut ere_only = false;
+    let (header, payload, stderr) = loop {
+        let output = run_script(
+            shell,
+            target,
+            &grep_script(target, &path, &pattern, cap, ere_only)?,
+            None,
+            SEARCH_TIMEOUT,
+            &wording,
+        )?;
+        // GNU grep gives up on a file whose line exhausts PCRE's limits and
+        // says so on stderr, with that file's later lines unread. The ERE
+        // rendering has no such limit.
+        if !ere_only && output.stderr.contains("PCRE") {
+            ere_only = true;
+            continue;
+        }
+        let (header, rest) = take_header(&output.stdout)?;
+        let payload = String::from_utf8_lossy(rest).into_owned();
+        let returned = payload.lines().filter(|line| !line.is_empty()).count();
+        let kept = matched_lines(&payload, &pattern.regex).count();
+        if kept >= wanted || returned < cap || attempt == GREP_ATTEMPTS {
+            break (header, payload, output.stderr);
+        }
+        cap = cap.saturating_mul(8);
+        attempt += 1;
+    };
     Ok(render_matches(
         target.profile,
         &header,
         &page,
-        &String::from_utf8_lossy(rest),
-        &output.stderr,
+        matched_lines(&payload, &pattern.regex),
+        &stderr,
     ))
+}
+
+/// The lines of a remote grep's answer that `regex` — the model's pattern,
+/// built as the host leg builds it — matches. A line whose shape cannot be
+/// read is kept: it is the machine's to explain, not the host's to drop.
+fn matched_lines<'a>(payload: &'a str, regex: &'a regex::Regex) -> impl Iterator<Item = &'a str> + 'a {
+    payload
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter(move |line| split_match(line).is_none_or(|(_, _, text)| regex.is_match(text)))
+}
+
+/// One line of a remote grep's answer split into its path, line number and
+/// text. The path is whatever the machine printed — an absolute POSIX path,
+/// or a Windows one with its drive colon — so the split is at the first
+/// `:<digits>:`, not at the first colon.
+fn split_match(line: &str) -> Option<(&str, &str, &str)> {
+    let mut from = 0;
+    while let Some(offset) = line[from..].find(':') {
+        let colon = from + offset;
+        let digits = line[colon + 1..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        if digits > 0 && line.as_bytes().get(colon + 1 + digits) == Some(&b':') {
+            return Some((
+                &line[..colon],
+                &line[colon + 1..colon + 1 + digits],
+                &line[colon + 2 + digits..],
+            ));
+        }
+        from = colon + 1;
+    }
+    None
 }
 
 /// `path:line:text`, with the path relative to the root and the text cut at the
 /// same 500 characters the host leg cuts it at.
 fn format_match(root: &str, line: &str) -> String {
-    let Some((path, rest)) = line.split_once(':') else {
-        return truncate_chars(line, 500);
-    };
-    let Some((number, text)) = rest.split_once(':') else {
-        return format!("{}:{}", display_relative(root, path), truncate_chars(rest, 500));
-    };
-    format!(
-        "{}:{number}:{}",
-        display_relative(root, path),
-        truncate_chars(text, 500)
-    )
+    match split_match(line) {
+        Some((path, number, text)) => format!(
+            "{}:{number}:{}",
+            display_relative(root, path),
+            truncate_chars(text, 500)
+        ),
+        None => truncate_chars(line, 500),
+    }
 }
 
-fn render_matches(
+fn render_matches<'a>(
     profile: &PromptProfile,
     header: &Header,
     page: &search_scope::GrepPage,
-    payload: &str,
+    lines: impl IntoIterator<Item = &'a str>,
     stderr: &str,
 ) -> String {
-    let matches = payload
-        .lines()
-        .filter(|line| !line.is_empty())
+    let matches = lines
+        .into_iter()
         .take(page.wanted())
         .map(|line| format_match(&header.root, line))
         .collect::<Vec<_>>();
@@ -1135,9 +1228,12 @@ fn read_with(
         images: Vec::new(),
         // No opened file: nothing on this host answers to a remote path, so the
         // renderer has nothing to open.
-        file_touch: file_guard.map(|_| FileGuardTouch {
+        // The touch names the file on its machine whether or not the run
+        // keeps a record: nested project instructions and the language
+        // servers find a remote file by it.
+        file_touch: Some(FileTouch {
             path: key,
-            read: Some(record),
+            read: file_guard.map(|_| record),
         }),
     })
 }
@@ -1446,7 +1542,7 @@ fn write_with(
         content.as_bytes(),
         &wording,
     )?;
-    let touch = file_guard.map(|guard| {
+    if let Some(guard) = file_guard {
         // The model wrote every byte, so its copy is the current one.
         guard.registry.record(
             guard.scope,
@@ -1457,10 +1553,10 @@ fn write_with(
                 true,
             ),
         );
-        FileGuardTouch {
-            path: key.clone(),
-            read: None,
-        }
+    }
+    let touch = Some(FileTouch {
+        path: key.clone(),
+        read: None,
     });
     let diff = before.and_then(|(before, created)| unified_diff(&path, &before, &content, created));
     Ok(RemoteOutcome {
@@ -1538,7 +1634,7 @@ fn edit_with(
         &wording,
     )?;
     let mut note = String::new();
-    let touch = file_guard.map(|guard| {
+    if let Some(guard) = file_guard {
         // After an edit the model knows the file only if it knew it before: a
         // full read it has seen, and no other changes applied on top.
         let in_model_context = !stale_recovered
@@ -1555,10 +1651,10 @@ fn edit_with(
             ),
         );
         note = write_receipt_note(target.profile, stale_recovered);
-        FileGuardTouch {
-            path: key.clone(),
-            read: None,
-        }
+    }
+    let touch = Some(FileTouch {
+        path: key.clone(),
+        read: None,
     });
     Ok(RemoteOutcome {
         output: format!(
@@ -1895,7 +1991,11 @@ pub(crate) mod tests {
         let app_data = tempfile::tempdir().unwrap();
         crate::remote_link::install(app_data.path(), Vec::new(), None);
         let runner = ShellRunner::Ssh {
-            agent_shell: AgentShell::new(ShellBackend::PowerShell, program),
+            // Either edition: the variable names the program, and its name says which.
+            agent_shell: AgentShell::new(
+                ShellBackend::WindowsPowerShell.of_recorded_program(&program),
+                program,
+            ),
             host,
             port: 0,
             identity_file: String::new(),
@@ -2166,6 +2266,35 @@ pub(crate) mod tests {
         assert!(formatted.ends_with('…'));
     }
 
+    /// A Windows machine prints its drive colon in the path: the split is at
+    /// the line number, so the path is still made relative and the text is
+    /// the line's own, colons and all.
+    #[test]
+    fn a_match_splits_at_its_line_number_not_at_a_drive_colon() {
+        assert_eq!(
+            split_match("C:/work/app/src/a.rs:7:let x: u8 = 1;"),
+            Some(("C:/work/app/src/a.rs", "7", "let x: u8 = 1;"))
+        );
+        assert_eq!(
+            format_match("C:/work/app", "C:/work/app/notes/it's.txt:1:third"),
+            "notes/it's.txt:1:third"
+        );
+        assert_eq!(split_match("/srv/a:b.txt:3::x"), Some(("/srv/a:b.txt", "3", ":x")));
+        assert_eq!(split_match("no number here"), None);
+    }
+
+    /// The machine's engine may return lines the pattern does not match;
+    /// only the ones it does reach the page.
+    #[test]
+    fn remote_lines_are_matched_again_with_the_pattern_itself() {
+        let regex = regex::Regex::new(r"^\d+$").unwrap();
+        let payload = "/r/a.txt:1:123\n/r/a.txt:2:12a\n\n/r/b.txt:9:7\nunreadable\n";
+        assert_eq!(
+            matched_lines(payload, &regex).collect::<Vec<_>>(),
+            ["/r/a.txt:1:123", "/r/b.txt:9:7", "unreadable"]
+        );
+    }
+
     #[test]
     fn unreadable_entries_are_reported_rather_than_dropped() {
         let profile = PromptProfile::default();
@@ -2178,7 +2307,7 @@ pub(crate) mod tests {
             &profile,
             &header,
             &page,
-            "",
+            [],
             "find: '/r/x': Permission denied\n",
         );
         assert_eq!(
@@ -2193,7 +2322,7 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(
-            render_matches(&profile, &header, &page, "", ""),
+            render_matches(&profile, &header, &page, [], ""),
             profile.text(PromptKey::ToolGrepNoMatch)
         );
     }
@@ -2321,7 +2450,8 @@ pub(crate) mod tests {
                 crate::shell_backend::ShellBackend::Bash => {
                     run_environment::local_bash_candidates().into_iter().next()?
                 }
-                crate::shell_backend::ShellBackend::PowerShell => return None,
+                crate::shell_backend::ShellBackend::Pwsh
+                | crate::shell_backend::ShellBackend::WindowsPowerShell => return None,
                 other => run_environment::local_program_path(other.id())?,
             };
             Some(Self {
@@ -2546,6 +2676,56 @@ pub(crate) mod tests {
         }
     }
 
+    /// A stage of the listing pipeline that died — macOS's awk refusing a
+    /// program the transport had mangled — exits 0 behind `head` with no
+    /// entries. What it said is reported rather than read as an empty
+    /// directory; a quiet empty answer still is one.
+    #[test]
+    fn an_empty_listing_with_stderr_reports_what_the_machine_said() {
+        struct Canned(&'static str);
+        impl RemoteShell for Canned {
+            fn run(
+                &self,
+                _script: &str,
+                _stdin: Option<&[u8]>,
+                _timeout: Duration,
+                _cancel: &CancelSignal,
+            ) -> Result<RemoteCommandOutput, String> {
+                Ok(RemoteCommandOutput {
+                    status: Some(0),
+                    stdout: b"/srv/app\n/srv/app\nnames\n\n".to_vec(),
+                    stderr: self.0.to_owned(),
+                })
+            }
+        }
+        let set = WorkspaceSet::local_root("/srv/app".to_owned());
+        let profile = PromptProfile::default();
+        let cancel = CancelSignal::default();
+        let target = RemoteWorkspace {
+            workspace: set.primary().expect("one workspace"),
+            machine_key: "ssh:devbox".to_owned(),
+            confinement: Confinement::Workspace,
+            also: Vec::new(),
+            sandbox: None,
+            profile: &profile,
+            cancel: &cancel,
+        };
+
+        let refused = ls_with(
+            &Canned("awk: syntax error at source line 1\n"),
+            &target,
+            &input(json!({})),
+        )
+        .refusal();
+        assert_eq!(
+            refused,
+            "The listing of . came back empty, and the remote machine said: awk: syntax error at source line 1"
+        );
+
+        let empty = ls_with(&Canned(""), &target, &input(json!({}))).unwrap();
+        assert_eq!(empty, profile.text(PromptKey::ToolLsEmpty));
+    }
+
     #[test]
     fn ls_lists_entries_relative_to_the_root_and_honours_depth() {
         let Some(fixture) = fixture() else { return };
@@ -2649,6 +2829,84 @@ pub(crate) mod tests {
             invalid.starts_with("Invalid regular expression:"),
             "{invalid}"
         );
+    }
+
+    /// The model writes Rust regex syntax on every machine. Patterns the
+    /// remote dialects used to read differently — `\d` (a literal `d` to
+    /// ERE), `(?i)`, escaped and bare braces, word boundaries, a lazy
+    /// quantifier, Unicode classes and case folding — find exactly what the
+    /// host leg finds, through whichever engine this machine's grep has, and
+    /// through POSIX ERE as well.
+    #[test]
+    fn both_legs_read_a_rust_pattern_alike() {
+        let Some(fixture) = fixture() else { return };
+        write_fixture_file(
+            &fixture,
+            "src/a.go",
+            "var x interface{} = 42\nfunc Café() {}\nid := 7\nwidth := 12\r\nΣΙΓΜΑ σίγμα\naaab\nTODO: fix\n".as_bytes(),
+        );
+        let harness = Harness::new(&fixture);
+        let target = harness.target(Confinement::Workspace);
+        let state = crate::state::AppState::default();
+        let host = |arguments: Value| {
+            let response = crate::tool_executor::execute(
+                crate::model::ToolExecutionRequest {
+                    conversation_id: "conversation-test".into(),
+                    workspace_path: fixture.workspace.clone(),
+                    tool_name: "grep".into(),
+                    input: input(arguments),
+                },
+                &state,
+            );
+            assert!(response.success, "{}", response.output);
+            response.output
+        };
+        let cases = [
+            json!({"pattern": r"\d+$"}),
+            json!({"pattern": r"(?i)todo"}),
+            json!({"pattern": r"interface\{\}"}),
+            json!({"pattern": r"\bid\b"}),
+            json!({"pattern": r"a+?b$"}),
+            json!({"pattern": r"Caf\w\("}),
+            json!({"pattern": r"^\p{Greek}+ \p{Greek}+$"}),
+            json!({"pattern": "σιγμα", "case_sensitive": false}),
+            json!({"pattern": r"[[:upper:]]{4}", "case_sensitive": true}),
+            json!({"pattern": r"width := \d{2}$", "case_sensitive": true}),
+        ];
+        for arguments in cases {
+            let remote = grep_with(&fixture.shell, &target, &input(arguments.clone())).unwrap();
+            assert_eq!(remote, host(arguments.clone()), "{arguments}");
+            assert_ne!(remote, harness.profile.text(PromptKey::ToolGrepNoMatch), "{arguments}");
+        }
+        // The ERE rendering, which macOS and BusyBox machines run, agrees too.
+        let path = ".".to_owned();
+        for arguments in [
+            json!({"pattern": r"\d+$"}),
+            json!({"pattern": r"\bid\b"}),
+            json!({"pattern": r"interface\{\}"}),
+        ] {
+            let pattern = crate::remote_regex::translate(arguments["pattern"].as_str().unwrap(), false).unwrap();
+            let output = run_script(
+                &fixture.shell,
+                &target,
+                &grep_script(&target, &path, &pattern, 100, true).unwrap(),
+                None,
+                SEARCH_TIMEOUT,
+                &ExitWording::new(&path).grep(),
+            )
+            .unwrap();
+            let (header, rest) = take_header(&output.stdout).unwrap();
+            let payload = String::from_utf8_lossy(rest).into_owned();
+            let page = search_scope::GrepPage::from_input(&JsonObject::new()).unwrap();
+            let rendered = render_matches(
+                &harness.profile,
+                &header,
+                &page,
+                matched_lines(&payload, &pattern.regex),
+                &output.stderr,
+            );
+            assert_eq!(rendered, host(arguments.clone()), "ERE {arguments}");
+        }
     }
 
     /// Plan mode on another machine: the repository probe runs there and

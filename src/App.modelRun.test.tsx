@@ -1593,11 +1593,13 @@ describe("App model run flow — modelRun", () => {
     fireEvent.contextMenu(container.querySelector(".empty-state")!, { clientX: 40, clientY: 180 });
     await user.click(screen.getByRole("menuitem", { name: /工具调用/ }));
     await user.click(screen.getByRole("menuitem", { name: "Shell" }));
-    await user.click(screen.getByRole("menuitem", { name: /^PowerShell$/ }));
+    // Each PowerShell edition is its own shell tool with its own menu row.
+    expect(screen.getByRole("menuitem", { name: /^Windows PowerShell$/ })).toBeInTheDocument();
+    await user.click(screen.getByRole("menuitem", { name: /^PowerShell 7$/ }));
     await user.type(screen.getByLabelText("命令 *"), "Get-ChildItem");
     await user.click(screen.getByRole("button", { name: "执行并添加" }));
 
-    const request = expect.objectContaining({ toolName: "powershell", input: { command: "Get-ChildItem" } });
+    const request = expect.objectContaining({ toolName: "pwsh", input: { command: "Get-ChildItem" } });
     await waitFor(() => expect(runtimeMocks.requestToolApproval).toHaveBeenCalledWith(request));
     expect(runtimeMocks.executeTool).toHaveBeenCalledWith(request, "approval-once");
   });
@@ -1966,7 +1968,7 @@ describe("App model run flow — modelRun", () => {
       type: "tool_approval_requested",
       promptId: "prompt-shell-1",
       toolName: "powershell",
-      label: "PowerShell",
+      label: "Windows PowerShell",
       summary: "npm run build",
       riskLevel: "高",
       reason: "命令会在工作区内执行",
@@ -1999,7 +2001,7 @@ describe("App model run flow — modelRun", () => {
       prompt: {
         promptId: "prompt-manual-1",
         toolName: "powershell",
-        label: "PowerShell",
+        label: "Windows PowerShell",
         summary: "Get-ChildItem",
         riskLevel: "高",
         reason: "命令会在工作区内执行",
@@ -2017,7 +2019,7 @@ describe("App model run flow — modelRun", () => {
     fireEvent.contextMenu(container.querySelector(".empty-state")!, { clientX: 40, clientY: 180 });
     await user.click(screen.getByRole("menuitem", { name: /工具调用/ }));
     await user.click(screen.getByRole("menuitem", { name: "Shell" }));
-    await user.click(screen.getByRole("menuitem", { name: /^PowerShell$/ }));
+    await user.click(screen.getByRole("menuitem", { name: /^Windows PowerShell$/ }));
     await user.type(screen.getByLabelText("命令 *"), "Get-ChildItem");
     await user.click(screen.getByRole("button", { name: "执行并添加" }));
 

@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestDocument as createSeedDocument } from "../test/fixtures";
-import { BUILTIN_AGENT_ROLE_IDS } from "../seed";
 import type { AgentRoleResource, ApiProvider, AppDocument, ContextItem, ModelProfile, SubagentRunRecord } from "../types";
 
 const tauriMocks = vi.hoisted(() => ({ invoke: vi.fn() }));
@@ -10,7 +9,6 @@ vi.mock("@tauri-apps/api/core", async (importOriginal) => ({
   invoke: tauriMocks.invoke
 }));
 
-import { CLAUDE_AGENT_REGISTRY } from "./claudeAgentProvider";
 import { DEFAULT_SEARCH_COMPRESSION_CUTOFF } from "./searchProviders";
 import { deleteAgentRole, deleteApiKey, defaultConversationWebSearchSettings, fetchModels, flushDocumentSaves, getStoredApiKeyLength, imageAttachmentData, loadDocument, normalizeAgentRole, normalizeDocument, prepareImageAttachment, refreshCapabilities, resetDocument, revealApiKey, runModel, saveAgentRole, saveApiKey, saveDocument } from "./runtime";
 
@@ -48,6 +46,7 @@ function wireRole(overrides: Record<string, unknown> = {}): Record<string, unkno
     hookIds: [],
     webSearch: defaultConversationWebSearchSettings(),
     templateId: null,
+    toolDescriptionFileId: null,
     ...overrides
   };
 }
@@ -199,6 +198,42 @@ describe("document normalization", () => {
       "ssh:m1|/srv/api": { K: "v" },
       "wsl:Ubuntu|/home/dev/x": { W: "1" }
     });
+  });
+
+  it("keeps either PowerShell edition as an agent shell and drops what is no backend", () => {
+    const document = createSeedDocument();
+    const machine = (id: string, agentShell?: string) => ({
+      id,
+      name: id,
+      host: `dev@${id}`,
+      port: 0,
+      identityFile: "",
+      ...(agentShell === undefined ? {} : { agentShell }),
+      createdAt: "2026-10-08T00:00:00Z",
+      updatedAt: "2026-10-08T00:00:00Z"
+    });
+    (document as unknown as { globalSettings: { executionEnvironments: unknown } }).globalSettings.executionEnvironments = {
+      sshMachines: [
+        machine("m-pwsh", "pwsh"),
+        machine("m-ps5", "powershell"),
+        machine("m-bash", "bash"),
+        machine("m-fish", "fish"),
+        machine("m-none")
+      ],
+      envVars: {},
+      // A WSL distribution has no PowerShell of either edition; it keeps bash.
+      wslAgentShells: { Ubuntu: "bash", Debian: "pwsh", Alpine: "powershell" }
+    };
+
+    const environments = normalizeDocument(document).globalSettings.executionEnvironments;
+    expect(environments.sshMachines.map((entry) => [entry.id, entry.agentShell])).toEqual([
+      ["m-pwsh", "pwsh"],
+      ["m-ps5", "powershell"],
+      ["m-bash", "bash"],
+      ["m-fish", undefined],
+      ["m-none", undefined]
+    ]);
+    expect(environments.wslAgentShells).toEqual({ Ubuntu: "bash" });
   });
 
   it("keeps a sidebar workspace on its machine through normalization", () => {
@@ -440,7 +475,8 @@ describe("document normalization", () => {
           domainFilter: "exclude",
           excludeDomains: ["ads.example"]
         },
-        templateId: "template_a"
+        templateId: "template_a",
+        toolDescriptionFileId: "tooldesc_builtin_concise_en_us"
       })
     });
 
@@ -473,7 +509,10 @@ describe("document normalization", () => {
         mcpIds: [],
         hookIds: [],
         webSearch: defaultConversationWebSearchSettings(),
-        templateId: null
+        templateId: null,
+        // Always emitted: the editor compares bodies structurally, and
+        // `null !== undefined`.
+        toolDescriptionFileId: null
       }
     });
     // A row with nothing to call itself by is listed under its id.
@@ -611,6 +650,22 @@ describe("document normalization", () => {
     expect(agent.role?.templateId).toBe(expected);
   });
 
+  it.each([
+    ["absent", undefined, null],
+    ["null", null, null],
+    ["blank", "", null],
+    ["not a string", 7, null],
+    // Only an id travels. A dangling one is the host's to resolve to the guided
+    // built-in, so it is kept as written.
+    ["a built-in id", "tooldesc_builtin_concise_en_us", "tooldesc_builtin_concise_en_us"],
+    ["a file id", "tooldesc_user_main_0f0f0f0f", "tooldesc_user_main_0f0f0f0f"]
+  ])("reads a role's tool-description file that is %s", (_label, stored, expected) => {
+    const [agent] = normalizedAgents([
+      wireRoleEntry("agent_a", { role: wireRole({ toolDescriptionFileId: stored }) })
+    ]);
+    expect(agent.role?.toolDescriptionFileId).toBe(expected);
+  });
+
   it("reads a role's web configuration the way a conversation's is read", () => {
     const read = (stored: unknown) => normalizedAgents([
       wireRoleEntry("agent_a", { role: wireRole({ webSearch: stored }) })
@@ -740,7 +795,7 @@ describe("document normalization", () => {
     expect(normalized.workspaces[0].draftConversation?.settings.agentIds).toEqual(expected);
   });
 
-  it("reads a preset's roles like its other resource ids, and a silent preset as the built-in roles", () => {
+  it("reads a preset's roles like its other resource ids, and a silent preset as the seed's, which selects none", () => {
     const read = (agentIds: unknown) => {
       const current = createSeedDocument();
       const settings = defaultPresetSettings(current) as unknown as Record<string, unknown>;
@@ -752,9 +807,9 @@ describe("document normalization", () => {
     expect(read(["agent_a", "agent_a", "", "   ", 7, "agent_b"])).toEqual(["agent_a", "agent_b"]);
     // An empty selection is an answer: a preset that chose no role keeps choosing none.
     expect(read([])).toEqual([]);
-    // Silence is not: the preset falls back to the roles the product ships.
-    expect(read(undefined)).toEqual([...BUILTIN_AGENT_ROLE_IDS]);
-    expect(read("agent_a")).toEqual([...BUILTIN_AGENT_ROLE_IDS]);
+    // Silence is not an answer: the preset falls back to the seed's, and no role ships.
+    expect(read(undefined)).toEqual([]);
+    expect(read("agent_a")).toEqual([]);
   });
 
   it("drops the legacy agentDefinitions list from every place a settings object lives", () => {
@@ -951,6 +1006,66 @@ describe("document normalization", () => {
     // the transcript regardless of what is on disk now.
     expect(loaded.toolLock?.skillIds).toEqual(["skill_gone_from_disk"]);
     expect(loaded.toolLock?.promptSkillIds).toEqual([]);
+  });
+
+  // The file write guards default to on: a document written before the switch
+  // existed, and a value that is not an outright `false`, both come back on.
+  it("reads the file write guards as on unless a conversation or preset says false", () => {
+    const loadedGuards = (value: unknown) => {
+      const current = createSeedDocument() as unknown as {
+        workspaces: { conversations: { settings: Record<string, unknown> }[] }[]
+      };
+      const settings = current.workspaces[0].conversations[0].settings;
+      if (value === undefined) delete settings.fileWriteGuardsEnabled;
+      else settings.fileWriteGuardsEnabled = value;
+      return normalizeDocument(current as unknown as AppDocument)
+        .workspaces[0].conversations[0].settings.fileWriteGuardsEnabled;
+    };
+    expect(loadedGuards(undefined)).toBe(true);
+    expect(loadedGuards(true)).toBe(true);
+    expect(loadedGuards(false)).toBe(false);
+    expect(loadedGuards(null)).toBe(true);
+    expect(loadedGuards("false")).toBe(true);
+
+    const loadedPreset = (value: unknown) => {
+      const current = createSeedDocument();
+      const settings = defaultPresetSettings(current) as unknown as Record<string, unknown>;
+      if (value === undefined) delete settings.fileWriteGuardsEnabled;
+      else settings.fileWriteGuardsEnabled = value;
+      return normalizeDocument(current).globalSettings.conversationPresets[0].settings.fileWriteGuardsEnabled;
+    };
+    expect(loadedPreset(undefined)).toBe(true);
+    expect(loadedPreset(false)).toBe(false);
+    expect(loadedPreset(true)).toBe(true);
+
+    // Every settings object a document carries goes through the one reading.
+    const document = createSeedDocument();
+    const workspace = document.workspaces[0];
+    const off = () => ({ ...structuredClone(workspace.conversations[0].settings), fileWriteGuardsEnabled: false });
+    (workspace as unknown as Record<string, unknown>).lastConversationSettings = off();
+    (workspace as unknown as Record<string, unknown>).draftConversation = { settings: off(), presetId: "" };
+    const normalized = normalizeDocument(document).workspaces[0];
+    expect(normalized.lastConversationSettings?.fileWriteGuardsEnabled).toBe(false);
+    expect(normalized.draftConversation?.settings.fileWriteGuardsEnabled).toBe(false);
+  });
+
+  it("keeps the tool lock's record of the file write guards, and reads an absent or foreign one as unknown", () => {
+    const lockedGuards = (value: unknown) => {
+      const current = createSeedDocument() as unknown as {
+        workspaces: { conversations: { settings: Record<string, unknown> }[] }[]
+      };
+      const lock: Record<string, unknown> = { tools: [], mcpIds: [], skillIds: [] };
+      if (value !== undefined) lock.fileWriteGuards = value;
+      current.workspaces[0].conversations[0].settings.toolLock = lock;
+      return normalizeDocument(current as unknown as AppDocument)
+        .workspaces[0].conversations[0].settings.toolLock?.fileWriteGuards;
+    };
+    expect(lockedGuards(true)).toBe(true);
+    expect(lockedGuards(false)).toBe(false);
+    // A lock from before the switch knows nothing of it, so it tones nothing.
+    expect(lockedGuards(undefined)).toBeNull();
+    expect(lockedGuards(null)).toBeNull();
+    expect(lockedGuards("false")).toBeNull();
   });
 
   /* A fetch provider this build cannot resolve is a broken binding, as on the
@@ -1956,9 +2071,9 @@ describe("document normalization", () => {
     expect(tauriMocks.invoke).toHaveBeenCalledWith("fetch_models", { provider });
   });
 
-  it("serves the built-in Claude Agent catalog in browser preview", async () => {
-    // There is no `GET /models` behind a local CLI, so the preview mirrors the
-    // host's built-in registry row for row instead of inventing placeholder ids.
+  it("serves placeholder Claude rows for Claude Agent in browser preview", async () => {
+    // The host asks the bundled CLI, which the preview does not have, and there
+    // is no built-in Claude Agent catalog to fall back on.
     const provider = {
       ...createSeedDocument().globalSettings.apiProviders[0],
       family: "claude_agent" as const,
@@ -1967,11 +2082,7 @@ describe("document normalization", () => {
 
     const models = await fetchModels(provider);
 
-    expect(models.map((model) => model.id)).toEqual(CLAUDE_AGENT_REGISTRY.map((entry) => entry.id));
-    expect(models.map((model) => model.contextWindow))
-      .toEqual(CLAUDE_AGENT_REGISTRY.map((entry) => entry.contextWindow));
-    expect(models.map((model) => model.maxOutputTokens))
-      .toEqual(CLAUDE_AGENT_REGISTRY.map((entry) => entry.maxOutputTokens));
+    expect(models.map((model) => model.id)).toEqual(["claude-sonnet-preview", "claude-opus-preview"]);
     expect(tauriMocks.invoke).not.toHaveBeenCalled();
   });
 

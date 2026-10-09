@@ -67,14 +67,15 @@ describe("withWorkspaceArgument", () => {
   const tools = [
     descriptor("read"),
     descriptor("bash", "shell"),
+    descriptor("pwsh", "shell"),
     descriptor("powershell", "shell"),
     descriptor("web_fetch", "web")
   ];
   const local: AttachedWorkspace = { machine: null, path: "C:\\src\\app" };
   const remote: AttachedWorkspace = { machine: { kind: "ssh", machineId: "m1" }, path: "/srv/app" };
   const parameterNames = (tool: ToolDescriptor) => tool.parameters.map((parameter) => parameter.name);
-  // This machine is Windows with PowerShell and Git Bash; the SSH machine has bash.
-  const windowsHost = (machine: AttachedWorkspace["machine"]) => machine ? ["bash"] : ["powershell", "bash"];
+  // This machine is Windows with both PowerShell editions and Git Bash; the SSH machine has bash.
+  const windowsHost = (machine: AttachedWorkspace["machine"]) => machine ? ["bash"] : ["pwsh", "powershell", "bash"];
   const posixHost = (machine: AttachedWorkspace["machine"]) => machine ? ["bash"] : ["zsh", "bash", "sh"];
 
   it("leaves every descriptor alone while the conversation has one workspace", () => {
@@ -82,22 +83,40 @@ describe("withWorkspaceArgument", () => {
   });
 
   it("offers the host's numbers to the workspace-scoped tools only", () => {
-    const [read, bash, powershell, fetch] = withWorkspaceArgument(tools, [local, remote], windowsHost, "Workspace");
+    const [read, bash, pwsh, powershell, fetch] = withWorkspaceArgument(
+      tools,
+      [local, remote],
+      windowsHost,
+      "Workspace"
+    );
     expect(parameterNames(read!)).toEqual(["path", "workspace"]);
     expect(parameterNames(bash!)).toEqual(["path", "workspace"]);
     expect(parameterNames(fetch!)).toEqual(["path"]);
     const argument = read!.parameters.at(-1)!;
     expect(argument).toMatchObject({ type: "number", required: false, placeholder: "1 | 2" });
     expect(argument.defaultValue).toBeUndefined();
-    // PowerShell runs only where a machine has it: this one.
+    // Each PowerShell edition runs only where a machine has it: this one.
+    expect(pwsh!.parameters.at(-1)).toMatchObject({ name: "workspace", placeholder: "1" });
     expect(powershell!.parameters.at(-1)).toMatchObject({ name: "workspace", placeholder: "1" });
   });
 
   it("withdraws the argument from a shell tool where no machine has the shell", () => {
-    const [, , powershell] = withWorkspaceArgument(tools, [remote, remote], windowsHost, "Workspace");
+    const [, , pwsh, powershell] = withWorkspaceArgument(tools, [remote, remote], windowsHost, "Workspace");
+    expect(parameterNames(pwsh!)).toEqual(["path"]);
     expect(parameterNames(powershell!)).toEqual(["path"]);
-    const [, , onPosixHost] = withWorkspaceArgument(tools, [local, remote], posixHost, "Workspace");
+    const [, , pwshOnPosixHost, onPosixHost] = withWorkspaceArgument(tools, [local, remote], posixHost, "Workspace");
+    expect(parameterNames(pwshOnPosixHost!)).toEqual(["path"]);
     expect(parameterNames(onPosixHost!)).toEqual(["path"]);
+  });
+
+  it("treats PowerShell 7 and Windows PowerShell as two shells, each addressed on its own machines", () => {
+    // The first machine has only Windows PowerShell 5.1, the second only PowerShell 7.
+    const first: AttachedWorkspace = { machine: null, path: "C:\\one" };
+    const second: AttachedWorkspace = { machine: { kind: "ssh", machineId: "m2" }, path: "C:\\two" };
+    const editions = (machine: AttachedWorkspace["machine"]) => machine ? ["pwsh"] : ["powershell"];
+    const [, , pwsh, powershell] = withWorkspaceArgument(tools, [first, second], editions, "Workspace");
+    expect(pwsh!.parameters.at(-1)).toMatchObject({ name: "workspace", placeholder: "2" });
+    expect(powershell!.parameters.at(-1)).toMatchObject({ name: "workspace", placeholder: "1" });
   });
 
   it("does not double a workspace argument a descriptor already declares", () => {

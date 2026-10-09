@@ -90,7 +90,7 @@
 -- kills the command, which is an ordinary failed receipt and needs no
 -- vocabulary of its own.
 --
--- bash and powershell accept `run_in_background`. A background leg is an
+-- bash, pwsh and powershell accept `run_in_background`. A background leg is an
 -- explicitly requested asynchronous task: it uses a task-slot pipeline, consumes
 -- approval before spawning, returns its spawn acknowledgement immediately, and
 -- delivers results through TaskWaitDeliver or AgentFold. Stopping such a task is

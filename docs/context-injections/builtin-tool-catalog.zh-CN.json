@@ -3,7 +3,7 @@
   "language": "zh-CN",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
   "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
-  "toolCount": 49,
+  "toolCount": 50,
   "tools": [
     {
       "name": "ls",
@@ -77,41 +77,20 @@
       ]
     },
     {
-      "name": "powershell",
-      "label": "PowerShell",
+      "name": "pwsh",
+      "label": "PowerShell 7",
       "description": "",
       "category": "shell",
       "dangerous": true,
-      "parameters": [
-        {
-          "name": "command",
-          "label": "命令",
-          "type": "multiline",
-          "required": true,
-          "placeholder": "Get-ChildItem -Force"
-        },
-        {
-          "name": "description",
-          "label": "说明",
-          "type": "string",
-          "required": false,
-          "placeholder": "列出当前目录的文件"
-        },
-        {
-          "name": "timeout",
-          "label": "超时（毫秒）",
-          "type": "number",
-          "required": false,
-          "placeholder": "120000"
-        },
-        {
-          "name": "run_in_background",
-          "label": "后台运行",
-          "type": "boolean",
-          "required": false,
-          "defaultValue": false
-        }
-      ]
+      "parameters": []
+    },
+    {
+      "name": "powershell",
+      "label": "Windows PowerShell",
+      "description": "",
+      "category": "shell",
+      "dangerous": true,
+      "parameters": []
     },
     {
       "name": "bash",

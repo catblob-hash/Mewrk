@@ -40,8 +40,16 @@ const tools: ToolDescriptor[] = [
     parameters: []
   },
   {
+    name: "pwsh",
+    label: "PowerShell 7",
+    description: "",
+    category: "shell",
+    dangerous: true,
+    parameters: []
+  },
+  {
     name: "powershell",
-    label: "PowerShell",
+    label: "Windows PowerShell",
     description: "",
     category: "shell",
     dangerous: true,
@@ -180,7 +188,8 @@ describe("ToolSelectionGroups", () => {
       expect(groupRegion(disclosure)).not.toHaveAttribute("inert");
     }
     expect(within(groupDisclosure("文件与搜索")).getByText("1 / 3")).toBeInTheDocument();
-    expect(within(groupDisclosure("Shell")).getByText("0 / 1")).toBeInTheDocument();
+    // The two PowerShell editions are two shell tools.
+    expect(within(groupDisclosure("Shell")).getByText("0 / 2")).toBeInTheDocument();
   });
 
   it("does not collapse a group when its last enabled tool is turned off", async () => {
@@ -550,6 +559,7 @@ describe("ToolSelectionGroups", () => {
     ).map((mark) => mark.textContent);
     expect(marks("lsp")).toEqual([]);
     expect(marks("powershell")).toEqual(["需审查"]);
+    expect(marks("pwsh")).toEqual(["需审查"]);
   });
 });
 
@@ -561,6 +571,8 @@ const fileAndShellTools: ToolDescriptor[] = ([
   ["edit", "编辑文件", "filesystem", true],
   ["find", "查找文件", "filesystem", false],
   ["read", "读取文件", "filesystem", false],
+  ["pwsh", "PowerShell 7", "shell", true],
+  ["powershell", "Windows PowerShell", "shell", true],
   ["bash", "Bash", "shell", true],
   ["zsh", "zsh", "shell", true]
 ] as const).map(([name, label, category, dangerous]) => ({
@@ -590,12 +602,23 @@ describe("the file and shell tools", () => {
     ).map((row) => row.dataset.toolName);
     expect(pickRows(groupRegion(groupDisclosure("文件与搜索"))))
       .toEqual(["ls", "grep", "write", "edit", "find", "read"]);
-    expect(pickRows(groupRegion(groupDisclosure("Shell")))).toEqual(["bash", "zsh"]);
-    expect(within(groupDisclosure("Shell")).getByText("1 / 2")).toBeInTheDocument();
+    // PowerShell 7 sits immediately before Windows PowerShell, as in the catalog.
+    expect(pickRows(groupRegion(groupDisclosure("Shell")))).toEqual(["pwsh", "powershell", "bash", "zsh"]);
+    expect(within(groupDisclosure("Shell")).getByText("1 / 4")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Bash已关闭" }));
     expect(onChange).toHaveBeenLastCalledWith(["zsh", "bash"]);
     expect(screen.getByRole("link", { name: "Bash的说明文档" }).getAttribute("href"))
       .toMatch(/\/tools\/bash\.html$/);
+
+    // Each PowerShell edition is its own row with its own page.
+    await user.click(screen.getByRole("button", { name: "PowerShell 7已关闭" }));
+    expect(onChange).toHaveBeenLastCalledWith(["zsh", "pwsh"]);
+    await user.click(screen.getByRole("button", { name: "Windows PowerShell已关闭" }));
+    expect(onChange).toHaveBeenLastCalledWith(["zsh", "powershell"]);
+    expect(screen.getByRole("link", { name: "PowerShell 7的说明文档" }).getAttribute("href"))
+      .toMatch(/\/tools\/pwsh\.html$/);
+    expect(screen.getByRole("link", { name: "Windows PowerShell的说明文档" }).getAttribute("href"))
+      .toMatch(/\/tools\/powershell\.html$/);
   });
 });

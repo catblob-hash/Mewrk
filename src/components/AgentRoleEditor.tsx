@@ -104,11 +104,8 @@ export interface AgentRoleEditorProps {
   onProbeMcpServer?: (resource: ResourceDescriptor) => Promise<McpProbeReport>;
   /** Writes the role file and resolves with its id once the catalog has it. */
   onSave: (target: SaveAgentRoleTarget, role: AgentRole) => Promise<string>;
-  /**
-   * A save that wrote a NEW file — a created role, or a built-in saved as a
-   * global copy, which then names the built-in it replaces. The opener selects it.
-   */
-  onCreated?: (id: string, replaces: string | null) => void;
+  /** A save that wrote a NEW file — a created role. The opener selects it. */
+  onCreated?: (id: string) => void;
   onClose: () => void;
 }
 
@@ -232,9 +229,9 @@ interface ExplicitModelOption {
   modelId: string;
 }
 
-/** The level a catalog entry was read from: `null` global, a workspace key, or the built-ins. */
+/** The level a catalog entry was read from: `null` global, or a workspace key. */
 function levelOf(resource: ResourceDescriptor): string | null {
-  return resource.source === "builtin" ? null : resource.workspaceKey ?? null;
+  return resource.workspaceKey ?? null;
 }
 
 /**
@@ -243,16 +240,17 @@ function levelOf(resource: ResourceDescriptor): string | null {
  *
  * A role answers which model it runs on, which tools, skills, MCP servers and
  * hooks it may use, how its searches and fetches go, and what it tells the model
- * it is for. Every one of those answers except the model and the effort is the
- * role's own, whichever conversation it is opened or called from: a role is a
- * file at the global or a workspace level, like a skill, and this window never
- * reads the calling conversation's tools, selections or web settings — opening
- * the same role from two conversations opens the same file. It carries no system
- * prompt of its own: a named child renders the conversation's prompt through the
- * same subagent addendum an ordinary child gets, so a role is a routing choice
- * rather than a second persona to keep in sync. The description is part of that
- * routing choice and nothing more — prose the model reads when picking a name,
- * never instructions the child receives.
+ * it is for. Every one of those answers except the model, the effort and the
+ * tool-description file is the role's own, whichever conversation it is opened
+ * or called from: a role is a file at the global or a workspace level, like a
+ * skill, and this window never reads the calling conversation's tools,
+ * selections or web settings — opening the same role from two conversations
+ * opens the same file. It carries no system prompt of its own: a named child
+ * renders the prompt through the same subagent addendum an ordinary child gets
+ * (worded by the caller's tool-description file unless the role picks one), so a
+ * role is a routing choice rather than a second persona to keep in sync. The
+ * description is part of that routing choice and nothing more — prose the model
+ * reads when picking a name, never instructions the child receives.
  */
 export function AgentRoleEditor({
   resource,
@@ -276,7 +274,6 @@ export function AgentRoleEditor({
   onClose
 }: AgentRoleEditorProps) {
   const { t } = useI18n();
-  const builtin = resource?.source === "builtin";
 
   /* Two whole categories are withheld here, for two unrelated reasons.
    *
@@ -387,8 +384,9 @@ export function AgentRoleEditor({
   /* A brand-new role is a reusable asset from its first keystroke, so nothing
    * about it is borrowed from the conversation the window happened to be opened
    * from: every tool the picker offers, no skills, servers or hooks, and the
-   * built-in preset's web configuration. Only the model and the effort start on
-   * "follow the caller" — the two answers a role may leave to whoever calls it. */
+   * built-in preset's web configuration. Only the model, the effort and the
+   * tool-description file start on "follow the caller" — the three answers a role
+   * may leave to whoever calls it. */
   const blankState = (): EditorState => ({
     original: null,
     workspaceKey: null,
@@ -403,7 +401,8 @@ export function AgentRoleEditor({
       mcpIds: [],
       hookIds: [],
       webSearch: defaultAgentRoleWebSearch(),
-      templateId: null
+      templateId: null,
+      toolDescriptionFileId: null
     }
   });
 
@@ -495,9 +494,8 @@ export function AgentRoleEditor({
     }
   };
 
-  /* The level the role's file is (or will be) at. A built-in is saved as a
-     global copy, so it answers for the global level. */
-  const roleLevel = resource && !builtin ? levelOf(resource) : editor.workspaceKey;
+  /* The level the role's file is (or will be) at. */
+  const roleLevel = resource ? levelOf(resource) : editor.workspaceKey;
   /* The one workspace the role's own capability pages may reach besides the
      global level: a role is called from conversations that may not have any
      other, so it may only name entries every caller of its level can reach. */
@@ -540,11 +538,10 @@ export function AgentRoleEditor({
   const draftName = draft.name.trim();
   const nameError = validateAgentTypeName(draftName);
   /* Two roles may share a name across levels — a workspace's own `reviewer`
-     shadows the global one, and a global copy of a built-in shadows the
-     built-in — but not within one, where the model could not tell them apart. */
+     shadows the global one — but not within one, where the model could not tell
+     them apart. */
   const duplicateName = catalog.agents.some((entry) => (
-    entry.source !== "builtin"
-    && (builtin || entry.id !== resource?.id)
+    entry.id !== resource?.id
     && (entry.workspaceKey ?? null) === roleLevel
     && (entry.role?.name ?? entry.name).trim() === draftName
   ));
@@ -606,6 +603,14 @@ export function AgentRoleEditor({
     const provider = providers.find((candidate) => candidate.id === selection.providerId);
     return provider ? `${provider.name} · ${selection.modelId}` : selection.modelId;
   };
+
+  /* A tool-description choice the catalog no longer lists. The host words the
+   * child with the guided built-in then, but the file may simply not have been
+   * scanned yet, so the id is kept and offered as it stands. */
+  const danglingToolDescriptionId = draft.toolDescriptionFileId
+    && !catalog.toolDescriptionFiles.some((file) => file.id === draft.toolDescriptionFileId)
+    ? draft.toolDescriptionFileId
+    : null;
 
   /* The template page. The body is read the first time the page is opened and
    * only then — a template is big enough that reading it on the chance the page
@@ -739,14 +744,14 @@ export function AgentRoleEditor({
     ].join(sentenceGap),
     hooks: [
       t(
-        "这个角色的子代理额外运行的钩子。调用它的对话里那些工具调用前后、权限请求与指令加载的钩子总会照常运行，角色绕不开它们；这里选的在它们之外再加上。会话开始、提交提示词与停止属于主对话的回合。改动对之后新调用的子代理生效，但新选上的钩子要等下一轮开始时确认过才会运行（完全访问不需要确认）。",
-        "The hooks this role's subagents run in addition. The calling conversation's hooks before and after a tool call, on a permission request and on instructions loaded always run as well, so a role cannot get around them; the ones picked here are added to those. Session start, prompt submitted and stop belong to the conversation's own turn. A change applies to the next subagent called, but a newly selected hook runs only once the next turn has confirmed it (Full access needs no confirmation)."
+        "这个角色的子代理运行的钩子，只有这里选的这些：调用它的对话里的钩子不会带过来，要让对话的守卫也管到这个角色，就在这里一并选上。子代理只跑工具调用前后、权限请求与指令加载这几类；会话开始、提交提示词与停止属于主对话的回合。改动对之后新调用的子代理生效，但新选上的钩子要等下一轮开始时确认过才会运行（完全访问不需要确认）。",
+        "The hooks this role's subagents run — only the ones picked here: the calling conversation's hooks do not carry over, so to have the conversation's guards cover this role, pick them here too. A subagent runs only the hooks before and after a tool call, on a permission request and on instructions loaded; session start, prompt submitted and stop belong to the conversation's own turn. A change applies to the next subagent called, but a newly selected hook runs only once the next turn has confirmed it (Full access needs no confirmation)."
       ),
       scopeNote
     ].join(sentenceGap),
     advanced: t(
-      "这个角色自己的联网搜索与抓取：后端、原生工具版本、结果整形与域名过滤。联网开关、记忆、工具描述与宿主消息的容器由调用它的对话决定，这里不出现；调用方对话没开联网时，这里怎么选都不会让子代理联网。",
-      "This role's own web search and fetch: the backends, the native tool versions, result shaping and the domain filter. Web access, memory, tool descriptions and the host-message container are decided by the conversation that calls it, so they do not appear here; when that conversation is offline, nothing chosen here puts its subagent online."
+      "这个角色自己的联网搜索与抓取：后端、原生工具版本、结果整形与域名过滤。联网开关、记忆、文件防误写保护与宿主消息的容器由调用它的对话决定，这里不出现；调用方对话没开联网时，这里怎么选都不会让子代理联网。",
+      "This role's own web search and fetch: the backends, the native tool versions, result shaping and the domain filter. Web access, memory, the file write guards and the host-message container are decided by the conversation that calls it, so they do not appear here; when that conversation is offline, nothing chosen here puts its subagent online."
     ),
     template: t(
       "这个角色的开局历史。模板里的用户消息若恰好含一个 {input}，主代理给的输入会替换到那里；没有或有两个以上时，输入作为最后一条用户消息追加。右上角的「从预设覆盖」可以用一份预设的对话模板换掉这里。",
@@ -784,9 +789,8 @@ export function AgentRoleEditor({
     setNameChecked(true);
     /* The file this window opened has to be the file still there. Another
      * window, a text editor or the host's own migration may have rewritten it
-     * since, and writing this draft over that would silently undo it. A built-in
-     * is never written, only copied, so there is nothing of it to overwrite. */
-    if (resource && !builtin) {
+     * since, and writing this draft over that would silently undo it. */
+    if (resource) {
       const current = catalog.agents.find((entry) => entry.id === resource.id);
       if (!current?.role || !editor.original || !sameAgentRole(current.role, editor.original)) {
         setEditorError(t(
@@ -822,10 +826,9 @@ export function AgentRoleEditor({
       mcpIds: [...new Set(draft.mcpIds)],
       hookIds: [...new Set(draft.hookIds)]
     };
-    const creating = !resource || builtin;
-    const target: SaveAgentRoleTarget = creating
-      ? { workspaceKey: roleLevel }
-      : { id: resource.id, workspaceKey: resource.workspaceKey ?? null };
+    const target: SaveAgentRoleTarget = resource
+      ? { id: resource.id, workspaceKey: resource.workspaceKey ?? null }
+      : { workspaceKey: roleLevel };
     setSaving(true);
     setEditorError(null);
     let savedId: string;
@@ -839,15 +842,11 @@ export function AgentRoleEditor({
     /* The draft has become the file, so it stops being a draft. */
     if (resource) editorDrafts.delete(draftKey);
     else forgetNewRoleDraft();
-    if (creating) onCreated?.(savedId, builtin && resource ? resource.id : null);
+    if (!resource) onCreated?.(savedId);
     setSaving(false);
     setPendingOverwrite(null);
     onClose();
   };
-
-  const saveLabel = builtin
-    ? t("另存为全局角色", "Save as a global role")
-    : t("保存角色", "Save role");
 
   return (
     <>
@@ -902,7 +901,7 @@ export function AgentRoleEditor({
                       // is missing is an answer.
                       disabled={saving}
                       onClick={() => void saveEditor()}
-                    >{saving ? t("正在保存…", "Saving…") : saveLabel}</button>
+                    >{saving ? t("正在保存…", "Saving…") : t("保存角色", "Save role")}</button>
                     {editorError && (
                       <p className="settings-nav__error" role="alert">{editorError}</p>
                     )}
@@ -957,10 +956,6 @@ export function AgentRoleEditor({
                   </div>
                 ) : undefined}
               />
-              {builtin && page === "role" && <p className="settings-page__note">{t(
-                "内置角色随 Mewrk 版本更新，不能修改或删除。在这里做的改动可以另存为 ~/.mewrk/agents/ 里的一份全局角色；本对话选着这个内置角色时，新角色会顶替它。",
-                "Built-in roles update with Mewrk and cannot be edited or deleted. What you change here can be saved as a global role in ~/.mewrk/agents/; where this conversation selects the built-in, the new role takes its place."
-              )}</p>}
               {page === "template" && overwriteError && (
                 <p className="settings-page__note settings-page__note--error" role="alert">{overwriteError}</p>
               )}
@@ -1018,7 +1013,7 @@ export function AgentRoleEditor({
                         />
                       </Field>
 
-                      {resource && !builtin && editor.original && editor.original.name.trim() !== draftName && (
+                      {resource && editor.original && editor.original.name.trim() !== draftName && (
                         <p className="agent-role-editor__warning">{t(
                           "改名不会换文件，选着它的对话仍然选着它；但已经按旧名称在跑的子代理不会自动跟随新名称。",
                           "Renaming keeps the file, so conversations that select this role still do; a subagent already running under the old name does not follow the new one."
@@ -1041,8 +1036,8 @@ export function AgentRoleEditor({
                                   "This model cannot be resolved right now — the provider has not fetched its models, is disabled, or the row is gone. The role cannot be called for now, but the binding is kept and recovers by itself once the model is back."
                                 )
                               : t(
-                                  "这个角色现在没有可用的模型（旧版本记下的失效绑定，或内置角色找不到对应的提供商）；请选择跟随对话或另一个可用模型。",
-                                  "This role has no model to run on right now (a broken binding an older build recorded, or a built-in role whose provider is missing). Choose the conversation's model or another available one."
+                                  "这个角色现在没有可用的模型（旧版本记下的失效绑定）；请选择跟随对话或另一个可用模型。",
+                                  "This role has no model to run on right now (a broken binding an older build recorded). Choose the conversation's model or another available one."
                                 )
                             : t(
                                 "只列出已启用提供商中的模型；保存精确 provider/model ID。",
@@ -1130,6 +1125,41 @@ export function AgentRoleEditor({
                           </select>
                         </Field>
 
+                        {/* Both built-ins are rows here, unlike the
+                          * conversation's page where "none picked" already is
+                          * the guided one: for a role, "Mewrk guided" pins the
+                          * default even under a caller on another file, which
+                          * following the caller does not. A choice the catalog
+                          * lost stays a visible option, or the closed select
+                          * would show "follow" for a role that is not
+                          * following. */}
+                        <Field
+                          label={t("工具描述", "Tool descriptions")}
+                          hint={t(
+                            "选「跟随调用方」时，这个角色的子代理用调用它的对话所用的工具描述；选一份，则它的工具与提示词措辞改用这一份。调用方模型读到的子代理结果仍用调用方的措辞。",
+                            "Follow the caller to word this role's subagent with the calling conversation's tool descriptions; pick a file to word its tools and prompts with that one instead. What the caller's model reads about the subagent keeps the caller's wording."
+                          )}
+                        >
+                          <select
+                            className="input"
+                            value={draft.toolDescriptionFileId ?? ""}
+                            aria-label={t("工具描述", "Tool descriptions")}
+                            onChange={(event) => replaceDraft({
+                              toolDescriptionFileId: event.target.value || null
+                            })}
+                          >
+                            <option value="">{t("跟随调用方", "Follow the caller")}</option>
+                            {catalog.toolDescriptionFiles.map((file) => (
+                              <option key={file.id} value={file.id}>{file.name}</option>
+                            ))}
+                            {danglingToolDescriptionId && (
+                              <option value={danglingToolDescriptionId}>
+                                {t("不可用：{id}", "Unavailable: {id}", { id: danglingToolDescriptionId })}
+                              </option>
+                            )}
+                          </select>
+                        </Field>
+
                         {/* Where the file is. A new role picks its level — the
                           * global one, or one of the workspaces of the
                           * conversation this window was opened from — and is
@@ -1144,13 +1174,9 @@ export function AgentRoleEditor({
                                 "A global role can be selected by every conversation; a workspace role only by conversations that have that workspace. The location cannot change after saving."
                               )}
                         >
-                          {resource && !builtin ? (
+                          {resource ? (
                             <span className="agent-role-editor__location" title={resource.location}>
                               {resource.location}
-                            </span>
-                          ) : builtin ? (
-                            <span className="agent-role-editor__location">
-                              {t("内置角色，随 Mewrk 版本更新", "Built in; updates with Mewrk")}
                             </span>
                           ) : (
                             <select
@@ -1176,8 +1202,11 @@ export function AgentRoleEditor({
                     switch (whether to reach the web at all is the caller's
                     decision, and stays the ceiling), the memory tiers (derived
                     from the caller's switches and the role's memory binding,
-                    never from a tool list), the tool-description profile and
-                    the host-message container. Nothing on either page follows
+                    never from a tool list), the file write guards (a run
+                    follows the conversation that called it) and the
+                    host-message container.
+                    The tool-description file is a field of the role, on its
+                    settings page. Nothing on either of these pages follows
                     the calling conversation: the list and the web answers are
                     the role's own. */}
                 {page === "tools" && (

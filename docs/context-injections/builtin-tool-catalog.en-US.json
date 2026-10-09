@@ -3,7 +3,7 @@
   "language": "en-US",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
   "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
-  "toolCount": 49,
+  "toolCount": 50,
   "tools": [
     {
       "name": "ls",
@@ -77,41 +77,20 @@
       ]
     },
     {
-      "name": "powershell",
-      "label": "PowerShell",
+      "name": "pwsh",
+      "label": "PowerShell 7",
       "description": "",
       "category": "shell",
       "dangerous": true,
-      "parameters": [
-        {
-          "name": "command",
-          "label": "Command",
-          "type": "multiline",
-          "required": true,
-          "placeholder": "Get-ChildItem -Force"
-        },
-        {
-          "name": "description",
-          "label": "Description",
-          "type": "string",
-          "required": false,
-          "placeholder": "List files in the current directory"
-        },
-        {
-          "name": "timeout",
-          "label": "Timeout (ms)",
-          "type": "number",
-          "required": false,
-          "placeholder": "120000"
-        },
-        {
-          "name": "run_in_background",
-          "label": "Run in background",
-          "type": "boolean",
-          "required": false,
-          "defaultValue": false
-        }
-      ]
+      "parameters": []
+    },
+    {
+      "name": "powershell",
+      "label": "Windows PowerShell",
+      "description": "",
+      "category": "shell",
+      "dangerous": true,
+      "parameters": []
     },
     {
       "name": "bash",

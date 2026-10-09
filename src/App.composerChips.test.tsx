@@ -397,7 +397,9 @@ describe("composer context chips", () => {
     expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-2`)).toBeNull();
   });
 
-  it("offers PowerShell and Git Bash for a workspace on a Windows host", async () => {
+  it("offers one PowerShell terminal and Git Bash for a workspace on a Windows host", async () => {
+    // A Windows host is assumed to have both PowerShell editions before its probe
+    // arrives; the terminal is not split, so they are still one menu row.
     const platform = vi.spyOn(window.navigator, "platform", "get").mockReturnValue("Win32");
     try {
       const user = userEvent.setup();
@@ -408,6 +410,32 @@ describe("composer context chips", () => {
       await user.click(within(toolbar).getByRole("button", { name: "终端" }));
       const menu = await screen.findByRole("menu", { name: "新建终端" });
       expect(menuTexts(menu)).toEqual(["PowerShell", "bash", "显示终端面板"]);
+    } finally {
+      platform.mockRestore();
+    }
+  });
+
+  it("starts the one PowerShell terminal on a Windows host whose probe found both editions", async () => {
+    const platform = vi.spyOn(window.navigator, "platform", "get").mockReturnValue("Win32");
+    try {
+      machineShellProbes.current = { local: probe("windows", ["pwsh", "powershell", "bash"]) };
+      const document = documentWithModel();
+      runtimeMocks.loadDocument.mockResolvedValue(document);
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByLabelText("向 Agent 发送消息");
+
+      const toolbar = window.document.querySelector(".pane-toolbar") as HTMLElement;
+      await user.click(within(toolbar).getByRole("button", { name: "终端" }));
+      const menu = await screen.findByRole("menu", { name: "新建终端" });
+      expect(menuTexts(menu)).toEqual(["PowerShell", "bash", "显示终端面板"]);
+      await user.click(within(menu).getByRole("menuitem", { name: "PowerShell" }));
+
+      // The terminal's own shell name stays `powershell`; the host picks the edition.
+      const conversationId = document.workspaces[0].conversations[0].id;
+      expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`))
+        .toHaveAttribute("data-launch", JSON.stringify({ workspace: 1, shell: "powershell" }));
+      expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["PowerShell 1"]);
     } finally {
       platform.mockRestore();
     }

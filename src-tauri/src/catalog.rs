@@ -53,6 +53,55 @@ fn descriptor(
     }
 }
 
+/// The parameters of both PowerShell tools: `pwsh` (PowerShell 7) and
+/// `powershell` (Windows PowerShell 5.1) are two tools with one shape
+/// (`shell_backend`).
+fn powershell_parameters() -> Vec<ToolParameter> {
+    use ToolParameterType::{Boolean, Multiline, Number, String as StringType};
+    vec![
+        parameter(
+            "command",
+            "命令",
+            Multiline,
+            true,
+            None,
+            Some("Get-ChildItem -Force"),
+            None,
+        ),
+        parameter(
+            "description",
+            "说明",
+            StringType,
+            false,
+            None,
+            Some("列出当前目录的文件"),
+            None,
+        ),
+        // No catalog default: the default lives in the host
+        // (tool_executor::SHELL_DEFAULT_TIMEOUT) and in the schema text.
+        // A default here would prefill the manual tool-call form and send
+        // the value explicitly, which is noise in the recorded input.
+        parameter(
+            "timeout",
+            "超时（毫秒）",
+            Number,
+            false,
+            None,
+            Some("120000"),
+            None,
+        ),
+        parameter(
+            "run_in_background",
+            "后台运行",
+            Boolean,
+            false,
+            Some(json!(false)),
+            None,
+            None,
+        ),
+    ]
+}
+
 pub fn tool_catalog() -> Vec<ToolDescriptor> {
     use ToolParameterType::{Boolean, Json, Multiline, Number, String as StringType};
 
@@ -139,53 +188,20 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
             ],
         ),
         descriptor(
-            "powershell",
-            "PowerShell",
+            "pwsh",
+            "PowerShell 7",
             "",
             ToolCategory::Shell,
             true,
-            vec![
-                parameter(
-                    "command",
-                    "命令",
-                    Multiline,
-                    true,
-                    None,
-                    Some("Get-ChildItem -Force"),
-                    None,
-                ),
-                parameter(
-                    "description",
-                    "说明",
-                    StringType,
-                    false,
-                    None,
-                    Some("列出当前目录的文件"),
-                    None,
-                ),
-                // No catalog default: the default lives in the host
-                // (tool_executor::SHELL_DEFAULT_TIMEOUT) and in the schema text.
-                // A default here would prefill the manual tool-call form and send
-                // the value explicitly, which is noise in the recorded input.
-                parameter(
-                    "timeout",
-                    "超时（毫秒）",
-                    Number,
-                    false,
-                    None,
-                    Some("120000"),
-                    None,
-                ),
-                parameter(
-                    "run_in_background",
-                    "后台运行",
-                    Boolean,
-                    false,
-                    Some(json!(false)),
-                    None,
-                    None,
-                ),
-            ],
+            powershell_parameters(),
+        ),
+        descriptor(
+            "powershell",
+            "Windows PowerShell",
+            "",
+            ToolCategory::Shell,
+            true,
+            powershell_parameters(),
         ),
         descriptor(
             "bash",
@@ -1677,7 +1693,8 @@ fn english_tool_label(name: &str) -> Option<&'static str> {
     Some(match name {
         "ls" => "List files",
         "grep" => "Search content",
-        "powershell" => "PowerShell",
+        "pwsh" => "PowerShell 7",
+        "powershell" => "Windows PowerShell",
         "bash" => "Bash",
         "zsh" => "zsh",
         "sh" => "sh",
@@ -2006,7 +2023,7 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
 fn english_parameter_placeholder(tool: &str, parameter: &str) -> Option<&'static str> {
     Some(match (tool, parameter) {
         ("bash", "description") => "Show working tree status",
-        ("powershell", "description") => "List files in the current directory",
+        ("pwsh" | "powershell", "description") => "List files in the current directory",
         ("zsh", "description") | ("sh", "description") => "List files in the current directory",
         ("web_search", "query") => "Anthropic Claude 4.5 release date",
         ("agent_spawn", "prompt") => "Inspect routing under src/ and summarize the key files",
@@ -2069,13 +2086,10 @@ fn builtin_codex_provider() -> ApiProvider {
     }
 }
 
-/// Ships a starting catalog already installed, so a fresh install can talk to
-/// Claude without first fetching. The fetch itself asks the CLI and cannot run
-/// while the default document is built, so the rows come from the seed table,
-/// projected the way a fetch projects rows — group, capabilities and reasoning
-/// shape included.
+/// Ships no models either: they are what the installed CLI lists under the
+/// user's login, fetched from the provider page once the components are in.
 fn builtin_claude_agent_provider() -> ApiProvider {
-    let mut provider = ApiProvider {
+    ApiProvider {
         id: builtin_provider_id(),
         name: "Claude Agent".into(),
         enabled: true,
@@ -2085,10 +2099,7 @@ fn builtin_claude_agent_provider() -> ApiProvider {
         notes: String::new(),
         models: Vec::new(),
         active_model_id: None,
-    };
-    provider.models = crate::model_discovery::claude_agent_seed_models(&provider);
-    provider.active_model_id = provider.models.first().map(|model| model.id.clone());
-    provider
+    }
 }
 
 #[cfg(test)]
@@ -2159,7 +2170,9 @@ pub(crate) const RETIRED_SEEDED_PRESETS: &[(&str, &str)] = &[
 /// request's system half.
 ///
 /// Engineering practice only. Where the model runs, with which tools and on
-/// which machines, is what the host's own sections say, so this says none of it.
+/// which machines, is what the host's own sections say, so this says none of it
+/// — how to delegate included: that rides on `agent_spawn`'s own description,
+/// which reaches the model only when the conversation can spawn a child.
 pub(crate) const BUILTIN_PRESET_PROMPT: &str = "\
     You are a software engineer working in the user's codebase. You help with engineering tasks: fixing bugs, building features, refactoring, explaining code and reviewing changes.\n\
     \n\
@@ -2177,10 +2190,6 @@ pub(crate) const BUILTIN_PRESET_PROMPT: &str = "\
     # Actions with consequences\n\
     - Confirm with the user before anything destructive or hard to reverse (deleting or overwriting files, discarding changes, rewriting history, force-pushing) and before anything others will see (pushing, publishing, sending messages). An approval covers the action it was given for, not later ones.\n\
     - Look at what you are about to delete or overwrite before you do it. Don't commit or push unless asked.\n\
-    \n\
-    # Delegating\n\
-    - Hand self-contained, independently checkable pieces of work to subagents, and run independent ones in parallel. Keep work that needs judgement across the whole task in the main thread.\n\
-    - A subagent sees only the prompt you give it: include the goal, the relevant paths and constraints, and what to return. Treat what comes back as a claim to check, not a fact.\n\
     \n\
     # Communicating\n\
     - Lead with the answer or the outcome, then the evidence, then anything still open. Be concise and skip preamble and recaps.\n\
@@ -2236,10 +2245,9 @@ pub(crate) fn builtin_preset_enabled_tools(
 /// the document it goes into.
 ///
 /// The one shell is this machine's and is chosen by storage, which takes a
-/// probe. Its roles are the four built-in ones, by id: each resolves against
-/// the document's providers whenever it is asked for (`agent_roles`), so one
-/// whose provider the document lacks is listed with its model unavailable and
-/// starts working once the provider is back.
+/// probe. It renders with the concise built-in tool descriptions and selects
+/// no role: none ships, so its children are anonymous ones on the
+/// conversation's model.
 pub(crate) fn builtin_preset(
     tools: &[ToolDescriptor],
     shell: Option<crate::shell_backend::ShellBackend>,
@@ -2251,15 +2259,12 @@ pub(crate) fn builtin_preset(
         template_id: BUILTIN_PRESET_TEMPLATE_ID.into(),
         settings: ConversationPresetSettings {
             enabled_tools: builtin_preset_enabled_tools(tools, shell),
-            tool_description_file_id: None,
-            agent_ids: crate::agent_roles::BUILTIN_ROLE_IDS
-                .iter()
-                .map(|id| (*id).to_owned())
-                .collect(),
+            tool_description_file_id: Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID.into()),
+            agent_ids: Vec::new(),
             agent_definitions: Vec::new(),
-            // Every child is one of the named roles, so the model cannot route
-            // around them by spawning an anonymous one.
-            allow_roleless_subagents: false,
+            // With no role selected, an anonymous child is the only kind
+            // `agent_spawn` and `workflow` can start.
+            allow_roleless_subagents: true,
             // Nothing is selected: skills, MCP servers and hooks are opt-in per
             // conversation, and that includes the built-in Mewrk SDK skill.
             hook_ids: Vec::new(),
@@ -2298,6 +2303,7 @@ pub(crate) fn builtin_preset(
             // Host messages come the way Claude Code delivers them; `box` is
             // a choice of the conversation's.
             host_message_container: crate::model::HostMessageContainer::User,
+            file_write_guards_enabled: true,
         },
     }
 }
@@ -2316,8 +2322,8 @@ pub(crate) fn product_default_document() -> AppDocument {
     let timestamp = |minutes: i64| (now - Duration::minutes(minutes)).to_rfc3339();
     let api_providers = product_default_api_providers();
     let presets = product_default_presets(&tools);
-    // The one built-in that works without a sign-in, so it is what a fresh
-    // install talks to. Leaving this null would make the renderer pick the first
+    // The one built-in enabled from the start, so it is what a fresh install's
+    // composer shows. Leaving this null would make the renderer pick the first
     // enabled row anyway and then persist the choice as a change.
     let active_provider_id = api_providers
         .iter()
@@ -2434,6 +2440,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
             skill_tool_enabled: false,
             mcp_tool_discovery_enabled: false,
             host_message_container: Default::default(),
+            file_write_guards_enabled: true,
         },
     }];
     document.presets.default_conversation_preset_id = "conversation_default".into();
@@ -2479,6 +2486,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                     skill_tool_enabled: false,
                     mcp_tool_discovery_enabled: false,
                     host_message_container: Default::default(),
+                    file_write_guards_enabled: true,
                     compaction_method: None,
                     legacy_sandbox: Default::default(),
                     tool_lock: None,
@@ -2582,7 +2590,7 @@ mod tests {
         let english = tool_catalog_for_language(ResolvedLanguage::EnUs);
         let chinese_after = tool_catalog_for_language(ResolvedLanguage::ZhCn);
 
-        assert_eq!(chinese.len(), 49);
+        assert_eq!(chinese.len(), 50);
         assert_eq!(english.len(), chinese.len());
         assert_eq!(chinese_after, chinese);
         for (localized, canonical) in english.iter().zip(&chinese) {

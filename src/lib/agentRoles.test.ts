@@ -61,6 +61,7 @@ function role(overrides: Partial<AgentRole> = {}): AgentRole {
     hookIds: [],
     webSearch: defaultAgentRoleWebSearch(),
     templateId: null,
+    toolDescriptionFileId: null,
     ...overrides
   };
 }
@@ -216,7 +217,6 @@ describe("agentRoles", () => {
     it("narrows to the conversation's own workspaces, as the count does", () => {
       const agents = [
         resource("agent_global"),
-        resource("agent_builtin", { source: "builtin" }),
         resource("agent_here", { source: "workspace", workspaceKey: "local|/work/a" }),
         resource("agent_elsewhere", { source: "workspace", workspaceKey: "local|/work/c" })
       ];
@@ -225,10 +225,8 @@ describe("agentRoles", () => {
       // have, so selecting only that one leaves nothing to call.
       expect(hasUsableAgentRole(agents, ["agent_elsewhere"], providers, keys)).toBe(false);
       expect(hasUsableAgentRole(agents, ["agent_elsewhere"], providers, [])).toBe(false);
-      // Global and built-in roles are always reachable, and so is a workspace's
-      // own.
+      // Global roles are always reachable, and so is a workspace's own.
       expect(hasUsableAgentRole(agents, ["agent_global"], providers, [])).toBe(true);
-      expect(hasUsableAgentRole(agents, ["agent_builtin"], providers, [])).toBe(true);
       expect(hasUsableAgentRole(agents, ["agent_here"], providers, keys)).toBe(true);
       expect(hasUsableAgentRole(agents, ["agent_here"], providers, [])).toBe(false);
       expect(hasUsableAgentRole(agents, ["agent_elsewhere", "agent_here"], providers, keys)).toBe(true);
@@ -268,17 +266,16 @@ describe("agentRoles", () => {
     it("narrows to the conversation's own workspaces the way the roles page does", () => {
       const scoped = [
         resource("agent_global"),
-        resource("agent_builtin", { source: "builtin" }),
         resource("agent_here", { source: "workspace", workspaceKey: "local|/work/a" }),
         resource("agent_elsewhere", { source: "workspace", workspaceKey: "local|/work/c" })
       ];
-      const ids = ["agent_global", "agent_builtin", "agent_here", "agent_elsewhere"];
+      const ids = ["agent_global", "agent_here", "agent_elsewhere"];
       // A role of a workspace this conversation does not have is dangling here.
-      expect(selectedAgentRoleCount(scoped, ids, ["local|/work/a"])).toBe(3);
+      expect(selectedAgentRoleCount(scoped, ids, ["local|/work/a"])).toBe(2);
       // A draft with no workspace yet reaches the global level alone.
-      expect(selectedAgentRoleCount(scoped, ids, [])).toBe(2);
+      expect(selectedAgentRoleCount(scoped, ids, [])).toBe(1);
       // A preset points at no workspace in particular, so nothing is narrowed.
-      expect(selectedAgentRoleCount(scoped, ids)).toBe(4);
+      expect(selectedAgentRoleCount(scoped, ids)).toBe(3);
     });
   });
 
@@ -343,6 +340,7 @@ describe("agentRoles", () => {
         modelSelection: { kind: "explicit", providerId: "provider_a", modelId: "gpt-4o" }
       });
       const reordered = {
+        toolDescriptionFileId: original.toolDescriptionFileId,
         templateId: original.templateId,
         webSearch: Object.fromEntries(Object.entries(original.webSearch).reverse()),
         hookIds: original.hookIds,
@@ -387,7 +385,8 @@ describe("agentRoles", () => {
       ["search call limit", { webSearch: { ...defaultAgentRoleWebSearch(), maxSearchesPerCall: 3 } }],
       ["domain filter", { webSearch: { ...defaultAgentRoleWebSearch(), domainFilter: "include" } }],
       ["domain list", { webSearch: { ...defaultAgentRoleWebSearch(), excludeDomains: ["ads.example"] } }],
-      ["template", { templateId: "template_a" }]
+      ["template", { templateId: "template_a" }],
+      ["tool-description file", { toolDescriptionFileId: "tooldesc_builtin_concise_en_us" }]
     ])("detects a change to the %s", (_label, change) => {
       const base = role({
         modelSelection: { kind: "explicit", providerId: "provider_a", modelId: "gpt-4o" }
@@ -399,6 +398,14 @@ describe("agentRoles", () => {
     it("tells an absent effort from a set one, and an empty list from a populated one", () => {
       expect(sameAgentRole(role({ effort: null }), role({ effort: "medium" }))).toBe(false);
       expect(sameAgentRole(role({ tools: [] }), role({ tools: ["read_file"] }))).toBe(false);
+    });
+
+    it("tells one tool-description file from another, and following the caller from naming the guided built-in", () => {
+      const named = (toolDescriptionFileId: string | null) => role({ toolDescriptionFileId });
+      expect(sameAgentRole(named("tooldesc_builtin_concise_en_us"), named("tooldesc_builtin_concise_en_us"))).toBe(true);
+      expect(sameAgentRole(named("tooldesc_builtin_concise_en_us"), named("tooldesc_user_main_0f0f0f0f"))).toBe(false);
+      // For a role these differ: the guided id pins the default under a caller on another file.
+      expect(sameAgentRole(named(null), named("tooldesc_builtin_en_us"))).toBe(false);
     });
   });
 
@@ -412,7 +419,8 @@ describe("agentRoles", () => {
         mcpIds: ["mcp_a"],
         hookIds: ["hook_a"],
         effort: "high",
-        templateId: "template_a"
+        templateId: "template_a",
+        toolDescriptionFileId: "tooldesc_builtin_concise_en_us"
       });
       original.webSearch.includeDomains = ["a.example"];
       const snapshot = structuredClone(original);
@@ -420,6 +428,7 @@ describe("agentRoles", () => {
       const copy = cloneAgentRole(original);
 
       expect(copy).toEqual(original);
+      expect(copy.toolDescriptionFileId).toBe("tooldesc_builtin_concise_en_us");
       expect(copy).not.toBe(original);
       expect(copy.modelSelection).not.toBe(original.modelSelection);
       expect(copy.webSearch).not.toBe(original.webSearch);

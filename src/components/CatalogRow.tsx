@@ -91,8 +91,7 @@ export function CatalogToggleRow({
   name: string;
   /**
    * The toggle's accessible name, when the bare name would not say what it
-   * turns or would not tell two rows apart — a built-in role and a copy of it
-   * share one. The name is the default.
+   * turns or would not tell two rows apart. The name is the default.
    */
   label?: string;
   /** What the row no longer prints — a path, a reason it is inert. Goes to `title`. */

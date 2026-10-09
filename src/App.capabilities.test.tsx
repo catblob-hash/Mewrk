@@ -97,7 +97,7 @@ describe("App model run flow — capabilities", () => {
    * conversation opened it.
    */
   it("draws a role's tools from the whole catalogue, not the shells this conversation's machine has", async () => {
-    // A Windows host: PowerShell and Bash, no zsh or sh.
+    // A Windows host: both PowerShell editions and Bash, no zsh or sh.
     const platform = vi.spyOn(window.navigator, "platform", "get").mockReturnValue("Win32");
     try {
       const document = documentWithModel();
@@ -112,7 +112,7 @@ describe("App model run flow — capabilities", () => {
       await user.click(screen.getByRole("button", { name: "更多选项" }));
       await user.click(await screen.findByRole("menuitemradio", { name: "对话设置" }));
       const settings = await screen.findByRole("region", { name: "对话设置" });
-      expect(toolNames(settings)).toEqual(expect.arrayContaining(["powershell", "bash"]));
+      expect(toolNames(settings)).toEqual(expect.arrayContaining(["pwsh", "powershell", "bash"]));
       expect(toolNames(settings)).not.toContain("zsh");
       expect(toolNames(settings)).not.toContain("sh");
 
@@ -122,7 +122,7 @@ describe("App model run flow — capabilities", () => {
       const dialog = await screen.findByRole("dialog", { name: "新建角色" });
       const rail = within(dialog).getByRole("navigation", { name: "角色设置分类" });
       await user.click(within(rail).getByRole("button", { name: /^工具/ }));
-      expect(toolNames(dialog)).toEqual(expect.arrayContaining(["powershell", "bash", "zsh", "sh"]));
+      expect(toolNames(dialog)).toEqual(expect.arrayContaining(["pwsh", "powershell", "bash", "zsh", "sh"]));
     } finally {
       platform.mockRestore();
     }

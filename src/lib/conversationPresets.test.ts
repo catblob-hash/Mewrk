@@ -19,6 +19,7 @@ const PRESET_FIELDS = [
   "agentIds",
   "allowRolelessSubagents",
   "enabledTools",
+  "fileWriteGuardsEnabled",
   "globalMemoryEnabled",
   "hookIds",
   "hostMessageContainer",
@@ -79,7 +80,8 @@ describe("conversation presets", () => {
       projectMemoryEnabled: false,
       skillToolEnabled: false,
       mcpToolDiscoveryEnabled: false,
-      hostMessageContainer: "user"
+      hostMessageContainer: "user",
+      fileWriteGuardsEnabled: true
     });
     expect(Object.keys(emptyConversationPresetSettings()).sort()).toEqual(PRESET_FIELDS);
   });
@@ -109,7 +111,9 @@ describe("conversation presets", () => {
       projectMemoryEnabled: settings.projectMemoryEnabled,
       skillToolEnabled: settings.skillToolEnabled,
       mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled,
-      hostMessageContainer: "user"
+      hostMessageContainer: "user",
+      // The fixture's settings say nothing about the guards, which reads as on.
+      fileWriteGuardsEnabled: true
     });
     // Conversation-only fields — plan mode among them — do not enter presets;
     // web search, security, and memory tiers do.
@@ -147,7 +151,8 @@ describe("conversation presets", () => {
       projectMemoryEnabled: false,
       skillToolEnabled: true,
       mcpToolDiscoveryEnabled: true,
-      hostMessageContainer: "box"
+      hostMessageContainer: "box",
+      fileWriteGuardsEnabled: false
     };
 
     const applied: ConversationSettings = applyConversationPresetSettings(
@@ -182,6 +187,12 @@ describe("conversation presets", () => {
     // So is the container host messages come in.
     expect(current.hostMessageContainer ?? "user").toBe("user");
     expect(applied.hostMessageContainer).toBe("box");
+    // And whether the file write guards run.
+    expect(current.fileWriteGuardsEnabled ?? true).toBe(true);
+    expect(applied.fileWriteGuardsEnabled).toBe(false);
+    // A preset that says nothing about them (one written before the switch) turns them on.
+    const { fileWriteGuardsEnabled: _unsaid, ...silent } = preset;
+    expect(applyConversationPresetSettings(applied, silent).fileWriteGuardsEnabled).toBe(true);
   });
 
   it("applies a preset over a conversation that has run, moving everything but the pins", () => {
@@ -211,7 +222,8 @@ describe("conversation presets", () => {
         modelRequests: [],
         hookIds: null,
         promptProfile: null,
-        hostMessageContainer: null
+        hostMessageContainer: null,
+        fileWriteGuards: null
       }
     };
     const preset = {
@@ -297,6 +309,18 @@ describe("conversation presets", () => {
     expect(cloned.hookIds).not.toBe(snapshot.hookIds);
   });
 
+  it("carries the file write guards into a clone as an explicit boolean", () => {
+    const document = createSeedDocument();
+    const snapshot = document.workspaces[0].conversations[0].settings;
+    // Absent reads as on, and the clone says so outright.
+    expect(snapshot.fileWriteGuardsEnabled).toBeUndefined();
+    expect(cloneConversationSettings(snapshot).fileWriteGuardsEnabled).toBe(true);
+    expect(cloneConversationSettings({ ...snapshot, fileWriteGuardsEnabled: false }).fileWriteGuardsEnabled)
+      .toBe(false);
+    expect(cloneConversationSettings({ ...snapshot, fileWriteGuardsEnabled: true }).fileWriteGuardsEnabled)
+      .toBe(true);
+  });
+
   it("resolves a preset id leniently", () => {
     const document = createSeedDocument();
     document.globalSettings.conversationPresets = [
@@ -336,6 +360,11 @@ describe("conversation presets", () => {
       enabledTools: ["read_file", "write_file"]
     })).toBe(false);
     expect(sameConversationPresetSettings(base, { ...base, securityLevel: "full_access" })).toBe(false);
+    // The file write guards are part of the body; an absent one is the same as on.
+    const { fileWriteGuardsEnabled: _omitted, ...unsaid } = base;
+    expect(sameConversationPresetSettings(base, unsaid)).toBe(true);
+    expect(sameConversationPresetSettings(base, { ...base, fileWriteGuardsEnabled: false })).toBe(false);
+    expect(sameConversationPresetSettings(unsaid, { ...base, fileWriteGuardsEnabled: false })).toBe(false);
     expect(sameConversationPresetSettings(base, {
       ...base,
       webSearch: { ...base.webSearch, maxSearchesPerCall: base.webSearch.maxSearchesPerCall + 1 }

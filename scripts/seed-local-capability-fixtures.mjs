@@ -63,7 +63,7 @@ const FIXTURE_HOOK_NAME_PREFIX = "fixture";
 
 export const WORKSPACE_HOOK_EVENT = "PostToolUse";
 /** Both the global and the project hook only care about the local shell tools. */
-const SHELL_HOOK_MATCHER = "^(powershell|bash)$";
+const SHELL_HOOK_MATCHER = "^(pwsh|powershell|bash)$";
 
 // On Windows the host runs a hook command through PowerShell, so these are
 // PowerShell one-liners. They only print, because a hook that changed anything

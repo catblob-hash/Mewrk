@@ -772,7 +772,7 @@ fn issue_step<'js>(
         if !(model.is_undefined() || model.is_null()) {
             return Err(Exception::throw_type(
                 ctx,
-                "Steps do not accept model: the role name is the complete model-facing input. Select a role with agentType; this tool schema's $defs.agentType lists valid values, and user configuration maps roles to provider/model.",
+                "Steps do not accept model: the role name is the complete model-facing input. Select a role with agentType instead: its legal values are this tool schema's $defs.agentType whenever the conversation's roles could be read, and user configuration maps roles to provider/model.",
             ));
         }
         request.label = read_opt_string(ctx, object, "label")?;

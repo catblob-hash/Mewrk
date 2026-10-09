@@ -14,12 +14,12 @@
 //! cannot carry those scripts is not registered on that OS, and so it is never
 //! probed there and never offered as a tool:
 //!
-//! | OS      | Registered backends          | Script dialect        |
-//! |---------|------------------------------|-----------------------|
-//! | Windows | PowerShell, Bash (Git Bash)  | PowerShell / POSIX sh |
-//! | macOS   | zsh, Bash, sh                | POSIX sh              |
-//! | Linux   | Bash, zsh, sh                | POSIX sh              |
-//! | WSL     | Bash, zsh, sh                | POSIX sh              |
+//! | OS      | Registered backends                                   | Script dialect        |
+//! |---------|-------------------------------------------------------|-----------------------|
+//! | Windows | PowerShell 7, Windows PowerShell 5.1, Bash (Git Bash) | PowerShell / POSIX sh |
+//! | macOS   | zsh, Bash, sh                                         | POSIX sh              |
+//! | Linux   | Bash, zsh, sh                                         | POSIX sh              |
+//! | WSL     | Bash, zsh, sh                                         | POSIX sh              |
 //!
 //! Left out on purpose: `cmd.exe` (its batch language cannot express the file
 //! tools' confinement checks or byte-exact reads), fish, nushell and the csh
@@ -28,6 +28,14 @@
 //! against Windows paths). WSL is an operating system in this table, not a
 //! shell: a distribution is a Linux machine the host reaches through
 //! `wsl.exe`, whichever of its shells runs the command.
+//!
+//! PowerShell 7 (`pwsh`) and Windows PowerShell 5.1 (`powershell.exe`) are two
+//! backends, not one shell with a preference between them: their languages
+//! differ (pipeline chain operators, the ternary and null operators, the
+//! default file encodings), so a command written for one can fail in the
+//! other. Each is probed for by its own program name and offered as its own
+//! tool. Mewrk's own PowerShell scripts are written against 5.1, so either can
+//! be a machine's agent shell.
 //!
 //! The table's order is also each OS's priority, fixed rather than
 //! configurable: a newly added machine's agent shell is the first backend in
@@ -45,10 +53,13 @@ pub enum ShellBackend {
     Bash,
     Zsh,
     Sh,
-    /// PowerShell 7 (`pwsh`) where installed, Windows PowerShell 5.1 otherwise —
-    /// Claude Code's own preference order. Registered on Windows only.
+    /// PowerShell 7 (`pwsh`). Registered on Windows only.
+    Pwsh,
+    /// Windows PowerShell 5.1 (`powershell.exe`), which every Windows has.
+    /// Registered on Windows only. Its id is the one the single PowerShell
+    /// backend had before the two editions were told apart.
     #[serde(rename = "powershell")]
-    PowerShell,
+    WindowsPowerShell,
 }
 
 /// How a backend reads the scripts Mewrk composes for it.
@@ -77,7 +88,13 @@ pub enum MachineOs {
 
 impl ShellBackend {
     /// Every backend, in the order tools are listed.
-    pub const ALL: [ShellBackend; 4] = [Self::Bash, Self::Zsh, Self::Sh, Self::PowerShell];
+    pub const ALL: [ShellBackend; 5] = [
+        Self::Bash,
+        Self::Zsh,
+        Self::Sh,
+        Self::Pwsh,
+        Self::WindowsPowerShell,
+    ];
 
     /// The stable identifier persisted in settings and sent to the renderer.
     pub fn id(self) -> &'static str {
@@ -85,7 +102,8 @@ impl ShellBackend {
             Self::Bash => "bash",
             Self::Zsh => "zsh",
             Self::Sh => "sh",
-            Self::PowerShell => "powershell",
+            Self::Pwsh => "pwsh",
+            Self::WindowsPowerShell => "powershell",
         }
     }
 
@@ -99,7 +117,8 @@ impl ShellBackend {
             Self::Bash => "Bash",
             Self::Zsh => "zsh",
             Self::Sh => "sh",
-            Self::PowerShell => "PowerShell",
+            Self::Pwsh => "PowerShell 7",
+            Self::WindowsPowerShell => "Windows PowerShell",
         }
     }
 
@@ -118,15 +137,44 @@ impl ShellBackend {
     pub fn dialect(self) -> ScriptDialect {
         match self {
             Self::Bash | Self::Zsh | Self::Sh => ScriptDialect::Posix,
-            Self::PowerShell => ScriptDialect::PowerShell,
+            Self::Pwsh | Self::WindowsPowerShell => ScriptDialect::PowerShell,
+        }
+    }
+
+    /// The language a command in this backend is written in, as a Markdown
+    /// code fence names it: both PowerShell editions write PowerShell.
+    pub fn language(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Sh => "sh",
+            Self::Pwsh | Self::WindowsPowerShell => "powershell",
         }
     }
 
     /// The program named when the machine's probe has not said where it is:
-    /// Windows PowerShell by name, which every Windows has, and the POSIX
-    /// shells by name for `PATH` to find.
+    /// each shell by its own name for `PATH` to find — `pwsh` for PowerShell 7,
+    /// `powershell` for Windows PowerShell 5.1.
     pub fn default_program(self) -> &'static str {
         self.id()
+    }
+
+    /// The backend `program` really is, for a record that names `self`.
+    ///
+    /// A record written before the two PowerShell editions were told apart
+    /// says `powershell` for whichever one the machine had, PowerShell 7
+    /// first; its program's name still tells them apart. Every other record
+    /// already names its own backend.
+    pub fn of_recorded_program(self, program: &str) -> Self {
+        let name = program
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(program)
+            .to_ascii_lowercase();
+        match self {
+            Self::WindowsPowerShell if name == "pwsh" || name == "pwsh.exe" => Self::Pwsh,
+            other => other,
+        }
     }
 }
 
@@ -194,9 +242,9 @@ impl std::fmt::Display for MachineOs {
 /// the one priority order: Mewrk ranks each OS's shells itself rather than
 /// asking the user to.
 pub fn backends_for(os: MachineOs) -> &'static [ShellBackend] {
-    use ShellBackend::{Bash, PowerShell, Sh, Zsh};
+    use ShellBackend::{Bash, Pwsh, Sh, WindowsPowerShell, Zsh};
     match os {
-        MachineOs::Windows => &[PowerShell, Bash],
+        MachineOs::Windows => &[Pwsh, WindowsPowerShell, Bash],
         MachineOs::Macos => &[Zsh, Bash, Sh],
         MachineOs::Linux | MachineOs::Wsl => &[Bash, Zsh, Sh],
     }
@@ -209,11 +257,12 @@ pub fn is_registered(os: MachineOs, backend: ShellBackend) -> bool {
 /// The program names a probe tries for a backend on an OS, best first.
 pub fn probe_names(os: MachineOs, backend: ShellBackend) -> &'static [&'static str] {
     match (os, backend) {
-        (MachineOs::Windows, ShellBackend::PowerShell) => &["pwsh", "powershell"],
+        (MachineOs::Windows, ShellBackend::Pwsh) => &["pwsh"],
+        (MachineOs::Windows, ShellBackend::WindowsPowerShell) => &["powershell"],
         (_, ShellBackend::Bash) => &["bash"],
         (_, ShellBackend::Zsh) => &["zsh"],
         (_, ShellBackend::Sh) => &["sh"],
-        (_, ShellBackend::PowerShell) => &[],
+        (_, ShellBackend::Pwsh | ShellBackend::WindowsPowerShell) => &[],
     }
 }
 
@@ -282,7 +331,7 @@ pub fn remote_command_argv(backend: ShellBackend, program: &str, command: &str) 
         ShellBackend::Bash => argv.extend(["--noprofile", "--norc", "-c"].map(String::from)),
         ShellBackend::Zsh => argv.extend(["-f", "-c"].map(String::from)),
         ShellBackend::Sh => argv.push("-c".into()),
-        ShellBackend::PowerShell => {
+        ShellBackend::Pwsh | ShellBackend::WindowsPowerShell => {
             argv.extend(powershell_flags());
             argv.push("-Command".into());
             argv.push(remote_powershell_command(command));
@@ -305,7 +354,7 @@ pub fn script_argv(backend: ShellBackend, program: &str, script: &str) -> Vec<St
         ShellBackend::Bash => argv.extend(["--noprofile", "--norc", "-c"].map(String::from)),
         ShellBackend::Zsh => argv.extend(["--emulate", "sh", "-f", "-c"].map(String::from)),
         ShellBackend::Sh => argv.push("-c".into()),
-        ShellBackend::PowerShell => {
+        ShellBackend::Pwsh | ShellBackend::WindowsPowerShell => {
             argv.extend(powershell_flags());
             argv.push("-Command".into());
         }
@@ -403,8 +452,46 @@ mod tests {
             }
         }
         assert!(!is_registered(MachineOs::Windows, ShellBackend::Zsh));
-        assert!(!is_registered(MachineOs::Wsl, ShellBackend::PowerShell));
+        assert!(!is_registered(MachineOs::Wsl, ShellBackend::WindowsPowerShell));
+        assert!(!is_registered(MachineOs::Linux, ShellBackend::Pwsh));
         assert!(is_registered(MachineOs::Wsl, ShellBackend::Sh));
+    }
+
+    /// The two PowerShell editions are probed for by their own program names,
+    /// never one standing in for the other.
+    #[test]
+    fn each_powershell_edition_is_probed_by_its_own_name() {
+        assert_eq!(probe_names(MachineOs::Windows, ShellBackend::Pwsh), ["pwsh"]);
+        assert_eq!(
+            probe_names(MachineOs::Windows, ShellBackend::WindowsPowerShell),
+            ["powershell"]
+        );
+        assert_eq!(ShellBackend::Pwsh.default_program(), "pwsh");
+        assert_eq!(ShellBackend::WindowsPowerShell.default_program(), "powershell");
+        assert_eq!(ShellBackend::Pwsh.dialect(), ScriptDialect::PowerShell);
+    }
+
+    /// A record from before the split says `powershell` for PowerShell 7 too;
+    /// its program says which one it was.
+    #[test]
+    fn a_recorded_powershell_is_read_by_its_program() {
+        use ShellBackend::{Bash, Pwsh, WindowsPowerShell};
+        assert_eq!(
+            WindowsPowerShell.of_recorded_program(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            Pwsh
+        );
+        assert_eq!(WindowsPowerShell.of_recorded_program("pwsh"), Pwsh);
+        assert_eq!(WindowsPowerShell.of_recorded_program("PWSH.EXE"), Pwsh);
+        assert_eq!(
+            WindowsPowerShell.of_recorded_program(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+            ),
+            WindowsPowerShell
+        );
+        assert_eq!(WindowsPowerShell.of_recorded_program("powershell"), WindowsPowerShell);
+        // Only the old shared id is reinterpreted.
+        assert_eq!(Pwsh.of_recorded_program("powershell.exe"), Pwsh);
+        assert_eq!(Bash.of_recorded_program("pwsh"), Bash);
     }
 
     #[test]
@@ -421,13 +508,15 @@ mod tests {
 
     #[test]
     fn each_os_prefers_its_first_shell_the_machine_has() {
-        use ShellBackend::{Bash, PowerShell, Sh, Zsh};
-        assert_eq!(backends_for(MachineOs::Windows), &[PowerShell, Bash]);
+        use ShellBackend::{Bash, Pwsh, Sh, WindowsPowerShell, Zsh};
+        assert_eq!(backends_for(MachineOs::Windows), &[Pwsh, WindowsPowerShell, Bash]);
         assert_eq!(backends_for(MachineOs::Linux), &[Bash, Zsh, Sh]);
         assert_eq!(backends_for(MachineOs::Macos), &[Zsh, Bash, Sh]);
         assert_eq!(preferred_backend(MachineOs::Macos, &[Sh, Bash]), Some(Bash));
         assert_eq!(preferred_backend(MachineOs::Windows, &[Bash]), Some(Bash));
-        assert_eq!(preferred_backend(MachineOs::Linux, &[PowerShell]), None);
+        assert_eq!(preferred_backend(MachineOs::Windows, &[Bash, WindowsPowerShell]), Some(WindowsPowerShell));
+        assert_eq!(preferred_backend(MachineOs::Windows, &[WindowsPowerShell, Pwsh]), Some(Pwsh));
+        assert_eq!(preferred_backend(MachineOs::Linux, &[Pwsh, WindowsPowerShell]), None);
         assert_eq!(preferred_backend(MachineOs::Linux, &[]), None);
     }
 
@@ -454,7 +543,7 @@ mod tests {
             script_argv(ShellBackend::Bash, "bash", "x"),
             ["bash", "--noprofile", "--norc", "-c", "x"]
         );
-        let ps = remote_command_argv(ShellBackend::PowerShell, "pwsh", "Get-Date");
+        let ps = remote_command_argv(ShellBackend::Pwsh, "pwsh", "Get-Date");
         assert_eq!(ps[0], "pwsh");
         assert!(ps.contains(&"-NoProfile".to_owned()));
         assert_eq!(ps[ps.len() - 2], "-Command");

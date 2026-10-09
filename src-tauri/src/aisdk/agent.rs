@@ -889,11 +889,17 @@ mod tests {
             }),
         };
         let model = |id: &str| {
-            let mut profile = crate::model_discovery::claude_agent_seed_models(&provider(ProviderFamily::ClaudeAgent))
-                .into_iter()
-                .next()
-                .unwrap();
-            profile.id = id.into();
+            let mut profile = ModelProfile {
+                id: id.into(),
+                name: String::new(),
+                group: String::new(),
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: Default::default(),
+                reasoning_content: Default::default(),
+                prompt_cache: true,
+                cache_ttl_minutes: None,
+            };
             profile.set_capability(
                 ModelCapability::ToolAppend,
                 crate::tool_append::known(ProviderFamily::ClaudeAgent, "", id) == Some(true),

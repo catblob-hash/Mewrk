@@ -116,7 +116,7 @@ Hooks are commands Mewrk runs at fixed points of a conversation. They read a JSO
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "^(bash|zsh|sh|powershell)$",
+        "matcher": "^(bash|zsh|sh|pwsh|powershell)$",
         "hooks": [
           {
             "type": "command",
@@ -133,7 +133,7 @@ Hooks are commands Mewrk runs at fixed points of a conversation. They read a JSO
 ```
 
 - Events: `SessionStart`, `InstructionsLoaded`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `Stop`. Other event names are skipped.
-- `matcher` is an unanchored regular expression tested against the tool name (`bash`, `zsh`, `sh`, `powershell`, `write`, `edit`, `read`, an `mcp__…` name, …) for the three tool events, against `startup` for `SessionStart`, and against the load reason for `InstructionsLoaded`. Claude Code's tool names also match the Mewrk tools doing the same job (`Bash` matches `bash`, `zsh` and `sh`; `Read`, `Write`, `Edit`, `Glob` for `find`, `Grep`, `LS`, `WebFetch`, `WebSearch`, `Task`/`Agent` for `agent_spawn`), so a block copied from Claude Code works unchanged. Absent or `"*"` matches everything; an invalid regex disables the group.
+- `matcher` is an unanchored regular expression tested against the tool name (`bash`, `zsh`, `sh`, `pwsh` for PowerShell 7, `powershell` for Windows PowerShell 5.1, `write`, `edit`, `read`, an `mcp__…` name, …) for the three tool events, against `startup` for `SessionStart`, and against the load reason for `InstructionsLoaded`. Claude Code's tool names also match the Mewrk tools doing the same job (`Bash` matches `bash`, `zsh` and `sh`; `PowerShell` matches both `pwsh` and `powershell`; `Read`, `Write`, `Edit`, `Glob` for `find`, `Grep`, `LS`, `WebFetch`, `WebSearch`, `Task`/`Agent` for `agent_spawn`), so a block copied from Claude Code works unchanged. Absent or `"*"` matches everything; an invalid regex disables the group.
 - Handler fields: `type` (only `"command"`), `command`, `commandWindows` (replaces `command` on Windows), `name`, `statusMessage`, `timeout` in seconds 1–600 (default 30; out of range drops the handler). `async` is honoured only for `InstructionsLoaded`; `asyncRewake` handlers are skipped.
 - Commands run through `bash -lc`, or through `pwsh`/`powershell -NoProfile -Command` on Windows, with the workspace's variables added to the environment: a workspace's hook in that workspace's folder (the conversation's worktree of it when there is one), a global hook on this computer in workspace 1's folder (a scratch folder when workspace 1 is on another machine). A hook from a WSL or SSH workspace's `hooks.json` runs on that machine, in its shell; `commandWindows` is used when that machine runs Windows. Give both `command` and `commandWindows` when the user is on Windows or shares the file across systems.
 - A workspace's hook watches that workspace: the tool events of a call that works in another workspace (a `read`, a shell command or a project-memory tool naming it, that workspace's MCP servers) never reach it. Calls that work in no one workspace (`web_search`, a subagent) and the conversation's own events reach every workspace's hooks. `InstructionsLoaded` reaches the global hooks and workspace 1's, whose instruction files they are.
@@ -206,6 +206,7 @@ Everything Mewrk itself says to the model, such as tool descriptions, receipts a
 
 - `prompts` maps registry keys to text; omitted keys keep the built-in wording, and `""` removes a text. Keep the `{placeholders}` a key declares; you cannot invent new ones.
 - `tools[].description` replaces what a tool is said to be; an entry without one is ignored. `toolName` is a built-in tool name or a full `mcp__…` name. Files written for the field's old name, `schemaNotes`, are still read.
+- A built-in tool's description (and its parameters' descriptions) may mention sibling tools through markers that are resolved on every request against the tools that request offers: `{?read}…{/}` keeps the text only while `read` is offered, `{?read|grep}…{/}` while either is, `{!read}…{/}` only while none of the named tools is, and `@shell` stands for any shell tool (`{?@shell}…{/}`). Segments nest and `{/}` closes the innermost one; a stray `{/}` is dropped and an unclosed segment runs to the end of the text. The built-in descriptions use them, so the shell tools name `find`, `grep`, `read`, `edit`, `write` and `ls` only while those are offered, and a `tools[].description` in a file may use them too. Markers are resolved for built-in tools only; an MCP tool's description is sent as it is.
 - Files over 64 KiB are not read. The file's name and location are its identity: renaming or moving it drops the selection back to the built-in.
 - Only the global `~/.mewrk/tool-descriptions/` is read; a workspace's own `.mewrk/tool-descriptions/` is not. The user picks at most one file on the **Tool descriptions** page of the conversation settings or of a preset; with none picked, the built-in profile applies.
 - A profile changes words, never what a tool can do, and not the conversation's own system prompt, which is a system card the user writes in the conversation.
