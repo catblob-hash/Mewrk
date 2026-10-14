@@ -36,6 +36,7 @@ pub(crate) fn tool_names(tool: &str) -> &'static [&'static str] {
         "web_fetch" => &["WebFetch"],
         "web_search" => &["WebSearch"],
         "agent_spawn" => &["Task", "Agent"],
+        "task_stop" => &["TaskStop"],
         "ask_user" => &["AskUserQuestion"],
         "exit_plan_mode" => &["ExitPlanMode"],
         "skill" => &["Skill"],
@@ -76,6 +77,27 @@ fn aliases(tool: &str) -> &'static [Alias] {
             mewrk: "query",
             claude_code: "pattern",
         }],
+        // `output_mode`, `glob`, `offset` and `path` are spelled alike in both;
+        // `-i` is the one argument that is the opposite of Mewrk's
+        // (`case_sensitive`), so it is handled apart.
+        "grep" => &[
+            Alias {
+                mewrk: "context",
+                claude_code: "-C",
+            },
+            Alias {
+                mewrk: "before",
+                claude_code: "-B",
+            },
+            Alias {
+                mewrk: "after",
+                claude_code: "-A",
+            },
+            Alias {
+                mewrk: "limit",
+                claude_code: "head_limit",
+            },
+        ],
         "agent_spawn" => &[
             Alias {
                 mewrk: "agent_type",
@@ -86,6 +108,11 @@ fn aliases(tool: &str) -> &'static [Alias] {
                 claude_code: "description",
             },
         ],
+        // Claude Code's `TaskStop` takes the task's id; Mewrk's address plays that part.
+        "task_stop" => &[Alias {
+            mewrk: "task",
+            claude_code: "task_id",
+        }],
         _ => &[],
     }
 }
@@ -349,6 +376,77 @@ mod tests {
         mewrk.insert("replace".into(), json!("newest"));
         let call = mewrk_input("edit", &sent, mewrk);
         assert_eq!(Value::Object(call), json!({"path": "/w/a.rs", "find": "old", "replace": "newest"}));
+    }
+
+    /// A `Grep` hook reads the search the way Claude Code spells it: `-i` for
+    /// "ignore case", `-A`/`-B`/`-C` for context, `head_limit` for the page —
+    /// and what it rewrites comes back as the Mewrk call it describes.
+    #[test]
+    fn a_grep_reads_under_both_vocabularies() {
+        let input = object(json!({
+            "pattern": "todo", "output_mode": "content", "glob": "*.rs",
+            "case_sensitive": false, "context": 2, "before": 4, "after": 1,
+            "limit": 30, "offset": 10
+        }));
+        let sent = tool_input("grep", &input);
+        assert_eq!(sent["-i"], true);
+        assert_eq!(sent["-C"], 2);
+        assert_eq!(sent["-B"], 4);
+        assert_eq!(sent["-A"], 1);
+        assert_eq!(sent["head_limit"], 30);
+        // Spelled alike in both: left as they are.
+        assert_eq!(sent["output_mode"], "content");
+        assert_eq!(sent["glob"], "*.rs");
+        assert_eq!(sent["offset"], 10);
+        assert_eq!(sent["limit"], 30, "Mewrk's own fields stay");
+
+        // Case-sensitive is Claude Code's default, so it says nothing about `-i`
+        // unless the call spelled the choice out.
+        let plain = tool_input("grep", &object(json!({"pattern": "x"})));
+        assert!(plain.get("-i").is_none() && plain.get("head_limit").is_none());
+        assert_eq!(tool_input("grep", &object(json!({"case_sensitive": true})))["-i"], false);
+
+        // A Claude Code script rewrites `-A` and `head_limit` and echoes the rest.
+        let mut claude = object(sent.clone());
+        claude.insert("-A".into(), json!(6));
+        claude.insert("head_limit".into(), json!(5));
+        let call = mewrk_input("grep", sent.as_object().unwrap(), claude);
+        assert_eq!(call.get("after"), Some(&json!(6)));
+        assert_eq!(call.get("limit"), Some(&json!(5)));
+        assert_eq!(call.get("before"), Some(&json!(4)));
+        assert_eq!(call.get("context"), Some(&json!(2)));
+        assert_eq!(call.get("case_sensitive"), Some(&json!(false)));
+        for name in ["-A", "-B", "-C", "-i", "head_limit"] {
+            assert!(!call.contains_key(name), "{name} is Claude Code's, not the call's");
+        }
+
+        // One that sends only the Claude Code fields it set.
+        let call = mewrk_input(
+            "grep",
+            sent.as_object().unwrap(),
+            object(json!({"pattern": "todo", "-C": 3, "-i": true, "head_limit": 7})),
+        );
+        assert_eq!(
+            Value::Object(call),
+            json!({"pattern": "todo", "context": 3, "case_sensitive": false, "limit": 7})
+        );
+    }
+
+    /// A `TaskStop` hook sees the address under Claude Code's `task_id`, and a
+    /// rewrite of it comes back as the Mewrk `task` the call runs with.
+    #[test]
+    fn a_task_stop_reads_under_both_vocabularies() {
+        assert_eq!(tool_names("task_stop"), ["TaskStop"]);
+        let input = object(json!({"task": "shell:3"}));
+        let sent = tool_input("task_stop", &input);
+        assert_eq!(sent["task_id"], "shell:3");
+        assert_eq!(sent["task"], "shell:3", "Mewrk's own field stays");
+        let call = mewrk_input(
+            "task_stop",
+            sent.as_object().unwrap(),
+            object(json!({"task_id": "shell:4"})),
+        );
+        assert_eq!(Value::Object(call), json!({"task": "shell:4"}));
     }
 
     #[test]

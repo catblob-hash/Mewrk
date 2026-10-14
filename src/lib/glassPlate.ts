@@ -8,7 +8,7 @@
  * (docs/why.md). The background is a still picture, so its glass can be one too. The
  * glass's filter is run once over the picture here, and the stylesheet
  * (`backdrop.css`) lays the result under every glass surface, fixed to the window and fitted
- * as the picture is (`--glass-under`), so a surface shows the part of it that lies under it
+ * as the picture is (`.glass-plate`), so a surface shows the part of it that lies under it
  * wherever the surface is and however it moves.
  *
  * Only the background is baked in, so glass is one layer deep: what floats over a glass

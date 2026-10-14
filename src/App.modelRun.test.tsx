@@ -92,13 +92,15 @@ describe("App model run flow — modelRun", () => {
         && saved.workspaces[0].conversations.find((conversation) => conversation.id === second.id)?.settings.reasoningEffort === "high";
     })).toBe(true));
 
-    await user.click(screen.getByText("高思考任务"));
+    // A new task's landing lists the same titles as the sidebar, so the click is scoped to the sidebar.
+    await user.click(within(screen.getByRole("navigation", { name: "对话列表" })).getByText("高思考任务"));
     expect(composerOptionValue("思考程度")).toBe("high");
 
     await user.click(screen.getByRole("button", { name: /^新建任务/ }));
     expect(composerOptionValue("思考程度")).toBe("extra");
 
-    await user.click(screen.getByText("高思考任务"));
+    // A new task's landing lists the same titles as the sidebar, so the click is scoped to the sidebar.
+    await user.click(within(screen.getByRole("navigation", { name: "对话列表" })).getByText("高思考任务"));
     expect(composerOptionValue("思考程度")).toBe("high");
   });
 

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { configureI18n } from "./i18n";
 import { emptyConversationPresetSettings } from "./lib/conversationPresets";
-import type { AppDocument } from "./types";
+import type { AppDocument, Conversation } from "./types";
 import {
   chooseComposerOption,
   composerOptionValue,
@@ -652,6 +652,54 @@ describe("draft conversation", () => {
     // It now belongs to its project for good: the project chip is gone, the composer text stays.
     await waitFor(() => expect(screen.queryByRole("button", { name: /^项目：/ })).not.toBeInTheDocument());
     expect(composer()).toHaveValue("工具之后再说");
+  });
+
+  /**
+   * The landing lists the project's sent tasks by recency, not in the order they are stored, and
+   * leaves another project's tasks off however recent they are.
+   */
+  it("lists the project's sent tasks on its new-task draft, most recent first, and opens the one clicked", async () => {
+    const seeded = documentWithModel();
+    const template = seeded.workspaces[0].conversations[0];
+    const sent = (id: string, title: string, updatedAt: string): Conversation => ({
+      ...template,
+      id,
+      title,
+      updatedAt,
+      contexts: [{ id: `${id}-user`, kind: "user", content: `${title}的内容`, createdAt: updatedAt }]
+    });
+    // Stored out of recency order, so only a sort by updatedAt reads right.
+    seeded.workspaces[0].conversations = [
+      sent("conv_older", "较早的任务", "2026-08-20T00:00:00Z"),
+      sent("conv_newest", "最新的任务", "2026-08-30T00:00:00Z"),
+      sent("conv_middle", "中间的任务", "2026-08-25T00:00:00Z")
+    ];
+    // The other project's task is the most recent of all, and still stays off this project's list.
+    const temporary = seeded.workspaces.find((workspace) => workspace.id === "__temporary__")!;
+    temporary.conversations = [sent("conv_other_project", "别的项目的任务", "2026-09-01T00:00:00Z")];
+    runtimeMocks.loadDocument.mockResolvedValue(seeded);
+
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByLabelText("向 Agent 发送消息");
+    await user.click(screen.getByRole("button", { name: "在 Mewrk 新建任务" }));
+    await screen.findByRole("button", { name: "项目：Mewrk" });
+
+    // The sidebar lists these tasks too, so every query below is scoped to the landing itself.
+    const landing = await screen.findByRole("region", { name: "最近任务" });
+    const titles = within(landing).getAllByRole("button").map(
+      (button) => button.querySelector(".draft-landing__task-title")?.textContent
+    );
+    expect(titles).toEqual(["最新的任务", "中间的任务", "较早的任务"]);
+    expect(within(landing).queryByText("别的项目的任务")).toBeNull();
+
+    await user.click(within(landing).getByRole("button", { name: /中间的任务/ }));
+    // The task it names is now on screen: the topbar carries its title, and the landing is gone.
+    const header = window.document.querySelector<HTMLElement>(".topbar")!;
+    await waitFor(() => expect(within(header).getByRole("button", { name: "对话标题：中间的任务，点击重命名" }))
+      .toBeInTheDocument());
+    expect(await screen.findByText("中间的任务的内容")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "最近任务" })).toBeNull();
   });
 });
 

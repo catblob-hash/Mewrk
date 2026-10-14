@@ -6,6 +6,10 @@
 //! or greps the file when the preview is not enough. The sizes are Claude
 //! Code's too: 30,000 characters for a shell command, 20,000 for `grep`.
 //!
+//! A background shell command's output is also kept here while it runs
+//! ([`create_live_file`]), so the model can read what a command has printed
+//! before it ends; that file is served and swept exactly like a spilled one.
+//!
 //! The files live under the application data directory, one directory per
 //! conversation ([`crate::workspace_dirs::ensure_tool_output_dir`]), and go
 //! when the conversation does. A conversation whose workspace is on another
@@ -87,12 +91,9 @@ pub(crate) fn fit(
     )
 }
 
-fn write(spill: Spill<'_>, text: &str) -> Result<PathBuf, String> {
-    let directory =
-        crate::workspace_dirs::ensure_tool_output_dir(spill.app_data, spill.conversation_id)?;
-    let stem = spill
-        .stem
-        .chars()
+/// `stem` as a file name's first part: ASCII letters, digits, `-` and `_`.
+fn file_stem(stem: &str) -> String {
+    stem.chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
                 character
@@ -101,7 +102,46 @@ fn write(spill: Spill<'_>, text: &str) -> Result<PathBuf, String> {
             }
         })
         .take(64)
-        .collect::<String>();
+        .collect()
+}
+
+/// Opens the file a background command's output is written to while it runs
+/// ([`crate::shell_tasks::ShellTaskRegistry::open_output_file`]), in the same
+/// conversation directory as a spilled output so `read` and `grep` serve it by
+/// the same rule ([`host_file`]) and the conversation's deletion sweeps it with
+/// the rest. `stem` is `shell-<id>`: the id is never reused, so the name is
+/// stable and says which task it belongs to; a leftover of the same name (a
+/// wiped command history) gets a random suffix instead of being overwritten.
+pub(crate) fn create_live_file(
+    app_data: &Path,
+    conversation_id: &str,
+    stem: &str,
+) -> Result<(PathBuf, fs::File), String> {
+    let directory = crate::workspace_dirs::ensure_tool_output_dir(app_data, conversation_id)?;
+    let stem = file_stem(stem);
+    let mut name = format!("{stem}-output.txt");
+    for _ in 0..3 {
+        let path = directory.join(&name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let suffix = uuid::Uuid::new_v4().simple().to_string();
+                name = format!("{stem}-output-{}.txt", &suffix[..12]);
+            }
+            Err(error) => return Err(format!("Could not create the output file: {error}")),
+        }
+    }
+    Err("Could not create the output file: the name is taken".into())
+}
+
+fn write(spill: Spill<'_>, text: &str) -> Result<PathBuf, String> {
+    let directory =
+        crate::workspace_dirs::ensure_tool_output_dir(spill.app_data, spill.conversation_id)?;
+    let stem = file_stem(spill.stem);
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let path = directory.join(format!("{stem}-{}.txt", &suffix[..12]));
     let mut file = fs::OpenOptions::new()
@@ -274,5 +314,52 @@ mod tests {
         assert_eq!(human_size(2_000), "2 KB");
         assert_eq!(human_size(70_312), "70.3 KB");
         assert_eq!(human_size(1_400_000), "1.4 MB");
+    }
+
+    /// A background command's live file is served and swept exactly like a spilled output:
+    /// the conversation reads it, no other does, it survives an application restart (a
+    /// reconcile is what every start and save runs) and goes with its conversation.
+    #[test]
+    fn a_live_file_is_read_by_its_conversation_and_outlives_a_restart() {
+        let app_data = tempfile::tempdir().unwrap();
+        let document = crate::catalog::default_document();
+        let kept = document.workspaces[0].conversations[0].id.clone();
+        let (path, mut file) = create_live_file(app_data.path(), &kept, "shell-4").unwrap();
+        file.write_all(b"output so far\n").unwrap();
+        let (gone_path, _gone) = create_live_file(app_data.path(), "conv_deleted", "shell-5").unwrap();
+        assert_eq!(path.file_name().unwrap(), "shell-4-output.txt");
+
+        let requested = path.display().to_string();
+        assert_eq!(
+            host_file(app_data.path(), &kept, &requested),
+            Some(fs::canonicalize(&path).unwrap())
+        );
+        assert_eq!(host_file(app_data.path(), "conv_deleted", &requested), None);
+        assert_eq!(host_file(app_data.path(), "another", &requested), None);
+
+        drop(file);
+        crate::workspace_dirs::reconcile_temporary_workspaces(
+            app_data.path(),
+            &document,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "output so far\n");
+        assert!(!gone_path.exists(), "a deleted conversation's file goes with it");
+    }
+
+    #[test]
+    fn a_live_file_never_overwrites_a_leftover_of_the_same_name() {
+        let app_data = tempfile::tempdir().unwrap();
+        let (first, _file) = create_live_file(app_data.path(), "conv", "shell-1").unwrap();
+        fs::write(&first, "leftover").unwrap();
+        let (second, _other) = create_live_file(app_data.path(), "conv", "shell-1").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read_to_string(&first).unwrap(), "leftover");
+        assert!(second
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("shell-1-output-"));
     }
 }

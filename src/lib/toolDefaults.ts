@@ -8,13 +8,17 @@ const englishParameterLabels: Record<string, string> = {
   agent_type: "Named agent type",
   accept: "Accept",
   action: "Action",
+  after: "Lines after",
   args: "Arguments",
+  before: "Lines before",
   case_sensitive: "Case sensitive",
   character: "Character",
   colorScheme: "Color scheme",
   command: "Command",
   content: "File content",
-  context: "Initial context",
+  // Shared by agent_spawn (a history switch) and grep (a line count): labels are keyed by
+  // parameter name alone, as in Rust's `english_parameter_label`, so the one word that fits both.
+  context: "Context",
   depth: "Recursion depth",
   description: "Description",
   doubleClick: "Double-click",
@@ -26,6 +30,7 @@ const englishParameterLabels: Record<string, string> = {
   filter: "Filter",
   filePath: "File path",
   find: "Find text",
+  glob: "File glob",
   height: "Height",
   image_id: "Image number",
   label: "Display name",
@@ -40,6 +45,7 @@ const englishParameterLabels: Record<string, string> = {
   offset: "Offset",
   old_text: "Original text",
   operation: "Operation",
+  output_mode: "Output mode",
   path: "Path",
   pattern: "Search pattern",
   plan: "Plan",
@@ -60,6 +66,7 @@ const englishParameterLabels: Record<string, string> = {
   serverId: "Server ID",
   start_line: "Start line",
   styles: "CSS properties",
+  task: "Task address",
   tasks: "Tasks",
   timeout: "Timeout (ms)",
   timeout_seconds: "Timeout (seconds)",
@@ -99,8 +106,20 @@ const englishParameterHelp: Record<string, string> = {
   "修改后这份记忆的一句话说明，会刷新 MEMORY.md 索引里的对应条目":
     "One sentence describing this memory after the change. It refreshes the document's entry in the MEMORY.md index.",
   "0 仅列出当前目录": "0 lists only the current directory.",
-  "最多返回的匹配行，默认 250，至多 1000": "Most matching lines to return: 250 by default, at most 1,000.",
-  "先跳过这么多匹配行，用于翻到下一页": "Matching lines to skip first, to fetch the next page.",
+  "只搜索路径匹配该 glob 的文件，例如 *.rs 或 src/**/*.tsx":
+    "Only search files whose path matches this glob, such as *.rs or src/**/*.tsx.",
+  "files_with_matches（默认）只列出含匹配的文件；content 列出匹配行；count 统计每个文件的匹配行数":
+    "files_with_matches (default) lists the files that match; content lists the matching lines; count gives the number of matching lines per file.",
+  "仅 content 模式：每处匹配前后各带几行上下文，0 至 20":
+    "content mode only: lines of context to show before and after each match, 0 to 20.",
+  "仅 content 模式：每处匹配之前的上下文行数，0 至 20":
+    "content mode only: lines of context to show before each match, 0 to 20.",
+  "仅 content 模式：每处匹配之后的上下文行数，0 至 20":
+    "content mode only: lines of context to show after each match, 0 to 20.",
+  "最多返回所选模式的结果条数，默认 250，至多 1000":
+    "Most results of the chosen mode to return: 250 by default, at most 1,000.",
+  "先跳过所选模式的这么多条结果，用于翻到下一页":
+    "Results of the chosen mode to skip first, to fetch the next page.",
   "本对话已选技能的名字，取自 schema 的 enum":
     "Name of a skill this conversation selected; the schema lists them as an enum.",
   "`select:<名字>[,<名字>…]` 按名取，或者用关键词搜索":
@@ -163,6 +182,7 @@ const englishParameterHelp: Record<string, string> = {
   "显示在时间线上的短名称": "Short name shown in the timeline.",
   "none（默认）：只看到任务；conversation：携带当前对话历史副本": "none (default): task only; conversation: include a copy of the current conversation history.",
   "5–600 秒，默认 60": "5–600 seconds; default: 60.",
+  "要停止的任务地址：后台命令写 shell:<id>，子代理与工作流直接写名称（工作流也可写 workflow:<runId>）；终端会话不能用它停止，开发服务器用 preview_stop。被停任务的结果仍会照常交付": "Address of the task to stop: a background command as shell:<id>, a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>). Terminal sessions cannot be stopped with this tool, and dev servers are stopped with preview_stop. The stopped task's result is still delivered.",
   "Claude Code AskUserQuestion 格式：1–4 题；每题含 header、question、2–4 个 label/description 选项及 multiSelect；无需添加 Other": "Claude Code AskUserQuestion format: 1–4 questions, each with header, question, 2–4 label/description options, and multiSelect. Do not add Other.",
   "分叉会话的第一条用户消息，也是你唯一一次下达指令的机会；说清任务与需要的全部背景":
     "First user message of the forked conversation, and your only chance to instruct it; state the task and all the background it needs",
@@ -237,6 +257,7 @@ const englishToolLabels: Record<string, string> = {
   agent_spawn: "Subagent",
   task_wait: "Wait for tasks",
   task_list: "List tasks",
+  task_stop: "Stop a task",
   box: "Background result",
   read_global_memory: "Read global memory",
   read_project_memory: "Read project memory",

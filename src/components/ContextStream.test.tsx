@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { ASK_USER_PENDING_OUTPUT, createTestDocument as createSeedDocument } from "../test/fixtures";
@@ -638,6 +638,46 @@ describe("ContextStream", () => {
     expect(screen.queryByText("在上下文之间右键，可精确插入新内容")).toBeNull();
   });
 
+  it("draws a supplied empty state in place of the stock notice, and right-click still inserts on it", () => {
+    const document = createSeedDocument();
+    const onInsert = vi.fn();
+    const landing = (
+      <div className="empty-state">
+        <p>自定义首页</p>
+      </div>
+    );
+    const { rerender } = render(
+      <ContextStream
+        contexts={[]}
+        tools={document.tools}
+        enabledTools={[]}
+        onInsert={onInsert}
+        emptyState={landing}
+      />
+    );
+    expect(screen.getByText("自定义首页")).toBeInTheDocument();
+    expect(screen.queryByText("这段对话还没有消息")).toBeNull();
+
+    // The supplied page sits inside the timeline, so a right-click on it is a timeline right-click.
+    fireEvent.contextMenu(screen.getByText("自定义首页"), { clientX: 32, clientY: 180 });
+    const menu = screen.getByRole("menu", { name: "添加上下文" });
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "用户输入" }));
+    expect(onInsert).toHaveBeenCalledWith(0, "user");
+
+    // Once the timeline holds a context, the supplied page goes with the notice it replaced.
+    rerender(
+      <ContextStream
+        contexts={[{ id: "empty-state-user", kind: "user", content: "已有上下文", createdAt: "2026-07-21T00:00:00Z" }]}
+        tools={document.tools}
+        enabledTools={[]}
+        onInsert={onInsert}
+        emptyState={landing}
+      />
+    );
+    expect(screen.queryByText("自定义首页")).toBeNull();
+    expect(screen.getByText("已有上下文")).toBeInTheDocument();
+  });
+
   it("forks the conversation at the insertion line from the same menu", () => {
     const contexts: ContextItem[] = [
       { id: "fork-u1", kind: "user", content: "第一问", createdAt: "2026-07-20T00:00:01Z" },
@@ -868,6 +908,27 @@ describe("ContextStream", () => {
     expect(requestFrame).toHaveBeenCalledTimes(1);
     frames.splice(0).forEach((callback) => callback(1));
     expect(scroller.scrollTop).toBe(640);
+    requestFrame.mockRestore();
+  });
+
+  it("does not follow contexts pasted or placed above the tail", () => {
+    const first = { id: "above-user", kind: "user" as const, content: "问题", createdAt: "2026-07-21T00:00:00Z" };
+    const last = { id: "above-reply", kind: "assistant" as const, content: "回复", createdAt: "2026-07-21T00:00:01Z" };
+    const pasted = { id: "above-pasted", kind: "user" as const, content: "粘贴的", createdAt: "2026-07-21T00:00:02Z" };
+    const frames: FrameRequestCallback[] = [];
+    const requestFrame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const { rerender } = render(
+      <ContextStream contexts={[first, last]} tools={[]} enabledTools={[]} onInsert={vi.fn()} />
+    );
+    frames.splice(0).forEach((callback) => callback(0));
+    requestFrame.mockClear();
+
+    // The timeline is longer but ends where it did: there is no new tail to follow to.
+    rerender(<ContextStream contexts={[first, pasted, last]} tools={[]} enabledTools={[]} onInsert={vi.fn()} />);
+    expect(requestFrame).not.toHaveBeenCalled();
     requestFrame.mockRestore();
   });
 
@@ -1345,6 +1406,50 @@ describe("ContextStream", () => {
       />
     );
     expect(screen.queryByRole("button", { name: "从此消息分支" })).not.toBeInTheDocument();
+  });
+
+  it("offers a rewind on real user messages only, right after branching, and disables it while the timeline is busy", () => {
+    const user = { id: "user-rewind", kind: "user" as const, content: "回到这里之前", createdAt: "2026-07-20T00:00:00Z" };
+    const hostNote = { id: "ctx_agent-result_1", kind: "user" as const, content: "子代理结果", createdAt: "2026-07-20T00:00:01Z" };
+    const assistant = { id: "assistant-rewind", kind: "assistant" as const, content: "回复", createdAt: "2026-07-20T00:00:02Z" };
+    const onRewindTo = vi.fn();
+    const props = {
+      contexts: [user, hostNote, assistant],
+      tools: [],
+      enabledTools: [],
+      onBranchFrom: vi.fn(),
+      onRewindTo,
+      onEdit: vi.fn(),
+      onDelete: vi.fn(),
+      onInsert: vi.fn()
+    };
+    const { container, rerender } = render(<ContextStream {...props} />);
+
+    const card = container.querySelector<HTMLElement>('[data-context-id="user-rewind"]')!;
+    const labels = within(card).getAllByRole("button").map((button) => button.getAttribute("aria-label"));
+    expect(labels).toEqual(["从此消息分支", "回退到此消息之前", "复制用户消息", "编辑上下文", "删除上下文"]);
+    // Neither the host's note nor a model reply is a message the user sent.
+    const note = container.querySelector<HTMLElement>('[data-context-id="ctx_agent-result_1"]')!;
+    expect(within(note).queryByRole("button", { name: "回退到此消息之前" })).not.toBeInTheDocument();
+    const reply = container.querySelector<HTMLElement>('[data-context-id="assistant-rewind"]')!;
+    expect(within(reply).queryByRole("button", { name: "回退到此消息之前" })).not.toBeInTheDocument();
+
+    const rewind = within(card).getByRole("button", { name: "回退到此消息之前" });
+    expect(rewind).toBeEnabled();
+    fireEvent.click(rewind);
+    expect(onRewindTo).toHaveBeenCalledWith(user);
+
+    rerender(<ContextStream {...props} rewindDisabledReason="模型回合进行中，完成或停止后才能回退" />);
+    const blocked = screen.getAllByRole("button", { name: "回退到此消息之前" })[0];
+    expect(blocked).toBeDisabled();
+    expect(blocked).toHaveAttribute("title", "模型回合进行中，完成或停止后才能回退");
+
+    // A timeline locked for a run disables it even where nobody gave a reason.
+    rerender(<ContextStream {...props} timelineMutationLocked />);
+    expect(screen.getAllByRole("button", { name: "回退到此消息之前" })[0]).toBeDisabled();
+
+    rerender(<ContextStream {...props} readOnly />);
+    expect(screen.queryByRole("button", { name: "回退到此消息之前" })).not.toBeInTheDocument();
   });
 
   it("copies an ordinary user message and confirms success", async () => {
@@ -2572,11 +2677,11 @@ describe("ContextStream", () => {
     ];
 
     /** Lays the cards out 100px apart down a 600px timeline: jsdom has no layout of its own. */
-    const layOut = (container: HTMLElement) => {
+    const layOut = (container: HTMLElement, contexts: ContextItem[] = messages) => {
       const scroller = container.querySelector<HTMLElement>(".context-scroll")!;
       vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue(box(0, 600));
       Object.defineProperty(scroller, "clientWidth", { configurable: true, value: 590 });
-      messages.forEach((message, index) => {
+      contexts.forEach((message, index) => {
         const card = container.querySelector<HTMLElement>(`[data-context-id="${message.id}"]`)!;
         vi.spyOn(card, "getBoundingClientRect").mockReturnValue(box(20 + index * 100, 60));
       });
@@ -2640,6 +2745,423 @@ describe("ContextStream", () => {
       rerender(<ContextStream contexts={messages} tools={[]} enabledTools={[]} onInsert={vi.fn()} />);
       drag(layOut(container), 50, 250);
       expect(container.querySelector("[data-timeline-selected]")).toBeNull();
+    });
+
+    /** A press let go where it was made, with the selection modifier held unless told otherwise. */
+    const click = (target: Element, y: number, modifiers = { ctrlKey: true }) => {
+      fireEvent.pointerDown(target, { button: 0, pointerId: 7, clientX: 30, clientY: y, ...modifiers });
+      fireEvent.pointerUp(window, { pointerId: 7, clientX: 30, clientY: y, ...modifiers });
+    };
+    const pickedIds = (container: HTMLElement) => Array.from(container.querySelectorAll("[data-timeline-selected]"))
+      .map((element) => element.getAttribute("data-context-id"));
+    const card = (container: HTMLElement, id: string) => container.querySelector<HTMLElement>(`[data-context-id="${id}"]`)!;
+
+    it("picks one context out or lets it go on a Ctrl-click, and adds a box to what is picked", () => {
+      const { container } = render(
+        <ContextStream contexts={messages} tools={[]} enabledTools={[]} onInsert={vi.fn()} onDeleteContexts={vi.fn()} />
+      );
+      const scroller = layOut(container);
+
+      click(card(container, "pick-1"), 50);
+      expect(pickedIds(container)).toEqual(["pick-1"]);
+      // Contexts that do not sit together are picked one click at a time.
+      click(card(container, "pick-3"), 250);
+      expect(pickedIds(container)).toEqual(["pick-1", "pick-3"]);
+      click(card(container, "pick-1"), 50);
+      expect(pickedIds(container)).toEqual(["pick-3"]);
+      // A click between cards picks nothing and lets nothing go.
+      click(scroller.querySelector(".context-stream")!, 100);
+      expect(pickedIds(container)).toEqual(["pick-3"]);
+      expect(container.querySelector(".timeline-marquee")).toBeNull();
+
+      drag(scroller, 130, 170);
+      expect(pickedIds(container)).toEqual(["pick-2", "pick-3"]);
+      // The press took focus into the timeline, where the selection's keys answer.
+      expect(scroller).toHaveFocus();
+    });
+
+    it("copies what is picked, and pastes over it or at the insertion line", async () => {
+      const onCopyContexts = vi.fn();
+      const onPasteContexts = vi.fn();
+      const props = {
+        contexts: messages,
+        tools: [],
+        enabledTools: [],
+        onInsert: vi.fn(),
+        onDeleteContexts: vi.fn(),
+        onCopyContexts,
+        onPasteContexts
+      };
+      const { container, rerender } = render(<ContextStream {...props} />);
+      const scroller = layOut(container);
+      click(card(container, "pick-3"), 250);
+      click(card(container, "pick-1"), 50);
+      // The click each press ended in is swallowed until the turn is over.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      fireEvent.contextMenu(card(container, "pick-2"), { clientX: 40, clientY: 150 });
+      const menu = screen.getByRole("menu", { name: "所选消息" });
+      expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent))
+        .toEqual(["复制Ctrl+C", "粘贴Ctrl+V", "删除"]);
+      // Nothing has been copied yet, so there is nothing to paste.
+      expect(within(menu).getByRole("menuitem", { name: /粘贴/ })).toBeDisabled();
+      fireEvent.click(within(menu).getByRole("menuitem", { name: /复制/ }));
+      // In timeline order, whatever order they were picked in; copying lets nothing go.
+      expect(onCopyContexts).toHaveBeenLastCalledWith(["pick-1", "pick-3"]);
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(pickedIds(container)).toEqual(["pick-1", "pick-3"]);
+
+      fireEvent.keyDown(scroller, { key: "c", ctrlKey: true });
+      expect(onCopyContexts).toHaveBeenCalledTimes(2);
+      fireEvent.keyDown(scroller, { key: "v", ctrlKey: true });
+      expect(onPasteContexts).not.toHaveBeenCalled();
+
+      rerender(<ContextStream {...props} pasteCount={2} />);
+      fireEvent.keyDown(scroller, { key: "v", ctrlKey: true });
+      // What was picked is what the paste replaces; it stays picked until the paste has taken it out.
+      expect(onPasteContexts).toHaveBeenLastCalledWith(0, ["pick-1", "pick-3"]);
+      expect(pickedIds(container)).toEqual(["pick-1", "pick-3"]);
+      const pasted: ContextItem[] = [
+        { id: "pasted-1", kind: "user", content: "粘贴的", createdAt: "2026-10-02T00:00:03Z" },
+        messages[1]
+      ];
+      rerender(<ContextStream {...props} contexts={pasted} pasteCount={2} />);
+      expect(pickedIds(container)).toEqual([]);
+
+      // With nothing picked, a right-click's own menu pastes at its line.
+      fireEvent.contextMenu(container.querySelector(".context-stream")!, { clientX: 30, clientY: 300 });
+      const insertMenu = screen.getByRole("menu", { name: "添加上下文" });
+      fireEvent.click(within(insertMenu).getByRole("menuitem", { name: /粘贴/ }));
+      expect(onPasteContexts).toHaveBeenLastCalledWith(2, []);
+      expect(screen.queryByRole("menu")).toBeNull();
+    });
+
+    describe("dragging what is picked", () => {
+      /** Renders the three messages, or the ones given, picks the named ones, and hands back what a drag is driven and read with. */
+      const setUp = (picked: string[], contexts: ContextItem[] = messages) => {
+        const frames: FrameRequestCallback[] = [];
+        const requestFrame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+          frames.push(callback);
+          return frames.length;
+        });
+        onTestFinished(() => requestFrame.mockRestore());
+        const flush = () => act(() => {
+          for (let count = 0; frames.length > 0 && count < 100; count += 1) frames.shift()!(0);
+        });
+        const onMoveContexts = vi.fn();
+        const { container } = render(
+          <ContextStream
+            contexts={contexts}
+            tools={[]}
+            enabledTools={[]}
+            onInsert={vi.fn()}
+            onDeleteContexts={vi.fn()}
+            onMoveContexts={onMoveContexts}
+          />
+        );
+        layOut(container, contexts);
+        for (const id of picked) click(card(container, id), 50 + contexts.findIndex((message) => message.id === id) * 100);
+        flush();
+        return {
+          container,
+          onMoveContexts,
+          stream: container.querySelector<HTMLElement>(".context-stream")!,
+          /** The line marking where the drag began, while there is a drag. */
+          home: () => container.querySelector<HTMLElement>(".context-stream > .timeline-drag-home"),
+          /** What the timeline's own insertion line is drawn above. */
+          lineAbove: (id: string) => container.querySelector(`[data-context-id="${id}"]`)!.previousElementSibling,
+          flush,
+          press: (id: string, y: number) => fireEvent.pointerDown(card(container, id), { button: 0, pointerId: 9, clientX: 30, clientY: y }),
+          moveTo: (y: number) => {
+            fireEvent.pointerMove(window, { pointerId: 9, clientX: 30, clientY: y });
+            flush();
+          },
+          letGo: (y: number) => {
+            fireEvent.pointerUp(window, { pointerId: 9, clientX: 30, clientY: y });
+            flush();
+          }
+        };
+      };
+
+      it("gathers scattered messages as the drag begins, marks where it began, and carries them to the insertion line", () => {
+        const { container, onMoveContexts, stream, home, lineAbove, press, moveTo, letGo } = setUp(["pick-1", "pick-3"]);
+
+        press("pick-3", 250);
+        // Nothing happens until the press has travelled.
+        expect(stream).not.toHaveAttribute("data-timeline-drag");
+        expect(home()).toBeNull();
+        moveTo(256);
+        // Gathered at once: both leave the timeline for the stack.
+        expect(stream).toHaveAttribute("data-timeline-drag", "gathered");
+        expect(container.querySelectorAll("[data-timeline-lifted]")).toHaveLength(2);
+        expect(document.querySelectorAll(".timeline-drag-ghost__piece")).toHaveLength(2);
+        // The drag is still where it began: the home line, under the last message staying put, is
+        // where a drop would land, and stands in for the timeline's own line.
+        expect(home()).toHaveAttribute("data-state", "at");
+        expect(home()!.style.top).toBe("180px");
+        expect(container.querySelector(".insertion-line")).toBeNull();
+
+        moveTo(100);
+        // Away from it, the timeline's line marks the drop and the home line only where the drag began.
+        expect(lineAbove("pick-2")).toHaveClass("insertion-line");
+        expect(home()).toHaveAttribute("data-state", "away");
+        letGo(100);
+        expect(onMoveContexts).toHaveBeenLastCalledWith(["pick-1", "pick-3"], 1);
+        // The page is put back in order: no lines, no stack, nothing left lifted, and the selection kept.
+        expect(stream).not.toHaveAttribute("data-timeline-drag");
+        expect(container.querySelector(".insertion-line")).toBeNull();
+        expect(home()).toBeNull();
+        expect(container.querySelector("[data-timeline-lifted]")).toBeNull();
+        expect(document.querySelector(".timeline-drag-ghost")).toBeNull();
+        expect(container.querySelector(".context-scroll")).not.toHaveAttribute("data-timeline-dragging");
+        expect(pickedIds(container)).toEqual(["pick-1", "pick-3"]);
+
+        // Let go without ever leaving, the scattered messages come together where the grabbed one sat.
+        press("pick-3", 250);
+        moveTo(256);
+        letGo(256);
+        expect(onMoveContexts).toHaveBeenLastCalledWith(["pick-1", "pick-3"], 3);
+      });
+
+      it("holds a fresh drag to the home line until the pointer has moved off the press", () => {
+        const { container, onMoveContexts, home, press, moveTo, letGo } = setUp(["pick-2"]);
+        // As the timeline lies once the second message is out of it: the third has closed up under the pointer.
+        vi.mocked(card(container, "pick-3").getBoundingClientRect).mockReturnValue(box(130, 20));
+
+        press("pick-2", 165);
+        moveTo(171);
+        // The pointer has barely moved, so the drop is still on the home line, not past what slid in.
+        expect(home()).toHaveAttribute("data-state", "at");
+        expect(container.querySelector(".insertion-line")).toBeNull();
+        moveTo(200);
+        expect(home()).toHaveAttribute("data-state", "away");
+        expect(container.querySelector(".context-stream > .insertion-line")).not.toBeNull();
+        // Coming back near the press does not hold it again: only the line's own reach counts now.
+        moveTo(171);
+        expect(home()).toHaveAttribute("data-state", "away");
+        letGo(171);
+        expect(onMoveContexts).toHaveBeenLastCalledWith(["pick-2"], 3);
+
+        press("pick-2", 165);
+        moveTo(171);
+        letGo(171);
+        expect(onMoveContexts).toHaveBeenLastCalledWith(["pick-2"], 2);
+      });
+
+      it("docks scattered pieces at the home line, where letting go leaves them together", () => {
+        const { container, onMoveContexts, stream, home, flush, press, moveTo, letGo } = setUp(["pick-1", "pick-3"]);
+        const dock = () => container.querySelector<HTMLElement>(".context-stream .timeline-drag-dock");
+
+        press("pick-3", 250);
+        moveTo(100);
+        expect(dock()).toBeNull();
+        moveTo(200);
+        // Back at the home line they are set down there side by side: copies in the timeline's own
+        // flow, under the last message staying put, with the two themselves still out of it.
+        expect(stream).toHaveAttribute("data-timeline-drag", "docked");
+        expect(container.querySelector('[data-context-id="pick-2"]')!.closest(".context-slot")!.nextElementSibling).toBe(dock());
+        expect(Array.from(dock()!.querySelectorAll(".context-card")).map((copy) => copy.textContent)).toEqual(["第一条", "第三条"]);
+        // The copies are nothing the timeline could take for its own cards.
+        expect(dock()!.querySelector("[data-context-id], [data-context-index]")).toBeNull();
+        expect(container.querySelectorAll("[data-timeline-lifted]")).toHaveLength(2);
+        expect(home()).toHaveAttribute("data-state", "counting");
+        expect(container.querySelector(".insertion-line")).toBeNull();
+        // A little past the line's reach is not yet away from it: its edge does not flicker.
+        moveTo(140);
+        expect(stream).toHaveAttribute("data-timeline-drag", "docked");
+        moveTo(130);
+        expect(stream).toHaveAttribute("data-timeline-drag", "gathered");
+        moveTo(200);
+        expect(stream).toHaveAttribute("data-timeline-drag", "docked");
+        letGo(200);
+        expect(onMoveContexts).toHaveBeenLastCalledWith(["pick-1", "pick-3"], 3);
+        expect(stream).not.toHaveAttribute("data-timeline-drag");
+        expect(home()).toBeNull();
+        expect(dock()).toBeNull();
+        expect(container.querySelector("[data-timeline-lifted]")).toBeNull();
+
+        onMoveContexts.mockClear();
+        press("pick-3", 250);
+        moveTo(100);
+        moveTo(200);
+        fireEvent.keyDown(window, { key: "Escape" });
+        flush();
+        expect(document.querySelector(".timeline-drag-ghost")).toBeNull();
+        expect(home()).toBeNull();
+        expect(dock()).toBeNull();
+        letGo(200);
+        expect(onMoveContexts).not.toHaveBeenCalled();
+        // Calling a drag off lets nothing go.
+        expect(pickedIds(container)).toEqual(["pick-1", "pick-3"]);
+
+        // A press let go where it was made is a click, and lets the selection go like any other.
+        press("pick-3", 250);
+        letGo(250);
+        expect(pickedIds(container)).toEqual([]);
+        expect(onMoveContexts).not.toHaveBeenCalled();
+      });
+
+      it("counts docked pieces down on the home line before putting them back apart, afresh on each return", () => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        onTestFinished(() => {
+          vi.useRealTimers();
+        });
+        const { container, onMoveContexts, stream, home, press, moveTo, letGo } = setUp(["pick-1", "pick-3"]);
+        const wait = (ms: number) => act(() => {
+          vi.advanceTimersByTime(ms);
+        });
+
+        press("pick-3", 250);
+        moveTo(256);
+        // A drag begins gathered at the home line: nothing is docked, and nothing counts down.
+        wait(5_000);
+        expect(stream).toHaveAttribute("data-timeline-drag", "gathered");
+        expect(home()).toHaveAttribute("data-state", "at");
+
+        moveTo(100);
+        moveTo(200);
+        expect(stream).toHaveAttribute("data-timeline-drag", "docked");
+        expect(home()).toHaveAttribute("data-state", "counting");
+        wait(500);
+        moveTo(100);
+        expect(stream).toHaveAttribute("data-timeline-drag", "gathered");
+        expect(home()).toHaveAttribute("data-state", "away");
+        moveTo(200);
+        expect(home()).toHaveAttribute("data-state", "counting");
+        // Leaving started the count over: the time spent docked before does not count.
+        wait(500);
+        expect(stream).toHaveAttribute("data-timeline-drag", "docked");
+        wait(250);
+        // The count is up: they are back where they were, the line above the grabbed one, lit.
+        expect(stream).toHaveAttribute("data-timeline-drag", "apart");
+        expect(home()).toHaveAttribute("data-state", "at");
+        expect(home()!.style.top).toBe("218px");
+        expect(container.querySelector(".insertion-line")).toBeNull();
+        // Apart is where they stay for as long as the drag is at the line.
+        wait(5_000);
+        expect(stream).toHaveAttribute("data-timeline-drag", "apart");
+        // Let go now, nothing moves.
+        letGo(200);
+        expect(onMoveContexts).not.toHaveBeenCalled();
+        expect(stream).not.toHaveAttribute("data-timeline-drag");
+      });
+
+      it("marks where messages that sit together began, and takes them apart there without a count", () => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        onTestFinished(() => {
+          vi.useRealTimers();
+        });
+        const { container, onMoveContexts, stream, home, press, moveTo, letGo } = setUp(["pick-1", "pick-2"]);
+
+        press("pick-1", 50);
+        moveTo(56);
+        expect(stream).toHaveAttribute("data-timeline-drag", "gathered");
+        // The home line is above the first message staying put, where the two would land again.
+        expect(home()).toHaveAttribute("data-state", "at");
+        expect(home()!.style.top).toBe("218px");
+        moveTo(260);
+        expect(container.querySelector(".context-stream > .insertion-line")).not.toBeNull();
+        expect(home()).toHaveAttribute("data-state", "away");
+        moveTo(56);
+        expect(stream).toHaveAttribute("data-timeline-drag", "apart");
+        expect(home()).toHaveAttribute("data-state", "at");
+        expect(home()!.style.top).toBe("18px");
+        act(() => {
+          vi.advanceTimersByTime(5_000);
+        });
+        expect(stream).toHaveAttribute("data-timeline-drag", "apart");
+        letGo(56);
+        expect(onMoveContexts).not.toHaveBeenCalled();
+      });
+
+      it("closes a timeline with no scroll to give up over what is dragged out of it, and keeps the home line's reach where it was", () => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        onTestFinished(() => {
+          vi.useRealTimers();
+        });
+        const four: ContextItem[] = [
+          ...messages,
+          { id: "pick-4", kind: "assistant", content: "第四条", createdAt: "2026-10-02T00:00:03Z" }
+        ];
+        const { container, onMoveContexts, stream, home, press, moveTo, letGo } = setUp(["pick-1", "pick-3"], four);
+        const wait = (ms: number) => act(() => {
+          vi.advanceTimersByTime(ms);
+        });
+        // Too short to scroll: nothing can be scrolled away to hold still what the drag began under.
+        Object.defineProperty(container.querySelector(".context-scroll")!, "scrollTop", {
+          configurable: true,
+          get: () => 0,
+          set: () => undefined
+        });
+        // With the first message out of it the timeline closes up from its head, and the second,
+        // which the home line hangs from, goes up with it; the fourth follows once the third is out
+        // from above it too, and is pushed back down by the copies docked there.
+        const look = () => stream.getAttribute("data-timeline-drag");
+        vi.mocked(card(container, "pick-2").getBoundingClientRect)
+          .mockImplementation(() => box(look() === "gathered" || look() === "docked" ? 20 : 120, 60));
+        vi.mocked(card(container, "pick-4").getBoundingClientRect)
+          .mockImplementation(() => box(look() === "gathered" ? 120 : 320, 60));
+
+        press("pick-3", 250);
+        moveTo(256);
+        expect(stream).toHaveAttribute("data-timeline-drag", "gathered");
+        // The column is given no room of its own to stand where the lifted messages were.
+        expect(stream.style.paddingTop).toBe("");
+        expect(stream.style.paddingBottom).toBe("");
+        // The home line went up with what it hangs from. The pointer has barely moved off the
+        // press, so the drag is still on that line, however far it has gone from under it.
+        expect(home()).toHaveAttribute("data-state", "at");
+        expect(home()!.style.top).toBe("118px");
+
+        moveTo(500);
+        expect(home()).toHaveAttribute("data-state", "away");
+        moveTo(100);
+        expect(stream).toHaveAttribute("data-timeline-drag", "docked");
+        wait(750);
+        // Put back apart, the first message pushes the line down from under the pointer...
+        expect(stream).toHaveAttribute("data-timeline-drag", "apart");
+        moveTo(104);
+        // ...which is still at the place that brought the pieces home: they are not gathered again.
+        expect(stream).toHaveAttribute("data-timeline-drag", "apart");
+        moveTo(300);
+        expect(stream).toHaveAttribute("data-timeline-drag", "gathered");
+        letGo(300);
+        expect(onMoveContexts).toHaveBeenLastCalledWith(["pick-1", "pick-3"], 4);
+
+        // Let go without leaving the press, the two come together where the grabbed one sat.
+        press("pick-3", 250);
+        moveTo(256);
+        letGo(256);
+        expect(onMoveContexts).toHaveBeenLastCalledWith(["pick-1", "pick-3"], 3);
+      });
+
+      it("keeps the insertion line in sight over a card too tall to show both its ends", () => {
+        const { container, onMoveContexts, home, lineAbove, press, moveTo, letGo } = setUp(["pick-1"]);
+        // The second message runs past the foot of the 600px timeline; the third is out of sight below it.
+        vi.mocked(card(container, "pick-2").getBoundingClientRect).mockReturnValue(box(120, 600));
+        vi.mocked(card(container, "pick-3").getBoundingClientRect).mockReturnValue(box(740, 60));
+
+        press("pick-1", 50);
+        moveTo(300);
+        expect(home()).toHaveAttribute("data-state", "at");
+        // Past its middle a drop would land below it, where no line could be seen: the end in sight is
+        // taken, which here is the home line.
+        moveTo(500);
+        expect(home()).toHaveAttribute("data-state", "at");
+        expect(container.querySelector(".insertion-line")).toBeNull();
+        letGo(500);
+        expect(onMoveContexts).toHaveBeenLastCalledWith(["pick-1"], 1);
+
+        // With its foot in sight, the same half of the card lands below it.
+        vi.mocked(card(container, "pick-2").getBoundingClientRect).mockReturnValue(box(120, 300));
+        vi.mocked(card(container, "pick-3").getBoundingClientRect).mockReturnValue(box(440, 60));
+        press("pick-1", 50);
+        moveTo(400);
+        expect(lineAbove("pick-3")).toHaveClass("insertion-line");
+        expect(home()).toHaveAttribute("data-state", "away");
+        letGo(400);
+        expect(onMoveContexts).toHaveBeenLastCalledWith(["pick-1"], 2);
+      });
     });
 
     it("answers Ctrl+Z and Ctrl+X anywhere in the timeline but inside a field", () => {

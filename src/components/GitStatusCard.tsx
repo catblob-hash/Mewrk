@@ -6,6 +6,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import type { GitWorkspaceSnapshot } from "../lib/git";
 import { sidePaneDomId } from "../lib/sidePanes";
+import { GlassPlate } from "./GlassPlate";
 
 /** The review pane these rows drive. */
 const reviewPageDomId = sidePaneDomId("review");
@@ -91,6 +92,7 @@ export function GitStatusCard({
         aria-controls={cardBodyId}
         onClick={() => setExpanded((current) => !current)}
       >
+        <GlassPlate />
         <GitCompareArrows size={13} aria-hidden="true" />
         <span className="composer-chip__label">{t("Git 状态", "Git status")}</span>
       </button>

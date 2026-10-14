@@ -159,13 +159,58 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     None,
                 ),
                 parameter(
+                    "glob",
+                    "文件通配",
+                    StringType,
+                    false,
+                    None,
+                    Some("*.rs"),
+                    Some("只搜索路径匹配该 glob 的文件，例如 *.rs 或 src/**/*.tsx"),
+                ),
+                parameter(
                     "case_sensitive",
                     "区分大小写",
                     Boolean,
                     false,
-                    Some(json!(false)),
+                    Some(json!(true)),
                     None,
                     None,
+                ),
+                parameter(
+                    "output_mode",
+                    "输出模式",
+                    StringType,
+                    false,
+                    Some(json!("files_with_matches")),
+                    None,
+                    Some("files_with_matches（默认）只列出含匹配的文件；content 列出匹配行；count 统计每个文件的匹配行数"),
+                ),
+                parameter(
+                    "context",
+                    "上下文行数",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("仅 content 模式：每处匹配前后各带几行上下文，0 至 20"),
+                ),
+                parameter(
+                    "before",
+                    "前置行数",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("仅 content 模式：每处匹配之前的上下文行数，0 至 20"),
+                ),
+                parameter(
+                    "after",
+                    "后置行数",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("仅 content 模式：每处匹配之后的上下文行数，0 至 20"),
                 ),
                 parameter(
                     "limit",
@@ -174,7 +219,7 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     false,
                     Some(json!(250)),
                     None,
-                    Some("最多返回的匹配行，默认 250，至多 1000"),
+                    Some("最多返回所选模式的结果条数，默认 250，至多 1000"),
                 ),
                 parameter(
                     "offset",
@@ -183,7 +228,7 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                     false,
                     Some(json!(0)),
                     None,
-                    Some("先跳过这么多匹配行，用于翻到下一页"),
+                    Some("先跳过所选模式的这么多条结果，用于翻到下一页"),
                 ),
             ],
         ),
@@ -1104,6 +1149,22 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
             vec![],
         ),
         descriptor(
+            "task_stop",
+            "停止任务",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![parameter(
+                "task",
+                "任务地址",
+                StringType,
+                true,
+                None,
+                Some("shell:1"),
+                Some("要停止的任务地址：后台命令写 shell:<id>，子代理与工作流直接写名称（工作流也可写 workflow:<runId>）；终端会话不能用它停止，开发服务器用 preview_stop。被停任务的结果仍会照常交付"),
+            )],
+        ),
+        descriptor(
             "box",
             "后台结果",
             "",
@@ -1723,6 +1784,7 @@ fn english_tool_label(name: &str) -> Option<&'static str> {
         "agent_spawn" => "Subagent",
         "task_wait" => "Wait for tasks",
         "task_list" => "List tasks",
+        "task_stop" => "Stop a task",
         "box" => "Background result",
         "read_global_memory" => "Read global memory",
         "read_project_memory" => "Read project memory",
@@ -1749,14 +1811,18 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
     Some(match name {
         "accept" => "Accept",
         "action" => "Action",
+        "after" => "Lines after",
         "agent_type" => "Named agent type",
         "args" => "Arguments",
+        "before" => "Lines before",
         "case_sensitive" => "Case sensitive",
         "character" => "Character",
         "colorScheme" => "Color scheme",
         "command" => "Command",
         "content" => "File content",
-        "context" => "Initial context",
+        // Shared by agent_spawn (a history switch) and grep (a line count): labels are
+        // keyed by parameter name alone, so the one word that fits both.
+        "context" => "Context",
         "depth" => "Recursion depth",
         "description" => "Description",
         "doubleClick" => "Double-click",
@@ -1766,6 +1832,7 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
         "filter" => "Filter",
         "filePath" => "File path",
         "find" => "Find text",
+        "glob" => "File glob",
         "height" => "Height",
         "image_id" => "Image number",
         "label" => "Display name",
@@ -1774,6 +1841,7 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
         "line" => "Line",
         "lines" => "Line limit",
         "operation" => "Operation",
+        "output_mode" => "Output mode",
         "max_results" => "Maximum results",
         "name" => "Name",
         "new_text" => "New text",
@@ -1799,6 +1867,7 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
         "serverId" => "Server ID",
         "start_line" => "Start line",
         "styles" => "CSS properties",
+        "task" => "Task address",
         "tasks" => "Tasks",
         "timeout" => "Timeout (ms)",
         "timeout_seconds" => "Timeout (seconds)",
@@ -1815,8 +1884,25 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
 fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
     Some(match (tool, parameter) {
         ("ls", "depth") => "0 lists only the current directory.",
-        ("grep", "limit") => "Most matching lines to return: 250 by default, at most 1,000.",
-        ("grep", "offset") => "Matching lines to skip first, to fetch the next page.",
+        ("grep", "glob") => {
+            "Only search files whose path matches this glob, such as *.rs or src/**/*.tsx."
+        }
+        ("grep", "output_mode") => {
+            "files_with_matches (default) lists the files that match; content lists the matching lines; count gives the number of matching lines per file."
+        }
+        ("grep", "context") => {
+            "content mode only: lines of context to show before and after each match, 0 to 20."
+        }
+        ("grep", "before") => {
+            "content mode only: lines of context to show before each match, 0 to 20."
+        }
+        ("grep", "after") => {
+            "content mode only: lines of context to show after each match, 0 to 20."
+        }
+        ("grep", "limit") => {
+            "Most results of the chosen mode to return: 250 by default, at most 1,000."
+        }
+        ("grep", "offset") => "Results of the chosen mode to skip first, to fetch the next page.",
         ("skill", "name") => {
             "Name of a skill this conversation selected; the schema lists them as an enum."
         }
@@ -1958,6 +2044,9 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
             "Array of task addresses: a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>), a background command as shell:<id>, a terminal as terminal:<id>, a dev server as preview:<serverId> (preview:<serverId>@<workspace> when the conversation has several workspaces). The wait ends once every named task has produced a result. Omit to wait for every child agent, workflow run and background command in this conversation (terminals and dev servers excluded)."
         }
         ("task_wait", "timeout_seconds") => "5-600 seconds; default: 60.",
+        ("task_stop", "task") => {
+            "Address of the task to stop: a background command as shell:<id>, a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>). Terminal sessions cannot be stopped with this tool, and dev servers are stopped with preview_stop. The stopped task's result is still delivered."
+        }
         ("box", "none") => "Always an empty list.",
         ("read_global_memory", "name") | ("read_project_memory", "name") => {
             "A document name listed in the memory index. The .md suffix is optional."
@@ -2590,7 +2679,7 @@ mod tests {
         let english = tool_catalog_for_language(ResolvedLanguage::EnUs);
         let chinese_after = tool_catalog_for_language(ResolvedLanguage::ZhCn);
 
-        assert_eq!(chinese.len(), 50);
+        assert_eq!(chinese.len(), 51);
         assert_eq!(english.len(), chinese.len());
         assert_eq!(chinese_after, chinese);
         for (localized, canonical) in english.iter().zip(&chinese) {

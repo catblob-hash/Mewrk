@@ -35,6 +35,7 @@ import { agentTimelineRouteId, agentTimelineRunStatus } from "../lib/subagents";
 import { isPreviewToolName } from "../lib/taskTools";
 import type { WorkflowRunView } from "../lib/workflowRuns";
 import { CopyButton, IconButton } from "./Common";
+import { FileIcon } from "./FileIcon";
 import { InlineTextEditor } from "./InlineTextEditor";
 import { InlineToolEditor } from "./InlineToolEditor";
 import { MarkdownContent } from "./MarkdownContent";
@@ -572,6 +573,7 @@ function ToolTitle({ subject, request }: { subject: TitleSubject; request?: Path
   useEffect(() => () => {
     if (dwell.current !== null) window.clearTimeout(dwell.current);
   }, []);
+  const icon = subject.path ? <FileIcon path={subject.path} size={13} inline /> : null;
   const text = request
     ? (
       // biome-ignore lint/a11y/noStaticElementInteractions: Inside the row's disclosure button nothing may take focus of its own, so this is the pointer's shortcut; the keyboard reaches the file through the file pane.
@@ -597,12 +599,13 @@ function ToolTitle({ subject, request }: { subject: TitleSubject; request?: Path
           openPath({ ...request, anchor: { left: box.left, top: box.top, right: box.right, bottom: box.bottom } });
         }}
       >
+        {icon}
         {subject.text}
       </span>
     )
     : subject.code
       ? <code className="timeline-row__code">{subject.text}</code>
-      : subject.text;
+      : <>{icon}{subject.text}</>;
   return <>{subject.before}{text}{subject.after}</>;
 }
 
@@ -943,7 +946,11 @@ export interface TimelineBlockProps {
   pathBaseDir?: string | null;
 }
 
-/** Persisted item references stay stable between stream flushes, so only active blocks rerender. */
+/**
+ * Persisted item references stay stable between stream flushes, so only active blocks rerender.
+ * A run's view is read by its own workflow row and no other, so the map is compared row by row:
+ * a running workflow's clock redraws the block that holds it, not the whole timeline.
+ */
 function timelineBlockPropsEqual(previous: TimelineBlockProps, next: TimelineBlockProps): boolean {
   return previous.tools === next.tools
     && previous.insertionIndex === next.insertionIndex
@@ -958,12 +965,16 @@ function timelineBlockPropsEqual(previous: TimelineBlockProps, next: TimelineBlo
     && previous.onOpenInsert === next.onOpenInsert
     && previous.onOpenSubagent === next.onOpenSubagent
     && previous.onOpenWorkflowRun === next.onOpenWorkflowRun
-    && previous.workflowRunByCall === next.workflowRunByCall
     && previous.deferOffscreen === next.deferOffscreen
     && previous.pathBaseDir === next.pathBaseDir
     && previous.entries.length === next.entries.length
     && previous.entries.every((entry, index) => (
-      entry.item === next.entries[index].item && entry.index === next.entries[index].index
+      entry.item === next.entries[index].item
+      && entry.index === next.entries[index].index
+      && (
+        entry.kind !== "workflow"
+        || previous.workflowRunByCall?.[entry.item.id] === next.workflowRunByCall?.[entry.item.id]
+      )
     ));
 }
 

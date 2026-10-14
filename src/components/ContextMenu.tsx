@@ -116,10 +116,14 @@ export function ContextMenu({ anchor, sections, label, onClose, placeholder }: C
     };
   }, [surfaces]);
 
-  // Whatever had focus gets it back: the menu was a detour from it.
+  // Whatever had focus gets it back when closing leaves focus nowhere: the menu was a detour
+  // from it. Focus that is somewhere by then was put there on purpose — by the row chosen, in a
+  // field to type a new name in, or by the press that closed the menu — and stays.
   useEffect(() => {
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     return () => {
+      const active = document.activeElement;
+      if (active && active !== document.body) return;
       if (previous?.isConnected) previous.focus({ preventScroll: true });
     };
   }, []);
@@ -142,7 +146,8 @@ export function ContextMenu({ anchor, sections, label, onClose, placeholder }: C
             <MenuLevel
               label={label}
               sections={sections}
-              autoFocus
+              // Not before the panel is placed: until then it is hidden, and nothing hidden takes focus.
+              autoFocus={position !== null}
               hang={position?.above ? "up" : "down"}
               onCloseLevel={() => onCloseRef.current()}
               onCloseAll={() => onCloseRef.current()}
@@ -158,7 +163,7 @@ interface MenuLevelProps {
   /** The level's accessible name: the menu's, or the row that opened it. */
   label: string;
   sections: ContextMenuSection[];
-  /** Focus the first row on mount: the level was opened from the keyboard, or is the menu itself. */
+  /** Focus the first row once this holds: the level was opened from the keyboard, or is the menu itself, placed. */
   autoFocus: boolean;
   /** Which way its submenus grow from their rows: up for a menu standing on the spot it was opened at. */
   hang: "down" | "up";

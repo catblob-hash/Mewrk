@@ -1086,6 +1086,24 @@ describe("FilesPane viewer", () => {
     expect(container.querySelector(".code-token--keyword")).toBeNull();
   });
 
+  it("offers to mention a right-clicked line of a file in its workspace", async () => {
+    const user = userEvent.setup();
+    const onMention = vi.fn();
+    files.local[`${ROOT}/src/App.tsx`] = textFile(`${ROOT}/src/App.tsx`, "const first = 1;\nconst second = 2;\n");
+    renderPane({ onMention });
+
+    await user.click(await screen.findByRole("treeitem", { name: rowName("src") }));
+    await user.click(await screen.findByRole("treeitem", { name: rowName("App.tsx") }));
+    const code = await screen.findByLabelText("src/App.tsx");
+    const line = code.querySelector('[data-line="2"] .numbered-code__text');
+    if (!line) throw new Error("no line 2 in src/App.tsx");
+
+    fireEvent.contextMenu(line, { clientX: 8, clientY: 9 });
+    await user.click(await screen.findByRole("menuitem", { name: "在会话中提及" }));
+
+    expect(onMention).toHaveBeenCalledWith({ path: "src/App.tsx", workspace: 1, line: 2 });
+  });
+
   it("shows a picture from its own bytes rather than calling it binary", async () => {
     const user = userEvent.setup();
     directories.local[ROOT] = [entry(ROOT, "logo.png"), entry(ROOT, "src", "directory")];

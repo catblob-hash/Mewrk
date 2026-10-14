@@ -184,6 +184,50 @@ describe("wordDiff", () => {
     ]);
   });
 
+  it("joins rewritten words across the spaces they still share", () => {
+    const result = wordDiff("// the quick brown fox", "// a slow red dog");
+
+    expect(result.bailed).toBe(false);
+    expect(result.before).toEqual([
+      { text: "// ", changed: false },
+      { text: "the quick brown fox", changed: true }
+    ]);
+    expect(result.after).toEqual([
+      { text: "// ", changed: false },
+      { text: "a slow red dog", changed: true }
+    ]);
+  });
+
+  it("leaves whitespace unmarked when only one neighbour changed", () => {
+    const result = wordDiff("const foo = bar;", "let baz = qux;");
+
+    expect(result.before).toEqual([
+      { text: "const foo", changed: true },
+      { text: " = ", changed: false },
+      { text: "bar", changed: true },
+      { text: ";", changed: false }
+    ]);
+    expect(result.after).toEqual([
+      { text: "let baz", changed: true },
+      { text: " = ", changed: false },
+      { text: "qux", changed: true },
+      { text: ";", changed: false }
+    ]);
+  });
+
+  it("joins changed words across whitespace that is being ignored", () => {
+    const result = wordDiff("x foo  bar", "x baz qux", { ignoreWhitespace: true });
+
+    expect(result.before).toEqual([
+      { text: "x ", changed: false },
+      { text: "foo  bar", changed: true }
+    ]);
+    expect(result.after).toEqual([
+      { text: "x ", changed: false },
+      { text: "baz qux", changed: true }
+    ]);
+  });
+
   it("holds the text and alternation invariants on every case", () => {
     const cases: Array<[string, string, Parameters<typeof wordDiff>[2]]> = [
       ["const value = compute();", "const result = compute();", undefined],

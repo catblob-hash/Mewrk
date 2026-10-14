@@ -498,11 +498,23 @@ pub fn workflow_spawn_output(run_id: &str, submitted_name: &str) -> String {
     TaskRef::Workflow(run_id.to_owned()).wire()
 }
 
-/// The parent-facing output of a background shell dispatch contains only its
-/// host-minted task address. Lifecycle and collection behavior are described by
-/// the `run_in_background` property.
-pub fn shell_background_spawn_output(_tool_name: &str, shell_ref: &str) -> String {
-    shell_ref.to_owned()
+/// The parent-facing output of a background shell dispatch: its host-minted task
+/// address and, when the host could open one, the file its output is written to
+/// while it runs — the only way to see that output before the command ends.
+/// Lifecycle and collection behavior are described by the `run_in_background`
+/// property. Without a file the receipt is the bare address.
+pub fn shell_background_spawn_output(
+    shell_ref: &str,
+    output_file: Option<&str>,
+    profile: &PromptProfile,
+) -> String {
+    match output_file {
+        Some(path) => profile.render(
+            PromptKey::TaskShellBackgroundReceipt,
+            &[("shell_ref", shell_ref), ("path", path)],
+        ),
+        None => shell_ref.to_owned(),
+    }
 }
 
 /// The receipt for a command that ran out of foreground time and was adopted by
@@ -510,20 +522,25 @@ pub fn shell_background_spawn_output(_tool_name: &str, shell_ref: &str) -> Strin
 ///
 /// Unlike an explicitly backgrounded command, this one is a surprise: the model
 /// asked for a result and is getting an address instead. So the receipt says why
-/// the swap happened, not just where the command went.
+/// the swap happened, not just where the command went — and where to read what
+/// it has printed so far, which the model was expecting to receive directly.
 pub fn shell_timeout_backgrounded_output(
-    _tool_name: &str,
     shell_ref: &str,
+    output_file: Option<&str>,
     timeout: std::time::Duration,
     profile: &PromptProfile,
 ) -> String {
-    profile.render(
-        PromptKey::TaskShellTimeoutBackgrounded,
-        &[
-            ("shell_ref", shell_ref),
-            ("seconds", &timeout.as_secs().max(1).to_string()),
-        ],
-    )
+    let seconds = timeout.as_secs().max(1).to_string();
+    match output_file {
+        Some(path) => profile.render(
+            PromptKey::TaskShellTimeoutBackgroundedFile,
+            &[("shell_ref", shell_ref), ("seconds", &seconds), ("path", path)],
+        ),
+        None => profile.render(
+            PromptKey::TaskShellTimeoutBackgrounded,
+            &[("shell_ref", shell_ref), ("seconds", &seconds)],
+        ),
+    }
 }
 
 /// The envelope body of a finished background shell command. The first line
@@ -556,15 +573,29 @@ pub fn shell_background_result_text(
     )
 }
 
-/// Appends the profile's "the user closed this task" sentence to a task result.
+/// Appends the profile's sentence naming who stopped a task to its result: "the
+/// user closed this task" for the sidebar button, "stopped with task_stop" for the
+/// model's own call.
 ///
 /// Applied at settlement, not at projection: the folded notification is rendered
 /// from the already-minted card body by `wire_history`, which has no profile, so
 /// the sentence has to be part of the envelope before the card is minted. It is
 /// keyed on who asked for the stop rather than on the terminal status, because
 /// `Stopped` also covers host-forced settlement and provider-declared stops.
-pub fn append_user_close_note(body: &str, profile: &PromptProfile) -> String {
-    let note = profile.text(PromptKey::TaskStoppedByUser);
+///
+/// `origin` is [`agents::AgentShared::stop_attribution`]; a stop nobody is to be
+/// credited with (`None`, or a host cancellation) leaves the body as it is.
+pub fn append_stop_note(
+    body: &str,
+    origin: Option<agents::StopOrigin>,
+    profile: &PromptProfile,
+) -> String {
+    let key = match origin {
+        Some(agents::StopOrigin::User) => PromptKey::TaskStoppedByUser,
+        Some(agents::StopOrigin::Model) => PromptKey::TaskStoppedByModel,
+        Some(agents::StopOrigin::Host) | None => return body.to_owned(),
+    };
+    let note = profile.text(key);
     if note.trim().is_empty() {
         return body.to_owned();
     }
@@ -574,14 +605,19 @@ pub fn append_user_close_note(body: &str, profile: &PromptProfile) -> String {
     format!("{}\n{note}", body.trim_end())
 }
 
-/// The envelope body of a background shell command the user stopped. Same shape
+/// The envelope body of a background shell command that was stopped. Same shape
 /// as a natural exit and carrying the same collected output — a stopped command
 /// still produced whatever it printed before it was killed, and throwing that
 /// away is the one thing the model cannot recover.
+///
+/// `by_model` picks the sentence: a stop the model made with `task_stop` is worded
+/// as that, because telling the model the user stopped it would report an
+/// intervention that did not happen.
 pub fn shell_background_stopped_text(
     tool_name: &str,
     shell_ref: &str,
     output: &str,
+    by_model: bool,
     profile: &PromptProfile,
 ) -> String {
     let body = if output.trim().is_empty() {
@@ -590,7 +626,11 @@ pub fn shell_background_stopped_text(
         output.trim_end()
     };
     profile.render(
-        PromptKey::TaskShellStoppedByUser,
+        if by_model {
+            PromptKey::TaskShellStoppedByModel
+        } else {
+            PromptKey::TaskShellStoppedByUser
+        },
         &[
             ("shell_ref", shell_ref),
             ("tool_name", tool_name),
@@ -652,11 +692,16 @@ pub struct TaskObservation {
 /// started them, on a model that takes asynchronous calls: each gets its
 /// `[name · status]` line and a note that its result is that call's output,
 /// in place of the result itself.
+///
+/// `output_files` pairs each still-running background command with the file its
+/// output so far can be read from. A wait that ends at its deadline otherwise
+/// tells the model nothing about the command but that it is running.
 pub fn format_wait_output(
     envelopes: &[AgentEnvelope],
     on_calls: &[(String, SubagentRunStatus)],
     statuses: &[(String, AgentLiveStatus)],
     observations: &[TaskObservation],
+    output_files: &[(String, String)],
     timed_out: bool,
     timeout_seconds: u64,
     profile: &PromptProfile,
@@ -793,6 +838,15 @@ pub fn format_wait_output(
                     .map(|(name, status)| format!("{name} {}", profile.text(status.prompt_key()))),
             ),
         );
+    }
+    for (task, path) in output_files {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&format!(
+            "{task} · {}",
+            profile.render(PromptKey::TaskShellOutputFile, &[("path", path)])
+        ));
     }
     truncate_agent_output(&output, profile)
 }
@@ -959,6 +1013,8 @@ pub struct TaskListRow {
     /// The agent's task text, the terminal's cwd, or the page URL.
     pub detail: String,
     pub latest_update: Option<String>,
+    /// The file a still-running background command writes its output to.
+    pub output_file: Option<String>,
 }
 
 /// Section header a group of rows renders under. The groups are fixed rather
@@ -1001,12 +1057,19 @@ pub fn format_task_list(groups: &[TaskListGroup], profile: &PromptProfile) -> St
                     ));
                 }
             }
+            // Not compacted: a path cut short names nothing.
+            if let Some(path) = &row.output_file {
+                output.push_str(&format!(
+                    "\n  {}",
+                    profile.render(PromptKey::TaskShellOutputFile, &[("path", path)])
+                ));
+            }
         }
     }
     truncate_agent_output(&output, profile)
 }
 
-fn compact_preview(value: &str, limit: usize) -> String {
+pub(crate) fn compact_preview(value: &str, limit: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= limit {
         return compact;
@@ -1332,6 +1395,52 @@ mod tests {
         }
     }
 
+    /// What a stopped task's result says about who stopped it, for each origin, in both
+    /// built-in profiles: the user's close names the user, the model's `task_stop` names
+    /// the tool and never the user, and a host cancellation says nothing at all.
+    #[test]
+    fn a_stopped_tasks_result_names_who_stopped_it() {
+        use agents::StopOrigin;
+        for profile in [PromptProfile::builtin_english(), PromptProfile::builtin_concise()] {
+            let by_user = append_stop_note("partial", Some(StopOrigin::User), &profile);
+            assert!(by_user.starts_with("partial\n"), "{by_user}");
+            assert!(by_user.contains("user"), "{by_user}");
+
+            let by_model = append_stop_note("partial", Some(StopOrigin::Model), &profile);
+            assert!(by_model.starts_with("partial\n"), "{by_model}");
+            assert!(by_model.contains("task_stop"), "{by_model}");
+            assert!(!by_model.to_lowercase().contains("user"), "{by_model}");
+
+            assert_eq!(append_stop_note("partial", Some(StopOrigin::Host), &profile), "partial");
+            assert_eq!(append_stop_note("partial", None, &profile), "partial");
+            // An empty body is replaced by the sentence rather than prefixed with a blank line.
+            assert_eq!(
+                append_stop_note("", Some(StopOrigin::Model), &profile),
+                profile.text(PromptKey::TaskStoppedByModel)
+            );
+        }
+    }
+
+    /// A stopped background command keeps what it printed and says who stopped it;
+    /// only the model's own `task_stop` leaves the user out of the sentence.
+    #[test]
+    fn a_stopped_background_commands_result_names_who_stopped_it() {
+        let profile = english_profile();
+        let by_user = shell_background_stopped_text("bash", "shell:3", "line one\n", false, &profile);
+        assert_eq!(
+            by_user,
+            "Background command shell:3 (bash) was stopped by the user:\nline one"
+        );
+        let by_model = shell_background_stopped_text("bash", "shell:3", "line one\n", true, &profile);
+        assert_eq!(
+            by_model,
+            "Background command shell:3 (bash) was stopped with task_stop:\nline one"
+        );
+        let silent = shell_background_stopped_text("bash", "shell:3", "  ", true, &profile);
+        assert!(silent.ends_with("(no output)"), "{silent}");
+        assert!(!silent.contains("user"), "{silent}");
+    }
+
     /// The cost footer is appended per envelope, so it has to be inside what
     /// `truncate_agent_output` bounds. If truncation ever stops being the last
     /// step, a maximal child result plus footers would blow past the cap.
@@ -1366,6 +1475,7 @@ mod tests {
             &[],
             &[("a1".into(), agents::AgentLiveStatus::Idle)],
             &[],
+            &[],
             false,
             60,
             &profile,
@@ -1382,6 +1492,7 @@ mod tests {
                 metrics: Some(metrics),
                 structured_output: None,
             }],
+            &[],
             &[],
             &[],
             &[],
@@ -1405,6 +1516,7 @@ mod tests {
                 metrics: None,
                 structured_output: None,
             }],
+            &[],
             &[],
             &[],
             &[],
@@ -1596,7 +1708,7 @@ mod tests {
             metrics: None,
             structured_output: Some(json!({"verdict": "ok", "score": 7})),
         }];
-        let output = format_wait_output(&envelopes, &[], &[], &[], false, 60, &profile);
+        let output = format_wait_output(&envelopes, &[], &[], &[], &[], false, 60, &profile);
         assert!(output.contains("[a1 · completed]\nfinal conclusion"));
         assert!(output.contains("Structured result:\n```json"));
         assert!(output.contains("\"verdict\": \"ok\""));
@@ -1981,7 +2093,7 @@ mod tests {
             ("a1".to_owned(), AgentLiveStatus::Running),
             ("a2".to_owned(), AgentLiveStatus::Idle),
         ];
-        let output = format_wait_output(&envelopes, &[], &statuses, &[], false, 60, &profile);
+        let output = format_wait_output(&envelopes, &[], &statuses, &[], &[], false, 60, &profile);
         assert!(output.contains("[a1 · progress update]\nscan completed"));
         assert!(output.contains("[a2 · completed]\nfinal conclusion"));
         assert!(output.contains("Current status:a1 running, a2 finished its turn"));
@@ -1989,7 +2101,7 @@ mod tests {
         // Timeout is a state statement and may coexist with accumulated progress
         // and delivered results. Address pending tasks separately to avoid
         // contradicting results in the same output.
-        let timeout = format_wait_output(&envelopes, &[], &statuses, &[], true, 45, &profile);
+        let timeout = format_wait_output(&envelopes, &[], &statuses, &[], &[], true, 45, &profile);
         assert!(timeout.contains("The 45-second wait expired"), "{timeout}");
         assert!(timeout.contains("the results of a2 are below"), "{timeout}");
         assert!(timeout.contains("a1 are still running"), "{timeout}");
@@ -2003,7 +2115,7 @@ mod tests {
         );
 
         // The no-result branch remains a state statement.
-        let empty_timeout = format_wait_output(&[], &[], &statuses, &[], true, 45, &profile);
+        let empty_timeout = format_wait_output(&[], &[], &statuses, &[], &[], true, 45, &profile);
         assert!(
             empty_timeout.contains("a1, a2 have not produced a result yet"),
             "{empty_timeout}"
@@ -2013,7 +2125,7 @@ mod tests {
             "{empty_timeout}"
         );
 
-        let idle = format_wait_output(&[], &[], &[], &[], false, 60, &profile);
+        let idle = format_wait_output(&[], &[], &[], &[], &[], false, 60, &profile);
         assert!(idle.contains("No task is running"));
     }
 
@@ -2050,7 +2162,7 @@ mod tests {
             structured_output: None,
         });
 
-        let output = format_wait_output(&envelopes, &[], &[], &[], false, 60, &profile);
+        let output = format_wait_output(&envelopes, &[], &[], &[], &[], false, 60, &profile);
         assert!(
             output.contains("[a1 · completed]\nfinal conclusion"),
             "the result that ended the wait must survive truncation"
@@ -2074,7 +2186,7 @@ mod tests {
             detail: Some("npm   run\nbuild".into()),
             settled: false,
         }];
-        let output = format_wait_output(&[], &[], &[], &observations, false, 60, &profile);
+        let output = format_wait_output(&[], &[], &[], &observations, &[], false, 60, &profile);
         assert!(
             output.contains("[terminal:t1 · running] (build)"),
             "{output}"
@@ -2127,7 +2239,7 @@ mod tests {
             task_status_wire(SubagentRunStatus::RoundLimit),
             "roundLimit"
         );
-        let wait = format_wait_output(&[envelope], &[], &[], &[], false, 60, &profile);
+        let wait = format_wait_output(&[envelope], &[], &[], &[], &[], false, 60, &profile);
         assert_eq!(
             wait,
             format!("[a1 · round limit reached]\n{notification}\n(This turn's cost: 88 tokens · 3 tool calls · 1200 ms)")
@@ -2144,7 +2256,7 @@ mod tests {
     fn a_result_on_its_call_is_reported_by_status_alone() {
         let profile = english_profile();
         let on_calls = [("a1".to_owned(), SubagentRunStatus::Completed)];
-        let wait = format_wait_output(&[], &on_calls, &[], &[], false, 60, &profile);
+        let wait = format_wait_output(&[], &on_calls, &[], &[], &[], false, 60, &profile);
         assert_eq!(
             wait,
             format!(
@@ -2154,7 +2266,7 @@ mod tests {
             )
         );
         let statuses = [("a2".to_owned(), agents::AgentLiveStatus::Running)];
-        let timed_out = format_wait_output(&[], &on_calls, &statuses, &[], true, 30, &profile);
+        let timed_out = format_wait_output(&[], &on_calls, &statuses, &[], &[], true, 30, &profile);
         assert!(timed_out.contains("a1"), "{timed_out}");
         assert!(!timed_out.contains(profile.text(PromptKey::TaskWaitIdle)), "{timed_out}");
     }
@@ -2182,6 +2294,7 @@ mod tests {
                     status_label: "interrupted".into(),
                     detail: "review   src directory\nand report results".into(),
                     latest_update: Some("half complete".into()),
+                    output_file: None,
                 }],
             },
             TaskListGroup {
@@ -2192,6 +2305,8 @@ mod tests {
                     status_label: "running".into(),
                     detail: "C:/work".into(),
                     latest_update: None,
+                    // The line a running background command's row gets under it.
+                    output_file: Some("C:/data/tool-output/c/shell-7-output.txt".into()),
                 }],
             },
         ];
@@ -2211,6 +2326,63 @@ mod tests {
             output.contains("- terminal:t1 · running (build)"),
             "{output}"
         );
+        assert!(
+            output.contains("\n  Output so far (read or grep): C:/data/tool-output/c/shell-7-output.txt"),
+            "{output}"
+        );
+        // Only the row that has a file names one.
+        assert_eq!(output.matches("Output so far").count(), 1, "{output}");
+    }
+
+    /// Both ways a command becomes a background task hand the model the file its
+    /// output is written to; one the host could not open a file for keeps the
+    /// bare address, and nothing then promises a file.
+    #[test]
+    fn background_shell_receipts_name_the_output_file() {
+        let profile = english_profile();
+        let path = "C:/data/tool-output/c/shell-3-output.txt";
+
+        let started = shell_background_spawn_output("shell:3", Some(path), &profile);
+        assert!(started.starts_with("shell:3\n"), "{started}");
+        assert!(started.contains(path), "{started}");
+        assert!(started.contains("read or grep"), "{started}");
+        assert!(started.contains("notified"), "{started}");
+        assert!(started.contains("task_stop"), "{started}");
+        assert_eq!(
+            shell_background_spawn_output("shell:3", None, &profile),
+            "shell:3"
+        );
+
+        let timeout = std::time::Duration::from_secs(120);
+        let adopted = shell_timeout_backgrounded_output("shell:3", Some(path), timeout, &profile);
+        assert!(adopted.contains("120s timeout"), "{adopted}");
+        assert!(adopted.contains("shell:3"), "{adopted}");
+        assert!(adopted.contains(path), "{adopted}");
+        assert!(adopted.contains("task_stop"), "{adopted}");
+        let adopted = shell_timeout_backgrounded_output("shell:3", None, timeout, &profile);
+        assert!(adopted.contains("120s timeout") && !adopted.contains("tool-output"), "{adopted}");
+    }
+
+    /// A wait that ends at its deadline names the file of every command still
+    /// running, next to the status line that says it is.
+    #[test]
+    fn a_timed_out_wait_names_the_output_file_of_a_running_command() {
+        let profile = english_profile();
+        let statuses = vec![("shell:3".to_owned(), agents::AgentLiveStatus::Running)];
+        let files = vec![(
+            "shell:3".to_owned(),
+            "C:/data/tool-output/c/shell-3-output.txt".to_owned(),
+        )];
+        let timeout = format_wait_output(&[], &[], &statuses, &[], &files, true, 45, &profile);
+        assert!(timeout.contains("shell:3 running"), "{timeout}");
+        assert!(
+            timeout.contains(
+                "shell:3 · Output so far (read or grep): C:/data/tool-output/c/shell-3-output.txt"
+            ),
+            "{timeout}"
+        );
+        let without = format_wait_output(&[], &[], &statuses, &[], &[], true, 45, &profile);
+        assert!(!without.contains("Output so far"), "{without}");
     }
 
     #[test]

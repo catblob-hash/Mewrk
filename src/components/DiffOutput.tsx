@@ -1,5 +1,12 @@
 import { type CSSProperties, useMemo } from "react";
 import { useI18n } from "../i18n";
+import type { CodeToken } from "../lib/codeHighlight";
+import { highlightDiffLines } from "../lib/diffHighlight";
+import { codeLanguage } from "../lib/fileViewers";
+import { wordDiff } from "../lib/wordDiff";
+import type { WordDiffSegment } from "../lib/wordDiff";
+import { DiffLineTokens } from "./CodeBlock";
+import { FileIcon } from "./FileIcon";
 import { PathText } from "./PathText";
 
 export type DiffLineKind = "file" | "hunk" | "context" | "addition" | "deletion" | "meta";
@@ -159,6 +166,62 @@ function gutterCharacters(lines: ParsedDiffLine[]): number {
   return String(widest).length;
 }
 
+/**
+ * Every hunk's lines coloured as the code they are (`diffHighlight.ts`). A hunk or file
+ * row ends an excerpt, so nothing left open in one hunk colours the next.
+ */
+function highlightParsedLines(
+  language: string | null,
+  lines: readonly ParsedDiffLine[]
+): Map<ParsedDiffLine, CodeToken[]> {
+  const tokens = new Map<ParsedDiffLine, CodeToken[]>();
+  if (language === null) return tokens;
+  let hunk: ParsedDiffLine[] = [];
+  const flush = () => {
+    const highlighted = highlightDiffLines(language, hunk, (line) => ({
+      side: line.kind === "addition" ? "new" : line.kind === "deletion" ? "old" : "both",
+      text: line.text
+    }));
+    for (const [line, lineTokens] of highlighted) tokens.set(line, lineTokens);
+    hunk = [];
+  };
+  for (const line of lines) {
+    if (line.kind === "context" || line.kind === "addition" || line.kind === "deletion") hunk.push(line);
+    else flush();
+  }
+  flush();
+  return tokens;
+}
+
+/**
+ * The words that changed within a replaced line. A run's removals and additions are
+ * paired in order, as the review pane pairs them; a line with no counterpart has nothing
+ * to be compared with. `lines` are as drawn, each run's removals first.
+ */
+function changedWords(lines: readonly ParsedDiffLine[]): Map<ParsedDiffLine, WordDiffSegment[]> {
+  const segments = new Map<ParsedDiffLine, WordDiffSegment[]>();
+  let index = 0;
+  while (index < lines.length) {
+    if (lines[index].kind !== "deletion") {
+      index += 1;
+      continue;
+    }
+    let additions = index;
+    while (additions < lines.length && lines[additions].kind === "deletion") additions += 1;
+    let end = additions;
+    while (end < lines.length && lines[end].kind === "addition") end += 1;
+    const pairs = Math.min(additions - index, end - additions);
+    for (let pair = 0; pair < pairs; pair += 1) {
+      const result = wordDiff(lines[index + pair].text, lines[additions + pair].text);
+      if (result.bailed) continue;
+      segments.set(lines[index + pair], result.before);
+      segments.set(lines[additions + pair], result.after);
+    }
+    index = end;
+  }
+  return segments;
+}
+
 export function DiffOutput({
   value,
   path
@@ -173,7 +236,11 @@ export function DiffOutput({
     [parsed.lines, t]
   );
   const gutter = useMemo(() => gutterCharacters(renderedLines), [renderedLines]);
-  const displayPath = path || parsed.path || t("文件", "File");
+  const language = useMemo(() => codeLanguage(path || parsed.path || ""), [path, parsed.path]);
+  const tokens = useMemo(() => highlightParsedLines(language, parsed.lines), [language, parsed.lines]);
+  const words = useMemo(() => changedWords(renderedLines), [renderedLines]);
+  const filePath = path || parsed.path;
+  const displayPath = filePath || t("文件", "File");
   const renderLineNumber = (line: ParsedDiffLine) => (
     <span className="diff-output__line-number" aria-hidden="true">{displayedLineNumber(line) ?? ""}</span>
   );
@@ -186,6 +253,7 @@ export function DiffOutput({
       style={{ "--diff-gutter": `${gutter}ch` } as CSSProperties}
     >
       <div className="diff-output__header">
+        {filePath && <FileIcon path={filePath} size={13} />}
         <PathText className="diff-output__path" path={displayPath} />
         <span className="diff-output__stats" aria-label={t("新增 {additions} 行，删除 {deletions} 行", "{additions} lines added, {deletions} lines deleted", { additions: parsed.additions, deletions: parsed.deletions })}>
           <b className="diff-output__stat diff-output__stat--addition">+{parsed.additions}</b>
@@ -196,7 +264,14 @@ export function DiffOutput({
         {renderedLines.length > 0 ? renderedLines.map((line, index) => (
           <div key={`${index}:${line.kind}`} className={`diff-output__line diff-output__line--${line.kind}`}>
             {renderLineNumber(line)}
-            <span className="diff-output__content">{line.text}</span>
+            <span className="diff-output__content">
+              <DiffLineTokens
+                text={line.text}
+                tokens={tokens.get(line)}
+                segments={words.get(line)}
+                wordClassName={`diff-output__word diff-output__word--${line.kind}`}
+              />
+            </span>
           </div>
         )) : (
           <div className="diff-output__empty">{t("没有行级变化", "No line-level changes")}</div>

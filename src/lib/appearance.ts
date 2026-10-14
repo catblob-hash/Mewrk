@@ -1,6 +1,13 @@
 import { useSyncExternalStore } from "react";
 import type { AppearancePreferences, KeyToken } from "../types";
 import { replacesThemeGround } from "./background";
+import {
+  CODE_THEME_VARIABLES,
+  codeThemeFor,
+  codeThemeVariables,
+  DEFAULT_CODE_THEME
+} from "./codeThemes";
+import type { CodeThemeScheme } from "./codeThemes";
 import { concreteBinding, PRIMARY_MODIFIER } from "./shortcuts";
 
 /**
@@ -77,6 +84,8 @@ export function defaultAppearancePreferences(): AppearancePreferences {
     customCss: "",
     liquidGlass: false,
     background: "solid",
+    codeThemeDay: DEFAULT_CODE_THEME.day,
+    codeThemeNight: DEFAULT_CODE_THEME.night,
     localModel: {
       titles: false,
       shellExplanations: false,
@@ -205,6 +214,22 @@ function applyCustomCss(css: string): void {
   }
 }
 
+/**
+ * Put one scheme's code theme on the root as `--code-<scheme>-*`. Both schemes are always
+ * there; the stylesheet reads the set the theme on screen names (`styles/base.css`). A
+ * variable the theme leaves out is removed, so the surface it would have coloured falls
+ * back to the app's own.
+ */
+function applyCodeTheme(style: CSSStyleDeclaration, scheme: CodeThemeScheme, id: string): void {
+  const variables = codeThemeVariables(codeThemeFor(id, scheme));
+  for (const name of CODE_THEME_VARIABLES) {
+    const property = `--code-${scheme}-${name}`;
+    const value = variables[name];
+    if (value === undefined) style.removeProperty(property);
+    else style.setProperty(property, value);
+  }
+}
+
 export function applyAppearance(appearance: AppearancePreferences): void {
   publishAppearance(appearance);
   if (typeof document === "undefined") return;
@@ -237,6 +262,8 @@ export function applyAppearance(appearance: AppearancePreferences): void {
   style.setProperty("--message-font-size", `${clampMessageFontSize(appearance.messageFontSize)}px`);
   // Use `zoom`, not `transform: scale()`, so layout, hit testing, and scrollbars scale too.
   style.setProperty("zoom", String(clampZoom(appearance.zoom)));
+  applyCodeTheme(style, "day", appearance.codeThemeDay);
+  applyCodeTheme(style, "night", appearance.codeThemeNight);
 
   root.dataset.wideMessages = appearance.wideMessages ? "true" : "false";
   root.dataset.codeWrap = appearance.codeBlockWrappable ? "true" : "false";

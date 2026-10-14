@@ -3,7 +3,7 @@
   "language": "en-US",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
   "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
-  "toolCount": 50,
+  "toolCount": 51,
   "tools": [
     {
       "name": "ls",
@@ -52,11 +52,48 @@
           "defaultValue": "."
         },
         {
+          "name": "glob",
+          "label": "File glob",
+          "type": "string",
+          "required": false,
+          "placeholder": "*.rs",
+          "help": "Only search files whose path matches this glob, such as *.rs or src/**/*.tsx."
+        },
+        {
           "name": "case_sensitive",
           "label": "Case sensitive",
           "type": "boolean",
           "required": false,
-          "defaultValue": false
+          "defaultValue": true
+        },
+        {
+          "name": "output_mode",
+          "label": "Output mode",
+          "type": "string",
+          "required": false,
+          "defaultValue": "files_with_matches",
+          "help": "files_with_matches (default) lists the files that match; content lists the matching lines; count gives the number of matching lines per file."
+        },
+        {
+          "name": "context",
+          "label": "Context",
+          "type": "number",
+          "required": false,
+          "help": "content mode only: lines of context to show before and after each match, 0 to 20."
+        },
+        {
+          "name": "before",
+          "label": "Lines before",
+          "type": "number",
+          "required": false,
+          "help": "content mode only: lines of context to show before each match, 0 to 20."
+        },
+        {
+          "name": "after",
+          "label": "Lines after",
+          "type": "number",
+          "required": false,
+          "help": "content mode only: lines of context to show after each match, 0 to 20."
         },
         {
           "name": "limit",
@@ -64,7 +101,7 @@
           "type": "number",
           "required": false,
           "defaultValue": 250,
-          "help": "Most matching lines to return: 250 by default, at most 1,000."
+          "help": "Most results of the chosen mode to return: 250 by default, at most 1,000."
         },
         {
           "name": "offset",
@@ -72,7 +109,7 @@
           "type": "number",
           "required": false,
           "defaultValue": 0,
-          "help": "Matching lines to skip first, to fetch the next page."
+          "help": "Results of the chosen mode to skip first, to fetch the next page."
         }
       ]
     },
@@ -866,7 +903,7 @@
         },
         {
           "name": "context",
-          "label": "Initial context",
+          "label": "Context",
           "type": "string",
           "required": false,
           "defaultValue": "none",
@@ -914,6 +951,23 @@
       "category": "orchestration",
       "dangerous": false,
       "parameters": []
+    },
+    {
+      "name": "task_stop",
+      "label": "Stop a task",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "task",
+          "label": "Task address",
+          "type": "string",
+          "required": true,
+          "placeholder": "shell:1",
+          "help": "Address of the task to stop: a background command as shell:<id>, a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>). Terminal sessions cannot be stopped with this tool, and dev servers are stopped with preview_stop. The stopped task's result is still delivered."
+        }
+      ]
     },
     {
       "name": "box",

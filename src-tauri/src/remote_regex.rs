@@ -48,23 +48,22 @@ pub(crate) struct RemotePattern {
     /// no single quote, so it can sit inside a single-quoted shell word.
     pub pcre: String,
     /// Whether `pcre` accepts exactly the host's lines rather than a
-    /// superset; likewise `ere_exact` and `dotnet_exact`. The grep leg does
-    /// not consult them — it cannot tell which engine a machine ran and
-    /// re-checks every line anyway — but the tests hold each rendering to
-    /// the claim.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// superset; likewise `ere_exact` and `dotnet_exact`. The grep leg cannot
+    /// tell which engine a machine ran, so it relies on a claim only when every
+    /// engine that could run makes it (`pcre_exact && ere_exact`; `dotnet_exact`
+    /// for PowerShell): then a machine may answer `files_with_matches` and
+    /// `count` in summaries instead of lines for the host to re-check. The
+    /// tests hold each rendering to the claim.
     pub pcre_exact: bool,
     /// For POSIX `grep -E` under `LC_ALL=C`, without `-i`. Raw bytes, because
     /// bracket expressions take no escapes; never a newline or a NUL. Pass it
     /// through [`ere_printf_argument`].
     pub ere: Vec<u8>,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub ere_exact: bool,
     /// For .NET `Regex` with `RegexOptions.CultureInvariant` and nothing else.
     /// Printable ASCII with no single quote, so it can sit inside a
     /// single-quoted PowerShell string.
     pub dotnet: String,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub dotnet_exact: bool,
     /// The host's own matcher, built exactly as the local leg builds it, for
     /// re-checking remote lines.

@@ -119,6 +119,14 @@ const tools: ToolDescriptor[] = [
     dangerous: false,
     parameters: []
   },
+  {
+    name: "task_stop",
+    label: "停止任务",
+    description: "",
+    category: "orchestration",
+    dangerous: false,
+    parameters: []
+  },
 ];
 
 function ControlledGroups({
@@ -446,10 +454,11 @@ describe("ToolSelectionGroups", () => {
   });
 
   it("does not render host-derived task runtime controls", () => {
-    render(<ControlledGroups initialEnabledTools={["read", "task_wait", "task_list", "box"]} expansionKey="preset-one" />);
+    render(<ControlledGroups initialEnabledTools={["read", "task_wait", "task_list", "task_stop", "box"]} expansionKey="preset-one" />);
 
     expect(screen.queryByText("等待任务")).not.toBeInTheDocument();
     expect(screen.queryByText("任务列表")).not.toBeInTheDocument();
+    expect(screen.queryByText("停止任务")).not.toBeInTheDocument();
     expect(screen.queryByText("后台结果")).not.toBeInTheDocument();
   });
 

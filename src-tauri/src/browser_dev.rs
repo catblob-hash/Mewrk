@@ -630,6 +630,14 @@ async fn dispatch(
             app.state::<AppState>(),
             arg(args, "request")?,
         )),
+        "attest_copied_tool_contexts" => result_value(super::attest_copied_tool_contexts(
+            app.clone(),
+            app.state::<AppState>(),
+            arg(args, "request")?,
+        )),
+        "rewind_files" => result_value(
+            super::rewind_files(app.clone(), app.state::<AppState>(), arg(args, "request")?).await,
+        ),
         "reorder_conversations" => result_value(super::reorder_conversations(
             app.clone(),
             app.state::<AppState>(),

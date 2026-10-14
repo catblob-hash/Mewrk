@@ -278,7 +278,7 @@ export function AgentRoleEditor({
   /* Two whole categories are withheld here, for two unrelated reasons.
    *
    * `orchestration` — a child may hold NONE of it. The host strips
-   * `agent_spawn` / `task_wait` / `task_list` / `workflow` / `ask_user` from
+   * `agent_spawn` / `task_wait` / `task_list` / `task_stop` / `workflow` / `ask_user` from
    * every child template (`SUBAGENT_DISABLED_TOOL_NAMES` in
    * `src-tauri/src/api.rs`), and that list is re-applied to the catalogue a
    * role's allowlist selects out of — so ticking one of them here could
@@ -297,9 +297,9 @@ export function AgentRoleEditor({
    * (`agent_roles::all_role_tool_names`) is drawn by the same rule.
    *
    * Two members of that category are NOT actually withdrawn by this rule.
-   * `skill` is available to a child on purpose, and `task_wait` / `task_list`
-   * are re-derived for a child that still holds a task-producing tool. All
-   * three are host-derived (`isHostDerivedToolName`), so `ToolSelectionGroups`
+   * `skill` is available to a child on purpose, and `task_wait` / `task_list` /
+   * `task_stop` are re-derived for a child that still holds a task-producing
+   * tool. All of them are host-derived (`isHostDerivedToolName`), so `ToolSelectionGroups`
    * has never offered them in any picker and nothing on this screen decides
    * their fate — the host exempts them from the allowlist in both directions.
    *

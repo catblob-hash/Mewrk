@@ -518,6 +518,150 @@ pub(crate) fn attest_inserted_tool_context(
     })
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AttestCopiedToolContextsRequest {
+    /// The conversation the copies go into.
+    pub conversation_id: String,
+    pub copies: Vec<CopiedToolContext>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CopiedToolContext {
+    /// The conversation the card was copied out of.
+    pub source_conversation_id: String,
+    /// The card as it was copied: under its own id, with its own attestation.
+    pub source: crate::model::ContextItem,
+    /// The id its copy takes.
+    pub context_id: String,
+}
+
+/// Issues one attestation per copied tool card, in request order, for the
+/// conversation and id each copy takes.
+///
+/// A copy is a new card in a new home, and the token is bound to both, so the
+/// source's cannot be carried over; it is re-issued, as a fork does. Re-issuing
+/// is a signature, so the source has to prove itself first — by its own token,
+/// or by being the very card the host already stores — or this command would
+/// launder a card the renderer forged. All or nothing: one refused copy
+/// refuses the batch, and nothing is partly signed.
+pub(crate) fn attest_copied_tool_contexts(
+    state: &AppState,
+    path: &Path,
+    request: AttestCopiedToolContextsRequest,
+) -> Result<Vec<String>, String> {
+    use crate::model::ContextItem;
+
+    if state.conversation_model_run_active(&request.conversation_id) {
+        return Err("对话正在运行，不能编辑工具记录".into());
+    }
+    if request.copies.is_empty() {
+        return Ok(Vec::new());
+    }
+    // A draft the user has not sent from yet has no row at all, and so no id
+    // a copy could collide with — the same as a placed call.
+    let destination = load(path, &request.conversation_id)?;
+    let mut taken: std::collections::HashSet<&str> = destination
+        .iter()
+        .flat_map(|conversation| {
+            conversation.contexts.iter().chain(
+                conversation
+                    .branches
+                    .iter()
+                    .flat_map(|branch| branch.contexts.iter()),
+            )
+        })
+        .map(ContextItem::id)
+        .collect();
+    let mut attestations = Vec::with_capacity(request.copies.len());
+    for copy in &request.copies {
+        let ContextItem::Tool {
+            id: source_id,
+            tool_name,
+            requested_input,
+            input,
+            result,
+            subagent,
+            attestation: source_attestation,
+            ..
+        } = &copy.source
+        else {
+            return Err("上下文不是工具记录".into());
+        };
+        if subagent.is_some() {
+            return Err("带有子代理记录的工具卡不能复制".into());
+        }
+        if copy.context_id.is_empty() || !taken.insert(copy.context_id.as_str()) {
+            return Err("该上下文编号已经存在".into());
+        }
+        let own_token = state.verify_tool_context(
+            &crate::tool_attestation::AttestationSubject {
+                conversation_id: &copy.source_conversation_id,
+                context_id: source_id,
+                tool_name,
+                input,
+                requested_input: requested_input.as_ref(),
+                result,
+                subagent: None,
+            },
+            source_attestation,
+        );
+        // A card stored before tokens existed has none to verify; the host
+        // holding it unchanged is the same trust the save check gives it.
+        let stored = || -> Result<bool, String> {
+            let Some(source) = load(path, &copy.source_conversation_id)? else {
+                return Ok(false);
+            };
+            Ok(source
+                .contexts
+                .iter()
+                .chain(
+                    source
+                        .branches
+                        .iter()
+                        .flat_map(|branch| branch.contexts.iter()),
+                )
+                .any(|held| {
+                    matches!(held, ContextItem::Tool {
+                        id: held_id,
+                        tool_name: held_tool,
+                        requested_input: held_requested,
+                        input: held_input,
+                        result: held_result,
+                        subagent: held_subagent,
+                        ..
+                    } if held_id == source_id
+                        && held_tool == tool_name
+                        && held_requested == requested_input
+                        && held_input == input
+                        && held_result == result
+                        && held_subagent == subagent)
+                }))
+        };
+        if !own_token && !stored()? {
+            return Err(format!(
+                "工具卡 {}（{}）无法证明来自本应用自己的执行，不能复制",
+                source_id, tool_name
+            ));
+        }
+        let attestation = state.attest_tool_context(&crate::tool_attestation::AttestationSubject {
+            conversation_id: &request.conversation_id,
+            context_id: &copy.context_id,
+            tool_name,
+            input,
+            requested_input: requested_input.as_ref(),
+            result,
+            subagent: None,
+        });
+        if attestation.is_empty() {
+            return Err("无法签发工具记录凭证".into());
+        }
+        attestations.push(attestation);
+    }
+    Ok(attestations)
+}
+
 /// Reads authoritative conversation prose: from memory when the shared pool
 /// holds the body, otherwise from the database. The renderer aligns its read
 /// model after every completed turn so persisted content is always visible.
@@ -950,6 +1094,308 @@ mod tests {
             attest_inserted_tool_context(&state, &anchor, insert_request(&conversation)).is_err()
         );
         state.finish_model_run("place-run", &cancel);
+    }
+
+    fn copy_request(
+        destination: &str,
+        source_conversation: &str,
+        copies: &[(&crate::model::ContextItem, &str)],
+    ) -> AttestCopiedToolContextsRequest {
+        AttestCopiedToolContextsRequest {
+            conversation_id: destination.into(),
+            copies: copies
+                .iter()
+                .map(|(source, context_id)| CopiedToolContext {
+                    source_conversation_id: source_conversation.into(),
+                    source: (*source).clone(),
+                    context_id: (*context_id).into(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The attestation subject of `card` as it would sit under `conversation_id`
+    /// and `context_id`, for asking the state whether a token belongs there.
+    fn verifies(
+        state: &AppState,
+        card: &crate::model::ContextItem,
+        conversation_id: &str,
+        context_id: &str,
+        token: &str,
+    ) -> bool {
+        let crate::model::ContextItem::Tool {
+            tool_name,
+            requested_input,
+            input,
+            result,
+            ..
+        } = card
+        else {
+            panic!("not a tool card");
+        };
+        state.verify_tool_context(
+            &crate::tool_attestation::AttestationSubject {
+                conversation_id,
+                context_id,
+                tool_name,
+                input,
+                requested_input: requested_input.as_ref(),
+                result,
+                subagent: None,
+            },
+            token,
+        )
+    }
+
+    #[test]
+    fn copied_card_is_reissued_for_its_new_id_and_saves() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, anchor, workspace_id, mut conversation) = edited_card_fixture(directory.path());
+        // The fixture's card predates tokens: the store holding it unchanged is
+        // what proves it.
+        let source = conversation.contexts[0].clone();
+        let tokens = attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(
+                &conversation.id,
+                &conversation.id,
+                &[(&source, "copied-card")],
+            ),
+        )
+        .unwrap();
+        assert_eq!(tokens.len(), 1);
+        let mut copy = source.clone();
+        if let crate::model::ContextItem::Tool {
+            id, attestation, ..
+        } = &mut copy
+        {
+            *id = "copied-card".into();
+            *attestation = tokens[0].clone();
+        }
+        conversation.contexts.push(copy);
+        // The expectation is what is on disk now, not what the proposal adds.
+        let ids = vec!["edited-card".to_owned()];
+        let saved = update(&state, &anchor, &workspace_id, &conversation, &ids).unwrap();
+        assert_eq!(saved.contexts, conversation.contexts);
+
+        // Nothing to copy is nothing to sign.
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(&conversation.id, &conversation.id, &[])
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn copied_card_verifies_in_another_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, anchor, _, conversation) = edited_card_fixture(directory.path());
+        let source = conversation.contexts[0].clone();
+        let tokens = attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(
+                "conv_never_saved",
+                &conversation.id,
+                &[(&source, "copied-card")],
+            ),
+        )
+        .unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert!(verifies(
+            &state,
+            &source,
+            "conv_never_saved",
+            "copied-card",
+            &tokens[0]
+        ));
+        // The token is bound to its new home, not carried from the old one.
+        assert!(!verifies(
+            &state,
+            &source,
+            &conversation.id,
+            "edited-card",
+            &tokens[0]
+        ));
+    }
+
+    #[test]
+    fn copied_card_proves_itself_by_its_own_token_when_the_store_lacks_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, anchor, _, conversation) = edited_card_fixture(directory.path());
+        let mut card = conversation.contexts[0].clone();
+        // A card from a conversation the store knows nothing about, carrying
+        // the token that conversation's own run would have issued.
+        let token = {
+            let crate::model::ContextItem::Tool {
+                id,
+                tool_name,
+                requested_input,
+                input,
+                result,
+                ..
+            } = &card
+            else {
+                panic!("not a tool card");
+            };
+            state.attest_tool_context(&crate::tool_attestation::AttestationSubject {
+                conversation_id: "conv_elsewhere",
+                context_id: id,
+                tool_name,
+                input,
+                requested_input: requested_input.as_ref(),
+                result,
+                subagent: None,
+            })
+        };
+        if let crate::model::ContextItem::Tool {
+            id, attestation, ..
+        } = &mut card
+        {
+            *id = "elsewhere-card".into();
+            *attestation = token;
+        }
+        // The token was minted for "edited-card"; under another id it proves nothing.
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(
+                &conversation.id,
+                "conv_elsewhere",
+                &[(&card, "copied-card")]
+            )
+        )
+        .is_err());
+        // Under its own id and conversation it proves itself, with no stored copy.
+        if let crate::model::ContextItem::Tool { id, .. } = &mut card {
+            *id = "edited-card".into();
+        }
+        let tokens = attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(
+                &conversation.id,
+                "conv_elsewhere",
+                &[(&card, "copied-card")],
+            ),
+        )
+        .unwrap();
+        assert!(verifies(
+            &state,
+            &card,
+            &conversation.id,
+            "copied-card",
+            &tokens[0]
+        ));
+        // And the same card claimed from a conversation it does not belong to does not.
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(&conversation.id, "conv_other", &[(&card, "copied-card")])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn copied_card_refuses_what_it_cannot_prove_or_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, anchor, _, conversation) = edited_card_fixture(directory.path());
+        let source = conversation.contexts[0].clone();
+        let id = conversation.id.as_str();
+
+        // (i) A forged result is not the card the host holds under that id.
+        let mut forged = source.clone();
+        if let crate::model::ContextItem::Tool { result, .. } = &mut forged {
+            result.output = "forged output".into();
+        }
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(id, id, &[(&forged, "copied-card")])
+        )
+        .is_err());
+
+        // (ii) An id already in the destination would quietly become a second card.
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(id, id, &[(&source, "edited-card")])
+        )
+        .is_err());
+        // An empty id names no card.
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(id, id, &[(&source, "")])
+        )
+        .is_err());
+
+        // (iii) Two copies cannot share one id, and one bad copy refuses the batch.
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(
+                id,
+                id,
+                &[(&source, "copied-card"), (&source, "copied-card")]
+            )
+        )
+        .is_err());
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(id, id, &[(&source, "copied-card"), (&forged, "other-card")])
+        )
+        .is_err());
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(id, id, &[(&source, "copied-card"), (&source, "other-card")])
+        )
+        .is_ok());
+
+        // (iv) A running destination takes no edits.
+        let (cancel, _) = state.begin_model_run("copy-run", id).unwrap();
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(id, id, &[(&source, "copied-card")])
+        )
+        .is_err());
+        state.finish_model_run("copy-run", &cancel);
+
+        // (v) Only a tool card is a tool card.
+        let message: crate::model::ContextItem = serde_json::from_value(serde_json::json!({
+            "kind": "user", "id": "user-1", "content": "hello",
+            "createdAt": "2026-09-10T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(id, id, &[(&message, "copied-card")])
+        )
+        .is_err());
+
+        // A card with a child transcript is not copied, even when the host holds it.
+        let mut with_child = source.clone();
+        if let crate::model::ContextItem::Tool { subagent, .. } = &mut with_child {
+            *subagent = Some(
+                serde_json::from_value(serde_json::json!({
+                    "task": "child", "status": "completed", "contexts": [], "updates": []
+                }))
+                .unwrap(),
+            );
+        }
+        assert!(attest_copied_tool_contexts(
+            &state,
+            &anchor,
+            copy_request(id, id, &[(&with_child, "copied-card")])
+        )
+        .is_err());
     }
 
     /// The user may move the level at any time: a write during a run lands at

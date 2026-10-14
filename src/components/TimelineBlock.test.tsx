@@ -317,6 +317,7 @@ describe("buildContextRenderNodes", () => {
       "followup_task",
       "task_wait",
       "task_list",
+      "task_stop",
       "box",
       "subagent",
       "subagent_update",
@@ -354,7 +355,7 @@ describe("buildContextRenderNodes", () => {
     // affordances still address the raw index they were built from.
     const blocks = nodes.filter((node) => node.kind === "block");
     expect(blocks.map((node) => (node.kind === "block" ? node.entries.map(({ index }) => index) : [])))
-      .toEqual([[0, 1, 2, 3, 4], [6, 7, 8, 9, 10, 11, 12, 13]]);
+      .toEqual([[0, 1, 2, 3, 4], [6, 7, 8, 9, 10, 11, 12, 13, 14]]);
     // The key names the block by the first record in it, so two blocks in one
     // run never collide.
     expect(blocks.map((node) => (node.kind === "block" ? node.key : "")))
@@ -589,12 +590,13 @@ describe("TimelineBlock", () => {
     // The red line says it failed; the body waits for the reader to open it.
     expect(row).toHaveClass("timeline-row--error");
     expect(getRowToggle(row)).toHaveAttribute("aria-expanded", "false");
-    expect(within(row).queryByRole("alert")).not.toBeInTheDocument();
+    expect(row.querySelector(".tool-renderer")).toBeNull();
 
+    // Open, it is an ordinary card that ends in the error: red stays on the title.
     await user.click(getRowToggle(row));
     expect(getRowToggle(row)).toHaveAttribute("aria-expanded", "true");
-    expect(within(row).getByRole("alert")).toHaveTextContent("读取文件失败");
-    expect(within(row).getByRole("alert")).toHaveTextContent("无法读取 broken.ts");
+    expect(row.querySelector(".tool-renderer")).toHaveTextContent("无法读取 broken.ts");
+    expect(within(row).queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("keeps an announced streaming call non-expandable and hides persisted-call actions", async () => {
@@ -652,6 +654,9 @@ describe("TimelineBlock", () => {
     const link = row.querySelector<HTMLElement>(".timeline-row__file")!;
     expect(link).toHaveTextContent("notes.md");
     expect(link).toHaveAttribute("title", "src/lib/notes.md");
+    // The file's type icon is part of the link, ahead of the name.
+    expect(link.firstElementChild).toHaveAttribute("src", "/file-icons/markdown.svg");
+    expect(link.firstElementChild).toHaveClass("file-icon--inline");
     await user.click(link);
     expect(requests).toEqual([expect.objectContaining({
       path: "src/lib/notes.md",
@@ -1156,5 +1161,40 @@ describe("TimelineBlock", () => {
     expect(rowText(labelledRow, "name")).toBe("调用了 MCP 工具 Search");
     expect(getRowToggle(labelledRow)).toHaveAttribute("aria-label", "调用了 MCP 工具 Search · Search · 订单退款 · 完成");
     expect(labelled.container.querySelector(".timeline-block")).toHaveAttribute("aria-label", "调用了 1 个 MCP 工具");
+  });
+
+  it("redraws for its own workflow run and for no other call's", () => {
+    const call = tool("wf-call", "workflow", {
+      round: 3,
+      input: { scriptName: "重构" },
+      output: "",
+      streaming: true,
+      streamStatus: "running"
+    });
+    const entries = [workflowEntry(call, 0), entry(tool("read-a", "read_file"), 1)];
+    // The comparator only compares the list's identity; a row reads it when it is drawn.
+    const drawn = vi.fn();
+    const tools = new Proxy<ToolDescriptor[]>([], {
+      get(target, key, receiver) {
+        drawn();
+        return Reflect.get(target, key, receiver);
+      }
+    });
+    const view = workflowView();
+    const block = (workflowRunByCall: Record<string, WorkflowRunView>) => (
+      <TimelineBlock entries={entries} tools={tools} insertionIndex={null} workflowRunByCall={workflowRunByCall} />
+    );
+    const { container, rerender } = render(block({ "wf-call": view }));
+    expect(drawn).toHaveBeenCalled();
+    drawn.mockClear();
+
+    // A stream flush or another run's clock hands every block a new map; this block's own
+    // run is the same object in it.
+    rerender(block({ "wf-call": view, "wf-other": workflowView() }));
+    expect(drawn).not.toHaveBeenCalled();
+
+    rerender(block({ "wf-call": { ...view, name: "重构二期" } }));
+    expect(drawn).toHaveBeenCalled();
+    expect(rowText(getRow(container, call.id), "name")).toBe("重构二期");
   });
 });

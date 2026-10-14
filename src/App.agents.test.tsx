@@ -94,7 +94,9 @@ describe("App model run flow — agents", () => {
     const oldStop = taskCapture.props!.onStopItem;
     const oldRow = { id: "same", conversationId: source.id, kind,
       agent: { name: "same", label: "same" } } as TaskItem;
-    await user.click(screen.getByRole("button", { name: /^Conversation B/ }));
+    // A new task's landing lists the same titles as the sidebar, so the click is scoped to the sidebar.
+    await user.click(within(screen.getByRole("navigation", { name: "对话列表" }))
+      .getByRole("button", { name: /^Conversation B/ }));
     await openTasksPane(user);
     await waitFor(() => expect(taskCapture.props?.conversationId).toBe("conversation-B"));
     act(() => oldStop(oldRow));

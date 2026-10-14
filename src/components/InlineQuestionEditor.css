@@ -54,7 +54,7 @@
   margin-bottom: 13px;
 }
 
-/* The same box every other tool card is read and edited in (`.tool-kv__value`
+/* The same box every other tool card is edited in (`.tool-kv__value`
    in conversation.css): a thin frame that hovering leaves alone, an error
    colours red, and focus colours over the error. The fill stays `.input`'s, so
    glass still swaps it for its panel. */

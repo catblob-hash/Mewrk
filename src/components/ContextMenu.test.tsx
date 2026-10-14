@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ContextMenu } from "./ContextMenu";
 import type { ContextMenuSection } from "./ContextMenu";
@@ -41,5 +42,70 @@ describe("ContextMenu", () => {
     expect(chosen).toHaveBeenCalledTimes(1);
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(loadChildren).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes the keyboard once it is placed, and gives focus back when it closes", () => {
+    // What a browser does and jsdom does not: nothing inside a hidden box takes focus.
+    const focus = HTMLElement.prototype.focus;
+    vi.spyOn(HTMLElement.prototype, "focus").mockImplementation(function (this: HTMLElement, options?: FocusOptions) {
+      for (let box: HTMLElement | null = this; box; box = box.parentElement) {
+        if (box.style.visibility === "hidden") return;
+      }
+      focus.call(this, options);
+    });
+    const opener = document.createElement("button");
+    document.body.append(opener);
+    opener.focus();
+    const onClose = vi.fn();
+    const { unmount } = render(
+      <ContextMenu
+        anchor={{ x: 10, y: 10 }}
+        sections={[{ id: "file", items: [{ id: "open", label: "Open" }, { id: "rename", label: "Rename" }] }]}
+        label="File actions"
+        onClose={onClose}
+      />
+    );
+    const menu = screen.getByRole("menu", { name: "File actions" });
+    const open = within(menu).getByRole("menuitem", { name: "Open" });
+
+    expect(open).toHaveFocus();
+    fireEvent.keyDown(open, { key: "ArrowDown" });
+    expect(within(menu).getByRole("menuitem", { name: "Rename" })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    unmount();
+    expect(opener).toHaveFocus();
+    opener.remove();
+  });
+
+  it("leaves focus where the chosen row put it", () => {
+    function Files() {
+      const [open, setOpen] = useState(true);
+      const [renaming, setRenaming] = useState(false);
+      return (
+        <>
+          {renaming && <input aria-label="New name" ref={(field) => field?.focus()} />}
+          {open && (
+            <ContextMenu
+              anchor={{ x: 10, y: 10 }}
+              sections={[{ id: "file", items: [{ id: "rename", label: "Rename", onSelect: () => setRenaming(true) }] }]}
+              label="File actions"
+              onClose={() => setOpen(false)}
+            />
+          )}
+        </>
+      );
+    }
+    const opener = document.createElement("button");
+    document.body.append(opener);
+    opener.focus();
+    render(<Files />);
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "New name" })).toHaveFocus();
+    opener.remove();
   });
 });

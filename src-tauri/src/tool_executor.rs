@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{Read, Seek},
+    io::{BufRead, BufReader, Read, Seek},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -19,6 +19,7 @@ use walkdir::WalkDir;
 use crate::host_platform::host_platform;
 use crate::{
     cancel::CancelSignal,
+    file_checkpoints::{self, CheckpointContext},
     file_read_state::{self, FileReadRecord, FileReadRegistry, ScopeRef},
     file_sandbox::FileSandbox,
     image_attachments::{is_supported_image, ImageAttachmentStore},
@@ -37,6 +38,8 @@ use crate::{
     state::AppState,
     storage::atomic_write,
 };
+
+pub(crate) mod read_text;
 
 const MAX_TOOL_OUTPUT: usize = 64 * 1024;
 const MAX_DIFF_OUTPUT: usize = 64 * 1024;
@@ -209,10 +212,21 @@ pub fn execute_with_scope_and_attachments(
     workspaces: &crate::workspace_set::WorkspaceSet,
     profile: &PromptProfile,
 ) -> ToolExecutionResponse {
+    // A tool run by hand is written into the conversation like any other call,
+    // so what it changes in a file belongs to the user's latest saved message.
+    let conversation_id = request.conversation_id.clone();
+    let anchor = app_data
+        .filter(|_| matches!(request.tool_name.as_str(), "write" | "edit"))
+        .and_then(|app_data| file_checkpoints::anchor_from_store(app_data, &conversation_id));
+    let checkpoint = app_data.zip(anchor.as_deref()).map(|(app_data, anchor)| CheckpointContext {
+        conversation_id: &conversation_id,
+        anchor,
+        app_data,
+    });
     // Direct IPC and test calls do not belong to a model turn, so they receive an
     // empty signal and no handoff. Their synchronous shells are stopped only by
     // their own task row, and a timed-out one has no pool to be adopted into.
-    execute_with_scope_and_attachments_verified(
+    execute_with_scope_and_attachments_guarded(
         request,
         state,
         scope,
@@ -221,6 +235,9 @@ pub fn execute_with_scope_and_attachments(
         workspaces,
         None,
         profile,
+        None,
+        checkpoint,
+        None,
     )
     .result
 }
@@ -233,6 +250,11 @@ pub fn execute_with_scope_and_attachments(
 /// model-turn dispatcher can supply one, because adopting a running command means
 /// putting it in that turn's task pool; direct IPC passes `None` and its
 /// timed-out commands are stopped.
+///
+/// With no guard and no checkpoint, which no caller outside the tests wants any
+/// more: the IPC entry above files its own checkpoint, and the run loop passes
+/// both.
+#[cfg(test)]
 pub(crate) fn execute_with_scope_and_attachments_verified(
     request: ToolExecutionRequest,
     state: &AppState,
@@ -254,6 +276,7 @@ pub(crate) fn execute_with_scope_and_attachments_verified(
         profile,
         None,
         None,
+        None,
     )
 }
 
@@ -261,6 +284,10 @@ pub(crate) fn execute_with_scope_and_attachments_verified(
 /// guards this turn runs under. Only the run loop has a guard to pass; every
 /// other caller keeps the unguarded contract, where `read` records nothing and
 /// `write`/`edit` check nothing.
+///
+/// `checkpoint` is where a `write` or `edit` files the content it is about to
+/// replace ([`file_checkpoints`]). It is independent of the guards: a
+/// conversation that turned them off is still rewound the same.
 ///
 /// `call_id` is the model's id for this call. A shell command files it on its
 /// task row, which is where the helper model's summary of the call finds it.
@@ -275,6 +302,7 @@ pub(crate) fn execute_with_scope_and_attachments_guarded(
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
+    checkpoint: Option<CheckpointContext<'_>>,
     call_id: Option<&str>,
 ) -> VerifiedToolExecutionResponse {
     let started = Instant::now();
@@ -290,6 +318,7 @@ pub(crate) fn execute_with_scope_and_attachments_guarded(
         handoff,
         profile,
         file_guard,
+        checkpoint,
         call_id,
     )
     .unwrap_or_else(|error| Outcome {
@@ -544,6 +573,7 @@ fn run_tool(
     handoff: Option<&ShellHandoff<'_>>,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
+    checkpoint: Option<CheckpointContext<'_>>,
     call_id: Option<&str>,
 ) -> Result<Outcome, String> {
     // A caller that resolved no set is a caller with one workspace: its own
@@ -665,8 +695,24 @@ fn run_tool(
                 call_id,
             )
         }
-        "write" => run_write(workspace, &request.input, scope, profile, file_guard, sandbox),
-        "edit" => run_edit(workspace, &request.input, scope, profile, file_guard, sandbox),
+        "write" => run_write_checkpointed(
+            workspace,
+            &request.input,
+            scope,
+            profile,
+            file_guard,
+            checkpoint,
+            sandbox,
+        ),
+        "edit" => run_edit_checkpointed(
+            workspace,
+            &request.input,
+            scope,
+            profile,
+            file_guard,
+            checkpoint,
+            sandbox,
+        ),
         "find" => {
             run_find(workspace, &request.input, scope, profile, sandbox).map(Outcome::success)
         }
@@ -1649,10 +1695,9 @@ fn run_grep(
 ) -> Result<String, String> {
     let pattern = required_string(input, "pattern", 4096, false)?;
     let path = optional_string(input, "path", ".", MAX_PATH_CHARS, false)?;
-    let case_sensitive = optional_bool(input, "case_sensitive", false)?;
-    let page = search_scope::GrepPage::from_input(input)?;
+    let query = search_scope::GrepQuery::from_input(input)?;
     let regex = RegexBuilder::new(&pattern)
-        .case_insensitive(!case_sensitive)
+        .case_insensitive(!query.case_sensitive)
         .build()
         .map_err(|error| format!("Invalid regular expression: {error}"))?;
     let workspace = canonical_workspace(workspace)?;
@@ -1661,16 +1706,26 @@ fn run_grep(
         sandbox.check_read(&root)?;
     }
 
+    let (before, after) = query.context();
     let mut search = GrepSearch {
         workspace: &workspace,
         regex: &regex,
-        wanted: page.wanted(),
+        mode: query.mode,
+        before,
+        after,
+        offset: query.page.offset,
+        // Only `content` can stop once its page is full: the other two modes
+        // sort or total over every file.
+        wanted: query.page.wanted(),
         matches: Vec::new(),
+        files: Vec::new(),
+        counts: Vec::new(),
         skipped: Vec::new(),
         sandbox,
     };
     if !root.is_dir() {
-        // A file named outright is searched whatever the ignore rules say.
+        // A file named outright is searched whatever the ignore rules or the
+        // glob say.
         search.file(&root);
     } else {
         match search_scope::local_search_files(&root) {
@@ -1681,7 +1736,9 @@ fn run_grep(
                 // this.
                 let mut linked = std::collections::HashMap::new();
                 for file in files {
-                    if search_scope::has_linked_parent(&root, &file, &mut linked) {
+                    if !query.allows(&file)
+                        || search_scope::has_linked_parent(&root, &file, &mut linked)
+                    {
                         continue;
                     }
                     let file = root.join(file);
@@ -1715,7 +1772,10 @@ fn run_grep(
                         }
                         continue;
                     }
-                    if entry.file_type().is_file() && !search.file(entry.path()) {
+                    if entry.file_type().is_file()
+                        && query.allows(&search_relative(&root, entry.path()))
+                        && !search.file(entry.path())
+                    {
                         break;
                     }
                 }
@@ -1723,66 +1783,224 @@ fn run_grep(
         }
     }
     let GrepSearch {
-        matches, skipped, ..
+        matches,
+        files,
+        counts,
+        skipped,
+        ..
     } = search;
-    Ok(page.render(matches, skipped, profile))
+    Ok(match query.mode {
+        search_scope::GrepMode::FilesWithMatches => query.render_files(files, skipped, profile),
+        search_scope::GrepMode::Content => query.render_content(matches, skipped, profile),
+        search_scope::GrepMode::Count => query.render_counts(counts, skipped, profile),
+    })
 }
 
-/// One `grep` call's search: the matches found so far, up to what the page
-/// needs.
+/// One `grep` call's search: what the files searched so far turned up, in the
+/// shape the call's mode lists it.
 struct GrepSearch<'a> {
     workspace: &'a Path,
     regex: &'a regex::Regex,
+    mode: search_scope::GrepMode,
+    /// Lines of context kept with each match of the page (`content` only).
+    before: usize,
+    after: usize,
+    /// Matches the page skips, which need no context kept.
+    offset: usize,
+    /// Matches after which `content` stops searching: the page and one more.
     wanted: usize,
-    matches: Vec<String>,
+    matches: Vec<search_scope::ContentMatch>,
+    files: Vec<search_scope::FileHit>,
+    counts: Vec<search_scope::CountHit>,
     skipped: Vec<String>,
     /// The workspace's sandbox, when it has one: each file is read through a
     /// handle proved to be a path it may read.
     sandbox: Option<&'a FileSandbox>,
 }
 
+/// Most bytes of one line `grep` takes in. A file is read a line at a time, so
+/// its size never decides how much memory a search holds — only its longest
+/// line does, up to this. A longer one (a minified bundle, a progress bar
+/// redrawn with `\r`) is matched and shown by its first this-many bytes and the
+/// rest is read past without being kept; it is still one line when lines are
+/// counted. The figure is the limit on the files `grep` used to read whole, so
+/// every line it could see before it still sees whole.
+const GREP_LINE_READ_BYTES: usize = MAX_TEXT_FILE as usize;
+
+/// Hands `visit` the lines of `reader` one at a time, decoded lossily as `read`
+/// decodes them, until it answers `false` or the stream ends.
+fn for_each_line(
+    reader: &mut dyn BufRead,
+    mut visit: impl FnMut(&str) -> bool,
+) -> std::io::Result<()> {
+    while let Some(line) = read_text::read_line(reader, GREP_LINE_READ_BYTES)? {
+        if !visit(&String::from_utf8_lossy(&line.bytes)) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl GrepSearch<'_> {
-    /// Searches one file; `false` once the page has all it needs. A link, a
-    /// file over 2 MiB and a binary file (a NUL in its first 8 KiB) are
-    /// passed over.
+    /// Searches one file; `false` once the page has all it needs. A link and a
+    /// binary file (a NUL in its first 8 KiB) are passed over. A text file is
+    /// searched whatever its size: it is streamed a line at a time off the disk,
+    /// which is what lets a long command's output, or a log, be searched like any
+    /// source file.
+    ///
+    /// A file that fails partway contributes nothing and is listed as skipped,
+    /// as one that fails to open does.
     fn file(&mut self, path: &Path) -> bool {
         let Ok(metadata) = fs::symlink_metadata(path) else {
             return true;
         };
-        if !metadata.is_file() || metadata.len() > MAX_TEXT_FILE {
+        if !metadata.is_file() {
             return true;
         }
-        let bytes = match self.sandbox {
-            None => fs::read(path).map_err(|error| error.to_string()),
-            Some(sandbox) => sandboxed_bytes(sandbox, path),
+        let opened = match self.sandbox {
+            None => File::open(path).map_err(|error| error.to_string()),
+            Some(sandbox) => sandboxed_file(sandbox, path),
         };
-        let bytes = match bytes {
-            Ok(bytes) => bytes,
+        let mut file = match opened {
+            Ok(file) => file,
             Err(error) => {
                 self.skipped
                     .push(format!("{}: {error}", display_path(self.workspace, path)));
                 return true;
             }
         };
-        if bytes.iter().take(8192).any(|byte| *byte == 0) {
+        // The head says whether it is text, as it does for `read`; what was
+        // looked at is put back in front of the rest of the stream.
+        let mut head = Vec::with_capacity(read_text::SNIFF_BYTES);
+        if let Err(error) = (&mut file)
+            .take(read_text::SNIFF_BYTES as u64)
+            .read_to_end(&mut head)
+        {
+            self.skipped
+                .push(format!("{}: {error}", display_path(self.workspace, path)));
             return true;
         }
-        let content = String::from_utf8_lossy(&bytes);
+        if head.contains(&0) {
+            return true;
+        }
+        let mut reader = BufReader::with_capacity(
+            read_text::IO_CHUNK,
+            std::io::Cursor::new(head).chain(file),
+        );
         let relative = display_path(self.workspace, path);
-        for (line_index, line) in content.lines().enumerate() {
+        let kept = self.matches.len();
+        let outcome = match self.mode {
+            search_scope::GrepMode::FilesWithMatches => {
+                // The first matching line settles it; the rest is not read.
+                let mut found = false;
+                for_each_line(&mut reader, |line| {
+                    found = self.regex.is_match(line);
+                    !found
+                })
+                .map(|()| {
+                    if found {
+                        self.files.push(search_scope::FileHit {
+                            path: relative,
+                            modified_ms: file_read_state::modified_ms_of(&metadata),
+                        });
+                    }
+                    true
+                })
+            }
+            search_scope::GrepMode::Count => {
+                let mut count = 0_u64;
+                for_each_line(&mut reader, |line| {
+                    count += u64::from(self.regex.is_match(line));
+                    true
+                })
+                .map(|()| {
+                    if count > 0 {
+                        self.counts.push(search_scope::CountHit {
+                            path: relative,
+                            count,
+                        });
+                    }
+                    true
+                })
+            }
+            search_scope::GrepMode::Content => self.content_matches(&mut reader, &relative),
+        };
+        outcome.unwrap_or_else(|error| {
+            self.matches.truncate(kept);
+            self.skipped
+                .push(format!("{}: {error}", display_path(self.workspace, path)));
+            true
+        })
+    }
+
+    /// The matching lines of one file for a `content` page, each with the
+    /// context asked for; `false` once the page is full.
+    ///
+    /// The file goes by once. The lines just above the one being read are kept,
+    /// already cut, for the matches that will show them, and a match that is
+    /// owed lines below it collects them as they pass — a window that is cut
+    /// short by the end of the file, or by the end of the page, is the same
+    /// window the whole file in memory would have given.
+    fn content_matches(
+        &mut self,
+        reader: &mut dyn BufRead,
+        relative: &str,
+    ) -> std::io::Result<bool> {
+        let cut = |line: &str| truncate_chars(line, search_scope::GREP_LINE_CHARS);
+        let mut above = std::collections::VecDeque::<String>::with_capacity(self.before);
+        // The matches still owed lines below them: where each is in
+        // `self.matches`, and how many.
+        let mut owing: Vec<(usize, usize)> = Vec::new();
+        let mut number = 0_u64;
+        let mut page_full = false;
+        for_each_line(reader, |line| {
+            number += 1;
+            if !owing.is_empty() {
+                let below = cut(line);
+                owing.retain_mut(|(at, left)| {
+                    self.matches[*at].after.push(below.clone());
+                    *left -= 1;
+                    *left > 0
+                });
+            }
+            if page_full {
+                // Only the last match's window is still being filled.
+                return !owing.is_empty();
+            }
             if self.regex.is_match(line) {
-                self.matches.push(format!(
-                    "{}:{}:{}",
-                    relative,
-                    line_index + 1,
-                    truncate_chars(line, 500)
-                ));
+                // A match the page skips shows nothing, so its context is not
+                // worth keeping.
+                let shown = self.matches.len() >= self.offset;
+                self.matches.push(search_scope::ContentMatch {
+                    path: relative.to_owned(),
+                    line: number,
+                    text: cut(line),
+                    before: if shown {
+                        above.iter().cloned().collect()
+                    } else {
+                        Vec::new()
+                    },
+                    after: Vec::new(),
+                });
+                if shown && self.after > 0 {
+                    owing.push((self.matches.len() - 1, self.after));
+                }
                 if self.matches.len() >= self.wanted {
-                    return false;
+                    page_full = true;
+                    if owing.is_empty() {
+                        return false;
+                    }
                 }
             }
-        }
-        true
+            if self.before > 0 {
+                if above.len() == self.before {
+                    above.pop_front();
+                }
+                above.push_back(cut(line));
+            }
+            true
+        })?;
+        Ok(!page_full)
     }
 }
 
@@ -1923,16 +2141,13 @@ fn run_lsp(
     )
 }
 
-/// Most lines one `read` returns, whatever range it asked for.
-const READ_MAX_LINES: u64 = 5_001;
-
 /// The line range a `read` asked for, read for what it plainly means.
 /// `end_line` is `u64::MAX` when the call did not bound it.
 ///
 /// Line numbers start at 1, so a `0` is a filled-in placeholder: `start_line: 0`
 /// starts at the top and `end_line: 0` sets no end. A range longer than one read
-/// returns is not refused either; [`slice_text_lines`] returns the first
-/// [`READ_MAX_LINES`] of it and says where to continue. Only an end before the
+/// returns is not refused either; [`read_text::read_lines`] returns the first
+/// [`read_text::READ_MAX_LINES`] of it and says where to continue. Only an end before the
 /// start is refused — that one is a real contradiction.
 pub(crate) fn parse_read_range(input: &JsonObject) -> Result<(u64, u64), String> {
     let start_line = optional_u64(input, "start_line", 1)?.max(1);
@@ -1943,97 +2158,6 @@ pub(crate) fn parse_read_range(input: &JsonObject) -> Result<(u64, u64), String>
         return Err("end_line cannot be less than start_line".into());
     }
     Ok((start_line, end_line))
-}
-
-/// What a text `read` shows for its range.
-pub(crate) struct TextSlice {
-    pub output: String,
-    /// Whether the whole file was in front of the model: no range, and the
-    /// line cap did not cut it. Only such a read can vouch for the file.
-    pub whole_file: bool,
-}
-
-/// Lines a `read` without `end_line` returns: Claude Code's default.
-pub(crate) const READ_DEFAULT_LINES: usize = 2_000;
-/// Bytes of text one `read` returns, whatever its range; a range past it is
-/// cut at a line boundary and says where to continue.
-pub(crate) const READ_MAX_BYTES: usize = 60 * 1024;
-
-/// Slices `content` to the validated range: [`READ_DEFAULT_LINES`] when no
-/// end was given, never more than [`READ_MAX_LINES`] when one was, and never
-/// more than [`READ_MAX_BYTES`] of whole lines either way.
-/// Shared by the host and remote legs so a file reads the same whichever
-/// machine it is on.
-pub(crate) fn slice_text_lines(
-    content: &str,
-    start_line: u64,
-    end_line: u64,
-    profile: &PromptProfile,
-) -> Result<TextSlice, String> {
-    let lines = content.lines().collect::<Vec<_>>();
-    let start_index = (start_line - 1).min(usize::MAX as u64) as usize;
-    if start_index >= lines.len() {
-        // Only an empty file reaches here from line 1, and that is a full read
-        // of it; any other start is a slice that saw nothing.
-        return Ok(TextSlice {
-            output: profile.text(PromptKey::ToolReadRangeOutOfBounds).to_owned(),
-            whole_file: start_line == 1 && end_line == u64::MAX,
-        });
-    }
-    // Where the call asked to stop (the file's end when it did not say), and
-    // where this read stops: the default length, or one read's most lines.
-    let asked_end = if end_line == u64::MAX {
-        lines.len()
-    } else {
-        end_line.min(lines.len() as u64) as usize
-    };
-    let length = if end_line == u64::MAX {
-        READ_DEFAULT_LINES
-    } else {
-        READ_MAX_LINES as usize
-    };
-    let wanted_end = asked_end.min(start_index.saturating_add(length));
-    let mut end_index = start_index;
-    let mut bytes = 0_usize;
-    while end_index < wanted_end {
-        let cost = lines[end_index].len() + 1;
-        if bytes + cost > READ_MAX_BYTES {
-            if end_index == start_index {
-                return Err(profile.render(
-                    PromptKey::ToolReadLineTooLong,
-                    &[
-                        ("line", &(end_index + 1).to_string()),
-                        (
-                            "size",
-                            &crate::tool_output::human_size(lines[end_index].len() as u64),
-                        ),
-                    ],
-                ));
-            }
-            break;
-        }
-        bytes += cost;
-        end_index += 1;
-    }
-    let mut output = lines[start_index..end_index].join("\n");
-    // Short of what was asked for — the byte budget or the line cap — or, with
-    // no end given, short of the file's end.
-    let stopped_early = end_index < asked_end;
-    if stopped_early {
-        output.push_str(&profile.render(
-            PromptKey::ToolReadLimit,
-            &[
-                ("from", &start_line.to_string()),
-                ("to", &end_index.to_string()),
-                ("total", &lines.len().to_string()),
-                ("next", &(end_index + 1).to_string()),
-            ],
-        ));
-    }
-    Ok(TextSlice {
-        output,
-        whole_file: start_line == 1 && end_line == u64::MAX && end_index >= lines.len(),
-    })
 }
 
 fn run_read(
@@ -2112,20 +2236,32 @@ fn run_read(
         .with_opened_file(file_path));
     }
     let (start_line, end_line) = parse_read_range(input)?;
-    let content = read_text_file_handle(&mut file)?;
     // The record takes the modification time the handle reported before the
     // bytes were read. If the file changes between the two, the record is
     // older than the disk and the next edit reads as stale — the safe side.
     let modified_ms = file_read_state::modified_ms_of(&metadata);
-    let slice = slice_text_lines(&content, start_line, end_line, profile)?;
-    // A full record needs the whole file in front of the model. Anything less
-    // is remembered, but vouches for nothing about the parts it did not show.
-    let record = if slice.whole_file {
-        FileReadRecord::full_read(modified_ms, file_read_state::normalize_text(&content))
-    } else {
-        FileReadRecord::partial_read(modified_ms)
+    file.rewind()
+        .map_err(|error| format!("Failed to rewind {}: {error}", file_path.display()))?;
+    // Streamed: only the lines asked for are held, whatever the file's size.
+    let text = read_text::read_lines(
+        &mut file,
+        Some(metadata.len()),
+        &path,
+        start_line,
+        end_line,
+        profile,
+    )?;
+    // A full record needs the whole file in front of the model, as plain UTF-8
+    // that `edit` can read back. Anything less — a range, a cut, a lossy or
+    // UTF-16 decoding, a file past the size `edit` accepts — is remembered,
+    // but vouches for nothing about the parts it did not show.
+    let record = match text.whole {
+        Some(whole) if metadata.len() <= MAX_TEXT_FILE => {
+            FileReadRecord::full_read(modified_ms, whole)
+        }
+        _ => FileReadRecord::partial_read(modified_ms),
     };
-    Ok(Outcome::success(slice.output)
+    Ok(Outcome::success(text.output)
         .with_file_touch(read_touch(file_guard, &file_path, record))
         .with_opened_file(file_path))
 }
@@ -2200,12 +2336,27 @@ pub(crate) fn write_receipt_note(profile: &PromptProfile, stale_recovered: bool)
     }
 }
 
+/// [`run_write_checkpointed`] with no checkpoint to file the old content in, as
+/// the tests of the write gates call it.
+#[cfg(test)]
 fn run_write(
     workspace: &Path,
     input: &JsonObject,
     scope: &ExecutionScope,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
+    sandbox: Option<&FileSandbox>,
+) -> Result<Outcome, String> {
+    run_write_checkpointed(workspace, input, scope, profile, file_guard, None, sandbox)
+}
+
+fn run_write_checkpointed(
+    workspace: &Path,
+    input: &JsonObject,
+    scope: &ExecutionScope,
+    profile: &PromptProfile,
+    file_guard: Option<FileGuardContext<'_>>,
+    checkpoint: Option<CheckpointContext<'_>>,
     sandbox: Option<&FileSandbox>,
 ) -> Result<Outcome, String> {
     let path = required_string(input, "path", MAX_PATH_CHARS, false)?;
@@ -2245,6 +2396,9 @@ fn run_write(
         }
         note = write_receipt_note(profile, false);
     }
+    // Every gate has passed, so this call is going to change the file. Its bytes
+    // are read afresh: `before` above is text, and only when the file decodes.
+    file_checkpoints::record_before_write(checkpoint, &file_path, sandbox.is_some());
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create parent directory: {error}"))?;
@@ -2279,12 +2433,26 @@ fn run_write(
     .with_file_touch(touch))
 }
 
+/// [`run_edit_checkpointed`] with no checkpoint to file the old content in.
+#[cfg(test)]
 fn run_edit(
     workspace: &Path,
     input: &JsonObject,
     scope: &ExecutionScope,
     profile: &PromptProfile,
     file_guard: Option<FileGuardContext<'_>>,
+    sandbox: Option<&FileSandbox>,
+) -> Result<Outcome, String> {
+    run_edit_checkpointed(workspace, input, scope, profile, file_guard, None, sandbox)
+}
+
+fn run_edit_checkpointed(
+    workspace: &Path,
+    input: &JsonObject,
+    scope: &ExecutionScope,
+    profile: &PromptProfile,
+    file_guard: Option<FileGuardContext<'_>>,
+    checkpoint: Option<CheckpointContext<'_>>,
     sandbox: Option<&FileSandbox>,
 ) -> Result<Outcome, String> {
     let path = required_string(input, "path", MAX_PATH_CHARS, false)?;
@@ -2326,6 +2494,7 @@ fn run_edit(
         ));
     }
     let diff = unified_diff(&path, &content, &next, false);
+    file_checkpoints::record_before_write(checkpoint, &file_path, sandbox.is_some());
     write_tool_file(&file_path, next.as_bytes(), sandbox)?;
     let mut note = String::new();
     if let Some(guard) = file_guard {
@@ -4727,14 +4896,18 @@ enum ShellCompletion {
 
 /// How a collected shell process ended, seen from the two stop channels. The
 /// background worker maps these onto pool statuses: `Exited` reports its exit
-/// code, while `StoppedByUser` and `Cancelled` both report the output collected
-/// before the kill. All three fold as deliverable results.
+/// code, while `StoppedByUser`, `StoppedByModel` and `Cancelled` all report the
+/// output collected before the kill. All of them fold as deliverable results.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum ShellProcessEnd {
     Exited,
     /// The shell-task registry stop flag — the sidebar stop button, or a
     /// whole-conversation cancel via `stop_conversation`.
     StoppedByUser,
+    /// The same flag, raised by the model's `task_stop`. Kept apart from
+    /// `StoppedByUser` only so the result can say which tool stopped the command
+    /// instead of telling the model that the user did.
+    StoppedByModel,
     /// The extra probe — the agent pool's cancel flag at turn end (background
     /// leg), or the synchronous leg's ownership signal (`RunModelRequest::round_cancellation`):
     /// the run's own flag for a top-level round, the task's own flag for a task
@@ -4864,7 +5037,15 @@ impl ShellRun {
                 Some(status) => break (status, ShellProcessEnd::Exited),
                 None => {
                     let end = if guard.stop_requested() {
-                        ShellProcessEnd::StoppedByUser
+                        // A stop nobody is credited with (the row dropped with
+                        // its conversation, the host's own cleanup) keeps the
+                        // original reading, as before there was a model stop.
+                        match guard.stop_attribution() {
+                            Some(crate::agents::StopOrigin::Model) => {
+                                ShellProcessEnd::StoppedByModel
+                            }
+                            _ => ShellProcessEnd::StoppedByUser,
+                        }
                     } else if extra_stop() {
                         ShellProcessEnd::Cancelled
                     } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -4940,7 +5121,9 @@ impl ShellRun {
     ) -> Result<ShellWaitOutcome, String> {
         let completion = match end {
             ShellProcessEnd::Exited => ShellCompletion::Exited,
-            ShellProcessEnd::StoppedByUser | ShellProcessEnd::Cancelled => ShellCompletion::Stopped,
+            ShellProcessEnd::StoppedByUser
+            | ShellProcessEnd::StoppedByModel
+            | ShellProcessEnd::Cancelled => ShellCompletion::Stopped,
             ShellProcessEnd::TimedOut => ShellCompletion::TimedOut,
         };
         // Reported from the real exit, before anything below can fail: every `?` from here on would
@@ -5519,18 +5702,13 @@ fn write_tool_file(path: &Path, bytes: &[u8], sandbox: Option<&FileSandbox>) -> 
     }
 }
 
-/// The bytes of a file `grep` walked onto in a sandboxed workspace: read only
-/// when its canonical path is one the sandbox lets be read, through a handle
-/// proved to be that path.
-fn sandboxed_bytes(sandbox: &FileSandbox, path: &Path) -> Result<Vec<u8>, String> {
+/// A file `grep` walked onto in a sandboxed workspace, opened only when its
+/// canonical path is one the sandbox lets be read, as a handle proved to be that
+/// path — so what is read from it is what the sandbox allowed.
+fn sandboxed_file(sandbox: &FileSandbox, path: &Path) -> Result<File, String> {
     let canonical = fs::canonicalize(path).map_err(|error| error.to_string())?;
     sandbox.check_read(&canonical)?;
-    let mut bytes = Vec::new();
-    crate::path_guard::open_verified_file(&canonical)?
-        .take(MAX_TEXT_FILE)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    Ok(bytes)
+    crate::path_guard::open_verified_file(&canonical)
 }
 
 pub(crate) fn required_string(
@@ -6816,7 +6994,7 @@ mod tests {
         );
         assert!(run(
             "grep",
-            json!({"path":"nested","pattern":"beta MEWRK_TOOL_E2E","case_sensitive":true}),
+            json!({"path":"nested","pattern":"beta MEWRK_TOOL_E2E","case_sensitive":true,"output_mode":"content"}),
         )
         .contains("nested/probe.txt:1"));
         assert!(run("find", json!({"path":".","query":"*.txt"})).contains("nested/probe.txt"));
@@ -6990,7 +7168,11 @@ mod tests {
             for _ in 0..600 {
                 let snapshots = registry.task_snapshots("conversation-test");
                 if let Some(task) = snapshots.first() {
-                    assert!(registry.request_stop("conversation-test", &task.shell_task_id));
+                    assert!(registry.request_stop(
+                        "conversation-test",
+                        &task.shell_task_id,
+                        crate::agents::StopOrigin::User
+                    ));
                     return true;
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -7304,14 +7486,23 @@ mod tests {
             &read.output[read.output.len() - 100..]
         );
 
-        let refused = execute(
+        // A line no read could return is cut inside the budget and says how
+        // much was left, rather than failing the whole file.
+        let cut = execute(
             request(directory.path(), "read", json!({"path":"one-line.min.js"})),
             &state,
         );
-        assert!(!refused.success);
-        assert_eq!(
-            refused.output,
-            "Line 1 alone is 70 KB, more than one read can return. Search the file for the part you need instead."
+        assert!(cut.success, "{}", cut.output);
+        assert!(cut.output.len() < read_text::READ_MAX_BYTES, "{}", cut.output.len());
+        assert!(cut.output.starts_with("yyyy"), "{}", &cut.output[..20]);
+        let kept = cut.output.chars().take_while(|character| *character == 'y').count();
+        assert!(
+            cut.output.ends_with(&format!(
+                " … [line cut: {} more characters not shown]",
+                70_000 - kept
+            )),
+            "{}",
+            &cut.output[cut.output.len() - 80..]
         );
     }
 
@@ -7380,7 +7571,7 @@ mod tests {
             (0..300).map(|n| format!("needle {n} {}\n", "z".repeat(200))).collect::<String>(),
         )
         .unwrap();
-        let grepped = run("grep", json!({"pattern": "needle"}));
+        let grepped = run("grep", json!({"pattern": "needle", "output_mode": "content"}));
         assert!(grepped.success, "{}", grepped.output);
         assert!(grepped.output.starts_with("<persisted-output>"), "{}", &grepped.output[..200]);
         let saved = fs::read_to_string(crate::tool_output::saved_path(&grepped.output).unwrap()).unwrap();
@@ -8407,7 +8598,11 @@ mod tests {
             for _ in 0..600 {
                 let snapshots = registry.task_snapshots("conversation-test");
                 if let Some(task) = snapshots.first() {
-                    return registry.request_stop("conversation-test", &task.shell_task_id);
+                    return registry.request_stop(
+                        "conversation-test",
+                        &task.shell_task_id,
+                        crate::agents::StopOrigin::User,
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -9622,6 +9817,659 @@ mod tests {
         // Without a guard at all — direct IPC, or a test — there is no record
         // to compare against, so there is nothing to hint about.
         assert!(stale_read_hint(None, workspace, "cargo fmt", started, &profile).is_none());
+    }
+
+    // ---- grep: output modes, context, glob -----------------------------------
+
+    fn set_modified(path: &Path, seconds_ago: u64) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds_ago))
+            .unwrap();
+    }
+
+    fn grep_in(directory: &Path, input: Value) -> ToolExecutionResponse {
+        execute(request(directory, "grep", input), &AppState::default())
+    }
+
+    #[test]
+    fn grep_is_case_sensitive_by_default_and_lists_the_newest_file_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("old.txt"), "a Needle here\n").unwrap();
+        fs::write(root.join("new.txt"), "another Needle\n").unwrap();
+        fs::write(root.join("mid.txt"), "no match\nNeedle too\n").unwrap();
+        set_modified(&root.join("old.txt"), 300);
+        set_modified(&root.join("mid.txt"), 200);
+        set_modified(&root.join("new.txt"), 100);
+
+        let strict = grep_in(root, json!({"pattern": "needle"}));
+        assert!(strict.success, "{}", strict.output);
+        assert_eq!(strict.output, "No matches found");
+
+        let loose = grep_in(root, json!({"pattern": "needle", "case_sensitive": false}));
+        assert_eq!(loose.output, "new.txt\nmid.txt\nold.txt");
+
+        let exact = grep_in(root, json!({"pattern": "Needle"}));
+        assert_eq!(exact.output, "new.txt\nmid.txt\nold.txt");
+    }
+
+    #[test]
+    fn files_modified_at_the_same_moment_are_listed_in_path_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for name in ["c.txt", "a.txt", "b.txt"] {
+            fs::write(root.join(name), "hit\n").unwrap();
+        }
+        let moment = std::time::SystemTime::now() - Duration::from_secs(50);
+        for name in ["c.txt", "a.txt", "b.txt"] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(root.join(name))
+                .unwrap()
+                .set_modified(moment)
+                .unwrap();
+        }
+        assert_eq!(grep_in(root, json!({"pattern": "hit"})).output, "a.txt\nb.txt\nc.txt");
+    }
+
+    #[test]
+    fn grep_content_mode_prints_matches_with_ripgreps_context_spelling() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let body = (1..=12).map(|n| format!("row {n}")).collect::<Vec<_>>().join("\n");
+        fs::write(root.join("a.txt"), format!("{body}\n")).unwrap();
+        fs::write(root.join("b.txt"), "zero\nrow 99\ntail\n").unwrap();
+        let rows = |pattern: &str, extra: Value| {
+            let mut input = json!({"pattern": pattern, "output_mode": "content"});
+            for (key, value) in extra.as_object().unwrap() {
+                input[key] = value.clone();
+            }
+            let response = grep_in(root, input);
+            assert!(response.success, "{}", response.output);
+            response.output
+        };
+
+        // No context: the plain `path:line:text` of old, no separators.
+        assert_eq!(rows(r"row (3|5)$", json!({})), "a.txt:3:row 3\na.txt:5:row 5");
+
+        // One line either side: the windows of 3 and 5 touch and print as one
+        // group; the window of 10 is apart from them, so `--` stands between.
+        assert_eq!(
+            rows(r"row (3|5|10)$", json!({"context": 1})),
+            "a.txt-2-row 2\na.txt:3:row 3\na.txt-4-row 4\na.txt:5:row 5\na.txt-6-row 6\n--\na.txt-9-row 9\na.txt:10:row 10\na.txt-11-row 11"
+        );
+        // Windows that overlap print each line once.
+        assert_eq!(
+            rows(r"row (3|6)$", json!({"context": 2})),
+            "a.txt-1-row 1\na.txt-2-row 2\na.txt:3:row 3\na.txt-4-row 4\na.txt-5-row 5\na.txt:6:row 6\na.txt-7-row 7\na.txt-8-row 8"
+        );
+        // `before` and `after` override `context` on their own side.
+        assert_eq!(
+            rows(r"row 3$", json!({"context": 3, "before": 0, "after": 1})),
+            "a.txt:3:row 3\na.txt-4-row 4"
+        );
+        // Groups in two files are told apart as well, and a window stops at the
+        // file's edges.
+        assert_eq!(
+            rows(r"row (12|99)$", json!({"after": 5})),
+            "a.txt:12:row 12\n--\nb.txt:2:row 99\nb.txt-3-tail"
+        );
+        // Context only means something to `content`.
+        assert_eq!(
+            grep_in(root, json!({"pattern": r"row 3$", "context": 2})).output,
+            "a.txt"
+        );
+    }
+
+    #[test]
+    fn only_matches_count_toward_the_page_and_context_comes_with_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(
+            root.join("a.txt"),
+            "hit 1\nfill\nhit 2\nfill\nfill\nfill\nhit 3\nend\n",
+        )
+        .unwrap();
+        let page = |offset: u64| {
+            grep_in(
+                root,
+                json!({"pattern": "hit", "output_mode": "content", "context": 1, "limit": 1, "offset": offset}),
+            )
+            .output
+        };
+        assert_eq!(
+            page(0),
+            "a.txt:1:hit 1\na.txt-2-fill\n… more matches follow. Showing 1–1; pass offset=1 for the next page, or narrow the pattern or path."
+        );
+        assert_eq!(
+            page(1),
+            "a.txt-2-fill\na.txt:3:hit 2\na.txt-4-fill\n… more matches follow. Showing 2–2; pass offset=2 for the next page, or narrow the pattern or path."
+        );
+        assert_eq!(page(2), "a.txt-6-fill\na.txt:7:hit 3\na.txt-8-end");
+        let beyond = page(3);
+        assert!(beyond.starts_with("No matches at offset 3; there are 3."), "{beyond}");
+    }
+
+    #[test]
+    fn grep_count_mode_gives_each_files_count_and_the_totals_of_the_whole_search() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.txt"), "x\nx\nx\ny\n").unwrap();
+        fs::write(root.join("b.txt"), "y\nx\n").unwrap();
+        fs::write(root.join("c.txt"), "none\n").unwrap();
+        fs::write(root.join("d.txt"), "x x x\n").unwrap();
+        let counted = grep_in(root, json!({"pattern": "x", "output_mode": "count"}));
+        assert_eq!(
+            counted.output,
+            "a.txt:3\nb.txt:1\nd.txt:1\nTotal: 5 matching line(s) in 3 file(s)."
+        );
+        // The page cuts the lines, never the totals.
+        let paged = grep_in(
+            root,
+            json!({"pattern": "x", "output_mode": "count", "limit": 2}),
+        );
+        assert_eq!(
+            paged.output,
+            "a.txt:3\nb.txt:1\n… more matches follow. Showing 1–2; pass offset=2 for the next page, or narrow the pattern or path.\nTotal: 5 matching line(s) in 3 file(s)."
+        );
+        let rest = grep_in(
+            root,
+            json!({"pattern": "x", "output_mode": "count", "limit": 2, "offset": 2}),
+        );
+        assert_eq!(rest.output, "d.txt:1\nTotal: 5 matching line(s) in 3 file(s).");
+        assert_eq!(
+            grep_in(root, json!({"pattern": "absent", "output_mode": "count"})).output,
+            "No matches found"
+        );
+    }
+
+    #[test]
+    fn grep_pages_the_file_list_with_the_same_hint() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for (index, name) in ["a.txt", "b.txt", "c.txt"].iter().enumerate() {
+            fs::write(root.join(name), "hit\n").unwrap();
+            set_modified(&root.join(name), 100 - index as u64 * 10);
+        }
+        // Newest first: c, b, a.
+        let first = grep_in(root, json!({"pattern": "hit", "limit": 2}));
+        assert_eq!(
+            first.output,
+            "c.txt\nb.txt\n… more matches follow. Showing 1–2; pass offset=2 for the next page, or narrow the pattern or path."
+        );
+        assert_eq!(
+            grep_in(root, json!({"pattern": "hit", "limit": 2, "offset": 2})).output,
+            "a.txt"
+        );
+    }
+
+    #[test]
+    fn a_glob_limits_the_files_searched_by_path_or_by_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for path in ["src/a.rs", "src/deep/b.rs", "src/c.ts", "docs/d.rs", "top.rs", "x.md"] {
+            let full = root.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, "hit\n").unwrap();
+        }
+        let files = |glob: &str| {
+            let response = grep_in(root, json!({"pattern": "hit", "glob": glob}));
+            assert!(response.success, "{}", response.output);
+            let mut lines = response.output.lines().map(str::to_owned).collect::<Vec<_>>();
+            lines.sort();
+            lines
+        };
+        // A name glob reaches every directory.
+        assert_eq!(files("*.rs"), ["docs/d.rs", "src/a.rs", "src/deep/b.rs", "top.rs"]);
+        // A path glob is read against the path below the directory searched; `**/`
+        // also matches no directory at all.
+        assert_eq!(files("src/**/*.rs"), ["src/a.rs", "src/deep/b.rs"]);
+        assert_eq!(files("src/*.ts"), ["src/c.ts"]);
+        assert_eq!(files("*.{ts,md}"), ["src/c.ts", "x.md"]);
+        assert_eq!(files("**/d.rs"), ["docs/d.rs"]);
+        assert_eq!(
+            grep_in(root, json!({"pattern": "hit", "glob": "*.zig"})).output,
+            "No matches found"
+        );
+        // A path below the root is matched relative to it, as `find` does.
+        let inside = grep_in(root, json!({"pattern": "hit", "path": "src", "glob": "deep/*.rs"}));
+        assert_eq!(inside.output, "src/deep/b.rs");
+        // A file named outright is searched whatever the glob says.
+        let named = grep_in(root, json!({"pattern": "hit", "path": "x.md", "glob": "*.rs"}));
+        assert_eq!(named.output, "x.md");
+        let bad = grep_in(root, json!({"pattern": "hit", "glob": "src/{a"}));
+        assert!(!bad.success);
+        assert!(bad.output.starts_with("Invalid glob pattern:"), "{}", bad.output);
+        // A blank glob, like a blank any other optional argument, is none.
+        assert_eq!(
+            grep_in(root, json!({"pattern": "hit", "glob": ""})).output.lines().count(),
+            6
+        );
+    }
+
+    #[test]
+    fn grep_rejects_an_unknown_mode_and_clamps_context_to_twenty() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let body = (1..=100).map(|n| format!("row {n}")).collect::<Vec<_>>().join("\n");
+        fs::write(root.join("a.txt"), body).unwrap();
+        let bad = grep_in(root, json!({"pattern": "row", "output_mode": "lines"}));
+        assert!(!bad.success);
+        assert_eq!(
+            bad.output,
+            "Parameter output_mode must be files_with_matches, content or count"
+        );
+        let wide = grep_in(
+            root,
+            json!({"pattern": "row 50$", "output_mode": "content", "context": 1000}),
+        );
+        assert!(wide.success, "{}", wide.output);
+        assert_eq!(wide.output.lines().count(), 41, "20 above, the match, 20 below");
+        assert!(wide.output.starts_with("a.txt-30-row 30\n"));
+        assert!(wide.output.ends_with("a.txt-70-row 70"));
+        // A blank value is "not given", as it is for every optional argument.
+        let blank = grep_in(
+            root,
+            json!({"pattern": "row 50$", "output_mode": "", "context": "", "glob": " "}),
+        );
+        assert_eq!(blank.output, "a.txt");
+        assert!(!grep_in(root, json!({"pattern": "x", "context": -1})).success);
+    }
+
+    #[test]
+    fn grep_content_cuts_long_lines_and_their_context_at_five_hundred_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let long = "é".repeat(800);
+        fs::write(root.join("a.txt"), format!("{long}\nhit {long}\n{long}\n")).unwrap();
+        let output = grep_in(
+            root,
+            json!({"pattern": "hit", "output_mode": "content", "context": 1}),
+        )
+        .output;
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{output}");
+        for line in &lines {
+            assert!(line.ends_with('…'), "{line}");
+        }
+        assert_eq!(lines[1].chars().count(), "a.txt:2:".len() + 500 + 1);
+        assert_eq!(lines[0].chars().count(), "a.txt-1-".len() + 500 + 1);
+    }
+
+    /// A numbered log of `lines` lines (23 bytes each) with `marks` — line number
+    /// and text — in place of the numbered line there.
+    fn numbered_log(lines: u64, marks: &[(u64, &str)]) -> String {
+        (1..=lines)
+            .map(|n| match marks.iter().find(|(line, _)| *line == n) {
+                Some((_, text)) => format!("{text}\n"),
+                None => format!("line {n:06} of the log\n"),
+            })
+            .collect()
+    }
+
+    /// The output of a command that ran long, or a log, is past 2 MiB soon enough
+    /// and is exactly what `grep` is reached for: no mode may pass it over.
+    #[test]
+    fn grep_searches_a_text_file_past_two_mebibytes_in_every_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        // 4.6 MiB; a match in the first line, in the middle, and in the last.
+        let text = numbered_log(
+            200_000,
+            &[
+                (1, "needle first"),
+                (100_000, "needle middle"),
+                (200_000, "needle last"),
+            ],
+        );
+        assert!(text.len() as u64 > 2 * MAX_TEXT_FILE);
+        fs::write(root.join("big.log"), &text).unwrap();
+        fs::write(root.join("small.txt"), "no match\n").unwrap();
+
+        assert_eq!(
+            grep_in(root, json!({"pattern": "needle"})).output,
+            "big.log"
+        );
+        assert_eq!(
+            grep_in(root, json!({"pattern": "needle", "output_mode": "count"})).output,
+            "big.log:3\nTotal: 3 matching line(s) in 1 file(s)."
+        );
+        // The last match has no line below it, and the one before it is far from the first.
+        assert_eq!(
+            grep_in(
+                root,
+                json!({"pattern": "needle", "output_mode": "content", "context": 1})
+            )
+            .output,
+            "big.log:1:needle first\nbig.log-2-line 000002 of the log\n--\nbig.log-99999-line 099999 of the log\nbig.log:100000:needle middle\nbig.log-100001-line 100001 of the log\n--\nbig.log-199999-line 199999 of the log\nbig.log:200000:needle last"
+        );
+        // A page past the first matches reaches the end of the file all the same.
+        assert_eq!(
+            grep_in(
+                root,
+                json!({"pattern": "needle", "output_mode": "content", "limit": 1, "offset": 2, "after": 2})
+            )
+            .output,
+            "big.log:200000:needle last"
+        );
+        // The page stops the read: its first match is all `limit: 1` needs.
+        assert_eq!(
+            grep_in(
+                root,
+                json!({"pattern": "needle", "output_mode": "content", "limit": 1})
+            )
+            .output,
+            "big.log:1:needle first\n… more matches follow. Showing 1–1; pass offset=1 for the next page, or narrow the pattern or path."
+        );
+    }
+
+    /// Size is no reason to skip a file, but binary data still is — and the NUL
+    /// that says so is looked for at the same place whatever the file's size.
+    #[test]
+    fn grep_still_skips_a_binary_file_however_big_it_is() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let filler = "needle filler\n".repeat(200_000);
+        assert!(filler.len() as u64 > MAX_TEXT_FILE);
+        let mut binary = b"MZ\x90\x00".to_vec();
+        binary.extend_from_slice(filler.as_bytes());
+        fs::write(root.join("big.bin"), &binary).unwrap();
+        // The same bytes with the NUL past the first 8 KiB are text as far as
+        // the tool can tell, as for `read`.
+        let mut late = filler.clone().into_bytes();
+        // At a line start (715 lines of 14 bytes in), so no match is broken.
+        late.insert(715 * 14, 0_u8);
+        fs::write(root.join("late-nul.txt"), &late).unwrap();
+        fs::write(root.join("text.txt"), &filler).unwrap();
+        for (mode, expected) in [
+            ("files_with_matches", "late-nul.txt\ntext.txt"),
+            (
+                "count",
+                "late-nul.txt:200000\ntext.txt:200000\nTotal: 400000 matching line(s) in 2 file(s).",
+            ),
+        ] {
+            let found = grep_in(root, json!({"pattern": "needle", "output_mode": mode}));
+            assert!(found.success, "{}", found.output);
+            let mut lines = found.output.lines().collect::<Vec<_>>();
+            if mode == "files_with_matches" {
+                lines.sort_unstable();
+            }
+            assert_eq!(lines.join("\n"), expected, "{mode}");
+            assert!(!found.output.contains("big.bin"), "{}", found.output);
+        }
+        // Named outright, a binary file is still not read.
+        assert_eq!(
+            grep_in(root, json!({"pattern": "needle", "path": "big.bin"})).output,
+            "No matches found"
+        );
+    }
+
+    /// A file's size does not decide how much of it `grep` holds, a line's does:
+    /// a line longer than the budget is cut there, is still one line when the
+    /// lines are counted, and is shown like any other long line.
+    #[test]
+    fn grep_survives_a_single_line_larger_than_the_line_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        // One 6 MiB line: a match at its start, one just inside the budget, and
+        // one beyond it. Around it, ordinary lines.
+        let budget = GREP_LINE_READ_BYTES;
+        let mut giant = String::from("needle-start ");
+        giant.push_str(&"é".repeat(budget / 2 - 30));
+        giant.push_str(" needle-inside ");
+        assert!(giant.len() < budget, "the second match has to start inside the budget");
+        giant.push_str(&"x".repeat(5 * 1024 * 1024));
+        giant.push_str(" needle-beyond");
+        assert!(giant.len() > 3 * budget);
+        fs::write(
+            root.join("bundle.js"),
+            format!("needle before\n{giant}\nneedle after\n"),
+        )
+        .unwrap();
+
+        let content = grep_in(
+            root,
+            json!({"pattern": "needle", "output_mode": "content"}),
+        );
+        assert!(content.success, "{}", content.output);
+        let lines = content.output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{}", content.output);
+        assert_eq!(lines[0], "bundle.js:1:needle before");
+        // The long line is found and shown cut at 500 characters, ending in `…`.
+        assert!(lines[1].starts_with("bundle.js:2:needle-start é"), "{}", lines[1]);
+        assert!(lines[1].ends_with('…'), "{}", lines[1]);
+        assert_eq!(lines[1].chars().count(), "bundle.js:2:".len() + 500 + 1);
+        // The lines after it keep their numbers.
+        assert_eq!(lines[2], "bundle.js:3:needle after");
+        assert_eq!(
+            grep_in(root, json!({"pattern": "needle", "output_mode": "count"})).output,
+            "bundle.js:3\nTotal: 3 matching line(s) in 1 file(s)."
+        );
+        // What the budget cuts off is not searched: a pattern only the cut-off
+        // tail matches finds nothing, and that is the bound the memory has.
+        assert_eq!(
+            grep_in(root, json!({"pattern": "needle-beyond"})).output,
+            "No matches found"
+        );
+        assert_eq!(
+            grep_in(root, json!({"pattern": "needle-inside"})).output,
+            "bundle.js"
+        );
+    }
+
+    /// The streamed lines are the lines `str::lines` gives: a CRLF is one
+    /// terminator, a lone CR is text, the last line needs no newline, invalid UTF-8
+    /// is lossy, and a context window stops at the end of the file.
+    #[test]
+    fn grep_cuts_a_streamed_file_into_the_lines_str_lines_would() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(
+            root.join("mixed.txt"),
+            b"one\r\nneedle two\r\nthree\rstill three\r\nneedle \xff four\n\nneedle last",
+        )
+        .unwrap();
+        let found = grep_in(
+            root,
+            json!({"pattern": "needle", "output_mode": "content", "context": 1}),
+        );
+        assert_eq!(
+            found.output,
+            "mixed.txt-1-one\nmixed.txt:2:needle two\nmixed.txt-3-three\rstill three\nmixed.txt:4:needle \u{fffd} four\nmixed.txt-5-\nmixed.txt:6:needle last"
+        );
+        // A pattern anchored at the end of a line does not see the CR.
+        assert_eq!(
+            grep_in(
+                root,
+                json!({"pattern": "two$", "output_mode": "count"})
+            )
+            .output,
+            "mixed.txt:1\nTotal: 1 matching line(s) in 1 file(s)."
+        );
+        assert_eq!(
+            grep_in(root, json!({"pattern": "^$", "output_mode": "count"})).output,
+            "mixed.txt:1\nTotal: 1 matching line(s) in 1 file(s)."
+        );
+    }
+
+    // ---- read: encodings, binary data, big files ----------------------------
+
+    fn read_in(directory: &Path, input: Value) -> ToolExecutionResponse {
+        execute(request(directory, "read", input), &AppState::default())
+    }
+
+    #[test]
+    fn a_file_that_is_not_utf8_reads_lossily_and_edit_still_cannot_touch_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("latin.txt"), b"caf\xe9 au lait\nsecond\n").unwrap();
+        let read = read_in(root, json!({"path": "latin.txt"}));
+        assert!(read.success, "{}", read.output);
+        assert!(read.output.starts_with("caf\u{fffd} au lait\nsecond"), "{}", read.output);
+        assert!(read.output.contains("not valid UTF-8"), "{}", read.output);
+
+        // The note tells the truth: the strict-UTF-8 edit refuses the file.
+        let registry = FileReadRegistry::default();
+        let guard = guard(&registry);
+        read_and_commit(root, "latin.txt", guard);
+        let scope = ExecutionScope::workspace_only(root);
+        let edited = run_edit(
+            root,
+            &object(json!({"path": "latin.txt", "find": "second", "replace": "2nd"})),
+            &scope,
+            &PromptProfile::builtin_english(),
+            Some(guard),
+            None,
+        );
+        assert!(edited.is_err(), "edit has to keep refusing what it cannot read back");
+        assert_eq!(fs::read(root.join("latin.txt")).unwrap(), b"caf\xe9 au lait\nsecond\n");
+    }
+
+    #[test]
+    fn utf16_with_a_byte_order_mark_reads_as_text_and_a_binary_file_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut le = vec![0xFF, 0xFE];
+        let mut be = vec![0xFE, 0xFF];
+        for unit in "héllo\nwörld\n".encode_utf16() {
+            le.extend_from_slice(&unit.to_le_bytes());
+            be.extend_from_slice(&unit.to_be_bytes());
+        }
+        fs::write(root.join("le.txt"), &le).unwrap();
+        fs::write(root.join("be.txt"), &be).unwrap();
+        for (name, label) in [("le.txt", "UTF-16LE"), ("be.txt", "UTF-16BE")] {
+            let read = read_in(root, json!({"path": name}));
+            assert!(read.success, "{}", read.output);
+            assert!(read.output.starts_with("héllo\nwörld"), "{}", read.output);
+            assert!(read.output.contains(label), "{}", read.output);
+        }
+
+        let mut binary = b"\x7fELF\x02\x01\x01\x00".to_vec();
+        binary.extend_from_slice(&[7_u8; 4096]);
+        fs::write(root.join("a.out"), &binary).unwrap();
+        let refused = read_in(root, json!({"path": "a.out"}));
+        assert!(!refused.success);
+        assert!(
+            refused.output.starts_with("This tool cannot read binary files: a.out"),
+            "{}",
+            refused.output
+        );
+    }
+
+    #[test]
+    fn a_file_past_two_mebibytes_is_read_in_ranges_and_never_as_a_whole() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        // About 4.6 MiB in 200,000 numbered lines.
+        let text = (1..=200_000)
+            .map(|n| format!("line {n:06} of the log\n"))
+            .collect::<String>();
+        assert!(text.len() as u64 > MAX_TEXT_FILE);
+        fs::write(root.join("big.log"), &text).unwrap();
+
+        let head = read_in(root, json!({"path": "big.log"}));
+        assert!(head.success, "{}", head.output);
+        assert!(head.output.starts_with("line 000001 of the log\n"));
+        assert!(
+            head.output
+                .ends_with("… showing lines 1–2000 of 200000. Continue with start_line=2001."),
+            "{}",
+            &head.output[head.output.len() - 100..]
+        );
+        let middle = read_in(
+            root,
+            json!({"path": "big.log", "start_line": 150000, "end_line": 150002}),
+        );
+        assert_eq!(
+            middle.output,
+            "line 150000 of the log\nline 150001 of the log\nline 150002 of the log"
+        );
+        let tail = read_in(root, json!({"path": "big.log", "start_line": 199999}));
+        assert_eq!(tail.output, "line 199999 of the log\nline 200000 of the log");
+        let past = read_in(root, json!({"path": "big.log", "start_line": 200001}));
+        assert_eq!(
+            past.output,
+            "(The file has only 200000 lines, so the requested start_line is out of range)"
+        );
+
+        // Neither read is a record `edit` could rely on.
+        let registry = FileReadRegistry::default();
+        let guard = guard(&registry);
+        read_and_commit(root, "big.log", guard);
+        let canonical = fs::canonicalize(root.join("big.log")).unwrap();
+        let record = guard.get(&canonical).expect("a read is remembered");
+        assert!(!record.full && record.content.is_none() && record.content_hash.is_none());
+    }
+
+    #[test]
+    fn the_read_record_is_full_only_for_a_whole_clean_utf8_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("small.txt"), "alpha\r\nbeta\n").unwrap();
+        fs::write(root.join("latin.txt"), b"caf\xe9\n").unwrap();
+        fs::write(root.join("empty.txt"), b"").unwrap();
+        let registry = FileReadRegistry::default();
+        let guard = guard(&registry);
+        let scope = ExecutionScope::workspace_only(root);
+        let profile = PromptProfile::builtin_english();
+        let record_of = |input: Value| {
+            let path = input["path"].as_str().unwrap().to_owned();
+            let outcome =
+                run_read(root, &object(input), &scope, None, &profile, Some(guard), None).unwrap();
+            let touch = outcome.file_touch.expect("a read reports its file");
+            let record = touch.read.expect("a read under a guard carries a record");
+            guard.record(touch.path.clone(), record);
+            guard.get(&fs::canonicalize(root.join(path)).unwrap()).unwrap()
+        };
+
+        let whole = record_of(json!({"path": "small.txt"}));
+        assert!(whole.full);
+        assert_eq!(whole.content.as_deref(), Some("alpha\nbeta\n"));
+        assert!(whole.matches("alpha\nbeta\n"));
+        assert!(!record_of(json!({"path": "small.txt", "start_line": 2})).full);
+        assert!(!record_of(json!({"path": "small.txt", "end_line": 1})).full);
+        assert!(
+            !record_of(json!({"path": "latin.txt"})).full,
+            "a lossy decoding vouches for nothing"
+        );
+        let empty = record_of(json!({"path": "empty.txt"}));
+        assert!(
+            empty.full && empty.content.as_deref() == Some(""),
+            "an empty file read whole is a full read of it"
+        );
+        assert!(!record_of(json!({"path": "empty.txt", "start_line": 2})).full);
+
+        // And the gate that depends on it still works for the whole read: an
+        // edit goes through after reading small.txt in full.
+        let edited = run_edit(
+            root,
+            &object(json!({"path": "small.txt", "find": "beta", "replace": "gamma"})),
+            &scope,
+            &profile,
+            Some(guard),
+            None,
+        );
+        assert!(edited.is_ok(), "{:?}", edited.err());
+    }
+
+    #[test]
+    fn an_empty_file_and_a_start_past_the_end_are_two_different_answers() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("empty.txt"), b"").unwrap();
+        fs::write(root.join("two.txt"), "one\ntwo\n").unwrap();
+        assert_eq!(
+            read_in(root, json!({"path": "empty.txt"})).output,
+            "(The file exists but is empty)"
+        );
+        assert_eq!(
+            read_in(root, json!({"path": "two.txt", "start_line": 3})).output,
+            "(The file has only 2 lines, so the requested start_line is out of range)"
+        );
+        assert_eq!(read_in(root, json!({"path": "two.txt", "start_line": 2})).output, "two");
     }
 }
 

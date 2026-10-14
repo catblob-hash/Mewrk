@@ -90,6 +90,7 @@ const browserDevOwnerFingerprintEntries = [
   "scripts/dev-server-port.mjs",
   "scripts/memory-e2e-workspace-fixture.mjs",
   "scripts/vite-csp.mjs",
+  "scripts/vite-file-icons.mjs",
   "scripts/windows-native-build-tools.mjs",
   "scripts/workspace-coordinator.mjs",
   "tsconfig.json",

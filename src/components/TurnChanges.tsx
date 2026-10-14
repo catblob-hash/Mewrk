@@ -5,7 +5,7 @@ import { isStructuredOutputNudge } from "../lib/orchestration";
 import { openPath } from "../lib/pathLinks";
 import type { ContextItem, ToolContext, ToolResult } from "../types";
 import { parseUnifiedDiff } from "./DiffOutput";
-import { EntryIcon } from "./DiffViewer";
+import { FileIcon } from "./FileIcon";
 import "./TurnChanges.css";
 
 /** Rows a long list shows before "Show N more". */
@@ -281,7 +281,7 @@ export const TurnChanges = memo(function TurnChanges({ summary, pathBaseDir }: T
                     });
                   }}
                 >
-                  <EntryIcon path={file.path} className="turn-changes__icon" />
+                  <FileIcon path={file.path} className="turn-changes__icon" />
                   <span className="turn-changes__name">{name}</span>
                   {directory && (names.get(name) ?? 0) > 1 && (
                     <span className="turn-changes__directory">{directory}</span>

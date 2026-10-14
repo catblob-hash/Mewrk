@@ -42,13 +42,15 @@ use crate::{
     search_scope::{self, IgnoreRules},
     shell_backend::ScriptDialect,
     tool_executor::{
-        apply_edit, edit_receipt, edit_replace_all, optional_bool, optional_string, optional_u64,
-        parse_read_range, required_string, slice_text_lines, truncate_chars, unified_diff,
+        apply_edit, edit_receipt, edit_replace_all, optional_string, optional_u64,
+        parse_read_range, read_text, required_string, truncate_chars, unified_diff,
         write_receipt_note, EditSpec, FileGuardContext, FileTouch, EDIT_FIND_EQUALS_REPLACE,
         FILE_MODIFIED_SINCE_READ, FILE_NOT_READ, MAX_PATH_CHARS, MAX_TEXT_FILE, MAX_WRITE_BYTES,
     },
     workspace_set::ResolvedWorkspace,
 };
+
+#[cfg(test)] mod powershell_tests;
 
 /// How far a call may reach on the machine.
 ///
@@ -826,11 +828,94 @@ fi
 /// page out of its cap.
 const GREP_ATTEMPTS: usize = 3;
 
+/// Lines of answer a `files_with_matches` or `count` search accepts from the
+/// machine. Those modes need every file, not the first page of matches, so
+/// there is no page to size the cap by; a search that fills this says so.
+const GREP_BULK_LINES: usize = 200_000;
+
 /// Succeeds only where `grep -P` works on bytes with lookarounds and
 /// subroutines, everything the PCRE rendering uses (`remote_regex`): GNU grep
 /// under the C locale. A grep without `-P`, or one whose PCRE refuses any of
 /// it, falls to the ERE rendering.
 const PCRE_PROBE: &str = r"printf 'a\303\251b\n' | grep -qP '^(?<![^\n])a\xc3(?1)(?<=\xa9)b(?![^\n])(?(DEFINE)(\xa9))' 2>/dev/null";
+
+/// Succeeds where `grep` can put a NUL after a file name (`--null`, GNU and
+/// BSD alike). The `path\0line:text` it makes is the one spelling of a match
+/// and of a context line that a file name cannot confuse: `path:12:text` and
+/// `path-12-text` read the same as a file called `a:12:b`. BusyBox has no
+/// `--null`; there context lines are not asked for at all.
+const NULL_PROBE: &str = "printf 'x\\n' | grep --null -n -H -e x >/dev/null 2>&1";
+
+/// Succeeds where `sort` reads NUL-terminated names and orders them field by
+/// field on `/` — GNU, BSD and macOS alike — which puts `a/y` before `a.z`, as
+/// a walk that sorts each directory's names does. A plain byte order puts
+/// `a.z` first.
+const SORT_PROBE: &str = "[ \"$(printf 'b/x\\000a.z\\000a/y\\000' | sort -z -t / -k 1,1 -k 2,2 2>/dev/null | tr '\\000' ' ')\" = 'a/y a.z b/x ' ]";
+
+/// How many `/`-separated fields of a path the remote walk is sorted on, the
+/// searched directory's own among them. Paths that agree on all of them fall
+/// back to a byte order, which differs from the host's walk only where a name
+/// that deep sorts below `/`.
+const WALK_SORT_FIELDS: usize = 64;
+
+/// What a remote `grep` is asked to send back. The mode of the call picks it,
+/// and so does how faithfully the machine's engine can say the pattern: an
+/// engine that may match more than the pattern does can only be checked line
+/// by line, on the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrepShape {
+    /// Matching lines as `path\0line:text`, context lines as `path\0line-text`
+    /// (or `path:line:text` where the machine's grep has no `--null`, and no
+    /// context).
+    Lines { before: usize, after: usize },
+    /// `modified path` for each file with a match: the answer of an exact
+    /// pattern in `files_with_matches` mode, in one trip.
+    Files,
+    /// `path:count` for each file with a match: the answer of an exact
+    /// pattern in `count` mode.
+    Counts,
+}
+
+/// One call's remote search: what to send back, and how much of it.
+pub(crate) struct GrepRequest<'a> {
+    pub shape: GrepShape,
+    /// Lines of answer the machine may send.
+    pub cap: usize,
+    /// Wildcards that accept every file the call's glob does (and possibly
+    /// more), for the machine to skip files by before reading them.
+    pub wildcards: Option<&'a [String]>,
+}
+
+/// A wildcard as a `case` pattern: `*` and `?` stay wild and every other
+/// character is taken for itself.
+fn case_pattern(wildcard: &str) -> String {
+    let mut text = String::with_capacity(wildcard.len() * 2);
+    for character in wildcard.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '*' | '?' | '.' | '_' | '-' | '/')
+            || !character.is_ascii()
+        {
+            text.push(character);
+        } else {
+            text.push('\\');
+            text.push(character);
+        }
+    }
+    text
+}
+
+/// The loop at the head of the per-batch shell that keeps only the files the
+/// wildcards accept, tried on the path below the searched directory and on
+/// the file's own name, as the host reads the glob.
+fn glob_filter(wildcards: &[String]) -> String {
+    let patterns = wildcards
+        .iter()
+        .map(|wildcard| case_pattern(wildcard))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "for f; do\nshift\nrel=${{f#\"$MEWRK_BASE\"/}}\nok=\ncase \"$rel\" in {patterns}) ok=1 ;; esac\nif [ -z \"$ok\" ]; then case \"${{rel##*/}}\" in {patterns}) ok=1 ;; esac; fi\nif [ -n \"$ok\" ]; then set -- \"$@\" \"$f\"; fi\ndone\n[ $# -gt 0 ] || exit 0\n"
+    )
+}
 
 /// The script that runs `pattern` on the machine: its [`RemotePattern`] in the
 /// dialect the machine's engine reads, never the model's pattern itself.
@@ -840,13 +925,13 @@ fn grep_script(
     target: &RemoteWorkspace<'_>,
     path: &str,
     pattern: &crate::remote_regex::RemotePattern,
-    wanted: usize,
+    request: &GrepRequest<'_>,
     ere_only: bool,
 ) -> Result<String, String> {
     if let Some(ps) = powershell(target)? {
         check_operand(path, "path")?;
         quote_search_operand(&pattern.dotnet, "pattern")?;
-        return Ok(crate::remote_powershell::grep(&ps, path, &pattern.dotnet, wanted));
+        return Ok(crate::remote_powershell::grep(&ps, path, &pattern.dotnet, request));
     }
     let pcre = quote_search_operand(&pattern.pcre, "pattern")?;
     let ere = crate::remote_regex::ere_printf_argument(&pattern.ere);
@@ -873,110 +958,182 @@ fn grep_script(
     script.push_str(&format!(
         "VERR=$(grep $GP -q -e \"$MEWRK_RX\" /dev/null 2>&1)\nif [ $? -eq {EXIT_BAD_PATTERN} ]; then printf '%s\\n' \"$VERR\" >&2; exit {EXIT_BAD_PATTERN}; fi\n"
     ));
+    // Whether the lines carry a NUL after the file name, said first so the
+    // host reads the rest the way it was written.
+    script.push_str(&format!(
+        "NUL=\nFMT=plain\nif {NULL_PROBE}; then NUL=--null; FMT=null; fi\nprintf '%s\\n' \"$FMT\"\n"
+    ));
+    // What `grep` prints and what happens to it next, by shape. `-I` skips
+    // binary files; `-n` numbers the lines; the context flags only where lines
+    // can be told apart from file names (`NUL`).
+    let (flags, body, filter) = match request.shape {
+        GrepShape::Lines { before, after } => {
+            let mut script_flags = String::from("MEWRK_GF=\"$GP -I -n $NUL\"\n");
+            for (name, count) in [("-B", before), ("-A", after)] {
+                if count > 0 {
+                    script_flags.push_str(&format!(
+                        "if [ -n \"$NUL\" ]; then MEWRK_GF=\"$MEWRK_GF {name} {count}\"; fi\n"
+                    ));
+                }
+            }
+            (
+                script_flags,
+                "exec grep $MEWRK_GF -e \"$MEWRK_RX\" /dev/null \"$@\"\n",
+                String::new(),
+            )
+        }
+        // The modification times come from the machine's own `stat`, in
+        // whichever spelling it has; the check is made once, here, because
+        // GNU's `stat -f` means something else entirely.
+        GrepShape::Files => (
+            "MEWRK_GF=\"$GP -I\"\nif stat -c %Y / >/dev/null 2>&1; then MEWRK_STAT=gnu; else MEWRK_STAT=bsd; fi\nexport MEWRK_STAT\n"
+                .to_owned(),
+            "grep -l $MEWRK_GF -e \"$MEWRK_RX\" /dev/null \"$@\" | tr '\\n' '\\000' | xargs -0 sh -c '[ $# -gt 0 ] || exit 0; case \"$MEWRK_STAT\" in gnu) exec stat -c \"%Y %n\" -- \"$@\" ;; *) exec stat -f \"%m %N\" -- \"$@\" ;; esac' sh\n",
+            String::new(),
+        ),
+        // `grep -c` lists every file it was given, matching or not.
+        GrepShape::Counts => (
+            "MEWRK_GF=\"$GP -I\"\n".to_owned(),
+            "exec grep -c $MEWRK_GF -e \"$MEWRK_RX\" /dev/null \"$@\"\n",
+            "| grep -v -e ':0$' ".to_owned(),
+        ),
+    };
+    script.push_str(&flags);
     // The files Git lists reach `grep` through `xargs`, whose child shell
     // prefixes each with the target — dropping any whose directory has become
     // a link since Git indexed it, which the host leg's walk would not have
     // followed either — and lets `find` pick the regular files a host-leg
-    // walk would read: no links, nothing a submodule's directory hides,
-    // nothing past 2 MiB (2049 one-kilobyte blocks once `find` has rounded
-    // up). The pattern travels in the environment, never through a second
-    // round of quoting.
+    // walk would read: no links, nothing a submodule's directory hides, and
+    // no limit on size — `grep` streams a file, as the host leg does, so a
+    // long command's output or a log is searched like any source file. The
+    // pattern travels in the environment, never through a second round of
+    // quoting.
     // `find` never sees the pattern: it starts `MEWRK_GREP`, which reads it
     // from the environment. In an argument, any `{}` a pattern holds would be
     // taken for `find`'s own placeholder.
-    script.push_str(
-        "MEWRK_GF=\"$GP -I -n\"\nMEWRK_GREP='exec grep $MEWRK_GF -e \"$MEWRK_RX\" /dev/null \"$@\"'\nexport MEWRK_RX MEWRK_GF MEWRK_GREP\n",
-    );
+    // The bodies are single-quoted words rather than here-documents inside
+    // `$(…)`: bash 3.2 (macOS's `sh`) cannot parse a `)` of a `case` pattern
+    // inside one.
+    script.push_str(&format!(
+        "MEWRK_BASE=${{C%/}}\nMEWRK_CORE={}\n",
+        run_environment::sh_single_quote(body)
+    ));
+    match request.wildcards {
+        Some(wildcards) => script.push_str(&format!(
+            "MEWRK_GREP={}\n",
+            run_environment::sh_single_quote(&format!("{}{body}", glob_filter(wildcards)))
+        )),
+        None => script.push_str("MEWRK_GREP=$MEWRK_CORE\n"),
+    }
+    script.push_str("export MEWRK_RX MEWRK_GF MEWRK_CORE MEWRK_GREP MEWRK_BASE\n");
     script.push_str("IGNORED=\nif [ -d \"$C\" ]; then\n");
     script.push_str(IGNORE_PROBE);
     script.push_str(&collapse_condition(true));
     script.push_str(
         r#"if [ "$IGN" = git ]; then
-( cd -- "$C" && GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false -c core.quotepath=false ls-files --cached --others --exclude-standard -- . 2>/dev/null ) | sed '/^"/d' | uniq | tr '\n' '\000' | xargs -0 sh -c 'd=${1%/}; shift; for f do shift; p=$f; ok=1; while :; do case $p in */*) p=${p%/*} ;; *) break ;; esac; if [ -L "$d/$p" ]; then ok=; break; fi; done; if [ -n "$ok" ]; then set -- "$@" "$d/$f"; fi; done; [ $# -gt 0 ] || exit 0; exec find "$@" -prune -type f -size -2049k -exec sh -c "$MEWRK_GREP" sh {} +' sh "$C"
-else
-find "$C" -mindepth 1 \( -type d \( "$@" \) -prune \) -o -type f -size -2049k -exec sh -c "$MEWRK_GREP" sh {} +
-fi
-else
-grep $MEWRK_GF -e "$MEWRK_RX" /dev/null "$C"
+( cd -- "$C" && GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false -c core.quotepath=false ls-files --cached --others --exclude-standard -- . 2>/dev/null ) | sed '/^"/d' | uniq | tr '\n' '\000' | xargs -0 sh -c 'd=${1%/}; shift; for f do shift; p=$f; ok=1; while :; do case $p in */*) p=${p%/*} ;; *) break ;; esac; if [ -L "$d/$p" ]; then ok=; break; fi; done; if [ -n "$ok" ]; then set -- "$@" "$d/$f"; fi; done; [ $# -gt 0 ] || exit 0; exec find "$@" -prune -type f -exec sh -c "$MEWRK_GREP" sh {} +' sh "$C"
 "#,
     );
-    script.push_str(&format!("fi | head -n {wanted}\n"));
+    // Without Git the host leg walks each directory in name order, which is
+    // how `content` pages its matches; a `find` walks in whatever order the
+    // filesystem keeps (sorted on NTFS, not on APFS or ext4). Sorting on
+    // every `/`-separated field puts the walk in the host's order — `a/x`
+    // before `a.txt` — without rewriting a name. A `sort` that cannot keeps
+    // the walk's own order.
+    script.push_str(&format!(
+        "elif {SORT_PROBE}; then\nfind \"$C\" -mindepth 1 \\( -type d \\( \"$@\" \\) -prune \\) -o -type f -print0 | sort -z -t / {} | xargs -0 sh -c \"$MEWRK_GREP\" sh\n",
+        (1..=WALK_SORT_FIELDS)
+            .map(|field| format!("-k {field},{field}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    script.push_str(
+        r#"else
+find "$C" -mindepth 1 \( -type d \( "$@" \) -prune \) -o -type f -exec sh -c "$MEWRK_GREP" sh {} +
+fi
+else
+"#,
+    );
+    // A file named outright is searched whatever the ignore rules say, and
+    // whatever the glob says.
+    script.push_str("sh -c \"$MEWRK_CORE\" sh \"$C\"\n");
+    script.push_str(&format!("fi {filter}| head -n {}\n", request.cap));
     Ok(script)
 }
 
-fn grep_with(
-    shell: &dyn RemoteShell,
-    target: &RemoteWorkspace<'_>,
-    input: &JsonObject,
-) -> Result<String, String> {
-    let pattern = required_string(input, "pattern", 4096, false)?;
-    let path = optional_string(input, "path", ".", MAX_PATH_CHARS, false)?;
-    let case_sensitive = optional_bool(input, "case_sensitive", false)?;
-    let page = search_scope::GrepPage::from_input(input)?;
-    // The host parses the pattern itself, exactly as its own leg does: a bad
-    // one is refused in the same words, and a good one is translated for the
-    // machine's engine (`remote_regex`).
-    let pattern = crate::remote_regex::translate(&pattern, case_sensitive)
-        .map_err(|error| format!("Invalid regular expression: {error}"))?;
-    let wording = ExitWording::new(&path).grep();
-    let wanted = page.wanted();
-    // The machine's engine reads a translation that may match more than the
-    // pattern does, never less, so every line it returns is matched again
-    // here with the pattern itself. When the extra lines fill the machine's
-    // cap before the page is full, there may be real matches past it: ask
-    // again with more room. An exact translation never comes back short.
-    let mut cap = wanted;
-    let mut attempt = 1;
-    let mut ere_only = false;
-    let (header, payload, stderr) = loop {
-        let output = run_script(
-            shell,
-            target,
-            &grep_script(target, &path, &pattern, cap, ere_only)?,
-            None,
-            SEARCH_TIMEOUT,
-            &wording,
-        )?;
-        // GNU grep gives up on a file whose line exhausts PCRE's limits and
-        // says so on stderr, with that file's later lines unread. The ERE
-        // rendering has no such limit.
-        if !ere_only && output.stderr.contains("PCRE") {
-            ere_only = true;
-            continue;
-        }
-        let (header, rest) = take_header(&output.stdout)?;
-        let payload = String::from_utf8_lossy(rest).into_owned();
-        let returned = payload.lines().filter(|line| !line.is_empty()).count();
-        let kept = matched_lines(&payload, &pattern.regex).count();
-        if kept >= wanted || returned < cap || attempt == GREP_ATTEMPTS {
-            break (header, payload, output.stderr);
-        }
-        cap = cap.saturating_mul(8);
-        attempt += 1;
-    };
-    Ok(render_matches(
-        target.profile,
-        &header,
-        &page,
-        matched_lines(&payload, &pattern.regex),
-        &stderr,
+/// The script that reads the modification time of each file named on standard
+/// input (NUL-separated absolute paths), `modified path` a line: the second
+/// trip of a `files_with_matches` search whose lines the host had to check.
+fn mtimes_script(target: &RemoteWorkspace<'_>) -> Result<String, String> {
+    if powershell(target)?.is_some() {
+        return Ok(crate::remote_powershell::mtimes());
+    }
+    Ok(String::from(
+        "set -f\nLC_ALL=C\nexport LC_ALL\nif stat -c %Y / >/dev/null 2>&1; then MEWRK_STAT=gnu; else MEWRK_STAT=bsd; fi\nexport MEWRK_STAT\nxargs -0 sh -c '[ $# -gt 0 ] || exit 0; case \"$MEWRK_STAT\" in gnu) exec stat -c \"%Y %n\" -- \"$@\" ;; *) exec stat -f \"%m %N\" -- \"$@\" ;; esac' sh\n",
     ))
 }
 
-/// The lines of a remote grep's answer that `regex` — the model's pattern,
-/// built as the host leg builds it — matches. A line whose shape cannot be
-/// read is kept: it is the machine's to explain, not the host's to drop.
-fn matched_lines<'a>(payload: &'a str, regex: &'a regex::Regex) -> impl Iterator<Item = &'a str> + 'a {
-    payload
-        .lines()
-        .filter(|line| !line.is_empty())
-        .filter(move |line| split_match(line).is_none_or(|(_, _, text)| regex.is_match(text)))
+/// One line of a remote `grep` that listed lines.
+#[derive(Debug, PartialEq, Eq)]
+struct Record {
+    /// As the machine printed it: absolute.
+    path: String,
+    line: u64,
+    /// Whether the machine called it a match (`:`) rather than context (`-`).
+    matched: bool,
+    text: String,
 }
 
-/// One line of a remote grep's answer split into its path, line number and
-/// text. The path is whatever the machine printed — an absolute POSIX path,
-/// or a Windows one with its drive colon — so the split is at the first
-/// `:<digits>:`, not at the first colon.
+/// The lines of a remote `grep` answer. `null` says they carry a NUL after the
+/// file name; otherwise they are `path:line:text` and the split is at the first
+/// `:<digits>:`, which a Windows drive colon or a colon in a name does not
+/// fool. The group separators GNU and BSD print between groups are dropped: the
+/// host knows where the groups are from the line numbers.
+fn parse_records(payload: &[u8], null: bool) -> Vec<Record> {
+    let mut records = Vec::new();
+    for raw in payload.split(|byte| *byte == b'\n') {
+        let line = String::from_utf8_lossy(raw);
+        // Like `str::lines`, which the host leg reads files with: the CR of a
+        // CRLF line is not part of its text.
+        let line = line.strip_suffix('\r').unwrap_or(&line);
+        if line.is_empty() || line == "--" {
+            continue;
+        }
+        let parsed = if null {
+            line.split_once('\0').and_then(|(path, rest)| {
+                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                let separator = *rest.as_bytes().get(digits)?;
+                (digits > 0 && matches!(separator, b':' | b'-')).then(|| {
+                    (
+                        path,
+                        &rest[..digits],
+                        separator == b':',
+                        &rest[digits + 1..],
+                    )
+                })
+            })
+        } else {
+            split_match(line).map(|(path, number, text)| (path, number, true, text))
+        };
+        if let Some((path, number, matched, text)) = parsed {
+            if let Ok(line) = number.parse::<u64>() {
+                records.push(Record {
+                    path: path.to_owned(),
+                    line,
+                    matched,
+                    text: text.to_owned(),
+                });
+            }
+        }
+    }
+    records
+}
+
+/// One line of a remote `grep` answer split into its path, line number and
+/// text, for a machine that cannot put a NUL after the name. The path is
+/// whatever the machine printed — an absolute POSIX path, or a Windows one
+/// with its drive colon — so the split is at the first `:<digits>:`, not at
+/// the first colon.
 fn split_match(line: &str) -> Option<(&str, &str, &str)> {
     let mut from = 0;
     while let Some(offset) = line[from..].find(':') {
@@ -997,40 +1154,356 @@ fn split_match(line: &str) -> Option<(&str, &str, &str)> {
     None
 }
 
-/// `path:line:text`, with the path relative to the root and the text cut at the
-/// same 500 characters the host leg cuts it at.
-fn format_match(root: &str, line: &str) -> String {
-    match split_match(line) {
-        Some((path, number, text)) => format!(
-            "{}:{number}:{}",
-            display_relative(root, path),
-            truncate_chars(text, 500)
-        ),
-        None => truncate_chars(line, 500),
+/// `modified path` lines to `(seconds, path)`. A path may hold spaces; the
+/// number is the first word.
+fn parse_modified(payload: &[u8]) -> Vec<(i64, String)> {
+    String::from_utf8_lossy(payload)
+        .lines()
+        .filter_map(|line| {
+            let (seconds, path) = line.split_once(' ')?;
+            Some((seconds.trim().parse::<i64>().ok()?, path.to_owned()))
+        })
+        .collect()
+}
+
+/// `path:count` lines to `(path, count)`: the count is the digits after the
+/// last colon, so a colon in a name is the name's own.
+fn parse_counts(payload: &[u8]) -> Vec<(String, u64)> {
+    String::from_utf8_lossy(payload)
+        .lines()
+        .filter_map(|line| {
+            let (path, count) = line.rsplit_once(':')?;
+            let count = count.trim().parse::<u64>().ok()?;
+            (count > 0).then(|| (path.to_owned(), count))
+        })
+        .collect()
+}
+
+/// The matching lines of `records` that `regex` — the model's pattern, built
+/// as the host leg builds it — really matches, in the order the machine
+/// printed them. A line the machine called a match and the pattern does not is
+/// context at most: it only costs the transfer.
+fn verified<'a>(
+    records: &'a [Record],
+    regex: &'a regex::Regex,
+) -> impl Iterator<Item = (usize, &'a Record)> + 'a {
+    records
+        .iter()
+        .enumerate()
+        .filter(move |(_, record)| record.matched && regex.is_match(&record.text))
+}
+
+/// `content` matches out of the machine's lines: the first `wanted` verified
+/// matches that pass the glob, each with the context lines printed beside it.
+fn content_matches(
+    records: &[Record],
+    query: &search_scope::GrepQuery,
+    regex: &regex::Regex,
+    root: &str,
+    canonical: &str,
+    wanted: usize,
+) -> Vec<search_scope::ContentMatch> {
+    let (before, after) = query.context();
+    let cut = |text: &str| truncate_chars(text, search_scope::GREP_LINE_CHARS);
+    let mut found = Vec::new();
+    for (index, record) in verified(records, regex) {
+        if !glob_allows(query, canonical, &record.path) {
+            continue;
+        }
+        let mut above = Vec::new();
+        let mut expect = record.line;
+        let mut at = index;
+        while above.len() < before && at > 0 {
+            let previous = &records[at - 1];
+            if previous.path != record.path || previous.line + 1 != expect {
+                break;
+            }
+            above.push(cut(&previous.text));
+            expect = previous.line;
+            at -= 1;
+        }
+        above.reverse();
+        let mut below = Vec::new();
+        let mut expect = record.line;
+        let mut at = index;
+        while below.len() < after && at + 1 < records.len() {
+            let next = &records[at + 1];
+            if next.path != record.path || expect + 1 != next.line {
+                break;
+            }
+            below.push(cut(&next.text));
+            expect = next.line;
+            at += 1;
+        }
+        found.push(search_scope::ContentMatch {
+            path: display_relative(root, &record.path),
+            line: record.line,
+            text: cut(&record.text),
+            before: above,
+            after: below,
+        });
+        if found.len() >= wanted {
+            break;
+        }
+    }
+    found
+}
+
+/// Whether the call's glob lets the file at the absolute `path` through: it is
+/// tried on the path below the directory searched, `canonical`, and on the name.
+fn glob_allows(query: &search_scope::GrepQuery, canonical: &str, path: &str) -> bool {
+    // A file named outright is searched whatever the glob says.
+    query.glob.is_none()
+        || path == canonical
+        || query.allows(&search_scope::relative_below(canonical, path))
+}
+
+/// Whether a `content` answer has everything its page needs. A machine that
+/// stopped at its cap may have cut the context of the last match short, so
+/// the page is complete only when the lookahead match has its own `after`
+/// lines behind it.
+fn content_is_complete(
+    records: &[Record],
+    regex: &regex::Regex,
+    wanted: usize,
+    after: usize,
+) -> bool {
+    match verified(records, regex).nth(wanted.saturating_sub(1)) {
+        None => false,
+        Some((index, _)) => records.len() - index - 1 >= after,
     }
 }
 
-fn render_matches<'a>(
-    profile: &PromptProfile,
-    header: &Header,
-    page: &search_scope::GrepPage,
-    lines: impl IntoIterator<Item = &'a str>,
-    stderr: &str,
-) -> String {
-    let matches = lines
-        .into_iter()
-        .take(page.wanted())
-        .map(|line| format_match(&header.root, line))
-        .collect::<Vec<_>>();
+fn grep_with(
+    shell: &dyn RemoteShell,
+    target: &RemoteWorkspace<'_>,
+    input: &JsonObject,
+) -> Result<String, String> {
+    let pattern = required_string(input, "pattern", 4096, false)?;
+    let path = optional_string(input, "path", ".", MAX_PATH_CHARS, false)?;
+    let query = search_scope::GrepQuery::from_input(input)?;
+    // The host parses the pattern itself, exactly as its own leg does: a bad
+    // one is refused in the same words, and a good one is translated for the
+    // machine's engine (`remote_regex`).
+    let pattern = crate::remote_regex::translate(&pattern, query.case_sensitive)
+        .map_err(|error| format!("Invalid regular expression: {error}"))?;
+    let wording = ExitWording::new(&path).grep();
+    let (before, after) = query.context();
+    // Whichever engine the machine turns out to run says the pattern exactly
+    // or not (`remote_regex`). An exact pattern lets a machine answer
+    // `files_with_matches` and `count` in summaries; any other makes it send
+    // lines for the host to check.
+    let exact = if powershell(target)?.is_some() {
+        pattern.dotnet_exact
+    } else {
+        pattern.pcre_exact && pattern.ere_exact
+    };
+    let shape = match (query.mode, exact) {
+        (search_scope::GrepMode::Content, _) => GrepShape::Lines { before, after },
+        (search_scope::GrepMode::FilesWithMatches, true) => GrepShape::Files,
+        (search_scope::GrepMode::Count, true) => GrepShape::Counts,
+        // Lines to check, whatever they are for.
+        (_, false) => GrepShape::Lines {
+            before: 0,
+            after: 0,
+        },
+    };
+    let wildcards = query
+        .glob
+        .as_ref()
+        .and_then(search_scope::GrepGlob::wildcard_superset);
+    let wanted = query.page.wanted();
+    // `content` stops at its page: a machine's engine reads a translation that
+    // may match more than the pattern does, never less, so every line it
+    // returns is matched again here with the pattern itself. When the extra
+    // lines fill the machine's cap before the page is full, there may be real
+    // matches past it: ask again with more room. An exact translation never
+    // comes back short. The other modes need every file, so they take as much
+    // as the machine will send.
+    let mut cap = match query.mode {
+        // A match is at most itself and its window, and the group may add a `--`.
+        search_scope::GrepMode::Content => wanted.saturating_mul(2 + before + after),
+        _ => GREP_BULK_LINES,
+    };
+    let mut attempt = 1;
+    let mut ere_only = false;
+    let (header, payload, stderr, null, returned) = loop {
+        let request = GrepRequest {
+            shape,
+            cap,
+            wildcards: wildcards.as_deref(),
+        };
+        let output = run_script(
+            shell,
+            target,
+            &grep_script(target, &path, &pattern, &request, ere_only)?,
+            None,
+            SEARCH_TIMEOUT,
+            &wording,
+        )?;
+        // GNU grep gives up on a file whose line exhausts PCRE's limits and
+        // says so on stderr, with that file's later lines unread. The ERE
+        // rendering has no such limit.
+        if !ere_only && output.stderr.contains("PCRE") {
+            ere_only = true;
+            continue;
+        }
+        let (header, rest) = take_header(&output.stdout)?;
+        let (format, rest) = take_lines(rest, 1)?;
+        let null = format[0].trim() == "null";
+        let returned = rest.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).count();
+        if query.mode == search_scope::GrepMode::Content && returned >= cap && attempt < GREP_ATTEMPTS {
+            let records = parse_records(rest, null);
+            if !content_is_complete(&records, &pattern.regex, wanted, after) {
+                cap = cap.saturating_mul(8);
+                attempt += 1;
+                continue;
+            }
+        }
+        break (header, rest.to_vec(), output.stderr, null, returned);
+    };
+
     // Whatever the remote `find`/`grep` could not open is reported the way the
     // host leg reports an unreadable entry, rather than being silently dropped.
-    let skipped = stderr
+    let mut skipped = stderr
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    page.render(matches, skipped, profile)
+    if query.mode != search_scope::GrepMode::Content && returned >= cap {
+        skipped.push(format!(
+            "the machine's answer was cut at {cap} lines, so this result is incomplete; narrow the pattern or path"
+        ));
+    }
+    let profile = target.profile;
+    let root = header.root.as_str();
+    let canonical = header.canonical.as_str();
+    let mut rendered = match query.mode {
+        search_scope::GrepMode::Content => {
+            let records = parse_records(&payload, null);
+            let matches = content_matches(&records, &query, &pattern.regex, root, canonical, wanted);
+            query.render_content(matches, skipped, profile)
+        }
+        search_scope::GrepMode::FilesWithMatches => {
+            let files = if shape == GrepShape::Files {
+                parse_modified(&payload)
+                    .into_iter()
+                    .filter(|(_, path)| glob_allows(&query, canonical, path))
+                    .map(|(seconds, path)| search_scope::FileHit {
+                        path: display_relative(root, &path),
+                        modified_ms: seconds.saturating_mul(1000),
+                    })
+                    .collect()
+            } else {
+                // Lines the host had to check; the files they come from still
+                // need their times, from a second trip.
+                let records = parse_records(&payload, null);
+                let mut paths = Vec::<String>::new();
+                for (_, record) in verified(&records, &pattern.regex) {
+                    if glob_allows(&query, canonical, &record.path) && !paths.contains(&record.path)
+                    {
+                        paths.push(record.path.clone());
+                    }
+                }
+                modified_times(shell, target, &header, paths)?
+                    .into_iter()
+                    .map(|(path, seconds)| search_scope::FileHit {
+                        path: display_relative(root, &path),
+                        modified_ms: seconds.saturating_mul(1000),
+                    })
+                    .collect()
+            };
+            query.render_files(files, skipped, profile)
+        }
+        search_scope::GrepMode::Count => {
+            let counts = if shape == GrepShape::Counts {
+                parse_counts(&payload)
+                    .into_iter()
+                    .filter(|(path, _)| glob_allows(&query, canonical, path))
+                    .collect::<Vec<_>>()
+            } else {
+                let records = parse_records(&payload, null);
+                let mut counts = Vec::<(String, u64)>::new();
+                for (_, record) in verified(&records, &pattern.regex) {
+                    if !glob_allows(&query, canonical, &record.path) {
+                        continue;
+                    }
+                    match counts.last_mut() {
+                        Some((path, count)) if *path == record.path => *count += 1,
+                        _ => counts.push((record.path.clone(), 1)),
+                    }
+                }
+                counts
+            };
+            query.render_counts(
+                counts
+                    .into_iter()
+                    .map(|(path, count)| search_scope::CountHit {
+                        path: display_relative(root, &path),
+                        count,
+                    })
+                    .collect(),
+                skipped,
+                profile,
+            )
+        }
+    };
+    // A machine whose grep cannot tell a context line from a file name sent
+    // matches only; say so instead of leaving the model to wonder where the
+    // surrounding lines went.
+    if query.mode == search_scope::GrepMode::Content && before + after > 0 && !null {
+        rendered.push('\n');
+        rendered.push_str(profile.text(PromptKey::ToolGrepContextUnavailable));
+    }
+    Ok(rendered)
+}
+
+/// When each of `paths` was last modified, in seconds, by the machine's own
+/// `stat`. A file that cannot be examined any more is dated at the epoch, so
+/// it sorts last rather than vanishing from the answer.
+fn modified_times(
+    shell: &dyn RemoteShell,
+    target: &RemoteWorkspace<'_>,
+    header: &Header,
+    paths: Vec<String>,
+) -> Result<Vec<(String, i64)>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Only files below the directory searched are asked about: a name the
+    // machine printed with a newline in it can be read as the path of anything.
+    let inside = |path: &str| {
+        path == header.canonical || path.starts_with(&format!("{}/", header.canonical.trim_end_matches('/')))
+    };
+    let mut stdin = Vec::new();
+    for path in paths.iter().filter(|path| inside(path)) {
+        stdin.extend_from_slice(path.as_bytes());
+        stdin.push(0);
+    }
+    let mut dated = std::collections::HashMap::new();
+    if !stdin.is_empty() {
+        let output = run_script(
+            shell,
+            target,
+            &mtimes_script(target)?,
+            Some(&stdin),
+            SEARCH_TIMEOUT,
+            &ExitWording::new(&header.canonical),
+        )?;
+        dated.extend(
+            parse_modified(&output.stdout)
+                .into_iter()
+                .map(|(seconds, path)| (path, seconds)),
+        );
+    }
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            let seconds = dated.get(&path).copied().unwrap_or(0);
+            (path, seconds)
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1131,20 +1604,90 @@ fn find_with(
 // read
 // ---------------------------------------------------------------------------
 
-fn read_script(target: &RemoteWorkspace<'_>, path: &str) -> Result<String, String> {
+/// The part of a file too big to send whole that a remote `read` cuts out on
+/// the machine, so that the cost of a read is its range and not the file.
+pub(crate) struct ReadSlice {
+    /// The first line wanted, and the last one the machine sends: one past the
+    /// lines the host will show, so the host sees whether the file goes on.
+    pub first_line: u64,
+    pub last_line: u64,
+    /// The most bytes of those lines the machine sends. The host asks for one
+    /// more than it can use, to see that the lines were cut.
+    pub max_bytes: usize,
+    /// Files up to this size have their lines counted, for the note that says
+    /// where the read stopped.
+    pub count_limit: u64,
+}
+
+/// Bytes of a slice the host can use: the most one read returns, plus the same
+/// again for the line that does not fit and tells it to stop.
+const READ_SLICE_BYTES: usize = 2 * read_text::READ_MAX_BYTES;
+
+fn read_script(
+    target: &RemoteWorkspace<'_>,
+    path: &str,
+    slice: &ReadSlice,
+) -> Result<String, String> {
     if let Some(ps) = powershell(target)? {
         check_operand(path, "path")?;
-        return Ok(crate::remote_powershell::read(&ps, path, MAX_IMAGE_ATTACHMENT_BYTES));
+        return Ok(crate::remote_powershell::read(
+            &ps,
+            path,
+            MAX_IMAGE_ATTACHMENT_BYTES,
+            slice.count_limit,
+            slice,
+        ));
     }
     let mut script = prologue(target, path, TargetMode::Existing)?;
     script.push_str(&format!("[ -f \"$C\" ] || exit {EXIT_WRONG_KIND}\n"));
     script.push_str("MT=$(digits \"$(mtime \"$C\")\")\nSZ=$(digits \"$(fsize \"$C\")\")\n");
-    // The larger of the two caps: the host decides text from image by the first
-    // twelve bytes, and an image may be bigger than a text file is allowed to be.
+    script.push_str("printf '%s\\n' \"$MT\"\nprintf '%s\\n' \"$SZ\"\n");
+    // A file up to the larger of the two caps travels whole, and the host
+    // decides text from image by the first twelve bytes: an image may be bigger
+    // than a text file is allowed to be.
     script.push_str(&format!(
-        "if [ \"$SZ\" -gt {MAX_IMAGE_ATTACHMENT_BYTES} ]; then exit {EXIT_TOO_LARGE}; fi\n"
+        "if [ \"$SZ\" -le {MAX_IMAGE_ATTACHMENT_BYTES} ]; then printf 'whole\\n'; cat -- \"$C\"; exit 0; fi\n"
     ));
-    script.push_str("printf '%s\\n' \"$MT\"\nprintf '%s\\n' \"$SZ\"\ncat -- \"$C\"\n");
+    // Past that, only a range of text is of any use, and it is cut out here.
+    // An image this large is refused as ever; UTF-16 cannot be cut at a newline
+    // byte; and a NUL near the start says what the host would have said.
+    script.push_str(&format!(
+        r#"HEAD=$(head -c 12 "$C" | od -An -tx1 | tr -d ' \n')
+case "$HEAD" in 89504e47*|ffd8ff*|47494638*|52494646????????57454250) exit {EXIT_TOO_LARGE} ;; esac
+case "$HEAD" in fffe*|feff*) printf 'utf16\n'; exit 0 ;; esac
+HN=$(( $(head -c 8192 "$C" | wc -c) ))
+HZ=$(( $(head -c 8192 "$C" | tr -d '\000' | wc -c) ))
+if [ "$HN" -ne "$HZ" ]; then printf 'binary\n'; exit 0; fi
+printf 'slice\n'
+S={first}
+E={last}
+"#,
+        first = slice.first_line,
+        last = slice.last_line,
+    ));
+    // The line count is a pass over the file: made when the file is small
+    // enough for that to be cheap, and otherwise only when the range starts
+    // past the end, which is when the host has to say how many lines there are.
+    script.push_str(&format!(
+        r#"TOTAL=-
+if [ "$SZ" -le {count} ]; then
+TOTAL=$(( $(wc -l < "$C") ))
+if [ -n "$(tail -c 1 "$C")" ]; then TOTAL=$((TOTAL + 1)); fi
+elif [ "$(( $(sed -n "${{S}}p;${{S}}q" "$C" | head -c 1 | wc -c) ))" -eq 0 ]; then
+TOTAL=$(( $(wc -l < "$C") ))
+if [ -n "$(tail -c 1 "$C")" ]; then TOTAL=$((TOTAL + 1)); fi
+fi
+MORE=0
+if [ "$TOTAL" != - ]; then
+if [ "$E" -lt "$TOTAL" ]; then MORE=1; fi
+elif [ "$(( $(sed -n "$((E + 1))p;$((E + 1))q" "$C" | head -c 1 | wc -c) ))" -gt 0 ]; then MORE=1; fi
+printf '%s\n%s\n' "$TOTAL" "$MORE"
+if [ "$TOTAL" = - ] || [ "$S" -le "$TOTAL" ]; then sed -n "${{S}},${{E}}p;${{E}}q" "$C" | head -c {bytes}; fi
+exit 0
+"#,
+        count = slice.count_limit,
+        bytes = slice.max_bytes + 1,
+    ));
     Ok(script)
 }
 
@@ -1155,75 +1698,153 @@ fn read_with(
     attachment_store: Option<&ImageAttachmentStore>,
     file_guard: Option<FileGuardContext<'_>>,
 ) -> Result<RemoteOutcome, String> {
+    read_counting(
+        shell,
+        target,
+        input,
+        attachment_store,
+        file_guard,
+        read_text::COUNT_SCAN_LIMIT,
+    )
+}
+
+/// [`read_with`], counting the lines of files up to `count_limit` bytes
+/// (the tests lower it to reach the note for a file too big to count).
+fn read_counting(
+    shell: &dyn RemoteShell,
+    target: &RemoteWorkspace<'_>,
+    input: &JsonObject,
+    attachment_store: Option<&ImageAttachmentStore>,
+    file_guard: Option<FileGuardContext<'_>>,
+    count_limit: u64,
+) -> Result<RemoteOutcome, String> {
     let path = required_string(input, "path", MAX_PATH_CHARS, false)?;
+    let (start_line, end_line) = parse_read_range(input)?;
     let wording = ExitWording::new(&path)
         .wrong_kind(format!("read target is not a file: {path}"))
         .too_large(format!(
             "File exceeds the {} MiB limit",
             MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024
         ));
+    let slice = ReadSlice {
+        first_line: start_line,
+        last_line: start_line.saturating_add(read_text::lines_per_read(start_line, end_line)),
+        max_bytes: READ_SLICE_BYTES,
+        count_limit,
+    };
     let output = run_script(
         shell,
         target,
-        &read_script(target, &path)?,
+        &read_script(target, &path, &slice)?,
         None,
         FILE_TIMEOUT,
         &wording,
     )?;
     let (header, rest) = take_header(&output.stdout)?;
-    let (meta, body) = take_lines(rest, 2)?;
+    let (meta, body) = take_lines(rest, 3)?;
     let modified_ms = seconds_to_ms(&meta[0]);
+    let profile = target.profile;
+    let touch = |record: FileReadRecord| FileTouch {
+        path: file_read_state::remote_key(&target.machine_key, &header.canonical),
+        read: file_guard.map(|_| record),
+    };
 
-    // An image read ignores any line range, as on the host.
-    if is_supported_image(body) {
-        if body.len() > MAX_IMAGE_ATTACHMENT_BYTES {
+    let text = match meta[2].trim() {
+        "whole" => {
+            // An image read ignores any line range, as on the host.
+            if is_supported_image(body) {
+                if body.len() > MAX_IMAGE_ATTACHMENT_BYTES {
+                    return Err(format!(
+                        "Image exceeds the {} MiB limit ({} bytes)",
+                        MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024,
+                        body.len()
+                    ));
+                }
+                let store = attachment_store.ok_or_else(|| {
+                    "read requires a trusted image attachment directory to read an image"
+                        .to_owned()
+                })?;
+                // Shrunk like any image the model sees. The transfer cap above
+                // stays at the stored-image size: it bounds every file sent
+                // whole, text included.
+                let image = store.import_compressed(base_name(&header.canonical), body)?;
+                return Ok(RemoteOutcome {
+                    output: profile.render(
+                        PromptKey::ToolReadImage,
+                        &[
+                            ("path", &display_relative(&header.root, &header.canonical)),
+                            ("mime", &image.mime),
+                            ("width", &image.width.to_string()),
+                            ("height", &image.height.to_string()),
+                            ("bytes", &image.bytes.to_string()),
+                        ],
+                    ),
+                    diff: None,
+                    images: vec![image],
+                    file_touch: None,
+                });
+            }
+            let text = read_text::read_lines(
+                body,
+                Some(body.len() as u64),
+                &path,
+                start_line,
+                end_line,
+                profile,
+            )?;
+            let record = match text.whole {
+                Some(whole) if body.len() as u64 <= MAX_TEXT_FILE => {
+                    FileReadRecord::full_read(modified_ms, whole)
+                }
+                _ => FileReadRecord::partial_read(modified_ms),
+            };
+            (text.output, record)
+        }
+        "slice" => {
+            let (counts, payload) = take_lines(body, 2)?;
+            let total = counts[0].trim().parse::<u64>().ok();
+            let mut more_after = counts[1].trim() == "1";
+            // The machine was allowed one byte more than the host can use:
+            // getting it means the lines were cut where the bytes ran out.
+            let payload = if payload.len() > slice.max_bytes {
+                more_after = true;
+                &payload[..slice.max_bytes]
+            } else {
+                payload
+            };
+            let text = read_text::read_window(
+                payload,
+                &path,
+                start_line,
+                end_line,
+                read_text::Window {
+                    base_line: start_line,
+                    total,
+                    more_after,
+                },
+                profile,
+            )?;
+            // A part of a file vouches for nothing about the rest.
+            (text.output, FileReadRecord::partial_read(modified_ms))
+        }
+        "binary" => {
+            return Err(profile.render(PromptKey::ToolReadBinary, &[("path", &path)]));
+        }
+        "utf16" => {
             return Err(format!(
-                "Image exceeds the {} MiB limit ({} bytes)",
-                MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024,
-                body.len()
+                "{path} is UTF-16 text larger than {} MiB, which cannot be read in ranges on a remote machine. Read it with a shell command there, or convert it to UTF-8.",
+                MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024
             ));
         }
-        let store = attachment_store.ok_or_else(|| {
-            "read requires a trusted image attachment directory to read an image".to_owned()
-        })?;
-        // Shrunk like any image the model sees. The transfer cap above stays at
-        // the stored-image size: it bounds every remote read, text included.
-        let image = store.import_compressed(base_name(&header.canonical), body)?;
-        return Ok(RemoteOutcome {
-            output: target.profile.render(
-                PromptKey::ToolReadImage,
-                &[
-                    ("path", &display_relative(&header.root, &header.canonical)),
-                    ("mime", &image.mime),
-                    ("width", &image.width.to_string()),
-                    ("height", &image.height.to_string()),
-                    ("bytes", &image.bytes.to_string()),
-                ],
-            ),
-            diff: None,
-            images: vec![image],
-            file_touch: None,
-        });
-    }
-
-    if body.len() as u64 > MAX_TEXT_FILE {
-        return Err(format!(
-            "Text file exceeds the {} MiB limit",
-            MAX_TEXT_FILE / 1024 / 1024
-        ));
-    }
-    let (start_line, end_line) = parse_read_range(input)?;
-    let content = String::from_utf8(body.to_vec())
-        .map_err(|error| format!("Failed to read text file as UTF-8: {error}"))?;
-    let slice = slice_text_lines(&content, start_line, end_line, target.profile)?;
-    let record = if slice.whole_file {
-        FileReadRecord::full_read(modified_ms, file_read_state::normalize_text(&content))
-    } else {
-        FileReadRecord::partial_read(modified_ms)
+        other => {
+            return Err(format!(
+                "The remote machine answered a read with something unexpected: {other}"
+            ));
+        }
     };
-    let key = file_read_state::remote_key(&target.machine_key, &header.canonical);
+    let (output, record) = text;
     Ok(RemoteOutcome {
-        output: slice.output,
+        output,
         diff: None,
         images: Vec::new(),
         // No opened file: nothing on this host answers to a remote path, so the
@@ -1231,14 +1852,11 @@ fn read_with(
         // The touch names the file on its machine whether or not the run
         // keeps a record: nested project instructions and the language
         // servers find a remote file by it.
-        file_touch: Some(FileTouch {
-            path: key,
-            read: file_guard.map(|_| record),
-        }),
+        file_touch: Some(touch(record)),
     })
 }
 
-/// The remote clock in whole milliseconds. Seconds are all `stat` promises
+// The remote clock in whole milliseconds. Seconds are all `stat` promises
 /// portably, and the value is only ever compared with another reading of the
 /// same clock.
 fn seconds_to_ms(seconds: &str) -> i64 {
@@ -1406,6 +2024,24 @@ fn fingerprint_is_sane(fingerprint: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == ' ')
 }
 
+/// Gives the temporary file the permission bits of the file it is about to
+/// replace, so that renaming it over that file does not drop them (an
+/// executable script would lose its executable bit). A file that does not
+/// exist yet keeps the default mode.
+///
+/// `stat` is spelled both ways because the flags differ: `-c %a` is GNU (and
+/// BusyBox), `-f %Lp` is BSD and macOS — `chmod --reference` would be GNU only.
+/// Both print the mode in octal, setuid and sticky bits included, and anything
+/// else (a `stat` that knows neither spelling) leaves the default in place. The
+/// `chmod` is best effort for the same reason: the content is already written,
+/// and a filesystem that refuses it is better served by the default mode than
+/// by a failed save.
+const KEEP_MODE: &str = r#"if [ -f "$C" ]; then
+M=$(stat -c %a -- "$C" 2>/dev/null || stat -f %Lp -- "$C" 2>/dev/null)
+case "$M" in ''|*[!0-7]*) ;; *) chmod "$M" "$TMP" 2>/dev/null ;; esac
+fi
+"#;
+
 /// The compare-and-swap write: the file must still be exactly what the probe
 /// saw, or the write is refused rather than overwriting someone else's change.
 fn cas_write_script(
@@ -1431,7 +2067,7 @@ D=$(dirname -- "$C")
 mkdir -p -- "$D" || exit 70
 TMP="$D/.mewrk-write.$$"
 cat > "$TMP" || {{ rm -f -- "$TMP"; exit 70; }}
-mv -f -- "$TMP" "$C" || {{ rm -f -- "$TMP"; exit 70; }}
+{KEEP_MODE}mv -f -- "$TMP" "$C" || {{ rm -f -- "$TMP"; exit 70; }}
 printf '%s\n' "$(digits "$(mtime "$C")")"
 "#
     ));
@@ -1887,9 +2523,9 @@ pub(crate) mod tests {
             let inside = run_ls(&target, &input(json!({"path": "target", "depth": 3}))).unwrap();
             assert!(inside.contains("target/debug/out.rs"), "{backend:?}: {inside}");
 
-            let grepped = run_grep(&target, &input(json!({"pattern": "needle"}))).unwrap();
+            let grepped = run_grep(&target, &input(json!({"pattern": "needle", "output_mode": "content"}))).unwrap();
             assert_eq!(grepped, "src/main.rs:1:fn needle() {}", "{backend:?}");
-            let grepped = run_grep(&target, &input(json!({"pattern": "needle", "path": "node_modules"}))).unwrap();
+            let grepped = run_grep(&target, &input(json!({"pattern": "needle", "path": "node_modules", "output_mode": "content"}))).unwrap();
             assert_eq!(grepped, "node_modules/pkg/index.js:1:needle", "{backend:?}");
 
             let found = run_find(&target, &input(json!({"query": "*.rs"}))).unwrap();
@@ -2060,7 +2696,7 @@ pub(crate) mod tests {
         let listing = run_ls(&target, &input(json!({"depth": 2}))).unwrap();
         assert!(listing.contains("notes/it's.txt") && listing.contains("link"), "{listing}");
         assert!(!listing.contains("link/secret.txt"), "a junction is not descended into: {listing}");
-        let grep = run_grep(&target, &input(json!({"pattern": "th(i)rd"}))).unwrap();
+        let grep = run_grep(&target, &input(json!({"pattern": "th(i)rd", "output_mode": "content"}))).unwrap();
         assert!(grep.contains("notes/it's.txt:1:third"), "{grep}");
         let bad = run_grep(&target, &input(json!({"pattern": "("}))).refusal();
         assert!(bad.contains("Invalid regular expression"), "{bad}");
@@ -2102,9 +2738,9 @@ pub(crate) mod tests {
         assert!(listing.contains("build/ (ignored)"), "{listing}");
         assert!(!listing.contains("build/out"), "{listing}");
         assert!(listing.contains(".git/ (ignored)"), "{listing}");
-        let grep = run_grep(&target, &input(json!({"pattern": "third"}))).unwrap();
+        let grep = run_grep(&target, &input(json!({"pattern": "third", "output_mode": "content"}))).unwrap();
         assert_eq!(grep, "notes/it's.txt:1:third", "{grep}");
-        let grep = run_grep(&target, &input(json!({"pattern": "third", "path": "build"}))).unwrap();
+        let grep = run_grep(&target, &input(json!({"pattern": "third", "path": "build", "output_mode": "content"}))).unwrap();
         assert!(grep.contains("build/out/gen.txt:1:third"), "{grep}");
         let found = run_find(&target, &input(json!({"query": "*.txt"}))).unwrap();
         let lines = found.lines().collect::<Vec<_>>();
@@ -2257,61 +2893,191 @@ pub(crate) mod tests {
         )));
     }
 
-    #[test]
-    fn a_match_is_relative_and_its_text_is_cut_at_five_hundred_characters() {
-        let long = "x".repeat(600);
-        let formatted = format_match("/srv/app", &format!("/srv/app/src/a.rs:12:{long}"));
-        assert!(formatted.starts_with("src/a.rs:12:"), "{formatted}");
-        assert_eq!(formatted.chars().count(), "src/a.rs:12:".len() + 501);
-        assert!(formatted.ends_with('…'));
+    fn record(path: &str, line: u64, matched: bool, text: &str) -> Record {
+        Record {
+            path: path.to_owned(),
+            line,
+            matched,
+            text: text.to_owned(),
+        }
     }
 
-    /// A Windows machine prints its drive colon in the path: the split is at
-    /// the line number, so the path is still made relative and the text is
-    /// the line's own, colons and all.
+    fn content_query(extra: Value) -> search_scope::GrepQuery {
+        let mut arguments = json!({"pattern": "x", "output_mode": "content"});
+        for (key, value) in extra.as_object().unwrap() {
+            arguments[key] = value.clone();
+        }
+        search_scope::GrepQuery::from_input(&input(arguments)).unwrap()
+    }
+
     #[test]
-    fn a_match_splits_at_its_line_number_not_at_a_drive_colon() {
+    fn a_match_is_relative_and_its_text_and_context_are_cut_at_five_hundred_characters() {
+        let long = "x".repeat(600);
+        let records = vec![
+            record("/srv/app/src/a.rs", 11, false, &long),
+            record("/srv/app/src/a.rs", 12, true, &long),
+        ];
+        let regex = regex::Regex::new("x").unwrap();
+        let query = content_query(json!({"before": 1}));
+        let found = content_matches(&records, &query, &regex, "/srv/app", "/srv/app", 10);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, "src/a.rs");
+        assert_eq!(found[0].line, 12);
+        assert_eq!(found[0].text.chars().count(), 501);
+        assert!(found[0].text.ends_with('…'));
+        assert_eq!(found[0].before.len(), 1);
+        assert_eq!(found[0].before[0].chars().count(), 501);
+    }
+
+    /// With `--null` a file name is the text up to the NUL, whatever colons and
+    /// dashes and digits it holds; the line number and the `:` or `-` after it
+    /// say whether the line matched or is context.
+    #[test]
+    fn a_null_terminated_line_splits_at_the_nul_and_never_inside_the_name() {
+        let payload = "/w/a:12:b\u{0}7:it matched\n/w/a:12:b\u{0}8-context: with colons\n--\n/w/c-3-d.txt\u{0}1:x:2:y\r\n\n";
+        let records = parse_records(payload.as_bytes(), true);
+        assert_eq!(
+            records,
+            [
+                record("/w/a:12:b", 7, true, "it matched"),
+                record("/w/a:12:b", 8, false, "context: with colons"),
+                record("/w/c-3-d.txt", 1, true, "x:2:y"),
+            ]
+        );
+        // Without it only the first `:<digits>:` can be trusted, which a
+        // Windows drive colon and a colon in a name do not fool.
+        let plain = parse_records(b"C:/w/src/a.rs:7:let x: u8 = 1;\n/srv/a:b.txt:3::x\nno number here\n", false);
+        assert_eq!(
+            plain,
+            [
+                record("C:/w/src/a.rs", 7, true, "let x: u8 = 1;"),
+                record("/srv/a:b.txt", 3, true, ":x"),
+            ]
+        );
         assert_eq!(
             split_match("C:/work/app/src/a.rs:7:let x: u8 = 1;"),
             Some(("C:/work/app/src/a.rs", "7", "let x: u8 = 1;"))
         );
-        assert_eq!(
-            format_match("C:/work/app", "C:/work/app/notes/it's.txt:1:third"),
-            "notes/it's.txt:1:third"
-        );
-        assert_eq!(split_match("/srv/a:b.txt:3::x"), Some(("/srv/a:b.txt", "3", ":x")));
         assert_eq!(split_match("no number here"), None);
     }
 
+    #[test]
+    fn summaries_parse_from_the_end_or_the_start_whichever_the_name_cannot_confuse() {
+        assert_eq!(
+            parse_modified(b"1737000000 /w/dir with space/a.txt\n1737000009 /w/b:1:c\nnot a number /w/x\n"),
+            [
+                (1_737_000_000, "/w/dir with space/a.txt".to_owned()),
+                (1_737_000_009, "/w/b:1:c".to_owned()),
+            ]
+        );
+        assert_eq!(
+            parse_counts(b"/w/a:b:4\n/w/c.txt:0\n/w/d:12\nbroken\n"),
+            [("/w/a:b".to_owned(), 4), ("/w/d".to_owned(), 12)]
+        );
+    }
+
     /// The machine's engine may return lines the pattern does not match;
-    /// only the ones it does reach the page.
+    /// only the ones it does are matches, and a line it called a match that the
+    /// pattern rejects is still there to be a neighbour's context.
     #[test]
     fn remote_lines_are_matched_again_with_the_pattern_itself() {
         let regex = regex::Regex::new(r"^\d+$").unwrap();
-        let payload = "/r/a.txt:1:123\n/r/a.txt:2:12a\n\n/r/b.txt:9:7\nunreadable\n";
+        let records = vec![
+            record("/r/a.txt", 1, true, "123"),
+            record("/r/a.txt", 2, true, "12a"),
+            record("/r/a.txt", 3, true, "45"),
+            record("/r/b.txt", 9, true, "7"),
+        ];
+        let query = content_query(json!({"context": 1}));
+        let found = content_matches(&records, &query, &regex, "/r", "/r", 10);
         assert_eq!(
-            matched_lines(payload, &regex).collect::<Vec<_>>(),
-            ["/r/a.txt:1:123", "/r/b.txt:9:7", "unreadable"]
+            found.iter().map(|hit| (hit.path.as_str(), hit.line)).collect::<Vec<_>>(),
+            [("a.txt", 1), ("a.txt", 3), ("b.txt", 9)]
         );
+        assert_eq!(found[0].after, ["12a"]);
+        assert_eq!(found[1].before, ["12a"]);
+        // Only the page's worth is gathered.
+        assert_eq!(content_matches(&records, &query, &regex, "/r", "/r", 2).len(), 2);
+    }
+
+    /// Context is whatever consecutive lines the machine printed beside a
+    /// match, and stops where the numbers do.
+    #[test]
+    fn context_is_the_consecutive_lines_printed_around_a_match() {
+        let records = vec![
+            record("/r/a.txt", 3, false, "three"),
+            record("/r/a.txt", 5, true, "five"),
+            record("/r/a.txt", 6, false, "six"),
+            record("/r/b.txt", 7, false, "seven"),
+            record("/r/b.txt", 8, true, "eight"),
+        ];
+        let regex = regex::Regex::new("^(five|eight)$").unwrap();
+        let found = content_matches(
+            &records,
+            &content_query(json!({"context": 2})),
+            &regex,
+            "/r",
+            "/r",
+            10,
+        );
+        assert_eq!(found[0].before, Vec::<String>::new(), "line 4 is not there");
+        assert_eq!(found[0].after, ["six"]);
+        assert_eq!(found[1].before, ["seven"], "another file's lines are not context");
+        // A page that needs the next match's context asks for more only when
+        // the machine stopped at its cap.
+        assert!(content_is_complete(&records, &regex, 1, 2));
+        assert!(!content_is_complete(&records, &regex, 3, 0), "a third match is missing");
+        assert!(!content_is_complete(&records, &regex, 2, 2), "no lines follow the last match");
+    }
+
+    #[test]
+    fn a_glob_reaches_the_machine_as_case_patterns_and_the_host_checks_it_again() {
+        let wildcards = ["*.rs".to_owned(), "src/*.ts".to_owned(), "a b(1)*".to_owned()];
+        let script = glob_filter(&wildcards);
+        assert!(
+            script.contains("case \"$rel\" in *.rs|src/*.ts|a\\ b\\(1\\)*) ok=1 ;; esac"),
+            "{script}"
+        );
+        assert!(script.contains("${rel##*/}"));
+        assert_eq!(case_pattern("é*?.x"), "é*?.x");
+        assert_eq!(case_pattern("a;b|c"), "a\\;b\\|c");
+
+        let query = content_query(json!({"glob": "src/**/*.rs"}));
+        assert!(glob_allows(&query, "/w", "/w/src/a/b.rs"));
+        assert!(!glob_allows(&query, "/w", "/w/docs/b.rs"));
+        assert!(glob_allows(&content_query(json!({})), "/w", "/w/anything"));
     }
 
     #[test]
     fn unreadable_entries_are_reported_rather_than_dropped() {
+        struct Canned(&'static str);
+        impl RemoteShell for Canned {
+            fn run(
+                &self,
+                _script: &str,
+                _stdin: Option<&[u8]>,
+                _timeout: Duration,
+                _cancel: &CancelSignal,
+            ) -> Result<RemoteCommandOutput, String> {
+                Ok(RemoteCommandOutput {
+                    status: Some(0),
+                    stdout: b"/r\n/r\nnull\n".to_vec(),
+                    stderr: self.0.to_owned(),
+                })
+            }
+        }
+        let set = WorkspaceSet::local_root("/r".to_owned());
         let profile = PromptProfile::default();
-        let header = Header {
-            root: "/r".into(),
-            canonical: "/r".into(),
-        };
-        let page = search_scope::GrepPage::from_input(&JsonObject::new()).unwrap();
-        let rendered = render_matches(
-            &profile,
-            &header,
-            &page,
-            [],
-            "find: '/r/x': Permission denied\n",
-        );
+        let cancel = CancelSignal::default();
+        let target = workspace(&set, &profile, &cancel, Confinement::Workspace);
+        let said = grep_with(
+            &Canned("find: '/r/x': Permission denied\n"),
+            &target,
+            &input(json!({"pattern": "x"})),
+        )
+        .unwrap();
         assert_eq!(
-            rendered,
+            said,
             format!(
                 "{}\n{}",
                 profile.text(PromptKey::ToolGrepNoMatch),
@@ -2322,9 +3088,54 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(
-            render_matches(&profile, &header, &page, [], ""),
+            grep_with(&Canned(""), &target, &input(json!({"pattern": "x"}))).unwrap(),
             profile.text(PromptKey::ToolGrepNoMatch)
         );
+    }
+
+    /// A machine whose grep has no `--null` cannot say which lines are context.
+    #[test]
+    fn a_grep_without_null_leaves_the_context_out_and_says_so() {
+        struct Plain;
+        impl RemoteShell for Plain {
+            fn run(
+                &self,
+                _script: &str,
+                _stdin: Option<&[u8]>,
+                _timeout: Duration,
+                _cancel: &CancelSignal,
+            ) -> Result<RemoteCommandOutput, String> {
+                Ok(RemoteCommandOutput {
+                    status: Some(0),
+                    stdout: b"/r\n/r\nplain\n/r/a.txt:2:needle here\n".to_vec(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let set = WorkspaceSet::local_root("/r".to_owned());
+        let profile = PromptProfile::default();
+        let cancel = CancelSignal::default();
+        let target = workspace(&set, &profile, &cancel, Confinement::Workspace);
+        let said = grep_with(
+            &Plain,
+            &target,
+            &input(json!({"pattern": "needle", "output_mode": "content", "context": 2})),
+        )
+        .unwrap();
+        assert_eq!(
+            said,
+            format!(
+                "a.txt:2:needle here\n{}",
+                profile.text(PromptKey::ToolGrepContextUnavailable)
+            )
+        );
+        let without = grep_with(
+            &Plain,
+            &target,
+            &input(json!({"pattern": "needle", "output_mode": "content"})),
+        )
+        .unwrap();
+        assert_eq!(without, "a.txt:2:needle here");
     }
 
     #[test]
@@ -2640,9 +3451,13 @@ pub(crate) mod tests {
 
         let grepped = grep_with(&fixture.shell, &target, &input(json!({"pattern": "needle"}))).unwrap();
         assert_eq!(grepped, host("grep", json!({"pattern": "needle"})));
+        assert_eq!(grepped, "src/main.rs", "{grepped}");
+        let content = json!({"pattern": "needle", "output_mode": "content"});
+        let grepped = grep_with(&fixture.shell, &target, &input(content.clone())).unwrap();
+        assert_eq!(grepped, host("grep", content));
         assert_eq!(grepped, "src/main.rs:1:fn needle() {}", "{grepped}");
-        let grepped = grep_with(&fixture.shell, &target, &input(json!({"pattern": "needle", "path": "target"}))).unwrap();
-        assert_eq!(grepped, host("grep", json!({"pattern": "needle", "path": "target"})));
+        let grepped = grep_with(&fixture.shell, &target, &input(json!({"pattern": "needle", "path": "target", "output_mode": "content"}))).unwrap();
+        assert_eq!(grepped, host("grep", json!({"pattern": "needle", "path": "target", "output_mode": "content"})));
         assert!(grepped.contains("target/debug/deep/x.rs:1:needle"), "{grepped}");
 
         let found = find_with(&fixture.shell, &target, &input(json!({"query": "*.rs"}))).unwrap();
@@ -2670,8 +3485,8 @@ pub(crate) mod tests {
             let docs = std::path::Path::new(&fixture.workspace).join("docs");
             std::fs::remove_dir_all(&docs).unwrap();
             std::os::unix::fs::symlink(outside.path(), &docs).unwrap();
-            let grepped = grep_with(&fixture.shell, &target, &input(json!({"pattern": "needle"}))).unwrap();
-            assert_eq!(grepped, host("grep", json!({"pattern": "needle"})));
+            let grepped = grep_with(&fixture.shell, &target, &input(json!({"pattern": "needle", "output_mode": "content"}))).unwrap();
+            assert_eq!(grepped, host("grep", json!({"pattern": "needle", "output_mode": "content"})));
             assert!(!grepped.contains("outside"), "{grepped}");
         }
     }
@@ -2791,7 +3606,7 @@ pub(crate) mod tests {
             assert!(edited.diff.as_deref().is_some_and(|diff| diff.contains("+2nd line")), "{backend}");
             let listing = ls_with(&shell, &target, &input(json!({"depth": 2}))).unwrap();
             assert_eq!(listing, "notes/\nnotes/it's.txt\nsub/\nsub/deep/\nsub/deep/c.txt", "{backend}");
-            let grep = grep_with(&shell, &target, &input(json!({"pattern": "2nd|gamma"}))).unwrap();
+            let grep = grep_with(&shell, &target, &input(json!({"pattern": "2nd|gamma", "output_mode": "content"}))).unwrap();
             assert!(grep.contains("notes/it's.txt:2:2nd line") && grep.contains("sub/deep/c.txt:1:gamma"), "{backend}: {grep}");
             let found = find_with(&shell, &target, &input(json!({"query": "*.txt"}))).unwrap();
             assert_eq!(found, "notes/it's.txt\nsub/deep/c.txt", "{backend}");
@@ -2801,23 +3616,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn grep_is_case_insensitive_by_default_and_reports_relative_matches() {
+    fn grep_is_case_sensitive_by_default_and_reports_relative_matches() {
         let Some(fixture) = fixture() else { return };
         write_fixture_file(&fixture, "src/a.rs", b"fn Alpha() {}\nfn beta() {}\n");
         write_fixture_file(&fixture, "src/b.rs", b"nothing here\n");
         let harness = Harness::new(&fixture);
         let target = harness.target(Confinement::Workspace);
 
-        let loose = grep_with(&fixture.shell, &target, &input(json!({"pattern": "alpha"}))).unwrap();
-        assert_eq!(loose, "src/a.rs:1:fn Alpha() {}", "{loose}");
+        let strict = grep_with(&fixture.shell, &target, &input(json!({"pattern": "alpha"}))).unwrap();
+        assert_eq!(strict, harness.profile.text(PromptKey::ToolGrepNoMatch));
 
-        let strict = grep_with(
+        let loose = grep_with(
             &fixture.shell,
             &target,
-            &input(json!({"pattern": "alpha", "case_sensitive": true})),
+            &input(json!({"pattern": "alpha", "case_sensitive": false, "output_mode": "content"})),
         )
         .unwrap();
-        assert_eq!(strict, harness.profile.text(PromptKey::ToolGrepNoMatch));
+        assert_eq!(loose, "src/a.rs:1:fn Alpha() {}", "{loose}");
 
         let invalid = grep_with(
             &fixture.shell,
@@ -2874,36 +3689,46 @@ pub(crate) mod tests {
             json!({"pattern": r"width := \d{2}$", "case_sensitive": true}),
         ];
         for arguments in cases {
-            let remote = grep_with(&fixture.shell, &target, &input(arguments.clone())).unwrap();
-            assert_eq!(remote, host(arguments.clone()), "{arguments}");
-            assert_ne!(remote, harness.profile.text(PromptKey::ToolGrepNoMatch), "{arguments}");
+            // Every mode answers as the host leg does, whether the machine
+            // sent summaries (an exact pattern) or lines to check.
+            for mode in ["content", "files_with_matches", "count"] {
+                let mut arguments = arguments.clone();
+                arguments["output_mode"] = json!(mode);
+                let remote = grep_with(&fixture.shell, &target, &input(arguments.clone())).unwrap();
+                assert_eq!(remote, host(arguments.clone()), "{arguments}");
+                assert_ne!(remote, harness.profile.text(PromptKey::ToolGrepNoMatch), "{arguments}");
+            }
         }
         // The ERE rendering, which macOS and BusyBox machines run, agrees too.
         let path = ".".to_owned();
         for arguments in [
-            json!({"pattern": r"\d+$"}),
-            json!({"pattern": r"\bid\b"}),
-            json!({"pattern": r"interface\{\}"}),
+            json!({"pattern": r"\d+$", "output_mode": "content"}),
+            json!({"pattern": r"\bid\b", "output_mode": "content"}),
+            json!({"pattern": r"interface\{\}", "output_mode": "content"}),
         ] {
-            let pattern = crate::remote_regex::translate(arguments["pattern"].as_str().unwrap(), false).unwrap();
+            let pattern = crate::remote_regex::translate(arguments["pattern"].as_str().unwrap(), true).unwrap();
+            let request = GrepRequest {
+                shape: GrepShape::Lines { before: 0, after: 0 },
+                cap: 100,
+                wildcards: None,
+            };
             let output = run_script(
                 &fixture.shell,
                 &target,
-                &grep_script(&target, &path, &pattern, 100, true).unwrap(),
+                &grep_script(&target, &path, &pattern, &request, true).unwrap(),
                 None,
                 SEARCH_TIMEOUT,
                 &ExitWording::new(&path).grep(),
             )
             .unwrap();
             let (header, rest) = take_header(&output.stdout).unwrap();
-            let payload = String::from_utf8_lossy(rest).into_owned();
-            let page = search_scope::GrepPage::from_input(&JsonObject::new()).unwrap();
-            let rendered = render_matches(
+            let (format, rest) = take_lines(rest, 1).unwrap();
+            let records = parse_records(rest, format[0] == "null");
+            let query = search_scope::GrepQuery::from_input(&input(arguments.clone())).unwrap();
+            let rendered = query.render_content(
+                content_matches(&records, &query, &pattern.regex, &header.root, &header.canonical, query.page.wanted()),
+                Vec::new(),
                 &harness.profile,
-                &header,
-                &page,
-                matched_lines(&payload, &pattern.regex),
-                &output.stderr,
             );
             assert_eq!(rendered, host(arguments.clone()), "ERE {arguments}");
         }
@@ -2967,7 +3792,8 @@ pub(crate) mod tests {
     fn read_records_a_full_file_and_only_remembers_a_slice_of_a_range() {
         let Some(fixture) = fixture() else { return };
         write_fixture_file(&fixture, "notes.txt", b"one\ntwo\nthree\n");
-        write_fixture_file(&fixture, "binary.bin", &[b'a', 0xFF, 0xFE, b'b']);
+        write_fixture_file(&fixture, "latin.txt", &[b'a', 0xFF, 0xFE, b'b', b'\n']);
+        write_fixture_file(&fixture, "binary.bin", &[b'M', b'Z', 0x90, 0, 3, 0]);
         let harness = Harness::new(&fixture);
         let target = harness.target(Confinement::Workspace);
         let registry = FileReadRegistry::default();
@@ -3023,9 +3849,24 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(
             past_end.output,
-            harness.profile.text(PromptKey::ToolReadRangeOutOfBounds)
+            harness.profile.render(PromptKey::ToolReadRangeOutOfBounds, &[("total", "3")])
         );
 
+        // Not UTF-8 is not a failure; a NUL says binary.
+        let lossy = read_with(
+            &fixture.shell,
+            &target,
+            &input(json!({"path": "latin.txt"})),
+            None,
+            Some(guard),
+        )
+        .unwrap();
+        assert!(lossy.output.starts_with("a\u{fffd}\u{fffd}b"), "{}", lossy.output);
+        assert!(lossy.output.contains("not valid UTF-8"), "{}", lossy.output);
+        assert!(
+            !lossy.file_touch.and_then(|touch| touch.read).expect("record").full,
+            "a lossy decoding vouches for nothing"
+        );
         let binary = read_with(
             &fixture.shell,
             &target,
@@ -3034,7 +3875,10 @@ pub(crate) mod tests {
             None,
         )
         .refusal();
-        assert!(binary.contains("UTF-8"), "{binary}");
+        assert!(
+            binary.starts_with("This tool cannot read binary files: binary.bin"),
+            "{binary}"
+        );
 
         let missing = read_with(
             &fixture.shell,
@@ -3476,5 +4320,443 @@ pub(crate) mod tests {
             .run(&absent, Some(b"mine\n"), FILE_TIMEOUT, &CancelSignal::default())
             .unwrap();
         assert_eq!(answer.status, Some(EXIT_CHANGED));
+    }
+
+    /// The write goes through a temporary file and a rename, and the temporary
+    /// starts out with the default mode. The script must hand the replaced
+    /// file's mode to it first, or an edit turns an executable script into a
+    /// plain file — and it must do so without `chmod --reference`, which is GNU
+    /// only: the remote may be a Mac.
+    ///
+    /// The mode half needs a filesystem whose modes mean something. Git Bash on
+    /// NTFS reports 644 for everything it cannot tell apart, so there that half
+    /// is skipped (and said so); the content half runs everywhere.
+    #[test]
+    fn a_write_keeps_the_mode_of_the_file_it_replaces() {
+        let Some(fixture) = fixture() else { return };
+        let cancel = CancelSignal::default();
+        let sh = |script: String| {
+            let answer = fixture
+                .shell
+                .run(&script, None, FILE_TIMEOUT, &cancel)
+                .expect("the shell runs");
+            String::from_utf8_lossy(&answer.stdout).trim().to_owned()
+        };
+        let root = run_environment::sh_single_quote(&fixture.posix_root);
+        // The same two spellings the script uses.
+        let mode_of = |name: &str| {
+            sh(format!(
+                "cd -- {root} && (stat -c %a -- {name} 2>/dev/null || stat -f %Lp -- {name})",
+                name = run_environment::sh_single_quote(name)
+            ))
+        };
+        let modes_are_real = {
+            write_fixture_file(&fixture, "mode-probe", b"x");
+            sh(format!("cd -- {root} && chmod 751 mode-probe")); // prints nothing
+            mode_of("mode-probe") == "751"
+        };
+
+        write_fixture_file(&fixture, "tool.sh", b"#!/bin/sh\necho old\n");
+        write_fixture_file(&fixture, "secret.txt", b"old\n");
+        sh(format!("cd -- {root} && chmod 755 tool.sh && chmod 600 secret.txt"));
+
+        let harness = Harness::new(&fixture);
+        let target = harness.target(Confinement::Workspace);
+        for (name, content) in [("tool.sh", "#!/bin/sh\necho new\n"), ("secret.txt", "new\n")] {
+            let probe = probe_file(&fixture.shell, &target, name, &ExitWording::new(name)).unwrap();
+            cas_write(
+                &fixture.shell,
+                &target,
+                name,
+                &probe.fingerprint,
+                content.as_bytes(),
+                &ExitWording::new(name),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(std::path::Path::new(&fixture.workspace).join(name))
+                    .unwrap(),
+                content,
+                "{name} holds the new content"
+            );
+        }
+        // A file that did not exist gets whatever a plain create gives, and
+        // no temporary is left beside anything.
+        cas_write(
+            &fixture.shell,
+            &target,
+            "fresh.txt",
+            "absent",
+            b"first\n",
+            &ExitWording::new("fresh.txt"),
+        )
+        .unwrap();
+        let leftovers = sh(format!("cd -- {root} && ls -a | grep -c mewrk-write || true"));
+        assert_eq!(leftovers, "0", "no temporary file is left behind");
+
+        if !modes_are_real {
+            eprintln!("skipped the mode half: this shell's filesystem does not keep modes");
+            return;
+        }
+        assert_eq!(mode_of("tool.sh"), "755", "the executable bit survives the write");
+        assert_eq!(mode_of("secret.txt"), "600", "a private file stays private");
+        sh(format!("cd -- {root} && : > baseline.txt"));
+        assert_eq!(
+            mode_of("fresh.txt"),
+            mode_of("baseline.txt"),
+            "a new file is not given anybody's mode"
+        );
+    }
+
+    /// Both spellings of `stat` are in the script, and neither is the
+    /// GNU-only `chmod --reference`.
+    #[test]
+    fn the_write_script_reads_the_mode_in_both_gnu_and_bsd_spellings() {
+        let set = workspace_set("/srv/app");
+        let profile = PromptProfile::default();
+        let cancel = CancelSignal::default();
+        let target = workspace(&set, &profile, &cancel, Confinement::Workspace);
+        let script = cas_write_script(&target, "tool.sh", "absent").unwrap();
+        assert!(script.contains("stat -c %a"), "{script}");
+        assert!(script.contains("stat -f %Lp"), "{script}");
+        assert!(!script.contains("--reference"), "{script}");
+        let keep = script.find("chmod \"$M\"").expect("the mode is applied");
+        let rename = script.find("mv -f").expect("the swap");
+        assert!(keep < rename, "the mode is set before the rename publishes the file");
+    }
+
+    // -- grep and read: modes, context, glob and big files, through bash -------
+
+    /// What the host leg answers for the same call.
+    fn host_leg(fixture: &Fixture, tool: &str, arguments: Value) -> String {
+        let response = crate::tool_executor::execute(
+            crate::model::ToolExecutionRequest {
+                conversation_id: "conversation-test".into(),
+                workspace_path: fixture.workspace.clone(),
+                tool_name: tool.into(),
+                input: input(arguments),
+            },
+            &crate::state::AppState::default(),
+        );
+        assert!(response.success, "{tool}: {}", response.output);
+        response.output
+    }
+
+    /// Dates a fixture file `seconds` ago, on the clock both legs read.
+    fn age(fixture: &Fixture, relative: &str, seconds: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(std::path::Path::new(&fixture.workspace).join(relative))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds))
+            .unwrap();
+    }
+
+    fn search_fixture(fixture: &Fixture) {
+        write_fixture_file(fixture, "src/a.rs", b"one\nfn needle() {}\nthree\nfour\nfive\nsix\nseven\nlet needle = 1;\nnine\n");
+        write_fixture_file(fixture, "src/deep/b.rs", b"Needle in a haystack\nand a needle\n");
+        write_fixture_file(fixture, "docs/c.md", b"# notes\nthe needle is here\n");
+        write_fixture_file(fixture, "top.rs", b"needle\n");
+        write_fixture_file(fixture, "my file.rs", b"first\nneedle with space\nlast\n");
+        write_fixture_file(fixture, "a-3-b.txt", b"x\nneedle in a dashed name\ny\n");
+        write_fixture_file(fixture, "none.txt", b"nothing here\n");
+        for (name, seconds) in [
+            ("src/a.rs", 900),
+            ("src/deep/b.rs", 800),
+            ("docs/c.md", 700),
+            ("top.rs", 600),
+            ("my file.rs", 500),
+            ("a-3-b.txt", 400),
+            ("none.txt", 100),
+        ] {
+            age(fixture, name, seconds);
+        }
+    }
+
+    fn every_mode_agrees(fixture: &Fixture) {
+        let harness = Harness::new(fixture);
+        let target = harness.target(Confinement::Workspace);
+        let cases = [
+            json!({"pattern": "needle"}),
+            json!({"pattern": "needle", "case_sensitive": false}),
+            json!({"pattern": "needle", "output_mode": "content"}),
+            json!({"pattern": "needle", "output_mode": "content", "context": 1}),
+            json!({"pattern": "needle", "output_mode": "content", "context": 2, "case_sensitive": false}),
+            json!({"pattern": "needle", "output_mode": "content", "before": 1}),
+            json!({"pattern": "needle", "output_mode": "content", "after": 3, "limit": 3}),
+            json!({"pattern": "needle", "output_mode": "content", "context": 1, "limit": 2, "offset": 2}),
+            json!({"pattern": "needle", "output_mode": "count"}),
+            json!({"pattern": "needle", "output_mode": "count", "limit": 2, "offset": 1}),
+            json!({"pattern": "needle", "limit": 3}),
+            json!({"pattern": "needle", "limit": 3, "offset": 3}),
+            json!({"pattern": "needle", "offset": 40}),
+            json!({"pattern": "needle", "glob": "*.rs"}),
+            json!({"pattern": "needle", "glob": "src/**/*.rs", "output_mode": "content"}),
+            json!({"pattern": "needle", "glob": "*.{md,txt}", "output_mode": "count"}),
+            json!({"pattern": "needle", "glob": "my file.rs", "output_mode": "content", "context": 1}),
+            json!({"pattern": "needle", "glob": "a-3-*", "output_mode": "content", "context": 1}),
+            json!({"pattern": "needle", "glob": "*.zig"}),
+            json!({"pattern": "needle", "path": "src", "glob": "deep/*.rs", "output_mode": "content"}),
+            json!({"pattern": "needle", "path": "src/a.rs", "glob": "*.zig", "output_mode": "content"}),
+            // A pattern its translation can only widen: lines come back to be
+            // checked, and the files' dates by a second trip.
+            json!({"pattern": r"ne\w+le"}),
+            json!({"pattern": r"ne\w+le", "output_mode": "count"}),
+            json!({"pattern": r"ne\w+le", "glob": "*.rs", "output_mode": "content", "context": 1}),
+        ];
+        for arguments in cases {
+            let remote = grep_with(&fixture.shell, &target, &input(arguments.clone())).unwrap();
+            assert_eq!(remote, host_leg(fixture, "grep", arguments.clone()), "{arguments}");
+        }
+        let widened = crate::remote_regex::translate(r"ne\w+le", true).unwrap();
+        assert!(
+            !(widened.pcre_exact && widened.ere_exact),
+            "the pattern is meant to need the host's check"
+        );
+        // The shapes themselves.
+        let listed = grep_with(&fixture.shell, &target, &input(json!({"pattern": "needle"}))).unwrap();
+        assert_eq!(
+            listed,
+            "a-3-b.txt\nmy file.rs\ntop.rs\ndocs/c.md\nsrc/deep/b.rs\nsrc/a.rs",
+            "newest first"
+        );
+        let counted = grep_with(
+            &fixture.shell,
+            &target,
+            &input(json!({"pattern": "needle", "output_mode": "count"})),
+        )
+        .unwrap();
+        assert!(counted.starts_with("a-3-b.txt:1\ndocs/c.md:1\nmy file.rs:1\nsrc/a.rs:2\nsrc/deep/b.rs:1\ntop.rs:1\n"), "{counted}");
+        assert!(counted.ends_with("Total: 7 matching line(s) in 6 file(s)."), "{counted}");
+        let context = grep_with(
+            &fixture.shell,
+            &target,
+            &input(json!({"pattern": "fn needle", "output_mode": "content", "context": 1, "glob": "src/*.rs"})),
+        )
+        .unwrap();
+        assert_eq!(context, "src/a.rs-1-one\nsrc/a.rs:2:fn needle() {}\nsrc/a.rs-3-three");
+    }
+
+    #[test]
+    fn every_grep_mode_answers_alike_on_both_legs_in_a_plain_directory() {
+        let Some(fixture) = fixture() else { return };
+        search_fixture(&fixture);
+        every_mode_agrees(&fixture);
+    }
+
+    #[test]
+    fn every_grep_mode_answers_alike_on_both_legs_in_a_git_work_tree() {
+        let Some(fixture) = fixture() else { return };
+        if crate::environment_tools::resolve_on_path("git").is_none() {
+            return;
+        }
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&fixture.workspace)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        write_fixture_file(&fixture, ".gitignore", b"ignored/\n");
+        write_fixture_file(&fixture, "ignored/z.rs", b"needle\n");
+        search_fixture(&fixture);
+        age(&fixture, ".gitignore", 1000);
+        every_mode_agrees(&fixture);
+    }
+
+    /// Every file `grep` is shown is regular and text, whatever its size; a link
+    /// to a file outside and a binary file — however big — are passed over on
+    /// both legs. A text file past 2 MiB is searched on both, in every mode.
+    #[test]
+    fn what_grep_passes_over_is_the_same_on_both_legs() {
+        let Some(fixture) = fixture() else { return };
+        write_fixture_file(&fixture, "ok.txt", b"needle\n");
+        write_fixture_file(&fixture, "binary.bin", b"needle\0needle\n");
+        // 4.2 MiB of text, the match we look for on its last line.
+        let mut big = b"needle filler\n".repeat(300_000);
+        big.extend_from_slice(b"needle tail-marker\n");
+        write_fixture_file(&fixture, "big.txt", &big);
+        // A binary file past 2 MiB: still binary, still passed over.
+        let mut big_binary = b"MZ\x90\x00needle\n".to_vec();
+        big_binary.extend_from_slice(&b"needle filler\n".repeat(300_000));
+        write_fixture_file(&fixture, "big.bin", &big_binary);
+        // Dated apart, so the newest-first listing has no tie to break.
+        age(&fixture, "big.txt", 300);
+        age(&fixture, "ok.txt", 100);
+        age(&fixture, "binary.bin", 200);
+        age(&fixture, "big.bin", 250);
+        let harness = Harness::new(&fixture);
+        let target = harness.target(Confinement::Workspace);
+        for arguments in [
+            json!({"pattern": "needle", "output_mode": "files_with_matches"}),
+            json!({"pattern": "needle", "output_mode": "count"}),
+            // The one match in `big.txt` that only a search of its whole length reaches.
+            json!({"pattern": "tail-marker", "output_mode": "content", "context": 1}),
+            json!({"pattern": "tail-marker", "output_mode": "count"}),
+        ] {
+            let remote = grep_with(&fixture.shell, &target, &input(arguments.clone())).unwrap();
+            assert_eq!(remote, host_leg(&fixture, "grep", arguments.clone()), "{arguments}");
+            assert!(remote.contains("big.txt"), "{arguments}: {remote}");
+            assert!(!remote.contains("binary") && !remote.contains("big.bin"), "{arguments}: {remote}");
+        }
+        let listed = grep_with(
+            &fixture.shell,
+            &target,
+            &input(json!({"pattern": "needle", "output_mode": "files_with_matches"})),
+        )
+        .unwrap();
+        assert_eq!(listed, "ok.txt\nbig.txt");
+        let tail = grep_with(
+            &fixture.shell,
+            &target,
+            &input(json!({"pattern": "tail-marker", "output_mode": "content", "context": 1})),
+        )
+        .unwrap();
+        assert_eq!(tail, "big.txt-300000-needle filler\nbig.txt:300001:needle tail-marker");
+    }
+
+    fn numbered_log(lines: usize) -> Vec<u8> {
+        (1..=lines)
+            .map(|n| format!("line {n:06} of the log\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    #[test]
+    fn a_remote_file_past_five_mebibytes_is_read_by_range_as_the_host_leg_reads_it() {
+        let Some(fixture) = fixture() else { return };
+        // 6 MiB: past what is sent whole, so the machine cuts the range out.
+        let log = numbered_log(270_000);
+        assert!(log.len() > MAX_IMAGE_ATTACHMENT_BYTES);
+        write_fixture_file(&fixture, "big.log", &log);
+        let harness = Harness::new(&fixture);
+        let target = harness.target(Confinement::Workspace);
+        let remote = |arguments: Value| {
+            read_with(&fixture.shell, &target, &input(arguments), None, None).unwrap().output
+        };
+        for arguments in [
+            json!({"path": "big.log"}),
+            json!({"path": "big.log", "start_line": 150000, "end_line": 150002}),
+            json!({"path": "big.log", "start_line": 269999}),
+            json!({"path": "big.log", "start_line": 269999, "end_line": 270000}),
+            json!({"path": "big.log", "start_line": 270001}),
+            json!({"path": "big.log", "start_line": 100000, "end_line": 109000}),
+            json!({"path": "big.log", "start_line": 2000, "end_line": 2000}),
+        ] {
+            assert_eq!(remote(arguments.clone()), host_leg(&fixture, "read", arguments.clone()), "{arguments}");
+        }
+        let head = remote(json!({"path": "big.log"}));
+        assert!(head.ends_with("… showing lines 1–2000 of 270000. Continue with start_line=2001."), "{}", &head[head.len() - 90..]);
+
+        // A file too big to count says so, and still reads by range.
+        let uncounted = read_counting(
+            &fixture.shell,
+            &target,
+            &input(json!({"path": "big.log", "start_line": 5})),
+            None,
+            None,
+            1000,
+        )
+        .unwrap()
+        .output;
+        assert!(uncounted.starts_with("line 000005 of the log\n"), "{uncounted}");
+        assert!(
+            uncounted.ends_with("… showing lines 5–2004; the total line count was not computed because the file is large. Continue with start_line=2005."),
+            "{}",
+            &uncounted[uncounted.len() - 140..]
+        );
+        let past = read_counting(
+            &fixture.shell,
+            &target,
+            &input(json!({"path": "big.log", "start_line": 300000})),
+            None,
+            None,
+            1000,
+        )
+        .unwrap()
+        .output;
+        assert_eq!(past, "(The file has only 270000 lines, so the requested start_line is out of range)");
+        let near_end = read_counting(
+            &fixture.shell,
+            &target,
+            &input(json!({"path": "big.log", "start_line": 269999})),
+            None,
+            None,
+            1000,
+        )
+        .unwrap()
+        .output;
+        assert_eq!(near_end, "line 269999 of the log\nline 270000 of the log");
+
+        // Nothing it reads is a record `edit` could build on.
+        let registry = FileReadRegistry::default();
+        let guard = FileGuardContext {
+            scope: ScopeRef {
+                id: "c1",
+                parent: None,
+            },
+            registry: &registry,
+        };
+        let outcome = read_with(&fixture.shell, &target, &input(json!({"path": "big.log"})), None, Some(guard)).unwrap();
+        assert!(!outcome.file_touch.and_then(|touch| touch.read).expect("record").full);
+    }
+
+    #[test]
+    fn a_remote_file_past_five_mebibytes_that_is_not_text_is_refused_for_what_it_is() {
+        let Some(fixture) = fixture() else { return };
+        let mut binary = b"MZ\x90\x00\x03\x00".to_vec();
+        binary.resize(MAX_IMAGE_ATTACHMENT_BYTES + 1024, b'a');
+        write_fixture_file(&fixture, "big.bin", &binary);
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.resize(MAX_IMAGE_ATTACHMENT_BYTES + 1024, 0x61);
+        write_fixture_file(&fixture, "big16.txt", &utf16);
+        let mut image = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        image.resize(MAX_IMAGE_ATTACHMENT_BYTES + 1024, 0);
+        write_fixture_file(&fixture, "big.png", &image);
+        let mut odd = numbered_log(270_000);
+        odd.extend_from_slice(b"caf\xe9 \xff\xfe\n");
+        write_fixture_file(&fixture, "big-latin.log", &odd);
+        let harness = Harness::new(&fixture);
+        let target = harness.target(Confinement::Workspace);
+        let read = |path: &str, start: u64| {
+            read_with(&fixture.shell, &target, &input(json!({"path": path, "start_line": start})), None, None)
+        };
+        let refused = read("big.bin", 1).refusal();
+        assert!(refused.starts_with("This tool cannot read binary files: big.bin"), "{refused}");
+        let refused = read("big16.txt", 1).refusal();
+        assert!(refused.contains("UTF-16"), "{refused}");
+        let refused = read("big.png", 1).refusal();
+        assert_eq!(
+            refused,
+            format!("File exceeds the {} MiB limit", MAX_IMAGE_ATTACHMENT_BYTES / 1024 / 1024)
+        );
+        // Bytes that are not UTF-8 are text with replacements, as on the host.
+        let lossy = read("big-latin.log", 270_001).unwrap().output;
+        assert!(lossy.starts_with("caf\u{fffd} \u{fffd}\u{fffd}"), "{lossy}");
+        assert!(lossy.contains("not valid UTF-8"), "{lossy}");
+    }
+
+    #[test]
+    fn a_line_longer_than_a_slice_is_cut_not_refused_on_a_remote_big_file() {
+        let Some(fixture) = fixture() else { return };
+        let mut text = b"first\n".to_vec();
+        text.extend_from_slice(&vec![b'z'; 6 * 1024 * 1024]);
+        text.extend_from_slice(b"\nlast\n");
+        write_fixture_file(&fixture, "wide.txt", &text);
+        let harness = Harness::new(&fixture);
+        let target = harness.target(Confinement::Workspace);
+        let head = read_with(&fixture.shell, &target, &input(json!({"path": "wide.txt"})), None, None)
+            .unwrap()
+            .output;
+        assert!(head.starts_with("first\n"), "{}", &head[..20]);
+        assert!(head.contains("… showing lines 1–1 of 3"), "{}", &head[head.len() - 100..]);
+        let wide = read_with(&fixture.shell, &target, &input(json!({"path": "wide.txt", "start_line": 2, "end_line": 2})), None, None)
+            .unwrap()
+            .output;
+        assert!(wide.len() < read_text::READ_MAX_BYTES, "{}", wide.len());
+        assert!(wide.starts_with("zzzz") && wide.contains("[line cut:"), "{}", &wide[wide.len() - 80..]);
+        let last = read_with(&fixture.shell, &target, &input(json!({"path": "wide.txt", "start_line": 3})), None, None)
+            .unwrap()
+            .output;
+        assert_eq!(last, "last");
     }
 }

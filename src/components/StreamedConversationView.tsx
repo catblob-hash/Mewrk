@@ -25,6 +25,10 @@ import type { ContextItem, SubagentRunRecord, ToolDescriptor } from "../types";
 
 const NO_TURNS: ConversationTurn[] = [];
 const NO_AGENTS: SubagentView[] = [];
+// One object each for a timeline with no workflow in it, so a stream flush hands the
+// blocks the same props it did the last time.
+const NO_WORKFLOW_PROGRESS: Record<string, WorkflowProgressView> = {};
+const NO_WORKFLOW_RUNS: Record<string, WorkflowRunView> = {};
 
 type Translate = ReturnType<typeof useI18n>["t"];
 
@@ -111,9 +115,14 @@ export function StreamedConversationView({
    * `ModelRunState`. The card does not depend on them — it is built from the
    * roster, which outlives the run — so this only contributes the plan slots
    * that never got an agent, and the run's narration lines.
+   *
+   * Keyed on the run's progress entries, not on the run: the run is a new object
+   * on every flush, and its entries only when a workflow reports.
    */
+  const workflowEntriesByCall = run?.workflowProgressByCall;
   const workflowProgressByCall = useMemo<Record<string, WorkflowProgressView>>(() => {
-    if (!run) return {};
+    const calls = workflowEntriesByCall ? Object.entries(workflowEntriesByCall) : [];
+    if (calls.length === 0) return NO_WORKFLOW_PROGRESS;
     const messages = {
       fallbackStepLabel: (index: number) => t("步骤 {number}", "Step {number}", { number: index + 1 }),
       unphasedHeading: t("未分组", "Ungrouped"),
@@ -127,12 +136,12 @@ export function StreamedConversationView({
       )
     };
     return Object.fromEntries(
-      Object.entries(run.workflowProgressByCall).map(([callId, entries]) => [
+      calls.map(([callId, entries]) => [
         callId,
         deriveWorkflowProgress(entries, messages)
       ])
     );
-  }, [run, t]);
+  }, [workflowEntriesByCall, t]);
 
   // A running workflow's card shows its own and its steps' elapsed time, and
   // nothing else re-derives it while a step sits in one long call.
@@ -144,8 +153,10 @@ export function StreamedConversationView({
    * projection settled on.
    */
   const workflowRunByCall = useMemo<Record<string, WorkflowRunView>>(() => {
+    const items = deriveWorkflowItems(agents, taskMessages, now);
+    if (items.length === 0) return NO_WORKFLOW_RUNS;
     const byCall: Record<string, WorkflowRunView> = {};
-    for (const item of deriveWorkflowItems(agents, taskMessages, now)) {
+    for (const item of items) {
       const progress = item.agent.callIds
         .map((callId) => workflowProgressByCall[callId])
         .find(Boolean) ?? null;

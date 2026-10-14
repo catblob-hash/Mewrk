@@ -998,6 +998,7 @@ test("browser-dev owner fingerprint separately covers long-lived Node and Vite i
     "scripts/browser-dev-coordinator.mjs",
     "scripts/browser-dev.mjs",
     "scripts/vite-csp.mjs",
+    "scripts/vite-file-icons.mjs",
     "scripts/workspace-coordinator.mjs",
     "vite.config.ts"
   ];

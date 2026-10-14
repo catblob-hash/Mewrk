@@ -28,17 +28,17 @@
   color: var(--text); font: inherit; font-size: 11.5px; line-height: 24px;
   text-align: left; cursor: pointer;
 }
-.diff-viewer__tree-row--directory { color: var(--muted); }
+/* A directory's row is an item of the column itself, where growing would mean growing tall. */
+.diff-viewer__tree-row--directory { flex: 0 0 auto; color: var(--muted); }
 .diff-viewer__tree-row--directory:hover { background: var(--hover); }
 .diff-viewer__tree-row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .diff-viewer__tree-chevron {
   flex: 0 0 13px; color: var(--faint); transition: transform .12s;
 }
 .diff-viewer__tree-chevron--collapsed { transform: rotate(-90deg); }
+/* Only the file's type icon stands in front of the name, no status letter or colour: the
+   path is what identifies the file, and a badge before it pushes every path to the right. */
 .diff-viewer__tree-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* No status letter or colour in front of the name: the path is what identifies the
-   file, and a badge before it pushes every path to the right. */
-.diff-viewer__tree-icon { flex: 0 0 13px; color: var(--muted); }
 
 .diff-viewer__tree-menu { flex: 0 0 auto; display: flex; align-items: center; opacity: 0; }
 .diff-viewer__tree-file:hover .diff-viewer__tree-menu,
@@ -82,7 +82,6 @@
 .diff-viewer__file-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .diff-viewer__file-chevron { flex: 0 0 14px; color: var(--faint); transition: transform .12s; }
 .diff-viewer__file-chevron--collapsed { transform: rotate(-90deg); }
-.diff-viewer__file-icon { flex: 0 0 13px; color: var(--muted); }
 .diff-viewer__file-path { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The directory is context and the name is the subject, so only the name is at full weight. */
 .diff-viewer__file-directory { color: var(--faint); }
@@ -103,10 +102,14 @@
 
 /* ---- code ---- */
 
+/* The code is drawn in the code theme (`lib/codeThemes.ts`): on the theme's ground where it has
+   one, the panel otherwise. `--diff-ground` is that ground, which every cell paints and every
+   tint is laid on, so a number column the code scrolls under hides what passes. */
 .diff-viewer__code {
+  --diff-ground: var(--code-bg, var(--panel));
   display: grid; overflow-x: auto;
   font: 12px/17px var(--mono); tab-size: 2;
-  background: var(--panel);
+  background: var(--diff-ground); color: var(--code-fg, inherit);
   padding-bottom: 8px;
   -webkit-user-select: text; user-select: text;
 }
@@ -140,12 +143,14 @@
 /* Lines and rows are grid pass-throughs so every cell aligns across the whole file. */
 .diff-viewer__line, .diff-viewer__row { display: contents; }
 
-/* No padding either side and no tint: a change colours its line, never its number. */
+/* No padding either side, and no surface of its own: the column is the text's ground, and a
+   change's band runs through it. */
 .diff-viewer__number {
   position: sticky; left: 0; z-index: 1;
   padding: 0;
   text-align: right; -webkit-user-select: none; user-select: none;
-  background: var(--panel); color: color-mix(in srgb, var(--text) 60%, var(--panel));
+  background: var(--diff-ground);
+  color: var(--code-line-number, color-mix(in srgb, var(--text) 60%, var(--diff-ground)));
 }
 /* With no number column between them, a rule is what tells the two sides apart. */
 .diff-viewer__text--right { border-left: 1px solid var(--border); }
@@ -154,7 +159,7 @@
    keeps the marker's column and the space after it, marked or not, so a changed line starts
    where an unchanged one does. */
 .diff-viewer__text {
-  position: relative; padding-inline: 2ch 1ch; white-space: pre; background: var(--panel);
+  position: relative; padding-inline: 2ch 1ch; white-space: pre; background: var(--diff-ground);
 }
 .diff-viewer__code--wrap .diff-viewer__text {
   white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0;
@@ -162,24 +167,30 @@
 .diff-viewer__line--addition > .diff-viewer__text::before,
 .diff-viewer__text--addition::before {
   content: "+"; position: absolute; left: 0; width: 1ch;
-  color: var(--success); -webkit-user-select: none; user-select: none;
+  color: var(--code-added); -webkit-user-select: none; user-select: none;
 }
 .diff-viewer__line--deletion > .diff-viewer__text::before,
 .diff-viewer__text--deletion::before {
   content: "-"; position: absolute; left: 0; width: 1ch;
-  color: var(--danger); -webkit-user-select: none; user-select: none;
+  color: var(--code-removed); -webkit-user-select: none; user-select: none;
 }
 
-/* The reference shell mixes the line colour into the surface at 12%, so a run of changes
-   reads as a band rather than a stack of stripes. The band stops at the number column. */
-.diff-viewer__line--addition > .diff-viewer__text,
+/* The theme's hue for the change, thinned and laid on the ground, so a run of changes reads as
+   a band rather than a stack of stripes. The band starts at the pane's edge: the number is part
+   of the line, and takes the hue itself. Side by side the number takes the colour of the side
+   beside it, or of the new side on a row with nothing on the old one. */
+.diff-viewer__line--addition > :is(.diff-viewer__number, .diff-viewer__text),
+.diff-viewer__number--addition,
 .diff-viewer__text--addition {
-  background: color-mix(in srgb, var(--success) 12%, var(--panel));
+  background: linear-gradient(var(--code-added-line), var(--code-added-line)) var(--diff-ground);
 }
-.diff-viewer__line--deletion > .diff-viewer__text,
+.diff-viewer__line--deletion > :is(.diff-viewer__number, .diff-viewer__text),
+.diff-viewer__number--deletion,
 .diff-viewer__text--deletion {
-  background: color-mix(in srgb, var(--danger) 12%, var(--panel));
+  background: linear-gradient(var(--code-removed-line), var(--code-removed-line)) var(--diff-ground);
 }
+.diff-viewer__line--addition > .diff-viewer__number, .diff-viewer__number--addition { color: var(--code-added); }
+.diff-viewer__line--deletion > .diff-viewer__number, .diff-viewer__number--deletion { color: var(--code-removed); }
 /* A side with no counterpart is not an empty line — it is the absence of one, and the
    hatch says so rather than leaving a blank that reads as a blank line in the file. */
 .diff-viewer__text--absent {
@@ -188,8 +199,8 @@
       -45deg,
       transparent,
       transparent 4px,
-      color-mix(in srgb, var(--text) 6%, var(--panel)) 4px,
-      color-mix(in srgb, var(--text) 6%, var(--panel)) 8px
+      color-mix(in srgb, var(--code-fg, var(--text)) 6%, var(--diff-ground)) 4px,
+      color-mix(in srgb, var(--code-fg, var(--text)) 6%, var(--diff-ground)) 8px
     );
 }
 
@@ -197,8 +208,8 @@
   border-radius: 3px; box-decoration-break: clone;
   background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
-.diff-viewer__word--addition { background: color-mix(in srgb, var(--success) 18%, transparent); }
-.diff-viewer__word--deletion { background: color-mix(in srgb, var(--danger) 18%, transparent); }
+.diff-viewer__word--addition { background: var(--code-added-word); }
+.diff-viewer__word--deletion { background: var(--code-removed-word); }
 
 .diff-viewer__no-newline { padding-left: 4px; color: var(--faint); -webkit-user-select: none; user-select: none; }
 
@@ -207,7 +218,7 @@
   grid-column: 1 / -1;
   height: 32px;
   display: flex; align-items: center; gap: 4px; padding: 0 6px;
-  background: color-mix(in srgb, var(--text) 4%, var(--panel));
+  background: color-mix(in srgb, var(--code-fg, var(--text)) 4%, var(--diff-ground));
   color: var(--muted); font-size: 10.5px; line-height: 17px;
   -webkit-user-select: none; user-select: none;
 }

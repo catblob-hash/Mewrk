@@ -228,7 +228,8 @@ const SUBAGENT_DISABLED_TOOL_NAMES: &[&str] = &[
     "followup_task",
     "task_wait",
     "task_list",
-    // Stripped like the other two runtime names, then re-derived for every
+    "task_stop",
+    // Stripped like the other runtime names, then re-derived for every
     // child by the conversation's container: a child is handed host messages
     // of its own (a truncated reply, a missing structured result, its hooks),
     // and its deliveries are its own, never its parent's.
@@ -525,13 +526,14 @@ pub(crate) fn session_task_approval(
                 // Classify using this call's workspace. Isolated workflow steps rely
                 // on `workspace_path` to distinguish an allowed isolated edit from a
                 // write escaping to the parent checkout; the host constructs this trusted field.
-                let decision = security::classify_model_call_in_workspaces(
+                let decision = security::classify_model_call_in_workspaces_at(
                     security_level.get(),
                     &workspaces,
                     Path::new(&tool_request.workspace_path),
                     Path::new(&app_data_path),
                     &additional_directories,
                     tool_request,
+                    &security::remembered_shell_cwd(&approval_state, &tool_request.conversation_id),
                 )?;
                 (
                     decision.mandatory_prompt,
@@ -3890,7 +3892,7 @@ fn run_model_inner(
                         })?;
                         crate::helper_model::uses::on_tool_started(state, &request, round, &call.id, &call.name, &call.input);
 
-                        let mut authorization = classify_tool_authorization(&request, &call)?;
+                        let mut authorization = classify_tool_authorization(&request, &call, state)?;
                         // A question card is already the user's say on an
                         // `ask_user` call, so a hook that asks for confirmation
                         // is answered by it: no approval card rides along with a
@@ -3957,7 +3959,7 @@ fn run_model_inner(
                                         call_id: call.id.clone(),
                                         input: public_tool_input(&call.name, &call.input),
                                     })?;
-                                    authorization = classify_tool_authorization(&request, &call)?;
+                                    authorization = classify_tool_authorization(&request, &call, state)?;
                                     denied = sandbox_refusal(&request, &call).or_else(|| {
                                         plan_mode_refusal(&request, &call, &authorization)
                                     });
@@ -6594,6 +6596,19 @@ fn execute_model_tool_with_scope(
         };
         return (result, ToolFileIdentities::default());
     }
+    // A `write` or `edit` files the content it replaces under the user message
+    // it is made for, so the user can have the file back as it was before that
+    // message (`file_checkpoints`). Only those two change files this way.
+    let checkpoint_anchor = matches!(execution_request.tool_name.as_str(), "write" | "edit")
+        .then(|| crate::file_checkpoints::anchor_for_run(request))
+        .flatten();
+    let checkpoint = checkpoint_anchor
+        .as_deref()
+        .map(|anchor| crate::file_checkpoints::CheckpointContext {
+            conversation_id: &request.conversation_id,
+            anchor,
+            app_data: Path::new(&request.app_data_path),
+        });
     let execution = tool_executor::execute_with_scope_and_attachments_guarded(
         execution_request,
         state,
@@ -6606,6 +6621,7 @@ fn execute_model_tool_with_scope(
         handoff,
         &request.prompt_profile,
         file_guard_context(request, state),
+        checkpoint,
         Some(call_id),
     );
     (
@@ -6937,13 +6953,14 @@ fn execute_model_tool_with_turn_states(
         state.record_receipt(&execution_request, &result);
         result
     } else {
-        let decision = security::classify_model_call_in_workspaces(
+        let decision = security::classify_model_call_in_workspaces_at(
             request.effective_security_level(),
             &request.workspaces,
             Path::new(&request.workspace_path),
             Path::new(&request.app_data_path),
             &request.additional_directories,
             &execution_request,
+            &security::remembered_shell_cwd(state, &request.conversation_id),
         );
         match decision {
             Err(error) => {
@@ -11282,13 +11299,14 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
             } else {
                 (status, output)
             };
-            // The sidebar close is the one terminal cause the model cannot
-            // infer from the partial text, so say it in the result itself.
-            let output = if shared.stopped_by_user() {
-                orchestration::append_user_close_note(&output, shared.caller_prompt_profile())
-            } else {
-                output
-            };
+            // Who stopped the task is the one terminal cause the model cannot
+            // infer from the partial text, so say it in the result itself — the
+            // user's sidebar close, or the model's own `task_stop`.
+            let output = orchestration::append_stop_note(
+                &output,
+                shared.stop_attribution(),
+                shared.caller_prompt_profile(),
+            );
             shared.complete_turn(
                 incarnation,
                 response.contexts,
@@ -11308,13 +11326,18 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
             let (status, text) = if shared.cancel.load(std::sync::atomic::Ordering::Acquire) {
                 (
                     AgentLiveStatus::Interrupted,
-                    if shared.stopped_by_user() {
-                        shared
+                    match shared.stop_attribution() {
+                        Some(agents::StopOrigin::User) => shared
                             .caller_prompt_profile()
                             .text(PromptKey::TaskStoppedByUser)
-                            .to_owned()
-                    } else {
-                        "(Subagent run interrupted)".into()
+                            .to_owned(),
+                        Some(agents::StopOrigin::Model) => shared
+                            .caller_prompt_profile()
+                            .text(PromptKey::TaskStoppedByModel)
+                            .to_owned(),
+                        Some(agents::StopOrigin::Host) | None => {
+                            "(Subagent run interrupted)".into()
+                        }
                     },
                 )
             } else {
@@ -11659,6 +11682,7 @@ fn run_agent_tool(
             run_task_wait(pool, shadow, parent, call, state, event_sink, round)
         }
         agents::AgentToolKind::List => Ok(run_task_list(pool, parent, call, state)),
+        agents::AgentToolKind::Stop => Ok(run_task_stop(pool, parent, call, state)),
     }
 }
 
@@ -11935,13 +11959,14 @@ fn run_background_shell(
     };
     // Use the synchronous approval discipline: classify first, then request approval
     // when the hook did not allow it or the classifier requires confirmation.
-    let decision = match security::classify_model_call_in_workspaces(
+    let decision = match security::classify_model_call_in_workspaces_at(
         parent.effective_security_level(),
         &parent.workspaces,
         Path::new(&parent.workspace_path),
         Path::new(&parent.app_data_path),
         &parent.additional_directories,
         &execution_request,
+        &security::remembered_shell_cwd(state, &parent.conversation_id),
     ) {
         Ok(decision) => decision,
         Err(error) => {
@@ -12088,9 +12113,11 @@ fn run_background_shell(
         Err(error) => {
             // The process is already running. On registration failure, terminate
             // its process tree so no unaddressable, uncleared command leaks.
-            state
-                .shell_tasks
-                .request_stop(&parent.conversation_id, guard.shell_task_id());
+            state.shell_tasks.request_stop(
+                &parent.conversation_id,
+                guard.shell_task_id(),
+                agents::StopOrigin::Host,
+            );
             let _ = tool_executor::collect_shell_process(
                 spawned,
                 &mut guard,
@@ -12108,6 +12135,16 @@ fn run_background_shell(
     let tool_name = kind.tool_name();
     let worker_ref = shell_ref.clone();
     let worker_call_id = call.id.clone();
+    // The output file exists before the readers start, so it holds the command's
+    // output from its first byte; the receipt below is the model's only way to
+    // learn where it is.
+    let output_file = open_shell_output_file(
+        state,
+        &parent.conversation_id,
+        &parent.app_data_path,
+        guard.shell_task_id(),
+        &parent.prompt_profile,
+    );
     // Draining starts before the worker thread does: a command that fills a pipe
     // buffer with nobody reading it blocks, and the gap between registering and
     // scheduling the worker is real.
@@ -12115,7 +12152,11 @@ fn run_background_shell(
         Ok(run) => run,
         Err(error) => return Ok(failed_tool_execution(call, error)),
     };
-    let spawn_output = orchestration::shell_background_spawn_output(tool_name, &shell_ref);
+    let spawn_output = orchestration::shell_background_spawn_output(
+        &shell_ref,
+        output_file.as_deref(),
+        &parent.prompt_profile,
+    );
     start_registered_worker_with(
         Arc::clone(&shared),
         event_sink,
@@ -12233,6 +12274,16 @@ fn adopt_timed_out_shell(
         return Outcome::Refused(run, guard, context);
     }
     shadow.tool_backgrounded(call_id, &name, shared.identity());
+    // Nothing below can refuse, so the file is only made for a command that is
+    // really being adopted. It starts with what the live buffer still holds: the
+    // command has been streaming since before the handoff.
+    let output_file = open_shell_output_file(
+        state,
+        &parent.conversation_id,
+        &parent.app_data_path,
+        guard.shell_task_id(),
+        &parent.prompt_profile,
+    );
 
     let worker_shared = Arc::clone(&shared);
     let worker_state = state.clone();
@@ -12257,11 +12308,58 @@ fn adopt_timed_out_shell(
         worker_guard.defuse();
     });
     Outcome::Adopted(orchestration::shell_timeout_backgrounded_output(
-        tool_name,
         &shell_ref,
+        output_file.as_deref(),
         timeout,
         &parent.prompt_profile,
     ))
+}
+
+/// Opens the file a background command's output is written to while it runs (see
+/// [`crate::shell_tasks::ShellTaskRegistry::open_output_file`]) and returns its
+/// path as the receipt prints it.
+///
+/// `None` when the run has no application data directory (direct execution) or
+/// the file could not be created: the command runs on unaffected, and its
+/// receipt then promises no file.
+fn open_shell_output_file(
+    state: &AppState,
+    conversation_id: &str,
+    app_data_path: &str,
+    shell_task_id: &str,
+    profile: &PromptProfile,
+) -> Option<String> {
+    if app_data_path.trim().is_empty() {
+        return None;
+    }
+    let earlier_output_lost = |bytes: u64| {
+        profile.render(
+            PromptKey::TaskShellOutputFileEarlierLost,
+            &[("size", &crate::tool_output::human_size(bytes))],
+        )
+    };
+    let spec = crate::shell_tasks::OutputFileSpec {
+        app_data: Path::new(app_data_path),
+        max_bytes: crate::shell_tasks::MAX_OUTPUT_FILE_BYTES,
+        earlier_output_lost: &earlier_output_lost,
+        limit_reached: profile.render(
+            PromptKey::TaskShellOutputFileLimit,
+            &[(
+                "size",
+                &crate::tool_output::human_size(crate::shell_tasks::MAX_OUTPUT_FILE_BYTES),
+            )],
+        ),
+    };
+    match state
+        .shell_tasks
+        .open_output_file(conversation_id, shell_task_id, &spec)
+    {
+        Ok(path) => Some(path.display().to_string()),
+        Err(error) => {
+            eprintln!("命令 shell:{shell_task_id} 的输出文件无法建立，模型看不到它的中间输出：{error}");
+            None
+        }
+    }
 }
 
 /// Pool worker for background shell. Poll the OS process to completion, then
@@ -12344,6 +12442,7 @@ fn drive_background_shell(
             // does give background commands a deadline still reports the output
             // rather than dropping it.
             tool_executor::ShellProcessEnd::StoppedByUser
+            | tool_executor::ShellProcessEnd::StoppedByModel
             | tool_executor::ShellProcessEnd::Cancelled
             | tool_executor::ShellProcessEnd::TimedOut => (
                 AgentLiveStatus::Stopped,
@@ -12351,6 +12450,9 @@ fn drive_background_shell(
                     tool_name,
                     &shell_ref,
                     &fit(result.output),
+                    // The model's own `task_stop` is the one stop that must not
+                    // be worded as the user's.
+                    result.end == tool_executor::ShellProcessEnd::StoppedByModel,
                     profile,
                 ),
             ),
@@ -13165,11 +13267,33 @@ fn run_task_wait(
         .iter()
         .map(|task| observe_task(task, parent, state))
         .collect::<Vec<_>>();
+    // A wait that ends with a background command still running says where its
+    // output so far can be read, since the command's own result is not coming yet.
+    let still_running_shells = watched
+        .iter()
+        .filter(|agent| {
+            agent.kind == SubagentRunKind::ShellCommand && agent.status() == AgentLiveStatus::Running
+        })
+        .map(|agent| agent.label.clone())
+        .chain(others.iter().filter_map(|task| match task {
+            orchestration::TaskRef::Shell(_) => Some(task.wire()),
+            _ => None,
+        }));
+    let output_files = still_running_shells
+        .filter_map(|address| {
+            let id = address.strip_prefix("shell:")?;
+            state
+                .shell_tasks
+                .output_file_path(&parent.conversation_id, id)
+                .map(|path| (address.clone(), path.display().to_string()))
+        })
+        .collect::<Vec<_>>();
     let output = orchestration::format_wait_output(
         &outcome.envelopes,
         &on_calls,
         &statuses,
         &observations,
+        &output_files,
         outcome.timed_out,
         spec.timeout_seconds,
         &parent.prompt_profile,
@@ -13215,6 +13339,7 @@ fn run_task_list(
                 status_label: profile.text(status.prompt_key()).to_owned(),
                 detail: agent.task.clone(),
                 latest_update: agent.latest_update(),
+                output_file: None,
             });
             continue;
         }
@@ -13224,6 +13349,7 @@ fn run_task_list(
             status_label: profile.text(status.prompt_key()).to_owned(),
             detail: agent.task.clone(),
             latest_update: agent.latest_update(),
+            output_file: None,
         });
     }
     for (name, record) in historical_agent_records(&parent.contexts) {
@@ -13244,6 +13370,7 @@ fn run_task_list(
                 ),
                 detail: record.task.clone(),
                 latest_update: record.updates.last().map(|update| update.content.clone()),
+                output_file: None,
             });
             continue;
         }
@@ -13256,6 +13383,7 @@ fn run_task_list(
             ),
             detail: record.task.clone(),
             latest_update: record.updates.last().map(|update| update.content.clone()),
+            output_file: None,
         });
     }
     let terminal_rows = state
@@ -13276,6 +13404,7 @@ fn run_task_list(
                 .to_owned(),
             detail: format!("{} · {}", snapshot.shell, snapshot.cwd),
             latest_update: None,
+            output_file: None,
         })
         .collect::<Vec<_>>();
     // The dev servers this conversation started, plus any nobody owns, in every
@@ -13291,12 +13420,26 @@ fn run_task_list(
                 .to_owned(),
             detail: preview_task_detail(&addressable.server),
             latest_update: None,
+            output_file: None,
         })
         .collect::<Vec<_>>();
     // A conversation's own shell command can only be one another tool call started,
     // so a *running* row here is normally one a sibling agent sharing the conversation
     // started. Finished rows are the conversation's own command history, which is what
     // makes this list answer "did that build pass" instead of only "what is running".
+    //
+    // A running background command also names the file its output so far is being
+    // written to: that, and `task_wait`'s deadline answer, are the only places the
+    // model learns of it again after the receipt scrolls away.
+    let running_output_file = |shell_task_id: &str, running: bool| -> Option<String> {
+        if !running {
+            return None;
+        }
+        state
+            .shell_tasks
+            .output_file_path(&parent.conversation_id, shell_task_id)
+            .map(|path| path.display().to_string())
+    };
     let shell_rows = state
         .shell_tasks
         .task_snapshots(&parent.conversation_id)
@@ -13326,6 +13469,7 @@ fn run_task_list(
             },
             detail: snapshot.command,
             latest_update: None,
+            output_file: running_output_file(&snapshot.shell_task_id, snapshot.outcome.is_none()),
         })
         .collect::<Vec<_>>();
     let groups = vec![
@@ -13361,6 +13505,164 @@ fn run_task_list(
             duration_ms: 0,
         },
         subagent: None,
+    }
+}
+
+/// `task_stop`: stops one task of the caller's own layer.
+///
+/// An ordinary synchronous call that does what the user's stop button does, by the
+/// same act ([`agents::stop_task_by_address`]), so the stopped task settles as it
+/// would for the button: a terminal result with what it produced first, delivered
+/// by `task_wait` or at the next round boundary, waking an idle conversation. It
+/// adds no event of its own — the stop is the task's, not the call's.
+///
+/// The one difference is the origin it passes, `StopOrigin::Model`: the result
+/// then says the task was stopped with `task_stop`, because saying the user
+/// closed it would tell the model about an intervention that never happened.
+///
+/// "Own layer" is the `pool` the call runs against: a top-level run's is the
+/// conversation's, a child's is its private one, so a child can stop only what it
+/// started and a command or agent of anyone else is refused rather than reached.
+/// A terminal session is the user's own and is refused by name.
+fn run_task_stop(
+    pool: &AgentPool,
+    parent: &RunModelRequest,
+    call: ToolCall,
+    state: &AppState,
+) -> ToolExecution {
+    let Some(address) = call
+        .input
+        .get("task")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .map(str::to_owned)
+    else {
+        return failed_tool_execution(
+            call,
+            "task is required: the address of the task to stop, as task_list prints it".into(),
+        );
+    };
+    let (target, detail) = match resolve_stop_target(pool, parent, state, &address) {
+        Ok(target) => target,
+        Err(error) => return failed_tool_execution(call, error),
+    };
+    if !agents::stop_task_by_address(
+        Some(pool),
+        &state.shell_tasks,
+        &parent.conversation_id,
+        &target,
+        agents::StopOrigin::Model,
+    ) {
+        // It ended between the check and the stop.
+        return failed_tool_execution(call, already_finished_message(&target));
+    }
+    ToolExecution {
+        call,
+        result: ToolResult {
+            success: true,
+            output: parent.prompt_profile.render(
+                PromptKey::TaskStopStopped,
+                &[
+                    ("task", &target),
+                    ("detail", &orchestration::compact_preview(&detail, 80)),
+                ],
+            ),
+            images: Vec::new(),
+            diff: None,
+            executed_at: Utc::now().to_rfc3339(),
+            duration_ms: 0,
+        },
+        subagent: None,
+    }
+}
+
+fn already_finished_message(address: &str) -> String {
+    format!(
+        "{address} has already finished, so there is nothing to stop; its result is delivered by task_wait or between rounds, like any task's"
+    )
+}
+
+/// The running task a `task_stop` address names in the caller's own `pool`, as the
+/// address [`agents::stop_task_by_address`] takes and a line saying what it is.
+///
+/// Every refusal says why, because the usual cause is an address copied from a
+/// listing that has moved on.
+fn resolve_stop_target(
+    pool: &AgentPool,
+    parent: &RunModelRequest,
+    state: &AppState,
+    raw: &str,
+) -> Result<(String, String), String> {
+    let task = orchestration::TaskRef::parse(raw)?;
+    let wire = task.wire();
+    match &task {
+        orchestration::TaskRef::Terminal(_) => Err(format!(
+            "{wire} is a terminal session the user opened; its commands are the user's own, so task_stop cannot stop it"
+        )),
+        orchestration::TaskRef::Preview { .. } => Err(format!(
+            "{wire} is a dev server, which is stopped with preview_stop rather than task_stop"
+        )),
+        orchestration::TaskRef::Shell(shell_task_id) => {
+            if let Some(shared) = pool.all().into_iter().find(|agent| {
+                agent.kind == SubagentRunKind::ShellCommand && agent.label == wire
+            }) {
+                if shared.status() != AgentLiveStatus::Running {
+                    return Err(already_finished_message(&wire));
+                }
+                return Ok((wire, shared.task.clone()));
+            }
+            // Not one of this layer's tasks. Say which kind of "not": gone, over, or
+            // someone else's.
+            match state
+                .shell_tasks
+                .task_snapshot(&parent.conversation_id, shell_task_id)
+            {
+                None => Err(format!(
+                    "There is no command {wire}; it may have already finished. Use task_list to see the existing tasks"
+                )),
+                Some(snapshot) if snapshot.outcome.is_some() => Err(already_finished_message(&wire)),
+                Some(_) => Err(format!(
+                    "{wire} is running but is not one of your own background commands (another agent started it), so task_stop cannot stop it; the user can stop it from the task panel"
+                )),
+            }
+        }
+        orchestration::TaskRef::Workflow(_) => {
+            // A driver's label is its address; see `resolve_wait_targets`.
+            match pool.all().into_iter().find(|agent| {
+                agent.kind == SubagentRunKind::WorkflowStep && agent.label == wire
+            }) {
+                Some(shared) if shared.status() == AgentLiveStatus::Running => {
+                    Ok((wire, shared.task.clone()))
+                }
+                Some(_) => Err(already_finished_message(&wire)),
+                None => Err(format!(
+                    "There is no running workflow {wire}; it may have already finished (its result is in the timeline). Use task_list to see the existing tasks"
+                )),
+            }
+        }
+        orchestration::TaskRef::Agent(name) => {
+            // A shell command's pool name (`a3`) is the host's own, so only an agent
+            // or a workflow driver answers to a bare name.
+            match pool.all().into_iter().find(|agent| {
+                agent.name == *name
+                    && matches!(
+                        agent.kind,
+                        SubagentRunKind::General | SubagentRunKind::WorkflowStep
+                    )
+            }) {
+                Some(shared) if shared.status() == AgentLiveStatus::Running => {
+                    Ok((name.clone(), shared.task.clone()))
+                }
+                Some(_) => Err(already_finished_message(name)),
+                None if historical_agent_records(&parent.contexts).contains_key(name) => {
+                    Err(already_finished_message(name))
+                }
+                None => Err(format!(
+                    "There is no subagent named {name}; use task_list to see the existing tasks"
+                )),
+            }
+        }
     }
 }
 
@@ -13716,29 +14018,65 @@ fn resync_written_file(
     ))
 }
 
-/// Tells the language server holding a file that the model just changed it.
+/// What a `write` or `edit` that succeeded means for the language servers, as
+/// Claude Code's `changeFile` has it. In three parts, by what they cost:
 ///
-/// Only when a server is already running: an edit is not a reason to pay a cold
-/// `rust-analyzer` start, and reading two configuration files off disk for
-/// every `write` would be a cost every conversation pays whether or not it uses
-/// code navigation at all.
+/// 1. The conversation's diagnostics for the file are made reportable again.
+///    Memory only, so always: what it was shown before the edit describes text
+///    that is gone, and a problem that is still there afterwards has to be
+///    mentioned once more.
+/// 2. A server that is already up and already holds the file is re-synced,
+///    inline. Only when one is running: reading two configuration files off
+///    disk for every `write` would be a cost every conversation pays whether or
+///    not it uses code navigation at all.
+/// 3. For a conversation that was given the `lsp` tool, the server that claims
+///    the file is brought up, if it is not, and made to hold the file — in the
+///    background, because a cold `rust-analyzer` takes as long as it takes and
+///    the edit must not wait for it. Only where an `lsp` call on that file
+///    would run without asking: a repository's own `lsp.json` names the command
+///    that gets launched, and below full access that takes an approval an edit
+///    cannot ask for. A conversation that was not offered `lsp` never causes a
+///    start.
 ///
 /// A file on another machine is recognized by the record the remote leg took
 /// for it — its key carries the machine and the canonical path there — and the
 /// registry is asked whether a live server on that machine holds it before
-/// anything crosses the transport again.
+/// anything crosses the transport again. Everything else about it (the
+/// configuration, which server claims the file) is a round trip and therefore
+/// part 3, off this thread.
 fn note_lsp_file_change(
     request: &RunModelRequest,
     execution: &ToolExecution,
     touch: Option<&tool_executor::FileTouch>,
     state: &AppState,
 ) {
-    if !execution.result.success
-        || !matches!(execution.call.name.as_str(), "write" | "edit")
-        || !state.lsp_servers.has_running_servers()
-    {
+    if !execution.result.success || !matches!(execution.call.name.as_str(), "write" | "edit") {
         return;
     }
+    let registry = &state.lsp_servers;
+    let may_start = request.enabled_tools.iter().any(|name| name == "lsp");
+    let any_running = registry.has_running_servers();
+    let tracked = registry.tracks_conversation(&request.conversation_id);
+    if !any_running && !may_start && !tracked {
+        return;
+    }
+    let language = request.prompt_profile.language;
+    let gate = || {
+        may_start
+            .then(|| {
+                crate::lsp::StartGate::new(
+                    request.security_level,
+                    request.live_security_level.clone(),
+                    request.workspaces.clone(),
+                    request.workspace_path.clone(),
+                    request.app_data_path.clone(),
+                    request.additional_directories.clone(),
+                    &request.conversation_id,
+                    &execution.call.input,
+                )
+            })
+            .flatten()
+    };
     if let Some((machine_key, canonical)) =
         touch.and_then(|touch| crate::file_read_state::remote_key_parts(&touch.path))
     {
@@ -13754,14 +14092,54 @@ fn note_lsp_file_change(
         let Some(workspace) = workspace else {
             return;
         };
-        let runner = workspace.runner.clone();
         let canonical = canonical.to_owned();
-        state.lsp_servers.notify_remote_file_changed(
-            machine_key,
-            Path::new(&canonical),
-            &request.conversation_id,
-            &|| crate::remote_lsp::read_text(&runner, &canonical),
-        );
+        if tracked {
+            registry.forget_file_diagnostics(&request.conversation_id, Path::new(&canonical));
+        }
+        if any_running {
+            let runner = workspace.runner.clone();
+            registry.notify_remote_file_changed(
+                machine_key,
+                Path::new(&canonical),
+                &request.conversation_id,
+                &|| crate::remote_lsp::read_text(&runner, &canonical),
+            );
+        }
+        if let Some(gate) = gate() {
+            let workspace = workspace.clone();
+            let machine_key = machine_key.to_owned();
+            let also = request.workspaces.imports().on_machine(&machine_key);
+            let profile = request.prompt_profile.clone();
+            let conversation_id = request.conversation_id.clone();
+            registry.in_background(move |registry| {
+                let cancel = crate::cancel::CancelSignal::default();
+                let full_access = gate.level() == crate::model::SecurityLevel::FullAccess;
+                let target = crate::remote_files::RemoteWorkspace {
+                    sandbox: workspace.sandbox.as_ref(),
+                    workspace: &workspace,
+                    machine_key,
+                    // What the classifier would grant an `lsp` call: the whole
+                    // machine only at full access, the workspace otherwise.
+                    confinement: if full_access {
+                        crate::remote_files::Confinement::Machine
+                    } else {
+                        crate::remote_files::Confinement::Workspace
+                    },
+                    also,
+                    profile: &profile,
+                    cancel: &cancel,
+                };
+                crate::remote_lsp::open_after_edit(
+                    registry,
+                    &target,
+                    &canonical,
+                    language,
+                    &conversation_id,
+                    full_access,
+                    &|| gate.permits_start(),
+                );
+            });
+        }
         return;
     }
     let Some(path) = execution.call.input.get("path").and_then(Value::as_str) else {
@@ -13777,15 +14155,29 @@ fn note_lsp_file_change(
         .map(|workspace| workspace.root.clone())
         .unwrap_or_else(|| request.workspace_path.clone());
     let workspace = Path::new(&selected);
-    let configs =
-        crate::lsp_config::servers_for_workspace(workspace, request.prompt_profile.language);
     let resolved = crate::lsp::resolved_workspace_path(workspace, path);
-    state.lsp_servers.notify_file_changed(
-        &configs,
-        workspace,
-        &resolved,
-        &request.conversation_id,
-    );
+    if tracked {
+        registry.forget_file_diagnostics(&request.conversation_id, &resolved);
+    }
+    if any_running {
+        let configs = crate::lsp_config::servers_for_workspace(workspace, language);
+        registry.notify_file_changed(&configs, workspace, &resolved, &request.conversation_id);
+    }
+    if let Some(gate) = gate() {
+        let conversation_id = request.conversation_id.clone();
+        registry.in_background(move |registry| {
+            let workspace = Path::new(&selected);
+            let configs = crate::lsp_config::servers_for_workspace(workspace, language);
+            crate::lsp::open_after_local_edit(
+                registry,
+                &configs,
+                workspace,
+                &resolved,
+                &conversation_id,
+                &|| gate.permits_start(),
+            );
+        });
+    }
 }
 
 /// Routes one host-minted delivery card to the carriers that owe it.
@@ -14159,12 +14551,13 @@ fn output_truncated_delivery(request: &RunModelRequest) -> crate::wire_history::
 /// Whether `context` is a message the user wrote: a user context the host did
 /// not write itself (a delivery card's legacy form, a Stop hook's continuation).
 fn is_genuine_user_message(context: &ContextItem) -> bool {
-    matches!(
-        context,
-        ContextItem::User { id, .. }
-            if !id.starts_with(AGENT_RESULT_CONTEXT_ID_PREFIX)
-                && !id.starts_with("ctx_hook-continuation_")
-    )
+    matches!(context, ContextItem::User { id, .. } if is_genuine_user_context_id(id))
+}
+
+/// [`is_genuine_user_message`] for a user context known only by its id, which
+/// is all the host's own cards leave to tell them apart by.
+pub(crate) fn is_genuine_user_context_id(id: &str) -> bool {
+    !id.starts_with(AGENT_RESULT_CONTEXT_ID_PREFIX) && !id.starts_with("ctx_hook-continuation_")
 }
 
 /// The call that started a background task and is still owed its result as
@@ -15562,6 +15955,7 @@ fn authorization_tool_input(request: &RunModelRequest, call: &ToolCall) -> JsonO
 fn classify_tool_authorization(
     request: &RunModelRequest,
     call: &ToolCall,
+    state: &AppState,
 ) -> Result<ToolAuthorization, String> {
     let binding = request
         .mcp_bindings
@@ -15578,13 +15972,16 @@ fn classify_tool_authorization(
             tool_name: call.name.clone(),
             input: authorization_input,
         };
-        Some(security::classify_model_call_in_workspaces(
+        Some(security::classify_model_call_in_workspaces_at(
             request.effective_security_level(),
             &request.workspaces,
             Path::new(&request.workspace_path),
             Path::new(&request.app_data_path),
             &request.additional_directories,
             &execution_request,
+            // The directory the call will start in, so the danger bit the
+            // kernel shadow sees is the one the execution path decides on.
+            &security::remembered_shell_cwd(state, &request.conversation_id),
         )?)
     };
     Ok(ToolAuthorization {
@@ -15597,7 +15994,7 @@ fn classify_tool_authorization(
 
 #[cfg(test)]
 fn tool_requires_approval(request: &RunModelRequest, call: &ToolCall) -> Result<bool, String> {
-    Ok(classify_tool_authorization(request, call)?
+    Ok(classify_tool_authorization(request, call, &AppState::default())?
         .requires_permission_hook(request.effective_security_level()))
 }
 
@@ -26501,7 +26898,7 @@ mod tests {
         // PRODUCERS of its own (`bash`, `web_search`, …). A child that could
         // start a background task and not collect it would be holding a receipt
         // it can never redeem.
-        for name in ["task_wait", "task_list"] {
+        for name in ["task_wait", "task_list", "task_stop"] {
             assert!(
                 child_tools.iter().any(|tool| tool["name"] == name),
                 "{name} must be re-derived for a child holding a task producer"
@@ -27157,6 +27554,410 @@ mod tests {
         );
     }
 
+    /// What a model does with a background command it cannot wait for: reads the output so
+    /// far from the file its receipt names, finds the file again in `task_wait`'s answer at
+    /// the deadline and in `task_list`, and stops the command with `task_stop`, whose
+    /// result is delivered like a stop from the task panel — with what was printed first.
+    ///
+    /// The command prints, then sleeps far longer than the test lives, so it can only be
+    /// ended by the stop. `first_call` is the `bash` call that starts it, backgrounded explicitly or
+    /// by a deadline it cannot meet.
+    fn run_live_output_flow(first_call: Value) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let request = loop_request_for(address, workspace.path());
+        let conversation = request.conversation_id.clone();
+        let directory =
+            crate::workspace_dirs::ensure_tool_output_dir(workspace.path(), &conversation).unwrap();
+        let output_path = directory.join("shell-1-output.txt");
+        // This test's application data directory is the workspace, so the shell reaches
+        // the file by a relative path; waiting on it keeps the test from racing the shell's
+        // start-up, which can take longer than a wait's shortest deadline.
+        let relative = format!(
+            "tool-output/{}/shell-1-output.txt",
+            directory.file_name().unwrap().to_string_lossy()
+        );
+        let wait_for_output = format!(
+            "for i in $(seq 1 150); do grep -q 'EARLY-MARK' '{relative}' && break; sleep 0.2; done"
+        );
+        let call = |id: &str, name: &str, arguments: Value| {
+            json!({"type":"function_call","status":"completed","call_id":id,"name":name,
+                "arguments":arguments.to_string()})
+        };
+        let completed = |output: Vec<Value>| {
+            json!({"model":"model-test","status":"completed","output":output,
+                "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}})
+        };
+        let server = serve_json_sequence(
+            listener,
+            vec![
+                completed(vec![call("start", "bash", first_call)]),
+                completed(vec![
+                    call("sync-wait", "bash", json!({"command": wait_for_output})),
+                    call(
+                        "wait-deadline",
+                        "task_wait",
+                        json!({"tasks":["shell:1"],"timeout_seconds":5}),
+                    ),
+                    call("read-live", "read", json!({"path": output_path.to_string_lossy()})),
+                    call("list", "task_list", json!({})),
+                    call("stop", "task_stop", json!({"task":"shell:1"})),
+                    call(
+                        "wait-stopped",
+                        "task_wait",
+                        json!({"tasks":["shell:1"],"timeout_seconds":30}),
+                    ),
+                ]),
+                responses_text_output("stopped it"),
+            ],
+        );
+        let state = AppState::default();
+        let response = run_model(request, &state, &discard_event, &approve_tool).unwrap();
+        let bodies = server.join().unwrap();
+
+        let outputs = |tool: &str| -> Vec<(bool, String)> {
+            response
+                .contexts
+                .iter()
+                .filter_map(|context| match context {
+                    ContextItem::Tool {
+                        tool_name, result, ..
+                    } if tool_name == tool => Some((result.success, result.output.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let file_name = "shell-1-output.txt";
+        let receipt = &outputs("bash")[0];
+        assert!(receipt.0 && receipt.1.contains("shell:1"), "{receipt:?}");
+        assert!(
+            receipt.1.contains(file_name) && receipt.1.contains("read or grep"),
+            "the receipt names the file: {receipt:?}"
+        );
+        assert!(bodies[1].contains(file_name), "the model is sent the receipt");
+
+        let waits = outputs("task_wait");
+        assert!(
+            waits[0].1.contains("shell:1 · Output so far (read or grep): ")
+                && waits[0].1.contains(file_name),
+            "the deadline answer names the file of a command still running: {waits:?}"
+        );
+        let read = &outputs("read")[0];
+        assert!(read.0, "{read:?}");
+        assert!(read.1.contains("EARLY-MARK"), "{read:?}");
+        let list = &outputs("task_list")[0];
+        assert!(
+            list.1.contains("shell:1 · running") && list.1.contains(file_name),
+            "the running command's row names the file: {list:?}"
+        );
+        let stop = &outputs("task_stop")[0];
+        assert!(stop.0 && stop.1.starts_with("Stopping shell:1"), "{stop:?}");
+        assert!(stop.1.contains("EARLY-%s"), "names what it stopped: {stop:?}");
+
+        // The stop is delivered as any stop is: the output printed before it, and the
+        // sentence that the task was stopped — by `task_stop`, which is what the model
+        // called. Saying the user stopped it would report an intervention that never
+        // happened.
+        let delivered = &waits[1].1;
+        assert!(waits[1].0, "{delivered}");
+        assert!(delivered.contains("EARLY-MARK"), "{delivered}");
+        assert!(delivered.contains("was stopped with task_stop"), "{delivered}");
+        assert!(!delivered.contains("stopped by the user"), "{delivered}");
+        // The worker retires the row right after it delivers, so give it a moment.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.shell_tasks.is_running(&conversation, "1") {
+            assert!(Instant::now() < deadline, "the stopped command's row stayed running");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            state.shell_tasks.task_snapshot(&conversation, "1").unwrap().outcome,
+            Some(crate::shell_tasks::ShellTaskOutcome::Stopped)
+        );
+
+        // The file keeps what the command printed, and is no longer advertised.
+        assert_eq!(std::fs::read_to_string(&output_path).unwrap(), "EARLY-MARK");
+        assert_eq!(state.shell_tasks.output_file_path(&conversation, "1"), None);
+        assert_eq!(bodies.len(), 3);
+    }
+
+    #[test]
+    fn a_background_commands_output_is_readable_while_it_runs_and_the_model_can_stop_it() {
+        run_live_output_flow(json!({
+            "command": "printf 'EARLY-%s' MARK; sleep 600",
+            "run_in_background": true
+        }));
+    }
+
+    #[test]
+    fn a_command_moved_to_the_background_at_its_deadline_keeps_its_output_readable() {
+        run_live_output_flow(json!({
+            "command": "printf 'EARLY-%s' MARK; sleep 600",
+            "timeout": 200
+        }));
+    }
+
+    /// A foreground command that finishes within its deadline is not a task and leaves no
+    /// file behind.
+    #[test]
+    fn a_command_that_finishes_in_the_foreground_writes_no_output_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_json_sequence(
+            listener,
+            vec![
+                json!({
+                    "model":"model-test",
+                    "status":"completed",
+                    "output":[
+                        {"type":"function_call","status":"completed","call_id":"quick","name":"bash",
+                            "arguments":json!({"command":"printf QUICK_MARKER"}).to_string()}
+                    ],
+                    "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                }),
+                responses_text_output("quick done"),
+            ],
+        );
+        let workspace = tempfile::tempdir().unwrap();
+        let request = loop_request_for(address, workspace.path());
+        let state = AppState::default();
+        run_model(request, &state, &discard_event, &approve_tool).unwrap();
+        let bodies = server.join().unwrap();
+        assert!(bodies[1].contains("QUICK_MARKER"));
+        assert!(
+            !workspace.path().join("tool-output").exists(),
+            "nothing was written for a command that stayed in the foreground"
+        );
+    }
+
+    fn stop_with(
+        pool: &AgentPool,
+        request: &RunModelRequest,
+        state: &AppState,
+        task: &str,
+    ) -> (bool, String) {
+        let call = ToolCall {
+            id: "stop".into(),
+            name: "task_stop".into(),
+            input: json!({ "task": task }).as_object().unwrap().clone(),
+        };
+        let execution = run_task_stop(pool, request, call, state);
+        (execution.result.success, execution.result.output)
+    }
+
+    fn pool_entry(
+        pool: &AgentPool,
+        state: &AppState,
+        request: &RunModelRequest,
+        (name, label, task): (&str, &str, &str),
+        kind: SubagentRunKind,
+        status: AgentLiveStatus,
+    ) -> Arc<AgentShared> {
+        pool.register(
+            name.into(),
+            label.into(),
+            task.into(),
+            agent_child_template(request),
+            kind,
+            state,
+            Vec::new(),
+            Vec::new(),
+            status,
+            format!("call-{name}"),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// `task_stop` is the task panel's stop button, asked for by the model: the same flag
+    /// on a command's row, the same stop on an agent or a workflow run — but recorded as
+    /// the model's, so the result says `task_stop` stopped it and not the user.
+    #[test]
+    fn task_stop_stops_what_the_stop_button_stops() {
+        let state = AppState::default();
+        let request = run_request(ProviderFamily::OpenaiResponses);
+        let pool = AgentPool::new();
+
+        let command = state
+            .shell_tasks
+            .register(&request.conversation_id, "bash", "npm run dev", true);
+        let address = format!("shell:{}", command.shell_task_id());
+        pool_entry(
+            &pool,
+            &state,
+            &request,
+            ("a1", &address, "npm run dev"),
+            SubagentRunKind::ShellCommand,
+            AgentLiveStatus::Running,
+        );
+        let (ok, output) = stop_with(&pool, &request, &state, &address);
+        assert!(ok, "{output}");
+        assert!(
+            output.starts_with(&format!("Stopping {address} (npm run dev)")),
+            "{output}"
+        );
+        assert!(output.contains("still delivered"), "{output}");
+        assert!(command.stop_requested(), "the flag the row's stop button raises");
+        assert_eq!(
+            command.stop_attribution(),
+            Some(agents::StopOrigin::Model),
+            "the command's result must not be worded as the user's stop"
+        );
+
+        let reviewer = pool_entry(
+            &pool,
+            &state,
+            &request,
+            ("reviewer", "reviewer", "review the diff"),
+            SubagentRunKind::General,
+            AgentLiveStatus::Running,
+        );
+        let (ok, output) = stop_with(&pool, &request, &state, "reviewer");
+        assert!(ok, "{output}");
+        assert!(output.starts_with("Stopping reviewer (review the diff)"), "{output}");
+        assert!(reviewer.cancel.load(Ordering::Acquire));
+        assert_eq!(
+            reviewer.stop_attribution(),
+            Some(agents::StopOrigin::Model),
+            "settles as a stop the model made, not as the user's close"
+        );
+
+        // A workflow run answers to its address and to its bare name.
+        let audit = pool_entry(
+            &pool,
+            &state,
+            &request,
+            ("audit", "workflow:audit", "audit the repo"),
+            SubagentRunKind::WorkflowStep,
+            AgentLiveStatus::Running,
+        );
+        let sweep = pool_entry(
+            &pool,
+            &state,
+            &request,
+            ("sweep", "workflow:sweep", "sweep the repo"),
+            SubagentRunKind::WorkflowStep,
+            AgentLiveStatus::Running,
+        );
+        assert!(stop_with(&pool, &request, &state, "workflow:audit").0);
+        assert!(stop_with(&pool, &request, &state, "sweep").0);
+        assert!(audit.cancel.load(Ordering::Acquire) && sweep.cancel.load(Ordering::Acquire));
+        assert_eq!(audit.stop_attribution(), Some(agents::StopOrigin::Model));
+        assert_eq!(sweep.stop_attribution(), Some(agents::StopOrigin::Model));
+    }
+
+    #[test]
+    fn task_stop_refuses_what_is_not_a_running_task_of_the_caller() {
+        let state = AppState::default();
+        let request = run_request(ProviderFamily::OpenaiResponses);
+        let pool = AgentPool::new();
+        let refused = |task: &str| {
+            let (ok, output) = stop_with(&pool, &request, &state, task);
+            assert!(!ok, "{task} must be refused: {output}");
+            output
+        };
+
+        // Nothing by that name.
+        assert!(refused("ghost").contains("There is no subagent named ghost"));
+        assert!(refused("shell:99").contains("There is no command shell:99"));
+        assert!(refused("workflow:none").contains("There is no running workflow workflow:none"));
+        assert!(refused("Bad Name").contains("lowercase"));
+        let (ok, output) = stop_with(&pool, &request, &state, "  ");
+        assert!(!ok && output.contains("task is required"), "{output}");
+
+        // The user's terminal sessions are not the model's to stop, and a dev server has its own tool.
+        let output = refused("terminal:t1");
+        assert!(output.contains("terminal session") && output.contains("cannot stop"), "{output}");
+        assert!(refused("preview:dev").contains("preview_stop"));
+
+        // Already over: said so, rather than reported as stopped.
+        let finished = state
+            .shell_tasks
+            .register(&request.conversation_id, "bash", "ls", true);
+        let finished_address = format!("shell:{}", finished.shell_task_id());
+        drop(finished);
+        assert!(refused(&finished_address).contains("already finished"));
+        pool_entry(
+            &pool,
+            &state,
+            &request,
+            ("done", "done", "finished work"),
+            SubagentRunKind::General,
+            AgentLiveStatus::Idle,
+        );
+        assert!(refused("done").contains("already finished"));
+
+        // A pool name the host gave a command is not an address the model was ever told.
+        let other = state
+            .shell_tasks
+            .register(&request.conversation_id, "bash", "sleep 60", true);
+        let other_address = format!("shell:{}", other.shell_task_id());
+        pool_entry(
+            &pool,
+            &state,
+            &request,
+            ("a7", &other_address, "sleep 60"),
+            SubagentRunKind::ShellCommand,
+            AgentLiveStatus::Running,
+        );
+        assert!(refused("a7").contains("There is no subagent named a7"));
+        assert!(!other.stop_requested());
+    }
+
+    /// A child agent's pool is its own: it reaches neither its parent's tasks nor a
+    /// command another agent started, whatever address it writes.
+    #[test]
+    fn a_child_agent_cannot_stop_what_its_parent_started() {
+        let state = AppState::default();
+        let request = run_request(ProviderFamily::OpenaiResponses);
+        let parent_pool = AgentPool::new();
+        let child_pool = AgentPool::new();
+
+        let command = state
+            .shell_tasks
+            .register(&request.conversation_id, "bash", "make watch", true);
+        let address = format!("shell:{}", command.shell_task_id());
+        pool_entry(
+            &parent_pool,
+            &state,
+            &request,
+            ("a1", &address, "make watch"),
+            SubagentRunKind::ShellCommand,
+            AgentLiveStatus::Running,
+        );
+        let reviewer = pool_entry(
+            &parent_pool,
+            &state,
+            &request,
+            ("reviewer", "reviewer", "review the diff"),
+            SubagentRunKind::General,
+            AgentLiveStatus::Running,
+        );
+
+        let (ok, output) = stop_with(&child_pool, &request, &state, &address);
+        assert!(!ok && output.contains("not one of your own"), "{output}");
+        let (ok, output) = stop_with(&child_pool, &request, &state, "reviewer");
+        assert!(!ok && output.contains("There is no subagent named reviewer"), "{output}");
+        assert!(!command.stop_requested());
+        assert!(!reviewer.cancel.load(Ordering::Acquire));
+
+        // Its own, it can stop.
+        let own = state
+            .shell_tasks
+            .register(&request.conversation_id, "bash", "sleep 60", true);
+        let own_address = format!("shell:{}", own.shell_task_id());
+        pool_entry(
+            &child_pool,
+            &state,
+            &request,
+            ("a1", &own_address, "sleep 60"),
+            SubagentRunKind::ShellCommand,
+            AgentLiveStatus::Running,
+        );
+        assert!(stop_with(&child_pool, &request, &state, &own_address).0);
+        assert!(own.stop_requested());
+    }
+
     /// A foreground command still running at its timeout moves to the background
     /// even while every subagent run slot is taken: subagents take turns among
     /// themselves, and nothing limits background commands. Its result is
@@ -27642,7 +28443,11 @@ mod tests {
             loop {
                 let rows = stopper_registry.task_snapshots("conv_test");
                 if let Some(row) = rows.iter().find(|row| row.outcome.is_none()) {
-                    assert!(stopper_registry.request_stop("conv_test", &row.shell_task_id));
+                    assert!(stopper_registry.request_stop(
+                        "conv_test",
+                        &row.shell_task_id,
+                        agents::StopOrigin::User
+                    ));
                     return;
                 }
                 assert!(Instant::now() < deadline, "后台命令行没有出现");
@@ -28144,7 +28949,7 @@ mod tests {
         let mut web_only = parent.clone();
         web_only.enabled_tools = vec![WEB_SEARCH_TOOL.to_string(), WEB_FETCH_TOOL.to_string()];
         let web_only_template = agent_child_template(&web_only);
-        for name in ["task_wait", "task_list"] {
+        for name in ["task_wait", "task_list", "task_stop"] {
             assert!(
                 !web_only_template
                     .enabled_tools
@@ -28346,6 +29151,27 @@ mod tests {
     /// appears, then requires a terminal stopped record well before the command timeout.
     #[test]
     fn stopping_a_task_kills_the_shell_that_task_is_blocked_on() {
+        let result = stop_a_task_blocked_on_a_shell(crate::agents::StopOrigin::User);
+        assert!(
+            result.contains("The user manually closed this task"),
+            "结果正文必须说清是用户手动关闭的：{result}"
+        );
+    }
+
+    /// The same stop made by the model's `task_stop` ends the shell just as promptly,
+    /// but the delivered result says `task_stop` stopped it: the user never touched it,
+    /// and a result claiming otherwise would send the model off to ask what they meant.
+    #[test]
+    fn a_task_the_model_stops_is_not_reported_as_closed_by_the_user() {
+        let result = stop_a_task_blocked_on_a_shell(crate::agents::StopOrigin::Model);
+        assert!(result.contains("stopped with task_stop"), "{result}");
+        assert!(!result.contains("The user"), "{result}");
+        assert!(!result.contains("closed this task"), "{result}");
+    }
+
+    /// Runs a task blocked on `sleep 20`, stops it as `origin`, checks the stop reached
+    /// the shell and the result is deliverable, and returns the result's text.
+    fn stop_a_task_blocked_on_a_shell(origin: crate::agents::StopOrigin) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -28446,7 +29272,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         let stopped_at = Instant::now();
-        shared.request_stop(crate::agents::StopOrigin::User);
+        shared.request_stop(origin);
 
         let outcome_deadline = Instant::now() + Duration::from_secs(15);
         let outcome = loop {
@@ -28483,17 +29309,11 @@ mod tests {
         let claimed = pool.take_undelivered_results();
         assert_eq!(claimed.len(), 1);
         assert!(
-            claimed[0]
-                .content
-                .contains("The user manually closed this task"),
-            "结果正文必须说清是用户手动关闭的：{}",
-            claimed[0].content
-        );
-        assert!(
             !parent_run.load(Ordering::SeqCst),
             "这条测试不得借道运行级取消"
         );
         assert_eq!(server.join().unwrap(), 1, "只应该有那一次子回合请求");
+        claimed[0].content.clone()
     }
 
     fn serve_child_tool_call(
@@ -32384,7 +33204,7 @@ mod tests {
         }
         .apply(&mut narrowed, AgentRunStart::Fresh)
         .unwrap();
-        for name in ["task_wait", "task_list"] {
+        for name in ["task_wait", "task_list", "task_stop"] {
             assert!(
                 !narrowed.enabled_tools.iter().any(|entry| entry == name),
                 "{name} 应随最后一个 producer 一起消失：{:?}",
@@ -32405,7 +33225,7 @@ mod tests {
         .apply(&mut widened, AgentRunStart::Fresh)
         .unwrap();
         assert!(widened.enabled_tools.iter().any(|name| name == "bash"));
-        for name in ["task_wait", "task_list"] {
+        for name in ["task_wait", "task_list", "task_stop"] {
             assert!(
                 widened.enabled_tools.iter().any(|entry| entry == name),
                 "{name} 必须随新选进的 producer 一起派生：{:?}",
@@ -34274,6 +35094,7 @@ mod tests {
                 (PromptKey::SubagentUpdateToolDescription, "MARKED progress."),
                 (PromptKey::SystemEnvironmentWorkingDirectory, "MARKED working directory: {path}"),
                 (PromptKey::TaskStoppedByUser, "MARKED closed by the user."),
+                (PromptKey::TaskStoppedByModel, "MARKED stopped by task_stop."),
                 (PromptKey::SubagentForcedStop, "MARKED {name} was stopped."),
             ]
             .map(|(key, text)| (key, text.to_owned()))
@@ -34414,7 +35235,8 @@ mod tests {
 
     /// What a child on its role's file hands back is worded in its caller's
     /// file, the one the caller's model reads: a close by the user before its
-    /// turn began, and the forced stop of a worker that never honoured a stop.
+    /// turn began, a `task_stop` by the caller's own model before it began, and the
+    /// forced stop of a worker that never honoured a stop.
     #[test]
     fn a_child_on_its_roles_file_reports_to_its_caller_in_the_callers_wording() {
         let (directory, state, mut parent, mut definition) =
@@ -34450,6 +35272,9 @@ mod tests {
         agent_worker_loop(&closed, &state, 0);
         let stuck = register("a2");
         stuck.settle_after_cancel_timeout();
+        let stopped = register("a3");
+        stopped.request_stop(crate::agents::StopOrigin::Model);
+        agent_worker_loop(&stopped, &state, 0);
 
         let envelopes = pool.take_undelivered_results();
         let content = |name: &str| {
@@ -34461,6 +35286,7 @@ mod tests {
         };
         assert_eq!(content("a1"), "MARKED closed by the user.");
         assert_eq!(content("a2"), "MARKED a2 was stopped.");
+        assert_eq!(content("a3"), "MARKED stopped by task_stop.");
         state.document_store.flush(Duration::from_secs(10)).unwrap();
     }
 
@@ -37869,6 +38695,7 @@ mod tests {
                 name: STRUCTURED_OUTPUT_TOOL.into(),
                 input: serde_json::from_value(json!({"verdict": "ok"})).unwrap(),
             },
+            &AppState::default(),
         )
         .expect("the run loop authorizes every call before dispatch");
     }
@@ -42516,7 +43343,8 @@ mod tests {
             input: serde_json::from_value(json!({"command":"rm -rf /"})).unwrap(),
         };
 
-        let authorization = classify_tool_authorization(&request, &call).unwrap();
+        let authorization =
+            classify_tool_authorization(&request, &call, &AppState::default()).unwrap();
         assert!(authorization.intrinsic_mandatory_prompt());
         assert!(authorization.requires_permission_hook(SecurityLevel::FullAccess));
         let security = authorization.security.expect("built-in security decision");
@@ -42631,6 +43459,230 @@ mod tests {
         );
         assert!(read.result.success);
         assert_eq!(read.result.output, "outside content");
+    }
+
+    /// `write` and `edit` file the content they replace under the user message
+    /// they are made for, and a rewind puts it back — for the run's own calls,
+    /// whose timeline names the message, and for a child's, which only the saved
+    /// conversation can name it for — with the file write guards on and off alike.
+    #[test]
+    fn what_write_and_edit_change_can_be_put_back_with_the_file_guards_on_and_off() {
+        use crate::file_checkpoints::{rewind, RewindContext, RewindFilesRequest};
+        use crate::file_read_state::{FileReadRecord, ScopeRef};
+
+        fn message(id: &str) -> ContextItem {
+            ContextItem::User {
+                id: id.into(),
+                content: format!("message {id}"),
+                images: Vec::new(),
+                files: Vec::new(),
+                created_at: "2026-10-13T00:00:00Z".into(),
+            }
+        }
+        fn answer(id: &str) -> ContextItem {
+            ContextItem::Assistant {
+                id: id.into(),
+                content: "done".into(),
+                round: None,
+                model_turn_id: None,
+                interrupted: false,
+                sources: Vec::new(),
+                created_at: "2026-10-13T00:00:01Z".into(),
+            }
+        }
+
+        for guards in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = root.path().join("workspace");
+            let app_data = root.path().join("app-data");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(&app_data).unwrap();
+            std::fs::write(workspace.join("notes.txt"), "alpha\n").unwrap();
+            std::fs::write(workspace.join("config.json"), "{\"port\":80}").unwrap();
+
+            let conversation_id = format!("conv_checkpoint_{guards}");
+            let mut request = run_request(ProviderFamily::OpenaiResponses);
+            request.conversation_id = conversation_id.clone();
+            request.workspace_path = workspace.to_string_lossy().into_owned();
+            request.app_data_path = app_data.to_string_lossy().into_owned();
+            request.tools = catalog::tool_catalog();
+            request.enabled_tools = request.tools.iter().map(|tool| tool.name.clone()).collect();
+            request.security_level = SecurityLevel::AllowEdits;
+            request.file_guard.enabled = guards;
+            request.contexts = vec![message("user-1")];
+
+            let anchor_file = app_data.join("document.v1.json");
+            let store = crate::conversation_store::store_for(&anchor_file).unwrap();
+            let save = |contexts: &[ContextItem]| {
+                let mut conversation = catalog::default_document().workspaces[0].conversations[0].clone();
+                conversation.id = conversation_id.clone();
+                conversation.contexts = contexts.to_vec();
+                store.put_conversation("workspace-test", &conversation).unwrap();
+            };
+            save(&request.contexts);
+
+            let state = AppState::default();
+            let run = |request: &RunModelRequest, name: &str, input: Value| {
+                let execution = execute_model_tool(
+                    request,
+                    ToolCall {
+                        id: format!("call-{name}"),
+                        name: name.into(),
+                        input: input.as_object().unwrap().clone(),
+                    },
+                    &state,
+                    &|_, _, _| panic!("a trusted workspace write must not ask"),
+                    false,
+                );
+                assert!(execution.result.success, "{name} (guards {guards}): {}", execution.result.output);
+            };
+            // What a `read` leaves behind once the run loop has committed it.
+            let have_read = |name: &str, text: &str| {
+                if !guards {
+                    return;
+                }
+                let path = std::fs::canonicalize(workspace.join(name)).unwrap();
+                state.file_read_state.record(
+                    ScopeRef { id: &conversation_id, parent: None },
+                    path.clone(),
+                    FileReadRecord::full_read(
+                        crate::file_read_state::modified_ms(&path).unwrap(),
+                        crate::file_read_state::normalize_text(text),
+                    ),
+                );
+            };
+            let read = |name: &str| std::fs::read_to_string(workspace.join(name)).ok();
+
+            // The first message edits a file and makes one.
+            have_read("notes.txt", "alpha\n");
+            run(&request, "edit", json!({"path": "notes.txt", "find": "alpha", "replace": "beta"}));
+            run(&request, "write", json!({"path": "created.txt", "content": "new\n"}));
+            // The second overwrites one, and edits the first file again.
+            request.contexts.extend([answer("answer-1"), message("user-2")]);
+            save(&request.contexts);
+            have_read("config.json", "{\"port\":80}");
+            run(&request, "write", json!({"path": "config.json", "content": "{\"port\":8080}"}));
+            run(&request, "edit", json!({"path": "notes.txt", "find": "beta", "replace": "gamma"}));
+            // The third is carried out by a child, whose request has no timeline of
+            // the conversation's: the saved conversation names its message.
+            request.contexts.extend([answer("answer-2"), message("user-3")]);
+            save(&request.contexts);
+            let mut child = request.clone();
+            child.subagent_depth = 1;
+            child.contexts = Vec::new();
+            child.file_guard = crate::model::FileGuard {
+                enabled: guards,
+                scope: crate::file_read_state::child_scope_id(&conversation_id),
+                parent_scope: Some(conversation_id.clone()),
+            };
+            run(&child, "edit", json!({"path": "notes.txt", "find": "gamma", "replace": "delta"}));
+            run(&child, "write", json!({"path": "child.txt", "content": "from a child\n"}));
+
+            assert_eq!(read("notes.txt").as_deref(), Some("delta\n"));
+            let recorded = store
+                .file_checkpoints(&conversation_id)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.anchor, row.path.rsplit(['/', '\\']).next().unwrap().to_owned()))
+                .collect::<Vec<_>>();
+            let pair = |anchor: &str, name: &str| (anchor.to_owned(), name.to_owned());
+            assert_eq!(
+                recorded,
+                [
+                    pair("user-1", "notes.txt"),
+                    pair("user-1", "created.txt"),
+                    pair("user-2", "config.json"),
+                    pair("user-2", "notes.txt"),
+                    pair("user-3", "notes.txt"),
+                    pair("user-3", "child.txt"),
+                ],
+                "guards {guards}"
+            );
+
+            let rewind_to = |context_id: &str| {
+                rewind(
+                    &state,
+                    &anchor_file,
+                    RewindFilesRequest {
+                        conversation_id: conversation_id.clone(),
+                        context_id: context_id.into(),
+                        dry_run: false,
+                    },
+                    &RewindContext {
+                        roots: std::slice::from_ref(&workspace),
+                        peers: &[],
+                    },
+                )
+                .unwrap()
+                .files
+                .into_iter()
+                .map(|entry| entry.display_path)
+                .collect::<Vec<_>>()
+            };
+            assert_eq!(rewind_to("user-3"), ["notes.txt", "child.txt"]);
+            assert_eq!(read("notes.txt").as_deref(), Some("gamma\n"));
+            assert_eq!(read("child.txt"), None);
+            assert_eq!(rewind_to("user-2"), ["config.json", "notes.txt"]);
+            assert_eq!(read("notes.txt").as_deref(), Some("beta\n"));
+            assert_eq!(read("config.json").as_deref(), Some("{\"port\":80}"));
+            assert_eq!(rewind_to("user-1"), ["notes.txt", "created.txt"]);
+
+            assert_eq!(read("notes.txt").as_deref(), Some("alpha\n"), "guards {guards}");
+            assert_eq!(read("created.txt"), None);
+            assert!(store.file_checkpoints(&conversation_id).unwrap().is_empty());
+            if guards {
+                // The model has to read what a rewind put back before it edits it.
+                let path = std::fs::canonicalize(workspace.join("notes.txt")).unwrap();
+                assert!(state
+                    .file_read_state
+                    .get(ScopeRef { id: &conversation_id, parent: None }, &path)
+                    .is_none());
+            }
+        }
+    }
+
+    /// The run's own timeline decides the anchor for a top-level run — minus the
+    /// user cards the host wrote itself — and a request with none of its own asks
+    /// the saved conversation.
+    #[test]
+    fn a_write_is_filed_under_the_last_message_the_user_wrote() {
+        fn user_card(id: &str) -> ContextItem {
+            ContextItem::User {
+                id: id.into(),
+                content: id.into(),
+                images: Vec::new(),
+                files: Vec::new(),
+                created_at: "2026-10-13T00:00:00Z".into(),
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut request = run_request(ProviderFamily::Anthropic);
+        request.app_data_path = root.path().to_string_lossy().into_owned();
+        request.contexts = vec![
+            user_card("typed-1"),
+            user_card("typed-2"),
+            user_card("ctx_agent-result_late"),
+            user_card("ctx_hook-continuation_stop"),
+        ];
+        assert_eq!(crate::file_checkpoints::anchor_for_run(&request).as_deref(), Some("typed-2"));
+        request.contexts = vec![user_card("ctx_agent-result_only")];
+        assert_eq!(crate::file_checkpoints::anchor_for_run(&request), None);
+        request.contexts = vec![user_card("typed-1")];
+        request.app_data_path.clear();
+        assert_eq!(crate::file_checkpoints::anchor_for_run(&request), None, "no store to file it in");
+
+        // A child asks what the conversation has saved, however its own contexts read.
+        request.app_data_path = root.path().to_string_lossy().into_owned();
+        let store = crate::conversation_store::store_for(&root.path().join("document.v1.json")).unwrap();
+        let mut conversation = catalog::default_document().workspaces[0].conversations[0].clone();
+        conversation.id = request.conversation_id.clone();
+        conversation.contexts = vec![user_card("saved-1"), user_card("saved-2"), user_card("ctx_agent-result_x")];
+        store.put_conversation("workspace-test", &conversation).unwrap();
+        request.subagent_depth = 1;
+        assert_eq!(crate::file_checkpoints::anchor_for_run(&request).as_deref(), Some("saved-2"));
+        request.subagent_depth = 2;
+        request.contexts = Vec::new();
+        assert_eq!(crate::file_checkpoints::anchor_for_run(&request).as_deref(), Some("saved-2"));
     }
 
     #[test]
@@ -43289,5 +44341,144 @@ mod tests {
         assert!(!description(&child, shell).contains("grep tool"));
         assert_ne!(description(&top, shell), description(&child, shell));
         assert!(!description(&child, shell).contains("fresh turn"), "a child is never woken");
+    }
+
+    /// What a successful `edit` sets in motion for the language servers, from
+    /// the hook the run loop calls: a server is started in the background, and
+    /// the file opened on it, only where the conversation has the `lsp` tool and
+    /// an `lsp` call on that file would run without asking. A project that ships
+    /// its own `lsp.json` names the command that would be launched, and below
+    /// full access an edit has no approval card to raise for it.
+    #[test]
+    fn an_edit_starts_a_language_server_only_where_an_lsp_call_would_not_ask() {
+        let Some(node) = crate::environment_tools::resolve_on_path("node") else {
+            eprintln!("skipped: node is not on PATH");
+            return;
+        };
+        // A server that logs its start and every document it is given.
+        const SERVER: &str = r#"
+const fs = require("fs");
+const log = process.env.FAKE_LSP_LOG;
+fs.appendFileSync(log, "start\n");
+let buffer = Buffer.alloc(0);
+function send(payload) {
+  const body = Buffer.from(JSON.stringify(payload), "utf8");
+  process.stdout.write("Content-Length: " + body.length + "\r\n\r\n");
+  process.stdout.write(body);
+}
+process.stdin.on("data", (chunk) => {
+  buffer = Buffer.concat([buffer, chunk]);
+  for (;;) {
+    const end = buffer.indexOf("\r\n\r\n");
+    if (end < 0) return;
+    const length = Number(/Content-Length:\s*(\d+)/i.exec(buffer.slice(0, end).toString("utf8"))[1]);
+    if (buffer.length < end + 4 + length) return;
+    const message = JSON.parse(buffer.slice(end + 4, end + 4 + length).toString("utf8"));
+    buffer = buffer.slice(end + 4 + length);
+    if (message.method === "initialize") {
+      send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+    } else if (message.method === "textDocument/didOpen") {
+      fs.appendFileSync(log, "open " + JSON.stringify(message.params.textDocument.text) + "\n");
+    } else if (message.method === "shutdown") {
+      send({ jsonrpc: "2.0", id: message.id, result: null });
+    } else if (message.method === "exit") {
+      process.exit(0);
+    }
+  }
+});
+process.stdin.on("end", () => process.exit(0));
+"#;
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::create_dir_all(workspace.join(".mewrk")).unwrap();
+        std::fs::write(workspace.join("src").join("a.rs"), "fn a() {}\n").unwrap();
+        let server = temp.path().join("server.js");
+        std::fs::write(&server, SERVER).unwrap();
+        let log = temp.path().join("server.log");
+        std::fs::write(
+            workspace.join(".mewrk").join("lsp.json"),
+            serde_json::to_string(&json!({
+                "lspServers": { "fake": {
+                    "command": node.to_string_lossy(),
+                    "args": [server.to_string_lossy()],
+                    "env": { "FAKE_LSP_LOG": log.to_string_lossy() },
+                    "extensionToLanguage": { ".rs": "rust" },
+                } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let edit = ToolExecution {
+            call: ToolCall {
+                id: "edit-1".into(),
+                name: "edit".into(),
+                input: serde_json::from_value(json!({ "path": "src/a.rs" })).unwrap(),
+            },
+            result: ToolResult {
+                success: true,
+                output: "edited".into(),
+                images: Vec::new(),
+                diff: None,
+                executed_at: String::new(),
+                duration_ms: 0,
+            },
+            subagent: None,
+        };
+        let request_with = |level: SecurityLevel, tools: &[&str]| {
+            let mut request = run_request(ProviderFamily::OpenaiResponses);
+            request.workspace_path = workspace.to_string_lossy().into_owned();
+            request.app_data_path = temp.path().join("app-data").to_string_lossy().into_owned();
+            request.security_level = level;
+            request.enabled_tools = tools.iter().map(|name| (*name).to_owned()).collect();
+            request
+        };
+        let started = || std::fs::read_to_string(&log).unwrap_or_default();
+
+        // The project ships a configuration, and the level would ask: nothing starts.
+        let state = AppState::default();
+        note_lsp_file_change(
+            &request_with(SecurityLevel::RequestApproval, &["edit", "lsp"]),
+            &edit,
+            None,
+            &state,
+        );
+        state.lsp_servers.wait_for_background_tasks(Duration::from_secs(20));
+        assert!(!state.lsp_servers.has_running_servers());
+        assert_eq!(started(), "", "an edit cannot approve a repository's own command");
+
+        // Full access, but the conversation was never offered the tool: nothing starts.
+        note_lsp_file_change(
+            &request_with(SecurityLevel::FullAccess, &["edit"]),
+            &edit,
+            None,
+            &state,
+        );
+        state.lsp_servers.wait_for_background_tasks(Duration::from_secs(20));
+        assert!(!state.lsp_servers.has_running_servers());
+        assert_eq!(started(), "", "without the lsp tool an edit starts no server");
+
+        // Full access and the tool: the server comes up and is given the file.
+        let returned = std::time::Instant::now();
+        note_lsp_file_change(
+            &request_with(SecurityLevel::FullAccess, &["edit", "lsp"]),
+            &edit,
+            None,
+            &state,
+        );
+        assert!(
+            returned.elapsed() < Duration::from_secs(5),
+            "the hook returns without waiting for the server"
+        );
+        state.lsp_servers.wait_for_background_tasks(Duration::from_secs(30));
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !started().contains("open ") {
+            assert!(std::time::Instant::now() < deadline, "the file was never opened: {:?}", started());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(started(), "start\nopen \"fn a() {}\\n\"\n");
+        assert!(state.lsp_servers.has_running_servers());
+        state.lsp_servers.stop_all();
     }
 }

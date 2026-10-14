@@ -1,8 +1,42 @@
 /* States */
 .empty-state { flex: 1; min-height: 260px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px; color: var(--muted); text-align: center; }
 .empty-state__icon { display: grid; place-items: center; color: var(--muted); }
-.empty-state h3 { margin: 12px 0 0; color: var(--text); font-size: 14px; }
-.empty-state p { max-width: 430px; margin: 5px 0 14px; font-size: 11.5px; line-height: 1.55; }
+.empty-state > h3 { margin: 12px 0 0; color: var(--text); font-size: 14px; }
+.empty-state > p { max-width: 430px; margin: 5px 0 14px; font-size: 11.5px; line-height: 1.55; }
+/* The new task's page (DraftLanding.tsx). It is the timeline's empty state — the same box, centred
+   over the composer, and the same right-click surface — holding the brand, then what the task can
+   start from. The foot is deeper than the head because the composer's chips row and its fade lie
+   over the timeline's last 46px, which would otherwise pull the block's centre down. */
+.draft-landing { container: draft-landing / inline-size; gap: 30px; padding: 20px 0 46px; }
+.draft-landing__hero { display: flex; flex-direction: column; align-items: center; }
+.draft-landing__mark { display: block; }
+.draft-landing__title { margin: 16px 0 0; color: var(--text); font-size: 22px; line-height: 1.3; font-weight: 650; letter-spacing: .02em; }
+.draft-landing__lede { max-width: 440px; margin: 6px 0 0; font-size: 12px; line-height: 1.6; }
+/* Side by side, each a column of its own; a lone one stays as narrow as it would be in a pair
+   instead of stretching across the timeline. */
+.draft-landing__columns { width: min(660px, 100%); display: flex; justify-content: center; gap: 40px; text-align: left; }
+.draft-landing__section { flex: 0 1 310px; min-width: 0; }
+.draft-landing__heading { height: 26px; margin: 0; padding: 0 8px; display: flex; align-items: center; text-transform: uppercase; letter-spacing: .07em; font-size: 10px; font-weight: 700; color: var(--faint); }
+.draft-landing__list { margin: 0; padding: 0; list-style: none; }
+/* A task row is the sidebar's: the same status mark at the same inset, then the title. */
+.draft-landing__task { position: relative; width: 100%; height: 30px; padding: 0 8px 0 28px; display: flex; align-items: center; gap: 12px; border-radius: 7px; background: transparent; color: var(--text); font-size: 12.5px; text-align: left; transition: background .14s; }
+.draft-landing__task:hover { background: var(--hover); }
+.draft-landing__task-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.draft-landing__task-age { flex: 0 0 auto; color: var(--faint); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.draft-landing__shortcut { height: 30px; padding: 0 8px; display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; }
+.draft-landing__shortcut-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.draft-landing__keys { flex: 0 0 auto; display: inline-flex; gap: 4px; }
+.draft-landing__keys kbd { min-width: 20px; height: 20px; padding: 0 5px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 5px; background: var(--subtle); color: var(--muted); font: 600 10.5px/1 var(--app-font-family); }
+/* The page never scrolls: its whole point is the composer under it, so what does not fit goes.
+   A tile too narrow for two columns — the chat beside open side panes — keeps the tasks, which
+   are the half that leads somewhere, and a short window keeps the brand alone. */
+@container draft-landing (max-width: 520px) {
+  .draft-landing__section { flex-basis: 100%; max-width: 310px; }
+  .draft-landing__section + .draft-landing__section { display: none; }
+}
+@media (max-height: 660px) {
+  .draft-landing__columns { display: none; }
+}
 .app-loading, .fatal-state { width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; background: var(--app); color: var(--muted); }
 /* The brand mark blinking as a text cursor does: 530ms on, 530ms off, the Windows default caret rate. */
 .app-loading__mark { height: 34px; width: auto; display: block; -webkit-user-select: none; user-select: none; color: var(--color-c98a1b); animation: app-loading-blink 1.06s step-end infinite; }
@@ -56,7 +90,7 @@
   .timeline-row__stat { display: none; }
   .timeline-row__details { margin-left: 18px; margin-right: 0; }
   .composer-wrap { padding-right: 10px; padding-left: 10px; }
-  .composer-context { left: 10px; right: 10px; width: auto; translate: none; }
+  .composer-context { left: 10px; right: 10px; width: auto; }
   .composer__footer { gap: 4px; }
   .composer__tools { gap: 3px; }
   .composer__options { gap: 3px; }

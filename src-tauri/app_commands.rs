@@ -9,6 +9,8 @@ macro_rules! mewrk_app_commands {
             update_conversation,
             attest_edited_tool_context,
             attest_inserted_tool_context,
+            attest_copied_tool_contexts,
+            rewind_files,
             reorder_conversations,
             load_conversation,
             load_conversation_plan,

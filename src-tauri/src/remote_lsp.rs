@@ -20,15 +20,15 @@
 
 use std::{
     collections::BTreeSet,
-    path::Path,
-    sync::{Mutex, OnceLock},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
 use crate::{
     lsp::{self, LspCall, LspFiles, MAX_FILE_BYTES},
     lsp_config::{self, LspServerConfig},
-    lsp_servers::{LspRegistry, ServerHost},
+    lsp_servers::{server_root, LspRegistry, ServerHost, ServerRoot},
     model::{JsonObject, ResolvedLanguage, ResourceSource},
     remote_files::{self, Confinement, ExitWording, RemoteShell, RemoteWorkspace, TargetMode},
     run_environment::{self, ShellRunner},
@@ -442,6 +442,182 @@ pub(crate) fn read_text_with(
         return None;
     }
     String::from_utf8(output.stdout).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Starting a server after an edit
+// ---------------------------------------------------------------------------
+
+/// How long "no server on this machine claims this extension" is remembered.
+///
+/// Finding that out takes a round trip to the machine (the configuration lives
+/// there), and most files a model edits — Markdown, JSON, a lockfile — have no
+/// server at all. Without this, each of those edits would pay the round trip.
+/// Short, because the answer changes when someone writes an `lsp.json` or
+/// installs a server, and nothing tells this side when they do.
+const NO_SERVER_TTL: Duration = Duration::from_secs(60);
+
+/// Entries kept; the oldest go first.
+const NO_SERVER_CAPACITY: usize = 256;
+
+/// `(machine, workspace root, extension)` triples found to have no server, and
+/// when. Keyed by the workspace root as the conversation spells it, which is
+/// what both the check and the entry know before anything is probed.
+#[derive(Default)]
+struct NoServerCache {
+    entries: Vec<(String, String, String, Instant)>,
+}
+
+impl NoServerCache {
+    fn recently_without(&mut self, machine: &str, root: &str, extension: &str, now: Instant) -> bool {
+        self.entries
+            .retain(|(_, _, _, taken)| now.duration_since(*taken) < NO_SERVER_TTL);
+        self.entries
+            .iter()
+            .any(|(m, r, e, _)| m == machine && r == root && e == extension)
+    }
+
+    fn remember(&mut self, machine: &str, root: &str, extension: &str, now: Instant) {
+        self.entries
+            .retain(|(m, r, e, _)| !(m == machine && r == root && e == extension));
+        self.entries
+            .push((machine.to_owned(), root.to_owned(), extension.to_owned(), now));
+        while self.entries.len() > NO_SERVER_CAPACITY {
+            self.entries.remove(0);
+        }
+    }
+}
+
+fn no_server_cache() -> &'static Mutex<NoServerCache> {
+    static CACHE: OnceLock<Mutex<NoServerCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(NoServerCache::default()))
+}
+
+/// What an edit should have a server on another machine do.
+#[derive(Debug)]
+struct EditPlan {
+    config: LspServerConfig,
+    language_id: String,
+    /// The root that server indexes, on the machine.
+    root: PathBuf,
+    /// The canonical path of the edited file, on the machine.
+    file: String,
+}
+
+/// Decides whether an edit of `canonical` on the machine should start (or feed)
+/// a language server there, and which. `None` is "leave it alone".
+///
+/// The questions, cheapest first, and none of them reached when an earlier one
+/// already says no:
+///
+/// 1. The extension was recently found to have no server on this machine: no
+///    round trip.
+/// 2. `may_start` — whether an `lsp` call on this file would run without
+///    asking (the classifier's answer, itself cached briefly per machine and
+///    root): a project that ships its own configuration raises a card below
+///    full access, and an edit has none to raise.
+/// 3. One probe, the same one a call makes: the machine's configuration
+///    files, its installed presets, and the file's text. A project
+///    configuration found here below full access is a "no" whatever the
+///    classifier's cached answer said — it may be older than the file.
+/// 4. A server that claims the extension. If none does, that is remembered.
+#[allow(clippy::too_many_arguments)]
+fn plan_open_after_edit(
+    shell: &dyn RemoteShell,
+    target: &RemoteWorkspace<'_>,
+    canonical: &str,
+    language: ResolvedLanguage,
+    full_access: bool,
+    may_start: &dyn Fn() -> bool,
+    cache: &Mutex<NoServerCache>,
+    now: Instant,
+) -> Option<EditPlan> {
+    let extension = Path::new(canonical)
+        .extension()
+        .map(|value| lsp_config::normalize_extension(&value.to_string_lossy()))?;
+    let machine = target.machine_key.as_str();
+    let root = target.workspace.root.as_str();
+    if cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .recently_without(machine, root, &extension, now)
+    {
+        return None;
+    }
+    if !may_start() {
+        return None;
+    }
+    let probe = probe_file(shell, target, canonical).ok()?;
+    if probe.project_config.is_some() && !full_access {
+        forget_declares(&target.workspace.runner, &target.workspace.root);
+        return None;
+    }
+    let configs = configs_for(&probe, &target.workspace.runner, language);
+    let Some((config, language_id)) =
+        LspRegistry::config_for_path(&configs, Path::new(&probe.canonical))
+    else {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remember(machine, root, &extension, now);
+        return None;
+    };
+    Some(EditPlan {
+        root: server_root(config, Path::new(&probe.root)),
+        config: config.clone(),
+        language_id,
+        file: probe.canonical,
+    })
+}
+
+/// Claude Code's `changeFile` for a file the model just wrote on another
+/// machine, the part that is not a quick re-sync (see
+/// [`LspRegistry::notify_remote_file_changed`]): have the server that claims it
+/// there be up and hold it. For a background thread; every step is a round trip.
+///
+/// `target` is built by the caller with the confinement the call is entitled
+/// to, and `full_access` is the conversation's level now.
+pub(crate) fn open_after_edit(
+    registry: &LspRegistry,
+    target: &RemoteWorkspace<'_>,
+    canonical: &str,
+    language: ResolvedLanguage,
+    conversation_id: &str,
+    full_access: bool,
+    may_start: &dyn Fn() -> bool,
+) {
+    let runner = &target.workspace.runner;
+    let Some(plan) = plan_open_after_edit(
+        runner,
+        target,
+        canonical,
+        language,
+        full_access,
+        may_start,
+        no_server_cache(),
+        Instant::now(),
+    ) else {
+        return;
+    };
+    let host = ServerHost::Remote {
+        runner: runner.clone(),
+        machine_key: target.machine_key.clone(),
+    };
+    let root = ServerRoot::new(&host, plan.root);
+    // The text is asked for again when the server is up rather than carried
+    // over from the probe: a start takes seconds, and the file may have been
+    // edited again since.
+    let reader = runner.clone();
+    let file = plan.file.clone();
+    registry.open_after_edit(
+        &host,
+        &plan.config,
+        &plan.language_id,
+        &root,
+        Path::new(&plan.file),
+        conversation_id,
+        Arc::new(move || read_text(&reader, &file)),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -920,5 +1096,200 @@ mod tests {
             &[format!("{root}/src/lib.rs")]
         )
         .is_none());
+    }
+
+    /// Counts the round trips an edit costs.
+    struct CountingShell<'a> {
+        inner: &'a crate::remote_files::tests::LocalBash,
+        runs: std::cell::Cell<usize>,
+    }
+
+    impl RemoteShell for CountingShell<'_> {
+        fn run(
+            &self,
+            script: &str,
+            stdin: Option<&[u8]>,
+            timeout: Duration,
+            cancel: &crate::cancel::CancelSignal,
+        ) -> Result<run_environment::RemoteCommandOutput, String> {
+            self.runs.set(self.runs.get() + 1);
+            self.inner.run(script, stdin, timeout, cancel)
+        }
+    }
+
+    fn plan_with(
+        shell: &CountingShell<'_>,
+        target: &RemoteWorkspace<'_>,
+        canonical: &str,
+        full_access: bool,
+        may_start: &dyn Fn() -> bool,
+        cache: &Mutex<NoServerCache>,
+        now: Instant,
+    ) -> Option<EditPlan> {
+        plan_open_after_edit(
+            shell,
+            target,
+            canonical,
+            ResolvedLanguage::EnUs,
+            full_access,
+            may_start,
+            cache,
+            now,
+        )
+    }
+
+    /// Most files a model edits have no language server, and finding that out
+    /// is a round trip to the machine. It is paid once per extension per
+    /// minute, not once per edit.
+    #[test]
+    fn an_extension_no_server_claims_is_remembered_for_a_minute() {
+        let Some(fixture) = fixture() else { return };
+        write_fixture_file(&fixture, "notes.txt", b"hello\n");
+        write_fixture_file(&fixture, "more.txt", b"hello\n");
+        write_fixture_file(&fixture, "src/main.rs", b"fn main() {}\n");
+        let harness = Harness::new(&fixture);
+        let target = harness.target(Confinement::Workspace);
+        let shell = CountingShell {
+            inner: &fixture.shell,
+            runs: std::cell::Cell::new(0),
+        };
+        let cache = Mutex::new(NoServerCache::default());
+        let root = &fixture.posix_root;
+        let (notes, more) = (format!("{root}/notes.txt"), format!("{root}/more.txt"));
+        let now = Instant::now();
+        let asked = std::cell::Cell::new(0);
+        let allow = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+
+        assert!(plan_with(&shell, &target, &notes, false, &allow, &cache, now).is_none());
+        assert_eq!(shell.runs.get(), 1, "the first edit probes the machine");
+
+        // Another file with the same extension: not even the classifier is
+        // asked, let alone the machine.
+        let before = asked.get();
+        let later = now + Duration::from_secs(10);
+        assert!(plan_with(&shell, &target, &more, false, &allow, &cache, later).is_none());
+        assert_eq!(shell.runs.get(), 1, "no second round trip");
+        assert_eq!(asked.get(), before, "and nobody is asked");
+
+        // The answer is about an extension on a machine and a root, nothing wider.
+        let machine = target.machine_key.as_str();
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .recently_without(machine, &target.workspace.root, ".txt", later)
+        );
+        assert!(
+            !cache
+                .lock()
+                .unwrap()
+                .recently_without(machine, &target.workspace.root, ".rs", later),
+            "another extension is not covered"
+        );
+        assert!(
+            !cache
+                .lock()
+                .unwrap()
+                .recently_without("ssh:other", &target.workspace.root, ".txt", later),
+            "another machine is not covered"
+        );
+        assert!(
+            !cache
+                .lock()
+                .unwrap()
+                .recently_without(machine, "/another/root", ".txt", later),
+            "another root is not covered"
+        );
+
+        // After the minute the machine is asked again, because someone may
+        // have written an lsp.json or installed a server since.
+        let much_later = now + NO_SERVER_TTL + Duration::from_secs(1);
+        assert!(plan_with(&shell, &target, &notes, false, &allow, &cache, much_later).is_none());
+        assert_eq!(shell.runs.get(), 2);
+    }
+
+    #[test]
+    fn the_negative_cache_is_bounded() {
+        let mut cache = NoServerCache::default();
+        let now = Instant::now();
+        for index in 0..(NO_SERVER_CAPACITY + 40) {
+            cache.remember("m", &format!("/root/{index}"), ".txt", now);
+        }
+        assert_eq!(cache.entries.len(), NO_SERVER_CAPACITY);
+        assert!(!cache.recently_without("m", "/root/0", ".txt", now), "the oldest went first");
+        assert!(cache.recently_without("m", &format!("/root/{}", NO_SERVER_CAPACITY + 39), ".txt", now));
+        // Remembering twice keeps one entry.
+        cache.remember("m", "/root/last", ".txt", now);
+        cache.remember("m", "/root/last", ".txt", now);
+        assert_eq!(
+            cache.entries.iter().filter(|(_, root, _, _)| root == "/root/last").count(),
+            1
+        );
+    }
+
+    /// An edit has no approval card to raise: below full access a project that
+    /// ships its own configuration starts nothing, whatever the classifier's
+    /// cached answer said; at full access the same project's server is planned.
+    #[test]
+    fn an_edit_starts_a_project_configured_server_only_at_full_access() {
+        let Some(fixture) = fixture() else { return };
+        write_fixture_file(&fixture, "src/main.rs", b"fn main() {}\n");
+        write_fixture_file(&fixture, ".mewrk/lsp.json", PROJECT_CONFIG.as_bytes());
+        let harness = Harness::new(&fixture);
+        let shell = CountingShell {
+            inner: &fixture.shell,
+            runs: std::cell::Cell::new(0),
+        };
+        let root = &fixture.posix_root;
+        let canonical = format!("{root}/src/main.rs");
+        let allow = || true;
+
+        // The classifier is stubbed to say yes (a cached "no project file" from
+        // before the file existed); the probe sees the file.
+        let confined = harness.target(Confinement::Workspace);
+        let cache = Mutex::new(NoServerCache::default());
+        assert!(
+            plan_with(&shell, &confined, &canonical, false, &allow, &cache, Instant::now()).is_none()
+        );
+        assert_eq!(shell.runs.get(), 1, "the probe is what found the project file");
+        assert!(
+            cache.lock().unwrap().entries.is_empty(),
+            "a refusal is not an answer about the extension"
+        );
+
+        let machine = harness.target(Confinement::Machine);
+        let plan = plan_with(&shell, &machine, &canonical, true, &allow, &cache, Instant::now())
+            .expect("at full access the project's server is planned");
+        assert_eq!(plan.config.command, "probe-ls");
+        assert_eq!(plan.language_id, "rust");
+        assert_eq!(plan.file, canonical);
+        assert_eq!(plan.root, PathBuf::from(root));
+    }
+
+    /// The gate is asked before anything crosses the transport.
+    #[test]
+    fn a_refusing_gate_costs_no_round_trip() {
+        let Some(fixture) = fixture() else { return };
+        write_fixture_file(&fixture, "src/main.rs", b"fn main() {}\n");
+        let harness = Harness::new(&fixture);
+        let target = harness.target(Confinement::Workspace);
+        let shell = CountingShell {
+            inner: &fixture.shell,
+            runs: std::cell::Cell::new(0),
+        };
+        let cache = Mutex::new(NoServerCache::default());
+        let canonical = format!("{}/src/main.rs", fixture.posix_root);
+        let deny = || false;
+        assert!(plan_with(&shell, &target, &canonical, false, &deny, &cache, Instant::now()).is_none());
+        assert_eq!(shell.runs.get(), 0);
+
+        // A file with no extension cannot be claimed by anything.
+        let bare = format!("{}/Makefile", fixture.posix_root);
+        let allow = || true;
+        assert!(plan_with(&shell, &target, &bare, false, &allow, &cache, Instant::now()).is_none());
+        assert_eq!(shell.runs.get(), 0);
     }
 }

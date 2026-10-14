@@ -17,6 +17,10 @@ const REMOTE_ANCHOR_ROOT: &str = "remote-workspace-anchors";
 /// Tool output too long to hand the model inline ([`crate::tool_output`]),
 /// one directory per conversation, whatever machine its workspace is on.
 const TOOL_OUTPUT_ROOT: &str = "tool-output";
+/// The contents of files a conversation's `write` and `edit` tools were about to
+/// change ([`crate::file_checkpoints`]), one directory per conversation, each
+/// file named by its hash.
+pub(crate) const FILE_HISTORY_ROOT: &str = "file-history";
 
 pub(crate) fn ensure_temporary_workspace(
     app_data: &Path,
@@ -55,6 +59,23 @@ pub(crate) fn tool_output_dir(app_data: &Path, conversation_id: &str) -> Result<
         .join(workspace_directory_name(conversation_id)?))
 }
 
+/// The directory a conversation's file checkpoints keep their contents in,
+/// created on first use.
+pub(crate) fn ensure_file_history_dir(
+    app_data: &Path,
+    conversation_id: &str,
+) -> Result<PathBuf, String> {
+    ensure_conversation_workspace(app_data, FILE_HISTORY_ROOT, conversation_id, "文件检查点")
+}
+
+/// Where [`ensure_file_history_dir`] puts a conversation's directory, without
+/// creating anything: the lookup a rewind makes.
+pub(crate) fn file_history_dir(app_data: &Path, conversation_id: &str) -> Result<PathBuf, String> {
+    Ok(app_data
+        .join(FILE_HISTORY_ROOT)
+        .join(workspace_directory_name(conversation_id)?))
+}
+
 /// Makes the App-Data-backed temporary workspace tree match the persisted
 /// document. Running this after every successful save also retries cleanup that
 /// may have been interrupted by a process exit or a transient filesystem lock.
@@ -85,7 +106,24 @@ pub(crate) fn reconcile_temporary_workspaces(
 
     remove_orphan_workspace_entries(&root, &expected, "临时工作区")?;
     reconcile_remote_workspace_anchors(app_data, document, drafts)?;
-    reconcile_tool_output(app_data, document, drafts)
+    reconcile_tool_output(app_data, document, drafts)?;
+    reconcile_file_history(app_data, document, drafts)
+}
+
+/// Drops the file checkpoint contents of conversations that no longer exist.
+/// The index rows go with the conversation (`ON DELETE CASCADE`); this is the
+/// other half, and like the tool output it is retried at every save.
+fn reconcile_file_history(
+    app_data: &Path,
+    document: &AppDocument,
+    drafts: &HashMap<String, String>,
+) -> Result<(), String> {
+    let expected = owner_ids(document, drafts, |_| true)
+        .into_iter()
+        .map(workspace_directory_name)
+        .collect::<Result<HashSet<_>, _>>()?;
+    let root = ensure_workspace_root(app_data, FILE_HISTORY_ROOT, "文件检查点")?;
+    remove_orphan_workspace_entries(&root, &expected, "文件检查点")
 }
 
 /// Drops the spilled output of conversations that no longer exist. Every
@@ -331,6 +369,27 @@ mod tests {
 
         reconcile_temporary_workspaces(app_data.path(), &document, &HashMap::new()).unwrap();
         assert!(kept_dir.join("bash-1.txt").is_file());
+        assert!(!gone_dir.exists());
+    }
+
+    #[test]
+    fn file_checkpoint_contents_go_with_their_conversation() {
+        let app_data = tempfile::tempdir().unwrap();
+        let document = crate::catalog::default_document();
+        let kept = document.workspaces[0].conversations[0].id.clone();
+        let kept_dir = ensure_file_history_dir(app_data.path(), &kept).unwrap();
+        let gone_dir = ensure_file_history_dir(app_data.path(), "conv_deleted").unwrap();
+        fs::write(kept_dir.join("a".repeat(64)), "kept").unwrap();
+        fs::write(gone_dir.join("b".repeat(64)), "gone").unwrap();
+        assert_eq!(
+            fs::canonicalize(file_history_dir(app_data.path(), &kept).unwrap()).unwrap(),
+            kept_dir
+        );
+        // Looking a directory up creates nothing.
+        assert!(!file_history_dir(app_data.path(), "conv_never_written").unwrap().exists());
+
+        reconcile_temporary_workspaces(app_data.path(), &document, &HashMap::new()).unwrap();
+        assert!(kept_dir.join("a".repeat(64)).is_file());
         assert!(!gone_dir.exists());
     }
 

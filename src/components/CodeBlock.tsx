@@ -1,9 +1,12 @@
 import { Check, Copy } from "lucide-react";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import { writeClipboardText } from "../lib/clipboard";
 import { highlightCodeLines } from "../lib/codeHighlight";
 import type { CodeToken } from "../lib/codeHighlight";
+import { markTokens } from "../lib/diffHighlight";
+import { lineAtTarget } from "../lib/fileMention";
+import type { WordDiffSegment } from "../lib/wordDiff";
 import { IconButton } from "./Common";
 import "./CodeBlock.css";
 
@@ -27,6 +30,35 @@ export function CodeTokens({ tokens, fallback }: { tokens: readonly CodeToken[] 
         token.kind === "plain"
           ? token.value
           : <span className={`code-token code-token--${token.kind}`} key={index}>{token.value}</span>
+      ))}
+    </>
+  );
+}
+
+/**
+ * One line of a diff: its syntax tokens, with the runs a word diff marked as changed
+ * each wrapped in `wordClassName`. Either may be missing — no grammar for the file, no
+ * counterpart to compare the line with — and the line is drawn with what there is.
+ */
+export function DiffLineTokens({
+  text,
+  tokens,
+  segments,
+  wordClassName
+}: {
+  text: string;
+  tokens: readonly CodeToken[] | undefined;
+  segments: readonly WordDiffSegment[] | undefined;
+  wordClassName: string;
+}) {
+  if (!segments) return <CodeTokens tokens={tokens} fallback={text} />;
+  const runs = markTokens(tokens?.length ? tokens : [{ kind: "plain", value: text }], segments);
+  return (
+    <>
+      {runs.map((run, index) => (
+        run.changed
+          ? <span className={wordClassName} key={index}><CodeTokens tokens={run.tokens} fallback="" /></span>
+          : <Fragment key={index}><CodeTokens tokens={run.tokens} fallback="" /></Fragment>
       ))}
     </>
   );
@@ -113,7 +145,8 @@ export function NumberedCode({
   language,
   label,
   litLine = null,
-  className
+  className,
+  onLineMenu
 }: {
   content: string;
   language: string | null;
@@ -121,11 +154,14 @@ export function NumberedCode({
   label: string;
   litLine?: number | null;
   className?: string;
+  /** Given, a right click on a line is the caller's to answer, told the line and where the pointer was. */
+  onLineMenu?: (line: number, point: { x: number; y: number }) => void;
 }) {
   const lines = useMemo(() => splitCodeLines(content), [content]);
   const tokens = useHighlightedLines(language, lines);
   const digits = String(lines.length).length;
   return (
+    // biome-ignore lint/a11y/noNoninteractiveElementInteractions: a right click on a line is the pointer's shortcut to that line's menu; the text itself is read, not operated.
     <pre
       className={`numbered-code${className ? ` ${className}` : ""}`}
       tabIndex={0}
@@ -133,6 +169,12 @@ export function NumberedCode({
       // The gutter is exactly as wide as the widest number the file has, so it
       // does not shift when scrolling from line 99 to line 100.
       style={{ ["--numbered-code-digits" as string]: String(digits) }}
+      onContextMenu={onLineMenu && ((event) => {
+        const line = lineAtTarget(event.target);
+        if (line === null) return;
+        event.preventDefault();
+        onLineMenu(line, { x: event.clientX, y: event.clientY });
+      })}
     >
       {lines.map((line, index) => (
         <span

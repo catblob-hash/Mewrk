@@ -61,6 +61,52 @@ export function insertionPatch(contexts: readonly ContextItem[], context: Contex
   };
 }
 
+/**
+ * The patch for gathering `ids` together, in list order, and putting them where
+ * `index` points in `contexts` — or null when that leaves the list as it is.
+ *
+ * A move takes the same contexts out and puts them back in, so undoing it is
+ * the same patch read the other way: nothing is copied, and no id changes.
+ */
+export function movePatch(contexts: readonly ContextItem[], ids: ReadonlySet<string>, index: number): TimelinePatch | null {
+  const moved = contexts.filter((context) => ids.has(context.id));
+  if (!moved.length) return null;
+  const at = Math.max(0, Math.min(index, contexts.length));
+  const rest = contexts.filter((context) => !ids.has(context.id));
+  const ahead = contexts.slice(0, at).filter((context) => !ids.has(context.id)).length;
+  const next = [...rest.slice(0, ahead), ...moved, ...rest.slice(ahead)];
+  if (next.every((context, position) => context === contexts[position])) return null;
+  return {
+    ...EMPTY_TIMELINE_PATCH,
+    removed: placedContexts(contexts, ids),
+    inserted: placedContexts(next, ids)
+  };
+}
+
+/**
+ * The patch for putting `pasted` where `index` points in `contexts`, taking
+ * `replacedIds` out as it does. With something to replace, the pasted contexts
+ * go where the first of it sat, wherever `index` points.
+ */
+export function pastePatch(
+  contexts: readonly ContextItem[],
+  pasted: readonly ContextItem[],
+  index: number,
+  replacedIds: ReadonlySet<string> = new Set()
+): TimelinePatch | null {
+  if (!pasted.length) return null;
+  const firstReplaced = contexts.findIndex((context) => replacedIds.has(context.id));
+  const at = firstReplaced >= 0 ? firstReplaced : Math.max(0, Math.min(index, contexts.length));
+  const rest = contexts.filter((context) => !replacedIds.has(context.id));
+  const ahead = contexts.slice(0, at).filter((context) => !replacedIds.has(context.id)).length;
+  const next = [...rest.slice(0, ahead), ...pasted, ...rest.slice(ahead)];
+  return {
+    ...EMPTY_TIMELINE_PATCH,
+    removed: placedContexts(contexts, replacedIds),
+    inserted: placedContexts(next, new Set(pasted.map((context) => context.id)))
+  };
+}
+
 /** The same edit, the other way round. */
 export function invertTimelinePatch(patch: TimelinePatch): TimelinePatch {
   return {
@@ -241,6 +287,26 @@ export function timelineHistoryKey(event: Pick<KeyboardEvent, "key" | "ctrlKey" 
   if (key === "z") return "undo";
   if (key === "x") return "redo";
   return null;
+}
+
+/**
+ * Whether a keydown copies what is picked out on the timeline, or pastes what
+ * was copied from one: Ctrl+C and Ctrl+V, with ⌘ in place of Ctrl on a Mac.
+ */
+export function timelineClipboardKey(event: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey" | "altKey" | "shiftKey">): "copy" | "paste" | null {
+  if (event.altKey || event.shiftKey) return null;
+  const primary = isApplePlatform ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  if (!primary) return null;
+  const key = event.key.toLowerCase();
+  if (key === "c") return "copy";
+  if (key === "v") return "paste";
+  return null;
+}
+
+/** The keycaps of the timeline's copy or paste, as this platform writes them. */
+export function timelineClipboardShortcut(action: "copy" | "paste"): string {
+  const letter = action === "copy" ? "C" : "V";
+  return isApplePlatform ? `⌘${letter}` : `Ctrl+${letter}`;
 }
 
 /** Whether a press holds the modifier that draws a selection box over the timeline. */

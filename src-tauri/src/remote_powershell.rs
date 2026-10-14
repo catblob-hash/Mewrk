@@ -322,19 +322,130 @@ pub(crate) fn find(target: &Target<'_>, path: &str, name_filter: Option<&str>, l
     script
 }
 
-/// `grep`: `path:line:text` for every matching line, files over 2 MiB and
+/// A wildcard as a `-like` pattern: `*` and `?` stay wild and every other
+/// character is taken for itself, which for `-like` means escaping its
+/// brackets and its own escape, the backtick. The POSIX form is
+/// `remote_files::case_pattern`.
+fn like_pattern(wildcard: &str) -> String {
+    let mut text = String::with_capacity(wildcard.len() + 2);
+    for character in wildcard.chars() {
+        if matches!(character, '[' | ']' | '`') {
+            text.push('`');
+        }
+        text.push(character);
+    }
+    ps_single_quote(&text)
+}
+
+/// `grep`: what `request.shape` asks for, out of the files under the target —
 /// binary files (a NUL in the first 8000 bytes, as `grep -I` decides) skipped
-/// under a directory, at most `limit` lines. Inside a Git work tree the files
-/// are the ones `git ls-files` shows; otherwise the walk skips what
-/// `Collapsed` names. A bad pattern exits 2 with .NET's complaint on stderr;
-/// an unreadable file is reported on stderr and skipped.
+/// under a directory, and no file skipped for its size — at most `request.cap`
+/// lines of it. Each file is read whole, so a very large one costs this
+/// machine its size in memory several times over (the bytes, the decoded text
+/// and its lines); the POSIX script streams instead. Inside a Git work tree the files are the ones `git ls-files` shows;
+/// otherwise the walk skips what `Collapsed` names. A bad pattern exits 2 with
+/// .NET's complaint on stderr; an unreadable file is reported on stderr and
+/// skipped.
+///
+/// After the format line (`null`: a NUL follows every file name, as `--null`
+/// makes GNU grep print it) the answer is, by shape:
+///
+/// * `Lines`: `path\0line:text` for each matching line and `path\0line-text`
+///   for each of the `before` lines above it and the `after` lines below it,
+///   every line once and in file order, which is all the host needs to find
+///   the groups: no `--` between them.
+/// * `Files`: `modified path` for each file with a matching line.
+/// * `Counts`: `path:count` for each file with a matching line.
+///
+/// `request.wildcards` are `-like` patterns a file must match, by its path
+/// below the target or by its name, to be read at all. `-like` ignores case
+/// and the host applies the glob itself to what comes back, so they only
+/// ever let more through, never less. A file named outright is searched
+/// whatever they say.
 ///
 /// `pattern` is .NET's translation of the model's Rust pattern
 /// (`remote_regex`), folded for case already, so it is matched without
 /// `IgnoreCase`: .NET's own case folding is not Rust's.
-pub(crate) fn grep(target: &Target<'_>, path: &str, pattern: &str, limit: usize) -> String {
+pub(crate) fn grep(
+    target: &Target<'_>,
+    path: &str,
+    pattern: &str,
+    request: &crate::remote_files::GrepRequest<'_>,
+) -> String {
+    use crate::remote_files::GrepShape;
+
+    let limit = request.cap;
     let options = "CultureInvariant";
+    // What `Scan` does with the `$count` lines of a file, by shape.
+    let report = match request.shape {
+        // grep's own way through a file: `$last` is the last line printed, so
+        // a window that reaches back into the one before prints only what is
+        // new, and `$tail` is how many lines the last match is still owed.
+        GrepShape::Lines { before, after } => format!(
+            r#"  $last = -1
+  $tail = 0
+  for ($n = 0; $n -lt $count; $n++) {{
+    if (Hit $Rx $lines[$n]) {{
+      for ($k = [Math]::Max($n - {before}, $last + 1); $k -lt $n; $k++) {{ Emit ($Shown + [char]0 + ($k + 1) + '-' + $lines[$k]) }}
+      Emit ($Shown + [char]0 + ($n + 1) + ':' + $lines[$n])
+      $last = $n
+      $tail = {after}
+    }} elseif ($tail -gt 0) {{
+      Emit ($Shown + [char]0 + ($n + 1) + '-' + $lines[$n])
+      $last = $n
+      $tail--
+    }}
+  }}
+"#
+        ),
+        // The first match is enough, and the time is read then: most files
+        // have none.
+        GrepShape::Files => r#"  for ($n = 0; $n -lt $count; $n++) {
+    if (Hit $Rx $lines[$n]) {
+      Emit ([string](Unix-Seconds ([System.IO.FileInfo]::new($File))) + ' ' + $Shown)
+      return
+    }
+  }
+"#
+        .to_owned(),
+        GrepShape::Counts => r#"  $hits = 0
+  for ($n = 0; $n -lt $count; $n++) { if (Hit $Rx $lines[$n]) { $hits++ } }
+  if ($hits -gt 0) { Emit ($Shown + ':' + $hits) }
+"#
+        .to_owned(),
+    };
+    // The glob's prefilter: its definition, and the test of it in the walk
+    // and in the loop over Git's list.
+    let (wanted, in_walk, in_list) = match request.wildcards {
+        Some(wildcards) => (
+            format!(
+                r#"$MewrkWild = @({})
+function Wanted([string]$Below) {{
+  $name = $Below.Substring($Below.LastIndexOf('/') + 1)
+  foreach ($wild in $MewrkWild) {{ if ($Below -like $wild -or $name -like $wild) {{ return $true }} }}
+  return $false
+}}
+"#,
+                wildcards
+                    .iter()
+                    .map(|wildcard| like_pattern(wildcard))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "elseif (Wanted ($path.Substring($MewrkBase.Length + 1))) { Scan $it.FullName $path $true }",
+            "  if (-not (Wanted $MewrkFile)) { continue }\n",
+        ),
+        None => (
+            String::new(),
+            "else { Scan $it.FullName $path $true }",
+            "",
+        ),
+    };
     let mut script = prologue(target, path, Mode::Existing);
+    // The lines below carry a NUL after the file name, as `--null` makes GNU
+    // grep print them.
+    script.push_str("Out-Line 'null'
+");
     script.push_str(&format!(
         r#"$Pattern = {pattern}
 $Options = [System.Text.RegularExpressions.RegexOptions]'{options}'
@@ -357,27 +468,39 @@ $Prefilter = $null
 if ($Pattern -notmatch '\\[AzZG]|\(\?<[=!]') {{ $Prefilter = [System.Text.RegularExpressions.Regex]::new($Pattern, $Options -bor [System.Text.RegularExpressions.RegexOptions]::Multiline, $Limit) }}
 $Utf8 = [System.Text.UTF8Encoding]::new($false, $false)
 $global:MewrkLeft = {limit}
+# Every line of the answer counts against the cap, whatever it says.
+function Emit([string]$Line) {{
+  Out-Line $Line
+  $global:MewrkLeft--
+  if ($global:MewrkLeft -le 0) {{ Quit 0 }}
+}}
 function Scan([string]$File, [string]$Shown, [bool]$SkipBinary) {{
   try {{ $bytes = [System.IO.File]::ReadAllBytes($File) }} catch {{ Out-Err ('grep: ' + $Shown + ': ' + $_.Exception.Message); return }}
   if ($SkipBinary -and [Array]::IndexOf($bytes, [byte]0, 0, [Math]::Min($bytes.Length, 8000)) -ge 0) {{ return }}
-  $text = $Utf8.GetString($bytes).Replace("`r`n", "`n")
+  # No file is skipped for its size, so a huge one can run this machine out of
+  # memory here: that is one skipped file in the answer, not a failed search.
+  try {{ $text = $Utf8.GetString($bytes).Replace("`r`n", "`n") }} catch {{ Out-Err ('grep: ' + $Shown + ': ' + $_.Exception.Message); return }}
   if ($null -ne $Prefilter -and -not (Hit $Prefilter $text)) {{ return }}
-  $lines = $text.Split("`n")
-  for ($n = 0; $n -lt $lines.Length; $n++) {{
-    if (Hit $Rx $lines[$n]) {{
-      Out-Line ($Shown + ':' + ($n + 1) + ':' + $lines[$n])
-      $global:MewrkLeft--
-      if ($global:MewrkLeft -le 0) {{ Quit 0 }}
-    }}
-  }}
-}}
-function Tree([string]$Dir, [string]$Shown) {{
+  # What follows the last newline is a line only when there is something
+  # there: a text that ends in a newline has no empty line after it, and an
+  # empty text has no line at all, as the host leg's `str::lines` reads them.
+  try {{ $lines = $text.Split([char]10) }} catch {{ Out-Err ('grep: ' + $Shown + ': ' + $_.Exception.Message); return }}
+  $count = $lines.Length
+  if ($lines[$count - 1].Length -eq 0) {{ $count-- }}
+{report}}}
+$MewrkBase = $C.TrimEnd('/')
+{wanted}function Tree([string]$Dir, [string]$Shown) {{
   try {{ $items = ([System.IO.DirectoryInfo]::new($Dir)).GetFileSystemInfos() }} catch {{ Out-Err ('grep: ' + $Shown + ': ' + $_.Exception.Message); return }}
+  # In name order, code unit by code unit, which is the order the host leg
+  # walks in: the order of the lines decides which matches make a page.
+  $names = New-Object string[] $items.Length
+  for ($i = 0; $i -lt $items.Length; $i++) {{ $names[$i] = $items[$i].Name }}
+  [Array]::Sort([Array]$names, [Array]$items, [System.Collections.IComparer][System.StringComparer]::Ordinal)
   foreach ($it in $items) {{
     if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {{ continue }}
     $path = $Shown + '/' + $it.Name
     if ($it -is [System.IO.DirectoryInfo]) {{ if (-not (Collapsed $path $it.Name)) {{ Tree $it.FullName $path }} }}
-    elseif ($it.Length -le 2097152) {{ Scan $it.FullName $path $true }}
+    {in_walk}
   }}
 }}
 "#,
@@ -385,6 +508,8 @@ function Tree([string]$Dir, [string]$Shown) {{
     ));
     script.push_str(&ignore_probe(false));
     script.push_str(&collapsed_function());
+    // A file named outright is searched whatever the ignore rules say, and
+    // whatever the glob says.
     script.push_str(
         r#"if (-not [System.IO.Directory]::Exists($C)) { Scan $C $C $true; Quit 0 }
 if ($Ign -eq 'git') {
@@ -394,7 +519,7 @@ if ($Ign -eq 'git') {
   try { $MewrkFiles = @(& git -c core.fsmonitor=false -c core.quotepath=false ls-files --cached --others --exclude-standard -- . 2>$null) } finally { Pop-Location; $ErrorActionPreference = $MewrkEap }
   if ($LASTEXITCODE -ne 0) { $Ign = 'names' }
 }
-if ($Ign -ne 'git') { Tree $C $C.TrimEnd('/'); Quit 0 }
+if ($Ign -ne 'git') { Tree $C $MewrkBase; Quit 0 }
 # A path whose directory has become a junction since Git indexed it is not
 # followed, as the walk would not have followed it.
 $MewrkLinked = @{}
@@ -412,10 +537,14 @@ $MewrkPrev = $null
 foreach ($MewrkFile in $MewrkFiles) {
   if (-not $MewrkFile -or $MewrkFile.StartsWith('"') -or $MewrkFile -eq $MewrkPrev) { continue }
   $MewrkPrev = $MewrkFile
-  if (Linked $MewrkFile) { continue }
+"#,
+    );
+    script.push_str(in_list);
+    script.push_str(
+        r#"  if (Linked $MewrkFile) { continue }
   try { $MewrkInfo = [System.IO.FileInfo]::new([System.IO.Path]::Combine($C, $MewrkFile)) } catch { continue }
-  if (-not $MewrkInfo.Exists -or ($MewrkInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or $MewrkInfo.Length -gt 2097152) { continue }
-  Scan $MewrkInfo.FullName ($C.TrimEnd('/') + '/' + $MewrkFile) $true
+  if (-not $MewrkInfo.Exists -or ($MewrkInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { continue }
+  Scan $MewrkInfo.FullName ($MewrkBase + '/' + $MewrkFile) $true
 }
 Quit 0
 "#,
@@ -423,19 +552,182 @@ Quit 0
     script
 }
 
-/// `read`: the modification time in seconds, the size, then the bytes. A file
-/// over `max_bytes` exits 68, a non-file 67.
-pub(crate) fn read(target: &Target<'_>, path: &str, max_bytes: usize) -> String {
+/// The modification time, in seconds, of each file named on standard input
+/// (UTF-8 paths separated by NULs), `modified path` a line: the second trip of
+/// a `files_with_matches` search whose lines the host had to check. A file
+/// that is gone is left out.
+pub(crate) fn mtimes() -> String {
+    let mut script = String::from(HELPERS);
+    script.push_str(READ_INPUT);
+    script.push_str(
+        r#"$MewrkText = [System.Text.Encoding]::UTF8.GetString((Read-Input))
+foreach ($MewrkPath in $MewrkText.Split([char]0)) {
+  if (-not $MewrkPath) { continue }
+  try {
+    $MewrkFile = [System.IO.FileInfo]::new($MewrkPath)
+    if ($MewrkFile.Exists) { Out-Line ([string](Unix-Seconds $MewrkFile) + ' ' + $MewrkPath) }
+  } catch {}
+}
+Quit 0
+"#,
+    );
+    script
+}
+
+/// `read`: the modification time in seconds, the size, a line naming what
+/// follows, and that — the answer of the POSIX script
+/// (`remote_files::read_script`), in its words. A non-file exits 67.
+///
+/// * `whole`, for a file of at most `max_bytes`: its bytes.
+/// * For a larger one, which only a range of text is read from: exit 68 when
+///   it starts like an image, `utf16` when it starts with a UTF-16 byte-order
+///   mark (such text cannot be cut at a newline byte), `binary` when a NUL is
+///   among its first 8192 bytes, and otherwise `slice`: the file's line
+///   count, or `-` when the file is over `count_limit` and line
+///   `slice.first_line` is there; `1` or `0` for whether a line follows
+///   `slice.last_line`; then the bytes of those lines, newlines included, cut
+///   after `slice.max_bytes + 1` of them — one more than the host can use,
+///   which is how it sees the cut.
+///
+/// The larger file is gone through once, a fixed buffer at a time, and never
+/// further than the answer needs: to its end to count its lines, otherwise to
+/// the line after the last one wanted.
+pub(crate) fn read(
+    target: &Target<'_>,
+    path: &str,
+    max_bytes: usize,
+    count_limit: u64,
+    slice: &crate::remote_files::ReadSlice,
+) -> String {
+    // No file has a line numbered past this, and it leaves the script's
+    // 64-bit arithmetic room for the line after the last.
+    let line = |number: u64| number.min(i64::MAX as u64 - 1);
     let mut script = prologue(target, path, Mode::Existing);
     script.push_str(&format!(
-        "if (-not [System.IO.File]::Exists($C)) {{ Quit 67 }}\n\
-         $F = [System.IO.FileInfo]::new($C)\n\
-         if ($F.Length -gt {max_bytes}) {{ Quit 68 }}\n\
-         $B = [System.IO.File]::ReadAllBytes($C)\n\
-         Out-Line (Unix-Seconds $F)\n\
-         Out-Line $B.Length\n\
-         Out-Bytes $B\n\
-         Quit 0\n"
+        r#"if (-not [System.IO.File]::Exists($C)) {{ Quit 67 }}
+$F = [System.IO.FileInfo]::new($C)
+# Opened so that whoever is still writing the file — a log — does not keep it
+# from being read: `File.ReadAllBytes` insists that nobody is.
+try {{ $MewrkIn = [System.IO.File]::Open($C, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]'ReadWrite, Delete') }} catch {{
+  $why = $_.Exception
+  if ($why.InnerException) {{ $why = $why.InnerException }}
+  Out-Err $why.Message
+  Quit 1
+}}
+if ($F.Length -le {max_bytes}) {{
+  $MewrkAll = New-Object System.IO.MemoryStream
+  $MewrkIn.CopyTo($MewrkAll)
+  $B = $MewrkAll.ToArray()
+  Out-Line (Unix-Seconds $F)
+  Out-Line $B.Length
+  Out-Line 'whole'
+  Out-Bytes $B
+  Quit 0
+}}
+Out-Line (Unix-Seconds $F)
+Out-Line $F.Length
+$MewrkHead = New-Object byte[] 8192
+$MewrkHeadLen = 0
+while ($MewrkHeadLen -lt $MewrkHead.Length) {{
+  $MewrkGot = $MewrkIn.Read($MewrkHead, $MewrkHeadLen, $MewrkHead.Length - $MewrkHeadLen)
+  if ($MewrkGot -le 0) {{ break }}
+  $MewrkHeadLen += $MewrkGot
+}}
+# An image this large is refused as ever; UTF-16 cannot be cut at a newline
+# byte; and a NUL near the start says what the host would have said.
+$MewrkSign = [System.BitConverter]::ToString($MewrkHead, 0, [Math]::Min($MewrkHeadLen, 12)).Replace('-', '')
+if ($MewrkSign -match '^(89504E47|FFD8FF|47494638|52494646.{{8}}57454250)') {{ Quit 68 }}
+if ($MewrkSign -match '^(FFFE|FEFF)') {{ Out-Line 'utf16'; Quit 0 }}
+if ([Array]::IndexOf($MewrkHead, [byte]0, 0, $MewrkHeadLen) -ge 0) {{ Out-Line 'binary'; Quit 0 }}
+Out-Line 'slice'
+# One pass over the file from its start. `$global:MewrkLine` is the line the
+# next unused byte of the buffer belongs to, and `$global:MewrkEnds` the last
+# byte read: a file that does not end in a newline has one line more than it
+# has newlines.
+$MewrkIn.Position = 0
+$MewrkBuf = New-Object byte[] 32768
+$MewrkBytes = [System.Text.Encoding]::GetEncoding(28591)
+$global:MewrkLen = 0
+$global:MewrkPos = 0
+$global:MewrkLine = [long]1
+$global:MewrkEnds = [byte]10
+# Whether a byte is left to use, after reading on when the buffer is used up.
+function Fill {{
+  if ($global:MewrkPos -lt $global:MewrkLen) {{ return $true }}
+  $global:MewrkLen = $MewrkIn.Read($MewrkBuf, 0, $MewrkBuf.Length)
+  $global:MewrkPos = 0
+  if ($global:MewrkLen -le 0) {{ return $false }}
+  $global:MewrkEnds = $MewrkBuf[$global:MewrkLen - 1]
+  return $true
+}}
+# The newlines among the buffer's unused bytes, counted by .NET instead of a
+# loop here that a file of gigabytes would spend minutes in: read as one
+# character a byte, the text is shorter without its newlines by their number.
+# A buffer of this size also keeps both strings off the large object heap.
+function Newlines {{
+  $text = $MewrkBytes.GetString($MewrkBuf, $global:MewrkPos, $global:MewrkLen - $global:MewrkPos)
+  return $text.Length - $text.Replace("`n", '').Length
+}}
+# Moves to the first byte of line `$Line`, or says the file ended before it.
+# A buffer the line does not start in is passed by its count; only the one it
+# starts in is searched newline by newline.
+function Reach([long]$Line) {{
+  while ($global:MewrkLine -lt $Line) {{
+    if (-not (Fill)) {{ return $false }}
+    $found = Newlines
+    if ($global:MewrkLine + $found -lt $Line) {{
+      $global:MewrkLine += $found
+      $global:MewrkPos = $global:MewrkLen
+      continue
+    }}
+    while ($global:MewrkLine -lt $Line) {{
+      $global:MewrkPos = [Array]::IndexOf($MewrkBuf, [byte]10, $global:MewrkPos, $global:MewrkLen - $global:MewrkPos) + 1
+      $global:MewrkLine++
+    }}
+  }}
+  return $true
+}}
+$MewrkFirst = {first}
+$MewrkFinal = {last}
+$MewrkRoom = {room}
+$MewrkKeep = New-Object System.IO.MemoryStream
+# A line is there when a byte follows the newline before it.
+$MewrkThere = (Reach $MewrkFirst) -and (Fill)
+if ($MewrkThere) {{
+  while ($global:MewrkLine -le $MewrkFinal -and $MewrkRoom -gt 0 -and (Fill)) {{
+    $MewrkHave = $global:MewrkLen - $global:MewrkPos
+    $MewrkAt = [Array]::IndexOf($MewrkBuf, [byte]10, $global:MewrkPos, $MewrkHave)
+    if ($MewrkAt -ge 0) {{ $MewrkHave = $MewrkAt + 1 - $global:MewrkPos; $global:MewrkLine++ }}
+    $MewrkTake = [Math]::Min($MewrkHave, $MewrkRoom)
+    $MewrkKeep.Write($MewrkBuf, $global:MewrkPos, $MewrkTake)
+    $MewrkRoom -= $MewrkTake
+    $global:MewrkPos += $MewrkHave
+  }}
+}}
+# The line count is the pass taken to the end of the file: when the file is
+# small enough for that to be cheap, and otherwise only when the range starts
+# past the end — the host then has to say how many lines there are, and the
+# search for the line has already read everything.
+if ($F.Length -le {count_limit} -or -not $MewrkThere) {{
+  while (Fill) {{
+    $global:MewrkLine += (Newlines)
+    $global:MewrkPos = $global:MewrkLen
+  }}
+  $MewrkTotal = $global:MewrkLine - 1
+  if ($global:MewrkEnds -ne 10) {{ $MewrkTotal++ }}
+  $MewrkMore = [int]($MewrkFinal -lt $MewrkTotal)
+}} else {{
+  $MewrkTotal = '-'
+  $MewrkMore = [int]((Reach ($MewrkFinal + 1)) -and (Fill))
+}}
+Out-Line $MewrkTotal
+Out-Line $MewrkMore
+Out-Bytes ($MewrkKeep.ToArray())
+Quit 0
+"#,
+        first = line(slice.first_line),
+        last = line(slice.last_line),
+        room = slice.max_bytes.saturating_add(1),
     ));
     script
 }
@@ -1391,6 +1683,24 @@ mod tests {
         }
     }
 
+    fn slice() -> crate::remote_files::ReadSlice {
+        crate::remote_files::ReadSlice {
+            first_line: 1,
+            last_line: 11,
+            max_bytes: 1000,
+            count_limit: 1000,
+        }
+    }
+
+    /// A `grep` that lists lines, `cap` of them at most.
+    fn lines(cap: usize) -> crate::remote_files::GrepRequest<'static> {
+        crate::remote_files::GrepRequest {
+            shape: crate::remote_files::GrepShape::Lines { before: 0, after: 0 },
+            cap,
+            wildcards: None,
+        }
+    }
+
     /// A confined script admits the files the conversation's instruction files
     /// import on the machine, each a single-quoted literal compared exactly.
     #[test]
@@ -1416,13 +1726,13 @@ mod tests {
         assert!(script.contains("Inside $C $ROOT"), "confinement is compiled in");
         assert!(!listing(&target(false), ".", 2, 11).contains("Inside $C $ROOT"));
         // PowerShell's typographic quotes delimit strings too.
-        let script = grep(&target(true), ".", "a\u{2019}b", 5);
+        let script = grep(&target(true), ".", "a\u{2019}b", &lines(5));
         assert!(script.contains("'a\u{2019}\u{2019}b'"), "{script}");
     }
 
     #[test]
     fn every_reserved_exit_code_is_where_the_posix_leg_has_it() {
-        let read = read(&target(true), "a.txt", 100);
+        let read = read(&target(true), "a.txt", 100, 1000, &slice());
         for code in ["Quit 64", "Quit 65", "Quit 66", "Quit 67", "Quit 68"] {
             assert!(read.contains(code), "{code}");
         }
@@ -1430,7 +1740,7 @@ mod tests {
         for code in ["Quit 69", "Quit 70"] {
             assert!(write.contains(code), "{code}");
         }
-        assert!(grep(&target(true), ".", "(", 5).contains("Quit 2"));
+        assert!(grep(&target(true), ".", "(", &lines(5)).contains("Quit 2"));
         assert!(lsp_launch("C:/w", "gopls", &[], &[]).contains("exit 127"));
     }
 
@@ -1454,12 +1764,17 @@ mod tests {
     /// the last preset's name as the file.
     #[test]
     fn no_script_reuses_the_prologues_variables_in_another_case() {
+        use crate::remote_files::GrepShape;
         let paths = [".mewrk/lsp.json".to_owned(), ".naiword/lsp.json".to_owned()];
+        let wildcards = ["*.rs".to_owned()];
         let scripts = [
             listing(&target(true), ".", 2, 11),
             find(&target(true), ".", Some("*.rs"), 10),
-            grep(&target(true), ".", "x", 10),
-            read(&target(true), "a", 10),
+            grep(&target(true), ".", "x", &lines(10)),
+            grep(&target(true), ".", "x", &shaped(GrepShape::Lines { before: 2, after: 3 }, Some(&wildcards))),
+            grep(&target(true), ".", "x", &shaped(GrepShape::Files, None)),
+            grep(&target(true), ".", "x", &shaped(GrepShape::Counts, None)),
+            read(&target(true), "a", 10, 1000, &slice()),
             probe(&target(true), "a", 10),
             cas_write(&target(true), "a", "absent"),
             lsp_probe(&target(true), "a", 10, 10, &paths, &["gopls", "clangd"]),
@@ -1479,5 +1794,121 @@ mod tests {
         assert!(script.contains("-like 'a``b*.rs'"), "{script}");
         let script = find(&target(true), ".", None, 10);
         assert!(script.contains("if ($true)"), "{script}");
+    }
+
+    /// A `grep` of the given shape, seven lines of it at most.
+    fn shaped(
+        shape: crate::remote_files::GrepShape,
+        wildcards: Option<&[String]>,
+    ) -> crate::remote_files::GrepRequest<'_> {
+        crate::remote_files::GrepRequest {
+            shape,
+            cap: 7,
+            wildcards,
+        }
+    }
+
+    /// What `Scan` does with a file's lines, which is where the shapes differ.
+    fn scan_of(script: &str) -> &str {
+        let start = script.find("function Scan(").expect("Scan");
+        let end = script[start..].find("$MewrkBase = ").expect("the end of Scan");
+        &script[start..start + end]
+    }
+
+    /// Each shape is its own few lines of `Scan`, and every line of every
+    /// shape goes out through `Emit`, which is what holds the answer to its
+    /// cap.
+    #[test]
+    fn grep_writes_the_shape_it_is_asked_for() {
+        use crate::remote_files::GrepShape;
+        let listed = grep(&target(true), ".", "x", &shaped(GrepShape::Lines { before: 2, after: 3 }, None));
+        let scan = scan_of(&listed);
+        assert!(scan.contains("for ($k = [Math]::Max($n - 2, $last + 1); $k -lt $n; $k++) { Emit ($Shown + [char]0 + ($k + 1) + '-' + $lines[$k]) }"), "{scan}");
+        assert!(scan.contains("Emit ($Shown + [char]0 + ($n + 1) + ':' + $lines[$n])\n      $last = $n\n      $tail = 3\n"), "{scan}");
+        assert!(scan.contains("} elseif ($tail -gt 0) {\n      Emit ($Shown + [char]0 + ($n + 1) + '-' + $lines[$n])"), "{scan}");
+
+        let files = grep(&target(true), ".", "x", &shaped(GrepShape::Files, None));
+        let scan = scan_of(&files);
+        assert!(scan.contains("Emit ([string](Unix-Seconds ([System.IO.FileInfo]::new($File))) + ' ' + $Shown)\n      return\n"), "{scan}");
+        assert!(!scan.contains("[char]0"), "{scan}");
+
+        let counts = grep(&target(true), ".", "x", &shaped(GrepShape::Counts, None));
+        let scan = scan_of(&counts);
+        assert!(scan.contains("if ($hits -gt 0) { Emit ($Shown + ':' + $hits) }"), "{scan}");
+        assert!(!scan.contains("[char]0"), "{scan}");
+
+        for script in [&listed, &files, &counts] {
+            assert!(script.contains("Out-Line $ROOT\nOut-Line $C\nOut-Line 'null'\n"), "{script}");
+            assert!(script.contains("$global:MewrkLeft = 7\n"), "{script}");
+            assert!(script.contains("function Emit([string]$Line) {\n  Out-Line $Line\n  $global:MewrkLeft--\n  if ($global:MewrkLeft -le 0) { Quit 0 }\n}"), "{script}");
+            let scan = scan_of(script);
+            assert!(!scan.contains("Out-Line"), "{scan}");
+            // The piece after a text's last newline is not a line of it.
+            assert!(scan.contains("$count = $lines.Length\n  if ($lines[$count - 1].Length -eq 0) { $count-- }"), "{scan}");
+            assert!(!scan.contains("$n -lt $lines.Length"), "{scan}");
+            assert!(script.trim_end().ends_with("Quit 0"), "{script}");
+        }
+    }
+
+    /// The glob's wildcards are tested in the walk and in the loop over Git's
+    /// list, on the path below the target, and nowhere else: a file named
+    /// outright is searched whatever they say.
+    #[test]
+    fn grep_skips_the_files_the_wildcards_leave_out_unless_one_is_named_outright() {
+        use crate::remote_files::GrepShape;
+        let wildcards = ["*.rs".to_owned(), "src/*.tsx".to_owned(), "it's[1]`.md".to_owned()];
+        let script = grep(&target(true), ".", "x", &shaped(GrepShape::Files, Some(&wildcards)));
+        assert!(script.contains("$MewrkWild = @('*.rs', 'src/*.tsx', 'it''s`[1`]``.md')\n"), "{script}");
+        assert!(script.contains("foreach ($wild in $MewrkWild) { if ($Below -like $wild -or $name -like $wild) { return $true } }"), "{script}");
+        assert!(script.contains("elseif (Wanted ($path.Substring($MewrkBase.Length + 1))) { Scan $it.FullName $path $true }"), "{script}");
+        assert!(script.contains("  $MewrkPrev = $MewrkFile\n  if (-not (Wanted $MewrkFile)) { continue }\n  if (Linked $MewrkFile) { continue }\n"), "{script}");
+        assert_eq!(script.matches("(Wanted ").count(), 2, "{script}");
+        assert!(script.contains("if (-not [System.IO.Directory]::Exists($C)) { Scan $C $C $true; Quit 0 }"), "{script}");
+
+        let plain = grep(&target(true), ".", "x", &shaped(GrepShape::Files, None));
+        assert!(!plain.contains("Wanted"), "{plain}");
+        assert!(plain.contains("    else { Scan $it.FullName $path $true }\n"), "{plain}");
+        assert!(plain.contains("  $MewrkPrev = $MewrkFile\n  if (Linked $MewrkFile) { continue }\n"), "{plain}");
+        // No file is passed over for its size, in the walk or in Git's list.
+        for script in [&plain, &script] {
+            assert!(!script.contains("2097152"), "{script}");
+            assert!(!script.contains("$MewrkInfo.Length"), "{script}");
+        }
+    }
+
+    /// A file sent whole is the only one read into memory; a larger one is
+    /// sniffed and then cut by line numbers that fit the script's arithmetic.
+    /// Neither is opened in a way a writer of the file would be refused by.
+    #[test]
+    fn read_sends_a_small_file_whole_and_streams_a_range_out_of_a_large_one() {
+        let range = crate::remote_files::ReadSlice {
+            first_line: 120,
+            last_line: 131,
+            max_bytes: 1000,
+            ..slice()
+        };
+        let script = read(&target(true), "a.log", 4096, 5000, &range);
+        assert!(script.contains("[System.IO.FileShare]'ReadWrite, Delete')"), "{script}");
+        assert!(script.contains("if ($F.Length -le 4096) {\n  $MewrkAll = New-Object System.IO.MemoryStream\n  $MewrkIn.CopyTo($MewrkAll)\n"), "{script}");
+        let kinds = ["Out-Line 'whole'", "Quit 68", "Out-Line 'utf16'", "Out-Line 'binary'", "Out-Line 'slice'"];
+        let places = kinds.map(|kind| script.find(kind).unwrap_or_else(|| panic!("{kind}")));
+        assert!(places.windows(2).all(|pair| pair[0] < pair[1]), "{places:?}");
+        assert!(script.contains("$MewrkFirst = 120\n$MewrkFinal = 131\n$MewrkRoom = 1001\n"), "{script}");
+        assert!(script.contains("if ($F.Length -le 5000 -or -not $MewrkThere) {"), "{script}");
+        assert!(script.contains("Out-Line $MewrkTotal\nOut-Line $MewrkMore\nOut-Bytes ($MewrkKeep.ToArray())\nQuit 0\n"), "{script}");
+        // Past the file sent whole, nothing holds more than a buffer of it.
+        let streamed = &script[script.find("Out-Line 'whole'").expect("whole")..];
+        for whole in ["ReadAllBytes", "CopyTo", "ReadToEnd"] {
+            assert!(!streamed.contains(whole), "{whole}: {streamed}");
+        }
+
+        // A line no file can have still leaves room for the one after it.
+        let far = crate::remote_files::ReadSlice {
+            first_line: u64::MAX,
+            last_line: u64::MAX,
+            ..slice()
+        };
+        let script = read(&target(true), "a.log", 4096, 5000, &far);
+        assert!(script.contains("$MewrkFirst = 9223372036854775806\n$MewrkFinal = 9223372036854775806\n"), "{script}");
     }
 }

@@ -304,12 +304,21 @@ pub fn open_verified_file(expected: &Path) -> Result<File, String> {
 /// that must not be raced out of where it was allowed to write: a file tool in
 /// a sandboxed workspace, whose commands can rearrange the directories the
 /// tool writes in ([`crate::file_sandbox`]).
+///
+/// Like `atomic_write`, a file that is replaced keeps its permission bits: the
+/// temporary file is created with the default mode, so without this renaming
+/// it over an executable script would quietly drop the executable bit.
 #[cfg(unix)]
 pub fn write_file_verified(target: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::{
         ffi::CString,
         io::Write,
-        os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawFd, io::FromRawFd},
+        os::unix::{
+            ffi::OsStrExt,
+            fs::{OpenOptionsExt, PermissionsExt},
+            io::AsRawFd,
+            io::FromRawFd,
+        },
         sync::atomic::{AtomicU64, Ordering},
     };
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -338,6 +347,18 @@ pub fn write_file_verified(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let name =
         CString::new(name.as_bytes()).map_err(|_| "Path contains an invalid character".to_owned())?;
     let dirfd = directory.as_raw_fd();
+    // The mode of the file being replaced, asked of the same directory handle
+    // the rename goes through and without following a link at the end: only a
+    // regular file has a mode worth carrying over.
+    //
+    // SAFETY: `name` is NUL-terminated, `directory` keeps `dirfd` open, and
+    // `status` is a plain C struct that `fstatat` fills in.
+    let replaced_mode = unsafe {
+        let mut status: libc::stat = std::mem::zeroed();
+        (libc::fstatat(dirfd, name.as_ptr(), &mut status, libc::AT_SYMLINK_NOFOLLOW) == 0
+            && (status.st_mode & libc::S_IFMT) == libc::S_IFREG)
+            .then(|| (status.st_mode as u32) & 0o7777)
+    };
     // SAFETY: both names are NUL-terminated and `directory` keeps `dirfd`
     // open for every call below.
     let fd = unsafe {
@@ -359,7 +380,13 @@ pub fn write_file_verified(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = unsafe { File::from_raw_fd(fd) };
     let result = (|| {
         file.write_all(bytes)
-            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("Failed to write {}: {error}", target.display()))?;
+        // Best effort, as in `atomic_write`: a filesystem that cannot chmod is
+        // better served by the default mode than by a refused save.
+        if let Some(mode) = replaced_mode {
+            let _ = file.set_permissions(fs::Permissions::from_mode(mode));
+        }
+        file.sync_all()
             .map_err(|error| format!("Failed to write {}: {error}", target.display()))?;
         // SAFETY: as above.
         if unsafe { libc::renameat(dirfd, temporary.as_ptr(), dirfd, name.as_ptr()) } != 0 {
@@ -1073,6 +1100,39 @@ mod tests {
             0,
             "no temporary file is left behind either"
         );
+    }
+
+    /// Replacing a file through a temporary and a rename must not change what
+    /// the file may do: an executable stays executable, a private file stays
+    /// private, and a file that did not exist gets the ordinary default.
+    #[cfg(unix)]
+    #[test]
+    fn a_verified_write_keeps_the_mode_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = fs::canonicalize(root.path()).unwrap();
+        let script = directory.join("run.sh");
+        fs::write(&script, b"#!/bin/sh\necho old\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        write_file_verified(&script, b"#!/bin/sh\necho new\n").unwrap();
+        assert_eq!(fs::read(&script).unwrap(), b"#!/bin/sh\necho new\n");
+        assert_eq!(mode_of(&script), 0o755, "the executable bit survives");
+
+        let private = directory.join("secret.txt");
+        fs::write(&private, b"old").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        write_file_verified(&private, b"new").unwrap();
+        assert_eq!(mode_of(&private), 0o600, "a private file stays private");
+
+        // A new file is not given the mode of anything: it is what a plain
+        // create under the same umask gives.
+        let fresh = directory.join("fresh.txt");
+        write_file_verified(&fresh, b"first").unwrap();
+        let baseline = directory.join("baseline.txt");
+        fs::File::create(&baseline).unwrap();
+        assert_eq!(mode_of(&fresh), mode_of(&baseline));
     }
 
     #[test]

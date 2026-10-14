@@ -535,6 +535,13 @@ pub struct AppearancePreferences {
     /// `builtin:<name>` (a picture the renderer bundles), or an image id in `background_images`.
     #[serde(default = "default_background")]
     pub background: String,
+    /// The code theme (`src/lib/codeThemes.ts`) code and diffs are drawn in while the day
+    /// theme is on screen. An id the renderer does not know reads as its default.
+    #[serde(default = "default_code_theme_day")]
+    pub code_theme_day: String,
+    /// The one they are drawn in while the night theme is on screen.
+    #[serde(default = "default_code_theme_night")]
+    pub code_theme_night: String,
     /// The local helper model's uses and prompts (Appearance → Local model).
     #[serde(default)]
     pub local_model: LocalModelPreferences,
@@ -606,6 +613,8 @@ impl Default for AppearancePreferences {
             custom_css: String::new(),
             liquid_glass: false,
             background: default_background(),
+            code_theme_day: default_code_theme_day(),
+            code_theme_night: default_code_theme_night(),
             local_model: LocalModelPreferences::default(),
         }
     }
@@ -4536,6 +4545,14 @@ fn default_background() -> String {
     "solid".into()
 }
 
+fn default_code_theme_day() -> String {
+    "mewrk-light".into()
+}
+
+fn default_code_theme_night() -> String {
+    "mewrk-dark".into()
+}
+
 /// Appearance, with documents from before the background library carried forward: their
 /// `customBackground` turned the picture and the glass on together, and `backgroundImage`
 /// was remembered even while it was off.
@@ -6917,6 +6934,11 @@ mod tests {
 
         let fresh = read(serde_json::json!({}));
         assert_eq!((fresh.liquid_glass, fresh.background.as_str()), (false, "solid"));
+        // The code themes start as the renderer's own (`src/lib/codeThemes.ts`).
+        assert_eq!(
+            (fresh.code_theme_day.as_str(), fresh.code_theme_night.as_str()),
+            ("mewrk-light", "mewrk-dark")
+        );
 
         let current = read(serde_json::json!({ "liquidGlass": true, "background": "builtin:desk" }));
         assert_eq!((current.liquid_glass, current.background.as_str()), (true, "builtin:desk"));

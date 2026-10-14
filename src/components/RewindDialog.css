@@ -1,0 +1,48 @@
+/* "Rewind to before this message" (RewindDialog.tsx): the dialog's own pieces. The window itself,
+   its buttons and its muted copy line are the shared ones. */
+
+/* Four choices do not fit one row in every language; they wrap, the last still nearest the corner. */
+.rewind-dialog .dialog__footer { flex-wrap: wrap; }
+
+.rewind-dialog__summary { margin: 0 0 8px; font-size: 12.5px; line-height: 1.5; }
+
+/* The files the rewind would touch scroll inside the window rather than growing it. */
+.rewind-dialog__files {
+  max-height: 220px;
+  margin: 0 0 12px;
+  padding: 2px 0;
+  overflow-y: auto;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--subtle);
+}
+.rewind-dialog__file {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+  align-items: baseline;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.rewind-dialog__path {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rewind-dialog__tag { color: var(--muted); font-size: 10.5px; font-weight: 600; white-space: nowrap; }
+.rewind-dialog__file[data-action="delete"]:not([data-skipped]) .rewind-dialog__tag { color: var(--danger); }
+/* A file the rewind leaves alone is greyed, with the reason under its name. */
+.rewind-dialog__file[data-skipped] { color: var(--faint); }
+.rewind-dialog__file[data-skipped] .rewind-dialog__tag { color: var(--faint); }
+.rewind-dialog__reason { grid-column: 1 / -1; color: var(--faint); font-size: 10.5px; line-height: 1.4; overflow-wrap: anywhere; }
+
+.rewind-dialog__scope { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.rewind-dialog__warning,
+.rewind-dialog__error { margin: 10px 0 0; font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere; }
+.rewind-dialog__warning { color: var(--warning); }
+.rewind-dialog__error { color: var(--danger); }

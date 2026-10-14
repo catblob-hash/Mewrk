@@ -1227,14 +1227,11 @@ fn drive_workflow_task(
                 (
                     SubagentRunStatus::Interrupted,
                     AgentLiveStatus::Interrupted,
-                    if shared.stopped_by_user() {
-                        crate::orchestration::append_user_close_note(
-                            &aborted,
-                            &parent.prompt_profile,
-                        )
-                    } else {
-                        aborted
-                    },
+                    crate::orchestration::append_stop_note(
+                        &aborted,
+                        shared.stop_attribution(),
+                        &parent.prompt_profile,
+                    ),
                 )
             } else {
                 (

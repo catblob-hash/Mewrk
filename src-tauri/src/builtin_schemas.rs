@@ -177,10 +177,40 @@ pub(crate) fn builtin_tool_schema(
                     "default": ".",
                     "description": profile.text(PromptKey::ToolGrepParamPath)
                 },
+                "glob": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024,
+                    "description": profile.text(PromptKey::ToolGrepParamGlob)
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["files_with_matches", "content", "count"],
+                    "default": "files_with_matches",
+                    "description": profile.text(PromptKey::ToolGrepParamOutputMode)
+                },
                 "case_sensitive": {
                     "type": "boolean",
-                    "default": false,
+                    "default": true,
                     "description": profile.text(PromptKey::ToolGrepParamCaseSensitive)
+                },
+                "context": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "description": profile.text(PromptKey::ToolGrepParamContext)
+                },
+                "before": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "description": profile.text(PromptKey::ToolGrepParamBefore)
+                },
+                "after": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "description": profile.text(PromptKey::ToolGrepParamAfter)
                 },
                 "limit": {
                     "type": "integer",
@@ -724,6 +754,20 @@ pub(crate) fn builtin_tool_schema(
             "type": "object",
             "description": profile.text(PromptKey::ToolTaskListDescription),
             "properties": {},
+            "additionalProperties": false
+        }),
+        "task_stop" => json!({
+            "type": "object",
+            "description": root_description(name, variant, profile),
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 320,
+                    "description": profile.text(PromptKey::ToolTaskStopParamTask)
+                }
+            },
+            "required": ["task"],
             "additionalProperties": false
         }),
         // One argument, always empty: the host's fabricated calls carry it, so

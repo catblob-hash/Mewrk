@@ -1,22 +1,24 @@
-/* Code wherever the app shows it: the file pane's numbered viewer and fenced blocks in rendered
-   Markdown share one set of token colours, so the same line reads the same in both. */
+/* Code wherever the app shows it: the file pane's numbered viewer, fenced blocks in rendered
+   Markdown and the lines of a diff share one set of token colours, so the same line reads the
+   same in each. The colours are the code theme's (`lib/codeThemes.ts`, `styles/base.css`). */
 
 /* Lexical shapes only — see `codeHighlight.ts` for why nothing here claims more. */
-.code-token--comment { color: var(--color-777771); font-style: italic; }
-.code-token--string { color: var(--color-246b4e); }
-.code-token--keyword { color: var(--color-6254aa); }
-.code-token--number { color: var(--color-8b611d); }
-.code-token--function { color: var(--color-795d2e); }
-.code-token--type { color: var(--color-267f99); }
-.code-token--meta { color: var(--color-aa4f6a); }
-.code-token--tag { color: var(--color-8e3630); }
-.code-token--attribute { color: var(--color-a56312); }
-.code-token--property { color: var(--color-315eae); }
-.code-token--variable { color: var(--color-315eae); }
+.code-token--comment { color: var(--code-comment); font-style: var(--code-comment-style); }
+.code-token--string { color: var(--code-string); }
+.code-token--keyword { color: var(--code-keyword); }
+.code-token--number { color: var(--code-number); }
+.code-token--function { color: var(--code-function); }
+.code-token--type { color: var(--code-type); }
+.code-token--meta { color: var(--code-meta); }
+.code-token--tag { color: var(--code-tag); }
+.code-token--attribute { color: var(--code-attribute); }
+.code-token--property { color: var(--code-property); }
+.code-token--variable { color: var(--code-variable); }
 /* A diff's added and removed lines are bands, not just coloured text: the eye scans for the
-   change, and a background carries further than a hue. */
-.code-token--inserted { color: var(--color-287a38); background: var(--color-eaf7f0); }
-.code-token--deleted { color: var(--color-a23737); background: var(--color-fff0f0); }
+   change, and a background carries further than a hue. The band is the theme's hue thinned, so
+   it tints whatever ground the code is on, glass included. */
+.code-token--inserted { color: var(--code-added); background: var(--code-added-line); }
+.code-token--deleted { color: var(--code-removed); background: var(--code-removed-line); }
 
 /* ---- fenced block in rendered Markdown ---- */
 
@@ -39,7 +41,7 @@
 }
 .markdown-code__bar .markdown-code__copy {
   width: 22px; height: 22px; flex: 0 0 22px; border-radius: 5px;
-  background: var(--color-f1f1ee); color: var(--muted);
+  background: var(--code-bg, var(--color-f1f1ee)); color: var(--muted);
 }
 .markdown-code__bar .markdown-code__copy:hover { background: var(--hover); color: var(--text); }
 
@@ -50,6 +52,8 @@
   flex: 1; min-width: 0; min-height: 0; margin: 0; padding: 4px 0;
   display: flex; flex-direction: column; overflow-y: scroll; overflow-x: hidden;
   font: 11.5px/18px var(--mono); tab-size: 2; -webkit-user-select: text; user-select: text;
+  /* A theme with a ground of its own paints the viewer; otherwise the pane shows through. */
+  background: var(--code-bg, transparent); color: var(--code-fg, inherit);
 }
 /* Rows keep their own height: as items of the scrolling column they would otherwise shrink to the
    18px minimum and wrapped lines would draw over the ones below. */
@@ -63,7 +67,7 @@
    widest number, with no padding either side; the space before the code is the code's own. */
 .numbered-code__number {
   flex: 0 0 auto; width: calc(var(--numbered-code-digits) * 1ch); padding: 0;
-  color: var(--faint); text-align: right; -webkit-user-select: none; user-select: none;
+  color: var(--code-line-number, var(--faint)); text-align: right; -webkit-user-select: none; user-select: none;
 }
 /* Wrapping is not a setting here, so the line box always owns its own height. */
 .numbered-code__text {

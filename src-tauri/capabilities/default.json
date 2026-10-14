@@ -17,6 +17,8 @@
     "allow-update-conversation",
     "allow-attest-edited-tool-context",
     "allow-attest-inserted-tool-context",
+    "allow-attest-copied-tool-contexts",
+    "allow-rewind-files",
     "allow-reorder-conversations",
     "allow-load-conversation",
     "allow-load-conversation-plan",

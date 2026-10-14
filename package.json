@@ -1,7 +1,7 @@
 {
   "name": "mewrk",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Mewrk — Mew. Work.",
   "license": "GPL-3.0-or-later",
   "repository": {
@@ -33,7 +33,7 @@
     "preview": "vite --config vite.config.ts preview",
     "test": "node scripts/shared-test.mjs",
     "test:rust": "node scripts/cargo-test.mjs",
-    "test:direct": "npm run lint && npm run test:theme-colors && npm run test:component-i18n && npm run test:command-acl && npm run test:catalog-parity && npm run test:e2e-fixture-surface && npm run test:frontend-csp && npm run test:native-build-tools && npm run test:dev-child-environment && npm run test:dev-server-port && npm run test:browser-dev-lifecycle && npm run test:browser-dev-concurrency-fixture && npm run test:cargo-test-lifecycle && npm run test:debug-client-entrypoints && npm run test:workspace-coordinator && npm run test:memory-e2e-fixture && npm run test:reset-app-data-plan && npm run test:cargo-target-prune-plan && npm run test:seed-capability-fixtures && npm run test:release-assets-plan && npm run test:third-party-licenses && vitest run",
+    "test:direct": "npm run lint && npm run test:theme-colors && npm run test:component-i18n && npm run test:command-acl && npm run test:catalog-parity && npm run test:e2e-fixture-surface && npm run test:frontend-csp && npm run test:file-icons && npm run test:native-build-tools && npm run test:dev-child-environment && npm run test:dev-server-port && npm run test:browser-dev-lifecycle && npm run test:browser-dev-concurrency-fixture && npm run test:cargo-test-lifecycle && npm run test:debug-client-entrypoints && npm run test:workspace-coordinator && npm run test:memory-e2e-fixture && npm run test:reset-app-data-plan && npm run test:cargo-target-prune-plan && npm run test:seed-capability-fixtures && npm run test:release-assets-plan && npm run test:third-party-licenses && vitest run",
     "test:theme-colors": "node scripts/check-theme-colors.mjs",
     "test:component-i18n": "node scripts/check-component-i18n.mjs",
     "test:command-acl": "node scripts/check-command-acl.mjs",
@@ -41,6 +41,7 @@
     "test:e2e-fixture-surface": "node --test scripts/tests/e2e-fixture-surface.test.mjs",
     "test:frontend-csp": "node scripts/check-frontend-csp.mjs && node --test scripts/tests/frontend-csp-source.test.mjs scripts/tests/frontend-csp.test.mjs scripts/tests/frontend-csp-browser.test.mjs",
     "test:frontend-csp-browser": "node --test scripts/tests/frontend-csp-browser.test.mjs",
+    "test:file-icons": "node --test scripts/tests/vite-file-icons.test.mjs",
     "test:native-build-tools": "node --test scripts/tests/windows-native-build-tools.test.mjs scripts/tests/macos-dev-signing.test.mjs",
     "test:dev-child-environment": "node --test scripts/tests/dev-child-environment.test.mjs",
     "test:dev-server-port": "node --test scripts/tests/dev-server-port.test.mjs",
@@ -80,6 +81,7 @@
     "hast-util-to-jsx-runtime": "^2.3.6",
     "hastscript": "^9.0.1",
     "lucide-react": "^0.468.0",
+    "material-icon-theme": "^5.39.0",
     "pdfjs-dist": "^6.3.289",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

@@ -1,22 +1,14 @@
-import {
-  Database,
-  File as FileGlyph,
-  FileCode2,
-  FileText,
-  LoaderCircle,
-  RefreshCw,
-  Sheet,
-  X
-} from "lucide-react";
+import { LoaderCircle, RefreshCw, X } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
-import { fileExtension, fileIconKind } from "../lib/fileIcons";
+import { fileExtension } from "../lib/fileIcons";
 import { useFloatingSurface } from "../lib/floatingSurfaces";
 import { memoryPool, pooledFetch } from "../lib/memoryPool";
 import { imageAttachmentData, imageAttachmentThumbnail } from "../lib/runtime";
 import type { FileAttachment, ImageAttachment } from "../types";
 import { FileAttachmentPreview } from "./FileAttachmentPreview";
+import { FileIcon } from "./FileIcon";
 import { formatBytes } from "./FilePreview/format";
 import "./ImageStrip.css";
 
@@ -294,23 +286,6 @@ function ImageThumbnail({
   );
 }
 
-function FileKindGlyph({ file }: { file: FileAttachment }) {
-  if (file.format === "pdf") return <FileText aria-hidden="true" />;
-  switch (fileIconKind(file.name)) {
-    case "code":
-      return <FileCode2 aria-hidden="true" />;
-    case "data":
-      return <Database aria-hidden="true" />;
-    case "sheet":
-      return <Sheet aria-hidden="true" />;
-    case "doc":
-    case "skill":
-      return <FileText aria-hidden="true" />;
-    default:
-      return <FileGlyph aria-hidden="true" />;
-  }
-}
-
 /** The short type label a file tile carries, the way an image carries its number. */
 function fileTypeLabel(file: FileAttachment): string {
   if (file.format === "pdf") return "PDF";
@@ -349,7 +324,8 @@ function FileTile({
         onClick={() => onOpen(file)}
       >
         <span className="image-strip__file-icon">
-          <FileKindGlyph file={file} />
+          {/* A PDF is one by its bytes, whatever it was named. */}
+          <FileIcon path={file.format === "pdf" ? "file.pdf" : file.name} size={compact ? 16 : 20} />
         </span>
         <span className="image-strip__file-text">
           <span className="image-strip__file-name">{file.name}</span>

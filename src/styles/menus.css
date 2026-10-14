@@ -13,6 +13,8 @@
 .context-menu__branch > button[aria-expanded="true"] { background: var(--hover); }
 .context-menu > button > svg, .context-menu__branch > button > svg, .context-menu__submenu > button > svg { flex: 0 0 auto; color: var(--faint); }
 .context-menu__more { margin-left: auto; padding-left: 10px; box-sizing: content-box; }
+/* The keys that do what a row does, at the row's far end. */
+.context-menu__keys { margin-left: auto; padding-left: 16px; color: var(--faint); font: 11px/1 var(--app-font-family); }
 .context-menu__divider { height: 1px; margin: 3px 2px; background: var(--border); }
 
 /* Shared popover menu (PopoverMenu.tsx).

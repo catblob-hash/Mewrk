@@ -1,0 +1,14 @@
+/* A file's type icon keeps the box its width and height attributes give it: a row that is
+   short of room ellipsizes the name, never the icon. */
+.file-icon {
+  flex: none;
+  object-fit: contain;
+  -webkit-user-select: none; user-select: none;
+}
+
+/* In a line of text the icon sits on the name's own baseline, a letter's gap ahead of it. */
+.file-icon--inline { vertical-align: -.2em; margin-inline-end: .4em; }
+
+/* An icon with a drawing for each ground renders both; only the theme's shows. */
+:root[data-theme="night"] .file-icon--day,
+:root:not([data-theme="night"]) .file-icon--night { display: none; }

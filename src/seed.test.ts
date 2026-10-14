@@ -89,7 +89,7 @@ describe("seed document", () => {
 
   it("ships workspace, web, and host-run orchestration tools", () => {
     const tools = createSeedDocument().tools;
-    expect(tools).toHaveLength(50);
+    expect(tools).toHaveLength(51);
     expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length);
     const webTools = tools.filter((tool) => tool.category === "web");
     expect(webTools.map((tool) => tool.name)).toEqual([
@@ -106,7 +106,7 @@ describe("seed document", () => {
     ]);
     const orchestrationTools = tools.filter((tool) => tool.category === "orchestration");
     expect(orchestrationTools.map((tool) => tool.name)).toEqual([
-      "agent_spawn", "task_wait", "task_list", "box",
+      "agent_spawn", "task_wait", "task_list", "task_stop", "box",
       "skill", "tool_search", "workflow", "ask_user", "fork",
       "plan", "exit_plan_mode",
       "read_handoff_note", "create_handoff_note", "edit_handoff_note", "handoff"
@@ -184,7 +184,7 @@ describe("seed document", () => {
     expect(preset.settings.enabledTools).toEqual(
       document.tools.map((tool) => tool.name).filter((name) => !(
         document.tools.find((tool) => tool.name === name)!.category === "memory"
-        || ["skill", "tool_search", "task_wait", "task_list", "box", "web_search", "web_fetch"].includes(name)
+        || ["skill", "tool_search", "task_wait", "task_list", "task_stop", "box", "web_search", "web_fetch"].includes(name)
         || ["plan", "exit_plan_mode"].includes(name)
         || ["read_handoff_note", "create_handoff_note", "edit_handoff_note", "handoff"].includes(name)
         || ["bash", "sh", "pwsh", "powershell"].includes(name)
@@ -267,6 +267,8 @@ describe("seed document", () => {
       customCss: "",
       liquidGlass: false,
       background: "solid",
+      codeThemeDay: "mewrk-light",
+      codeThemeNight: "mewrk-dark",
       localModel: {
         titles: false,
         shellExplanations: false,
@@ -300,6 +302,26 @@ describe("seed document", () => {
     expect(read({ background: "solid:night" }).background).toBe("solid:night");
     expect(read({ background: "builtin:shelf", liquidGlass: true }))
       .toMatchObject({ liquidGlass: true, background: "builtin:shelf" });
+  });
+
+  it("keeps a code theme only as a theme of the scheme it is saved for", () => {
+    const read = (appearance: Record<string, unknown>) => {
+      const document = createSeedDocument();
+      return normalizeDocument({
+        ...document,
+        globalSettings: { ...document.globalSettings, appearance: { ...document.globalSettings.appearance, ...appearance } }
+      }).globalSettings.appearance;
+    };
+
+    expect(read({ codeThemeDay: "github-light", codeThemeNight: "dracula" }))
+      .toMatchObject({ codeThemeDay: "github-light", codeThemeNight: "dracula" });
+    // Each scheme's choice names the other scheme's theme: the scheme's own default stands.
+    expect(read({ codeThemeDay: "dracula", codeThemeNight: "github-light" }))
+      .toMatchObject({ codeThemeDay: "mewrk-light", codeThemeNight: "mewrk-dark" });
+    expect(read({ codeThemeDay: "no-such-theme", codeThemeNight: "nope" }))
+      .toMatchObject({ codeThemeDay: "mewrk-light", codeThemeNight: "mewrk-dark" });
+    expect(read({ codeThemeDay: 7, codeThemeNight: null }))
+      .toMatchObject({ codeThemeDay: "mewrk-light", codeThemeNight: "mewrk-dark" });
   });
 
   it("gives a fresh conversation the default per-conversation search behaviour", () => {

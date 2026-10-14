@@ -23,7 +23,7 @@ members = [
 
 [package]
 name = "mewrk"
-version = "1.0.1"
+version = "1.0.2"
 description = "Mewrk — Mew. Work."
 authors = ["Mewrk contributors"]
 license = "GPL-3.0-or-later"

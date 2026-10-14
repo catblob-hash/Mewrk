@@ -21,6 +21,8 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    io::Write,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -202,6 +204,10 @@ struct ShellTaskEntry {
     started_at: String,
     /// Raised by `request_stop`; the running tool call polls it.
     stop: Arc<AtomicBool>,
+    /// Who raised `stop`, when the delivered result should name them. Shared with
+    /// the guard, which hands it to the worker that words the result. Written
+    /// before `stop` is raised, so a worker that sees the flag sees the mark.
+    stop_mark: Arc<crate::agents::StopMark>,
     /// Set once, when the command ends. A finished entry is never revived.
     ended_at: Option<String>,
     outcome: Option<ShellTaskOutcome>,
@@ -225,6 +231,101 @@ struct ShellTaskEntry {
     output: ShellTaskOutput,
 }
 
+/// How large a background command's output file may grow, in bytes. Past it nothing more is
+/// written (a one-line notice says so); the command and its final result are unaffected.
+pub(crate) const MAX_OUTPUT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The model's copy of a background command's output, written as it arrives.
+///
+/// The tail buffer above serves a person watching the task page and keeps only the end; the model
+/// has no such window, and the command's result reaches it only once the command is over. This
+/// file is the missing middle: `read` and `grep` serve it like any spilled output, and it is
+/// written from the same chunks the page gets, so every way a command can run — local, sandboxed,
+/// WSL, SSH — is covered without each leg knowing about it.
+struct OutputFile {
+    path: PathBuf,
+    file: std::fs::File,
+    written: u64,
+    limit: u64,
+    /// Written once, when `limit` is reached. Rendered by the caller from the prompt profile.
+    limit_note: String,
+    /// A `\r` that ended the previous chunk. It is held back because the next chunk may open with
+    /// the `\n` that makes it a line ending, which is folded to a bare `\n`.
+    held_cr: bool,
+    /// Nothing more is written: the limit was reached or a write failed. A file the disk refuses
+    /// must not disturb the command, so a failure only ends the file.
+    closed: bool,
+}
+
+impl OutputFile {
+    /// Appends decoded console text, with CRLF folded to LF as in the result the model gets. A
+    /// bare `\r` is a progress redraw there and stays so here.
+    fn append(&mut self, text: &str) {
+        if self.closed {
+            return;
+        }
+        let mut folded = String::with_capacity(text.len() + 1);
+        let mut rest = text;
+        if std::mem::take(&mut self.held_cr) && !rest.starts_with('\n') {
+            folded.push('\r');
+        }
+        if let Some(head) = rest.strip_suffix('\r') {
+            self.held_cr = true;
+            rest = head;
+        }
+        folded.push_str(&rest.replace("\r\n", "\n"));
+        self.write(&folded);
+    }
+
+    fn write(&mut self, text: &str) {
+        let room = self.limit.saturating_sub(self.written) as usize;
+        if text.len() <= room {
+            self.put(text.as_bytes());
+            return;
+        }
+        let mut end = room;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.put(text[..end].as_bytes());
+        // The notice goes on a line of its own and may run past the limit: it is the one thing
+        // the reader needs to know about why the file stops.
+        let note = format!("\n{}\n", self.limit_note);
+        let _ = self.file.write_all(note.as_bytes());
+        self.closed = true;
+    }
+
+    fn put(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        match self.file.write_all(bytes) {
+            Ok(()) => self.written += bytes.len() as u64,
+            Err(_) => self.closed = true,
+        }
+    }
+
+    /// The command ended: a `\r` still held is its last output byte.
+    fn finish(&mut self) {
+        if std::mem::take(&mut self.held_cr) && !self.closed {
+            self.write("\r");
+        }
+    }
+}
+
+/// What a command's output file says about itself, rendered by the caller in the prompt
+/// profile's words. The registry has no profile of its own.
+pub(crate) struct OutputFileSpec<'a> {
+    pub app_data: &'a Path,
+    /// See [`MAX_OUTPUT_FILE_BYTES`]; a parameter so tests can reach the limit.
+    pub max_bytes: u64,
+    /// Opens a file that starts after the live buffer already dropped output: the argument is
+    /// how many bytes of the command's earlier output are gone.
+    pub earlier_output_lost: &'a dyn Fn(u64) -> String,
+    /// Closes a file that reached `max_bytes`.
+    pub limit_reached: String,
+}
+
 #[derive(Default)]
 struct ShellTaskOutput {
     /// Tail buffer. A deque so trimming the front is not a memmove of the whole retained window
@@ -236,6 +337,9 @@ struct ShellTaskOutput {
     /// [`ShellTaskRegistry::detach_output`].
     sinks: Vec<(u64, Channel<ShellOutputEvent>)>,
     next_subscription: u64,
+    /// The model-readable copy of a background command's output; see [`OutputFile`]. Absent for a
+    /// command that never became a background task, and gone again once the command ends.
+    file: Option<OutputFile>,
 }
 
 impl ShellTaskOutput {
@@ -417,6 +521,8 @@ pub struct ShellTaskGuard {
     registry: ShellTaskRegistry,
     shell_task_id: String,
     stop: Arc<AtomicBool>,
+    /// See [`ShellTaskEntry::stop_mark`].
+    stop_mark: Arc<crate::agents::StopMark>,
     /// Outcome the `Drop` records. `finish` sets it from the real exit; a call that unwinds before
     /// reporting one leaves it `None`, and `Drop` then records a stop — an abandoned command did
     /// not succeed, and claiming it did would be the one lie the row must not tell.
@@ -429,6 +535,13 @@ impl ShellTaskGuard {
     /// True once a stop has been requested for this task. The running command polls this.
     pub fn stop_requested(&self) -> bool {
         self.stop.load(Ordering::Acquire)
+    }
+
+    /// Who the result should say asked for the stop, once [`Self::stop_requested`]
+    /// is true. `None` for a stop nobody is to be credited with — the row going
+    /// away with its conversation, or the host cleaning up after itself.
+    pub fn stop_attribution(&self) -> Option<crate::agents::StopOrigin> {
+        self.stop_mark.attributed()
     }
 
     /// Records how the command ended, before the guard drops. The `Drop` still runs and is what
@@ -544,6 +657,7 @@ impl ShellTaskRegistry {
                     command: snapshot.command,
                     started_at: snapshot.started_at,
                     stop: Arc::new(AtomicBool::new(false)),
+                    stop_mark: Arc::default(),
                     ended_at: snapshot.ended_at,
                     outcome: snapshot.outcome,
                     exit_code: snapshot.exit_code,
@@ -638,6 +752,7 @@ impl ShellTaskRegistry {
         origin: ShellTaskOrigin<'_>,
     ) -> Result<ShellTaskGuard, String> {
         let stop = Arc::new(AtomicBool::new(false));
+        let stop_mark = Arc::<crate::agents::StopMark>::default();
         let started_at = Utc::now().to_rfc3339();
         let (shell_task_id, snapshot, evicted) = {
             let mut registry = self.lock();
@@ -659,6 +774,7 @@ impl ShellTaskRegistry {
                 command: display_command(command),
                 started_at,
                 stop: stop.clone(),
+                stop_mark: stop_mark.clone(),
                 ended_at: None,
                 outcome: None,
                 exit_code: None,
@@ -695,6 +811,7 @@ impl ShellTaskRegistry {
             registry: self.clone(),
             shell_task_id,
             stop,
+            stop_mark,
             outcome: None,
             runtime: None,
         })
@@ -783,12 +900,23 @@ impl ShellTaskRegistry {
     /// Asks the named command to stop. Returns false when the task is unknown, already finished, or
     /// belongs to another conversation. The caller must supply the owning conversation: a stop is a
     /// per-conversation action, and one conversation may never reach into another's processes.
-    pub fn request_stop(&self, conversation_id: &str, shell_task_id: &str) -> bool {
+    ///
+    /// `origin` is who is asking, and the result the model later reads names it (see
+    /// [`ShellTaskGuard::stop_attribution`]): `User` for the row's button, `Model` for `task_stop`,
+    /// `Host` for cleanup nobody is to be credited with. The mark goes in before the flag, so a
+    /// worker that sees the flag raised never reads a mark older than the request.
+    pub fn request_stop(
+        &self,
+        conversation_id: &str,
+        shell_task_id: &str,
+        origin: crate::agents::StopOrigin,
+    ) -> bool {
         self.lock()
             .entries
             .get(shell_task_id)
             .filter(|entry| entry.conversation_id == conversation_id && !entry.finished())
             .map(|entry| {
+                entry.stop_mark.record(origin);
                 entry.stop.store(true, Ordering::Release);
                 true
             })
@@ -848,6 +976,83 @@ impl ShellTaskRegistry {
             .is_some_and(|entry| entry.conversation_id == conversation_id && !entry.finished())
     }
 
+    /// Starts writing a running command's output to a file in the conversation's tool-output
+    /// directory, and returns its path. Everything retained so far is written first, so the file
+    /// is complete from the first byte the live buffer still holds; after that every chunk the
+    /// pipe readers produce lands in it as it arrives.
+    ///
+    /// This is what makes a command's output readable by the model while it runs. A command that
+    /// is a background task from its start opens the file before its readers do, so nothing is
+    /// missing; one handed over at its deadline has been streaming for a while, and when the
+    /// live buffer already dropped its head the file begins with a note saying so.
+    ///
+    /// Fails for an unknown, finished or foreign-conversation row, and when the file cannot be
+    /// created; the command is unaffected either way and simply has no file.
+    pub(crate) fn open_output_file(
+        &self,
+        conversation_id: &str,
+        shell_task_id: &str,
+        spec: &OutputFileSpec<'_>,
+    ) -> Result<PathBuf, String> {
+        let stem = format!("shell-{shell_task_id}");
+        // Before the lock: this touches the disk, and the lock is every reader's.
+        let (path, file) =
+            crate::tool_output::create_live_file(spec.app_data, conversation_id, &stem)?;
+        let attached = {
+            let mut registry = self.lock();
+            match registry
+                .entries
+                .get_mut(shell_task_id)
+                .filter(|entry| entry.conversation_id == conversation_id && !entry.finished())
+            {
+                Some(entry) if entry.output.file.is_none() => {
+                    let mut output_file = OutputFile {
+                        path: path.clone(),
+                        file,
+                        written: 0,
+                        limit: spec.max_bytes,
+                        limit_note: spec.limit_reached.clone(),
+                        held_cr: false,
+                        closed: false,
+                    };
+                    if entry.output.dropped_head_bytes > 0 {
+                        output_file.append(&format!(
+                            "{}\n",
+                            (spec.earlier_output_lost)(entry.output.dropped_head_bytes)
+                        ));
+                    }
+                    output_file.append(&entry.output.snapshot());
+                    entry.output.file = Some(output_file);
+                    Ok(())
+                }
+                Some(_) => Err("This command already has an output file".to_owned()),
+                None => Err("This command is not running".to_owned()),
+            }
+        };
+        match attached {
+            Ok(()) => Ok(path),
+            Err(error) => {
+                let _ = std::fs::remove_file(&path);
+                Err(error)
+            }
+        }
+    }
+
+    /// Where a *running* command's output is being written, if it has a file. A finished
+    /// command's file stays on disk but is no longer growing, so it is not advertised.
+    pub(crate) fn output_file_path(
+        &self,
+        conversation_id: &str,
+        shell_task_id: &str,
+    ) -> Option<PathBuf> {
+        self.lock()
+            .entries
+            .get(shell_task_id)
+            .filter(|entry| entry.conversation_id == conversation_id && !entry.finished())
+            .and_then(|entry| entry.output.file.as_ref())
+            .map(|file| file.path.clone())
+    }
+
     /// Appends one chunk of live output and forwards it to whoever is watching.
     ///
     /// The send happens **after** the lock is released. The registry is a single mutex that
@@ -861,6 +1066,10 @@ impl ShellTaskRegistry {
                 return;
             };
             let seq = entry.output.push(text.as_bytes());
+            // Under the same lock as `push`, so the file's order is the page's order.
+            if let Some(file) = entry.output.file.as_mut() {
+                file.append(text);
+            }
             let sinks = entry
                 .output
                 .sinks
@@ -1005,6 +1214,11 @@ impl ShellTaskRegistry {
             // Taken, not cloned: nothing can write to this command again, so the watchers' channels
             // must not be held past the one event that says so.
             let output_sinks = std::mem::take(&mut entry.output.sinks);
+            // The command's last output has been appended by now (its readers are joined before
+            // the guard drops). Closing the handle also lets a deleted conversation's directory go.
+            if let Some(mut file) = entry.output.file.take() {
+                file.finish();
+            }
             let conversation_id = entry.conversation_id.clone();
             let snapshot = entry.snapshot(shell_task_id);
             let evicted = registry.evict_finished(&conversation_id);
@@ -1091,7 +1305,7 @@ mod tests {
         assert_eq!(rows[0].outcome, Some(ShellTaskOutcome::Failed));
         assert_eq!(rows[0].exit_code, None);
         assert_eq!(rows[0].ended_at, None);
-        assert!(!recovered.request_stop("conversation-a", &id));
+        assert!(!recovered.request_stop("conversation-a", &id, crate::agents::StopOrigin::User));
         let output = recovered
             .subscribe_output("conversation-a", &id, Channel::new(|_| Ok(())))
             .unwrap();
@@ -1469,7 +1683,7 @@ mod tests {
         let shell_task_id = {
             let mut guard = registry.register("conversation-a", "bash", "sleep 100", false);
             let id = guard.shell_task_id().to_owned();
-            assert!(registry.request_stop("conversation-a", &id));
+            assert!(registry.request_stop("conversation-a", &id, crate::agents::StopOrigin::User));
             assert!(
                 registry
                     .task_snapshot("conversation-a", &id)
@@ -1499,7 +1713,11 @@ mod tests {
             guard.shell_task_id().to_owned()
         };
 
-        assert!(!registry.request_stop("conversation-a", &shell_task_id));
+        assert!(!registry.request_stop(
+            "conversation-a",
+            &shell_task_id,
+            crate::agents::StopOrigin::User
+        ));
         assert_eq!(registry.stop_conversation("conversation-a"), 0);
     }
 
@@ -1660,7 +1878,11 @@ mod tests {
         let guard = registry.register("conversation-a", "bash", "sleep 100", false);
 
         assert!(!guard.stop_requested());
-        assert!(registry.request_stop("conversation-a", guard.shell_task_id()));
+        assert!(registry.request_stop(
+            "conversation-a",
+            guard.shell_task_id(),
+            crate::agents::StopOrigin::User
+        ));
         assert!(guard.stop_requested());
         assert!(
             registry
@@ -1677,7 +1899,11 @@ mod tests {
         let registry = ShellTaskRegistry::default();
         let guard = registry.register("conversation-a", "bash", "sleep 100", false);
 
-        assert!(!registry.request_stop("conversation-b", guard.shell_task_id()));
+        assert!(!registry.request_stop(
+            "conversation-b",
+            guard.shell_task_id(),
+            crate::agents::StopOrigin::User
+        ));
         assert!(!guard.stop_requested());
         assert!(registry
             .task_snapshot("conversation-b", guard.shell_task_id())
@@ -1700,8 +1926,41 @@ mod tests {
     #[test]
     fn stopping_an_unknown_task_is_a_refusal_rather_than_an_error() {
         let registry = ShellTaskRegistry::default();
-        assert!(!registry.request_stop("conversation-a", "shell-404"));
+        assert!(!registry.request_stop(
+            "conversation-a",
+            "shell-404",
+            crate::agents::StopOrigin::User
+        ));
         assert_eq!(registry.stop_conversation("conversation-a"), 0);
+    }
+
+    /// The row's button, `task_stop` and the host's own cleanup raise the same flag, and
+    /// the guard reports who asked so the result the model reads can say so: the user over
+    /// the model whichever came first, and a host stop credits nobody.
+    #[test]
+    fn a_stop_request_carries_who_asked_to_the_guard() {
+        use crate::agents::StopOrigin;
+        let registry = ShellTaskRegistry::default();
+        let ask = |origin: StopOrigin| {
+            let guard = registry.register("conversation-a", "bash", "sleep 100", true);
+            assert_eq!(guard.stop_attribution(), None);
+            assert!(registry.request_stop("conversation-a", guard.shell_task_id(), origin));
+            assert!(guard.stop_requested());
+            guard
+        };
+        assert_eq!(ask(StopOrigin::User).stop_attribution(), Some(StopOrigin::User));
+        assert_eq!(ask(StopOrigin::Model).stop_attribution(), Some(StopOrigin::Model));
+        assert_eq!(ask(StopOrigin::Host).stop_attribution(), None);
+
+        let both = ask(StopOrigin::Model);
+        assert!(registry.request_stop("conversation-a", both.shell_task_id(), StopOrigin::User));
+        assert_eq!(both.stop_attribution(), Some(StopOrigin::User));
+        assert!(registry.request_stop("conversation-a", both.shell_task_id(), StopOrigin::Model));
+        assert_eq!(
+            both.stop_attribution(),
+            Some(StopOrigin::User),
+            "a later model stop does not take the user's stop back"
+        );
     }
 
     /// Ids must never collide: two commands started back to back are two rows and two stop buttons.
@@ -2187,5 +2446,160 @@ mod tests {
             .try_register("conv", "bash", "ls", false, origin("call-early"))
             .unwrap();
         assert_eq!(snapshot(&again).explanation, None);
+    }
+
+    // ---- The file a background command writes its output to while it runs ----
+
+    fn lost_note(bytes: u64) -> String {
+        format!("[lost {bytes}]")
+    }
+
+    fn file_spec<'a>(
+        app_data: &'a Path,
+        max_bytes: u64,
+        lost: &'a dyn Fn(u64) -> String,
+    ) -> OutputFileSpec<'a> {
+        OutputFileSpec {
+            app_data,
+            max_bytes,
+            earlier_output_lost: lost,
+            limit_reached: "[limit]".to_owned(),
+        }
+    }
+
+    fn read_file(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// The file is the page's output in the page's order, as the result the model gets is
+    /// written: decoded, CRLF folded to LF, a bare `\r` left as the progress redraw it is.
+    #[test]
+    fn output_arrives_in_the_file_as_the_command_prints_it() {
+        let app_data = tempfile::tempdir().unwrap();
+        let registry = ShellTaskRegistry::default();
+        let guard = registry.register("conv", "bash", "make", true);
+        let id = guard.shell_task_id().to_owned();
+        let spec = file_spec(app_data.path(), MAX_OUTPUT_FILE_BYTES, &lost_note);
+        let path = registry.open_output_file("conv", &id, &spec).unwrap();
+        assert_eq!(registry.output_file_path("conv", &id), Some(path.clone()));
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(&format!("shell-{id}-")));
+
+        let mut stdout = guard.output_sink(ShellOutputStream::Stdout);
+        let mut stderr = guard.output_sink(ShellOutputStream::Stderr);
+        stdout.append(b"one\r\n");
+        assert_eq!(read_file(&path), "one\n", "readable the moment it is printed");
+        stderr.append(b"warn\n");
+        // A line ending split across two reads is still one line ending.
+        stdout.append(b"two\r");
+        stdout.append(b"\nthree\n");
+        // A bare `\r` followed by more output is a redraw, and stays.
+        stdout.append(b"50%\r");
+        stdout.append(b"100%\n");
+        assert_eq!(read_file(&path), "one\nwarn\ntwo\nthree\n50%\r100%\n");
+
+        // A `\r` held at the very end is the command's last byte.
+        stdout.append(b"tail\r");
+        stdout.finish();
+        stderr.finish();
+        drop(guard);
+        assert_eq!(read_file(&path), "one\nwarn\ntwo\nthree\n50%\r100%\ntail\r");
+        // Once the command is over the file stays, and is no longer advertised.
+        assert_eq!(registry.output_file_path("conv", &id), None);
+    }
+
+    /// A command handed to the task surface at its deadline has been printing for a while: its
+    /// file opens with what the live buffer holds, and says so when that is not everything.
+    #[test]
+    fn a_command_handed_over_late_starts_its_file_with_what_it_already_printed() {
+        let app_data = tempfile::tempdir().unwrap();
+        let registry = ShellTaskRegistry::default();
+        let guard = registry.register("conv", "bash", "make", false);
+        let id = guard.shell_task_id().to_owned();
+        let mut stdout = guard.output_sink(ShellOutputStream::Stdout);
+        stdout.append(b"early\n");
+        // A foreground command has no file, and nobody is told of one.
+        assert_eq!(registry.output_file_path("conv", &id), None);
+
+        assert!(registry.mark_background("conv", &id));
+        let spec = file_spec(app_data.path(), MAX_OUTPUT_FILE_BYTES, &lost_note);
+        let path = registry.open_output_file("conv", &id, &spec).unwrap();
+        stdout.append(b"later\n");
+        assert_eq!(read_file(&path), "early\nlater\n");
+
+        // Once the live buffer has dropped the command's head, the file cannot have it either.
+        let busy = registry.register("conv", "bash", "chatty", false);
+        let busy_id = busy.shell_task_id().to_owned();
+        let mut chatty = busy.output_sink(ShellOutputStream::Stdout);
+        for line in 0..300 {
+            chatty.append(format!("{line:04} {}\n", "x".repeat(1019)).as_bytes());
+        }
+        assert!(registry.mark_background("conv", &busy_id));
+        let path = registry.open_output_file("conv", &busy_id, &spec).unwrap();
+        let text = read_file(&path);
+        let (note, rest) = text.split_once('\n').unwrap();
+        assert!(note.starts_with("[lost ") && note != "[lost 0]", "{note}");
+        assert!(rest.ends_with(&format!("0299 {}\n", "x".repeat(1019))));
+        assert!(!rest.contains("0000 "), "the earliest line is gone");
+    }
+
+    /// A file stops at its limit with a note, and neither the command nor the page that
+    /// watches it notices.
+    #[test]
+    fn the_file_stops_at_its_limit_and_the_command_carries_on() {
+        let app_data = tempfile::tempdir().unwrap();
+        let registry = ShellTaskRegistry::default();
+        let guard = registry.register("conv", "bash", "make", true);
+        let id = guard.shell_task_id().to_owned();
+        let spec = file_spec(app_data.path(), 10, &lost_note);
+        let path = registry.open_output_file("conv", &id, &spec).unwrap();
+        let mut stdout = guard.output_sink(ShellOutputStream::Stdout);
+        stdout.append(b"0123456789abcdef\n");
+        stdout.append(b"more\n");
+        assert_eq!(read_file(&path), "0123456789\n[limit]\n");
+
+        let (channel, _received) = collecting_channel();
+        let handle = registry.subscribe_output("conv", &id, channel).unwrap();
+        assert_eq!(handle.snapshot, "0123456789abcdef\nmore\n");
+
+        // The cut never lands inside a character.
+        let other = registry.register("conv", "bash", "cjk", true);
+        let other_id = other.shell_task_id().to_owned();
+        let path = registry.open_output_file("conv", &other_id, &file_spec(app_data.path(), 4, &lost_note)).unwrap();
+        other
+            .output_sink(ShellOutputStream::Stdout)
+            .append("ab中文\n".as_bytes());
+        assert_eq!(read_file(&path), "ab\n[limit]\n");
+    }
+
+    #[test]
+    fn a_file_is_only_opened_for_a_running_command_of_that_conversation_once() {
+        let app_data = tempfile::tempdir().unwrap();
+        let registry = ShellTaskRegistry::default();
+        let spec = file_spec(app_data.path(), MAX_OUTPUT_FILE_BYTES, &lost_note);
+        let mut guard = registry.register("conv", "bash", "make", true);
+        let id = guard.shell_task_id().to_owned();
+        let first = registry.open_output_file("conv", &id, &spec).unwrap();
+        assert!(registry.open_output_file("conv", &id, &spec).is_err());
+        assert!(registry.open_output_file("another", &id, &spec).is_err());
+        assert!(registry.open_output_file("conv", "999", &spec).is_err());
+        assert_eq!(registry.output_file_path("another", &id), None);
+        guard.finish(ShellTaskOutcome::Succeeded, Some(0));
+        drop(guard);
+        let finished = registry.register("conv", "bash", "done", true);
+        let finished_id = finished.shell_task_id().to_owned();
+        drop(finished);
+        assert!(registry.open_output_file("conv", &finished_id, &spec).is_err());
+        // The refusals left nothing behind but the first file.
+        let directory = crate::workspace_dirs::tool_output_dir(app_data.path(), "conv").unwrap();
+        let names = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert_eq!(names[0].file_name(), first.file_name());
     }
 }

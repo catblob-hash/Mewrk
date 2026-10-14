@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import App from "./App";
 import { configureI18n } from "./i18n";
 import type {
@@ -12,9 +12,14 @@ import type {
 import { resetAppMocks, answeredQuestionPair, documentWithModel, model, runtimeMocks } from "./test/appMocks";
 import { EMPTY_TOOL_LOCK } from "./lib/toolLock";
 
+/** The host's proofs for pasted copies of tool cards: the shared mocks do not carry this command. */
+const copiedToolProofs = vi.hoisted(() => ({ attestCopiedToolContexts: vi.fn() }));
+/** The host's file rewind: the shared mocks do not carry this command either. */
+const rewindMocks = vi.hoisted(() => ({ rewindFiles: vi.fn() }));
+
 vi.mock("./lib/runtime", async (importOriginal) => {
   const { runtimeMocks } = await import("./test/appMockInstances");
-  return { ...await importOriginal<typeof import("./lib/runtime")>(), ...runtimeMocks };
+  return { ...await importOriginal<typeof import("./lib/runtime")>(), ...runtimeMocks, ...copiedToolProofs, ...rewindMocks };
 });
 vi.mock("./lib/terminal", async () => (await import("./test/appMockInstances")).terminalMocks);
 vi.mock("./lib/browser", async () => (await import("./test/appMockInstances")).browserMocks);
@@ -184,7 +189,8 @@ describe("App model run flow — timeline", () => {
     await user.click(within(firstReply).getByRole("button", { name: "删除上下文" }));
     await waitFor(() => expect(screen.queryByText("第一段对话的回复")).not.toBeInTheDocument());
 
-    await user.click(screen.getByText("第二段对话"));
+    // Emptied of its only reply, the first conversation is a new task whose landing repeats this title.
+    await user.click(within(screen.getByRole("navigation", { name: "对话列表" })).getByText("第二段对话"));
     expect(await screen.findByText("第二段对话的回复")).toBeInTheDocument();
     mainTimeline().focus();
     await user.keyboard("{Control>}z{/Control}");
@@ -628,5 +634,496 @@ describe("App model run flow — timeline", () => {
     await waitFor(() => expect(branches()).toHaveLength(2));
     const empty = branches().find((candidate) => candidate.contexts.length === 0);
     expect(empty?.settings.toolLock).toBeUndefined();
+  });
+});
+
+describe("copying, pasting and moving on the timeline", () => {
+  beforeEach(() => {
+    resetAppMocks();
+    copiedToolProofs.attestCopiedToolContexts.mockReset();
+  });
+
+  const at = (second: number) => `2026-10-12T00:00:0${second}Z`;
+  const textMessages = (): ContextItem[] => [
+    { id: "copy-1", kind: "user", content: "第一条", createdAt: at(0) },
+    { id: "copy-2", kind: "assistant", content: "第二条", createdAt: at(1) },
+    { id: "copy-3", kind: "user", content: "第三条", createdAt: at(2) },
+    { id: "copy-4", kind: "assistant", content: "第四条", createdAt: at(3) }
+  ];
+  const documentHolding = (contexts: ContextItem[]) => {
+    const appDocument = documentWithModel();
+    const conversation = appDocument.workspaces[0].conversations[0];
+    conversation.contexts = contexts;
+    runtimeMocks.loadDocument.mockResolvedValue(appDocument);
+    return conversation;
+  };
+
+  const rect = (top: number, height: number) => ({
+    x: 0,
+    y: top,
+    top,
+    left: 0,
+    right: 600,
+    bottom: top + height,
+    width: 600,
+    height,
+    toJSON: () => ({})
+  } as DOMRect);
+  const timelineCards = () => Array.from(mainTimeline().querySelectorAll<HTMLElement>("[data-context-id]"));
+  const card = (id: string) => mainTimeline().querySelector<HTMLElement>(`[data-context-id="${id}"]`)!;
+  const order = () => timelineCards().map((element) => element.getAttribute("data-context-id") as string);
+  const pickedIds = () => timelineCards()
+    .filter((element) => element.hasAttribute("data-timeline-selected"))
+    .map((element) => element.getAttribute("data-context-id"));
+  /** jsdom has no layout: the cards are laid 100px apart down a 600px timeline, the first at 20. */
+  const layOut = () => {
+    const scroller = mainTimeline();
+    vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue(rect(0, 600));
+    Object.defineProperty(scroller, "clientWidth", { configurable: true, value: 590 });
+    timelineCards().forEach((element, index) => {
+      vi.spyOn(element, "getBoundingClientRect").mockReturnValue(rect(20 + index * 100, 60));
+    });
+    return scroller;
+  };
+  /** The vertical middle of the nth card as `layOut` drew it. */
+  const middleOf = (index: number) => 50 + index * 100;
+  /** A press let go where it was made, with Ctrl held: it picks the card out or lets it go. */
+  const ctrlClick = async (id: string, y: number) => {
+    fireEvent.pointerDown(card(id), { button: 0, pointerId: 7, clientX: 30, clientY: y, ctrlKey: true });
+    fireEvent.pointerUp(window, { pointerId: 7, clientX: 30, clientY: y, ctrlKey: true });
+    // The click each press ended in is swallowed until the turn is over.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  };
+  const press = (key: string) => fireEvent.keyDown(mainTimeline(), { key, ctrlKey: true });
+  const savedContexts = () => (runtimeMocks.saveDocument.mock.calls.at(-1)?.[0] as AppDocument | undefined)
+    ?.workspaces[0].conversations[0].contexts ?? [];
+
+  it("copies two picked messages and pastes them over a third, which one undo brings back", async () => {
+    documentHolding(textMessages());
+    // Installs the clipboard the copy's text is written to.
+    userEvent.setup();
+    render(<App />);
+    await screen.findByText("第四条");
+    layOut();
+    const original = order();
+    expect(original).toEqual(["copy-1", "copy-2", "copy-3", "copy-4"]);
+
+    await ctrlClick("copy-3", middleOf(2));
+    await ctrlClick("copy-1", middleOf(0));
+    expect(pickedIds()).toEqual(["copy-1", "copy-3"]);
+    press("c");
+    expect(await screen.findByText("已复制 2 条消息")).toBeInTheDocument();
+    // Their text goes to the system clipboard too, in timeline order.
+    await waitFor(async () => expect(await navigator.clipboard.readText()).toBe("第一条\n\n第三条"));
+
+    // Copying lets nothing go; a third message is picked on its own.
+    expect(pickedIds()).toEqual(["copy-1", "copy-3"]);
+    fireEvent.keyDown(mainTimeline(), { key: "Escape" });
+    expect(pickedIds()).toEqual([]);
+    await ctrlClick("copy-2", middleOf(1));
+    expect(pickedIds()).toEqual(["copy-2"]);
+    press("v");
+
+    expect(await screen.findByText("已粘贴 2 条消息")).toBeInTheDocument();
+    const pasted = order();
+    expect(pasted).toHaveLength(5);
+    // Where the picked message sat, in timeline order, under ids of their own.
+    expect(pasted[0]).toBe("copy-1");
+    expect(pasted.slice(3)).toEqual(["copy-3", "copy-4"]);
+    const [first, second] = pasted.slice(1, 3);
+    expect([first, second]).not.toContain("copy-1");
+    expect([first, second]).not.toContain("copy-3");
+    expect(first).not.toBe(second);
+    expect(card(first)).toHaveTextContent("第一条");
+    expect(card(second)).toHaveTextContent("第三条");
+    expect(screen.queryByText("第二条")).not.toBeInTheDocument();
+    expect(pickedIds()).toEqual([]);
+    // No tool card was copied, so the host proved nothing.
+    expect(copiedToolProofs.attestCopiedToolContexts).not.toHaveBeenCalled();
+    await waitFor(() => expect(savedContexts().map((context) => context.id)).toEqual(pasted));
+
+    press("z");
+    await waitFor(() => expect(order()).toEqual(original));
+    expect(screen.getByText("第二条")).toBeInTheDocument();
+    expect(screen.getByText("已撤回：粘贴 2 条消息")).toBeInTheDocument();
+    await waitFor(() => expect(savedContexts().map((context) => context.id)).toEqual(original));
+  });
+
+  it("offers 粘贴 on the insert menu only once something was copied, and puts the copies at its line", async () => {
+    documentHolding(textMessages().slice(0, 3));
+    render(<App />);
+    await screen.findByText("第三条");
+    layOut();
+    const stream = () => mainTimeline().querySelector(".context-stream")!;
+    /** Between the first and second messages. */
+    const rightClickBetween = () => fireEvent.contextMenu(stream(), { clientX: 30, clientY: 100 });
+
+    rightClickBetween();
+    const emptyMenu = screen.getByRole("menu", { name: "添加上下文" });
+    expect(within(emptyMenu).getByRole("menuitem", { name: /粘贴/ })).toBeDisabled();
+    fireEvent.keyDown(emptyMenu, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    await ctrlClick("copy-3", middleOf(2));
+    press("c");
+    expect(await screen.findByText("已复制 1 条消息")).toBeInTheDocument();
+    fireEvent.keyDown(mainTimeline(), { key: "Escape" });
+    expect(pickedIds()).toEqual([]);
+
+    rightClickBetween();
+    const menu = screen.getByRole("menu", { name: "添加上下文" });
+    const paste = within(menu).getByRole("menuitem", { name: /粘贴/ });
+    expect(paste).toBeEnabled();
+    fireEvent.click(paste);
+
+    expect(await screen.findByText("已粘贴 1 条消息")).toBeInTheDocument();
+    const pasted = order();
+    expect(pasted).toHaveLength(4);
+    expect([pasted[0], pasted[2], pasted[3]]).toEqual(["copy-1", "copy-2", "copy-3"]);
+    expect(timelineCards().map((element) => element.textContent?.match(/第[一二三]条/)?.[0]))
+      .toEqual(["第一条", "第三条", "第二条", "第三条"]);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  describe("a copied tool card", () => {
+    const source: ToolContext = {
+      id: "tool-source",
+      kind: "tool",
+      toolName: "read",
+      round: 1,
+      providerCallId: "call_provider_1",
+      attestation: "proof-for-source",
+      input: { path: "src/kept.ts" },
+      result: { success: true, output: "src/kept.ts 的内容", executedAt: at(1), durationMs: 1 },
+      createdAt: at(1)
+    };
+
+    /** Copies the tool card and opens the insert menu at the end of the timeline, ready to paste. */
+    const copyToolCard = async () => {
+      const conversation = documentHolding([
+        { id: "tool-ask", kind: "user", content: "读一下", createdAt: at(0) },
+        structuredClone(source)
+      ]);
+      render(<App />);
+      await waitFor(() => expect(card(source.id)).toBeTruthy());
+      layOut();
+      await ctrlClick(source.id, middleOf(1));
+      press("c");
+      expect(await screen.findByText("已复制 1 条消息")).toBeInTheDocument();
+      fireEvent.keyDown(mainTimeline(), { key: "Escape" });
+      expect(pickedIds()).toEqual([]);
+      fireEvent.contextMenu(mainTimeline().querySelector(".context-stream")!, { clientX: 30, clientY: 400 });
+      return {
+        conversation,
+        paste: within(screen.getByRole("menu", { name: "添加上下文" })).getByRole("menuitem", { name: /粘贴/ })
+      };
+    };
+
+    it("is pasted with a proof the host issued for its new id, and without the source's provider id", async () => {
+      copiedToolProofs.attestCopiedToolContexts.mockResolvedValue(["proof-for-copy"]);
+      const { conversation, paste } = await copyToolCard();
+      fireEvent.click(paste);
+
+      expect(await screen.findByText("已粘贴 1 条消息")).toBeInTheDocument();
+      expect(copiedToolProofs.attestCopiedToolContexts).toHaveBeenCalledTimes(1);
+      const request = copiedToolProofs.attestCopiedToolContexts.mock.calls[0][0];
+      expect(request.conversationId).toBe(conversation.id);
+      expect(request.copies).toHaveLength(1);
+      const [copy] = request.copies;
+      expect(copy.sourceConversationId).toBe(conversation.id);
+      expect(copy.source.id).toBe(source.id);
+      expect(copy.contextId).toEqual(expect.any(String));
+      expect(copy.contextId).not.toBe(source.id);
+
+      expect(order()).toEqual(["tool-ask", source.id, copy.contextId]);
+      await waitFor(() => expect(savedContexts().map((context) => context.id))
+        .toEqual(["tool-ask", source.id, copy.contextId]));
+      const [, kept, pasted] = savedContexts() as ToolContext[];
+      expect(pasted).toMatchObject({
+        id: copy.contextId,
+        kind: "tool",
+        toolName: source.toolName,
+        input: source.input,
+        result: source.result,
+        attestation: "proof-for-copy"
+      });
+      expect(pasted.providerCallId).toBeUndefined();
+      // The original keeps its own proof and the provider's id for its call.
+      expect(kept).toMatchObject({ attestation: "proof-for-source", providerCallId: "call_provider_1" });
+    });
+
+    it("is not pasted at all when the host refuses to vouch for it", async () => {
+      copiedToolProofs.attestCopiedToolContexts.mockRejectedValue(new Error("拒绝"));
+      const { paste } = await copyToolCard();
+      fireEvent.click(paste);
+
+      expect(await screen.findByText(/没有粘贴/)).toHaveTextContent("拒绝");
+      expect(copiedToolProofs.attestCopiedToolContexts).toHaveBeenCalledTimes(1);
+      expect(order()).toEqual(["tool-ask", source.id]);
+      expect(screen.queryByText("已粘贴 1 条消息")).not.toBeInTheDocument();
+      expect(savedContexts().map((context) => context.id)).toEqual(["tool-ask", source.id]);
+    });
+  });
+
+  it("moves two picked messages below the last in one drag, which one undo takes back", async () => {
+    documentHolding(textMessages().slice(0, 3));
+    // Drag frames are run by hand, so the test decides when the pieces settle.
+    const frames: FrameRequestCallback[] = [];
+    const requestFrame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    onTestFinished(() => requestFrame.mockRestore());
+    const flush = () => act(() => {
+      for (let count = 0; frames.length > 0 && count < 100; count += 1) frames.shift()?.(0);
+    });
+    render(<App />);
+    await screen.findByText("第三条");
+    layOut();
+    const original = order();
+    expect(original).toEqual(["copy-1", "copy-2", "copy-3"]);
+
+    await ctrlClick("copy-1", middleOf(0));
+    await ctrlClick("copy-3", middleOf(2));
+    flush();
+    expect(pickedIds()).toEqual(["copy-1", "copy-3"]);
+
+    // Taken by the first of them, carried below the one that stays, and let go there.
+    fireEvent.pointerDown(card("copy-1"), { button: 0, pointerId: 9, clientX: 30, clientY: middleOf(0) });
+    fireEvent.pointerMove(window, { pointerId: 9, clientX: 30, clientY: 260 });
+    flush();
+    fireEvent.pointerUp(window, { pointerId: 9, clientX: 30, clientY: 260 });
+    flush();
+
+    expect(await screen.findByText("已移动 2 条消息")).toBeInTheDocument();
+    await waitFor(() => expect(order()).toEqual(["copy-2", "copy-1", "copy-3"]));
+    await waitFor(() => expect(savedContexts().map((context) => context.id)).toEqual(["copy-2", "copy-1", "copy-3"]));
+
+    press("z");
+    await waitFor(() => expect(order()).toEqual(original));
+    expect(screen.getByText("已撤回：移动 2 条消息")).toBeInTheDocument();
+    await waitFor(() => expect(savedContexts().map((context) => context.id)).toEqual(original));
+  });
+});
+
+describe("rewinding to before a user message", () => {
+  beforeEach(() => {
+    resetAppMocks();
+    rewindMocks.rewindFiles.mockReset();
+  });
+
+  const at = (second: number) => `2026-10-13T00:00:0${second}Z`;
+  const messages = (): ContextItem[] => [
+    { id: "rw-u1", kind: "user", content: "先读一下配置", createdAt: at(0) },
+    { id: "rw-a1", kind: "assistant", content: "配置已读完", createdAt: at(1) },
+    { id: "rw-u2", kind: "user", content: "把端口改成 8080", createdAt: at(2) },
+    { id: "rw-a2", kind: "assistant", content: "端口已改成 8080", createdAt: at(3) }
+  ];
+  const changedFiles = [
+    { path: "/work/config.json", displayPath: "config.json", action: "restore" as const, skipped: null },
+    { path: "/work/notes.md", displayPath: "notes.md", action: "delete" as const, skipped: null },
+    { path: "/work/locked.txt", displayPath: "locked.txt", action: "restore" as const, skipped: "文件被外部修改过" }
+  ];
+  const documentHolding = (contexts: ContextItem[], confirmMessageDelete = false) => {
+    const appDocument = documentWithModel();
+    appDocument.globalSettings.appearance = { ...appDocument.globalSettings.appearance, confirmMessageDelete };
+    const conversation = appDocument.workspaces[0].conversations[0];
+    conversation.contexts = contexts;
+    runtimeMocks.loadDocument.mockResolvedValue(appDocument);
+    return conversation;
+  };
+  const savedIds = () => (
+    (runtimeMocks.saveDocument.mock.calls.at(-1)?.[0] as AppDocument | undefined)?.workspaces[0].conversations[0].contexts ?? []
+  ).map((context) => context.id);
+  const composer = () => screen.getByRole("textbox", { name: "向 Agent 发送消息" });
+  const rewindCalls = () => rewindMocks.rewindFiles.mock.calls.map(([request]) => request);
+  const openRewind = async (user: ReturnType<typeof userEvent.setup>, text: string) => {
+    const message = (await screen.findByText(text)).closest("article") as HTMLElement;
+    await user.click(within(message).getByRole("button", { name: "回退到此消息之前" }));
+    const dialog = await screen.findByRole("dialog", { name: "回退到这条消息之前" });
+    await within(dialog).findByRole("list");
+    return dialog;
+  };
+  const dialogGone = () => waitFor(() => expect(screen.queryByRole("dialog", { name: "回退到这条消息之前" })).toBeNull());
+  /** Previews list every file; the real restore reports the same, the locked one still skipped. */
+  const hostRewinds = () => rewindMocks.rewindFiles.mockImplementation(async () => ({ files: changedFiles }));
+
+  it("previews the files, then restores them before cutting the conversation, which one undo brings back", async () => {
+    const conversation = documentHolding(messages());
+    hostRewinds();
+    const user = userEvent.setup();
+    render(<App />);
+
+    const dialog = await openRewind(user, "把端口改成 8080");
+    expect(rewindCalls()).toEqual([{ conversationId: conversation.id, contextId: "rw-u2", dryRun: true }]);
+    expect(within(dialog).getByText("将恢复 1 个文件，删除 1 个之后新建的文件；1 个会被跳过")).toBeInTheDocument();
+    expect(within(dialog).getByText("config.json")).toBeInTheDocument();
+    expect(within(dialog).getByText("文件被外部修改过")).toBeInTheDocument();
+    // Looking changes nothing.
+    expect(screen.getByText("端口已改成 8080")).toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("button", { name: "恢复对话和文件" }));
+    await dialogGone();
+
+    expect(rewindCalls().map((request) => request.dryRun)).toEqual([true, false]);
+    expect(rewindCalls()[1]).toEqual({ conversationId: conversation.id, contextId: "rw-u2", dryRun: false });
+    // The message and everything after it left the timeline, and the message is back in the composer to edit.
+    await waitFor(() => expect(screen.queryByText("端口已改成 8080")).not.toBeInTheDocument());
+    expect(screen.getByText("配置已读完")).toBeInTheDocument();
+    expect(composer()).toHaveValue("把端口改成 8080");
+    await waitFor(() => expect(savedIds()).toEqual(["rw-u1", "rw-a1"]));
+    expect(runtimeMocks.runModel).not.toHaveBeenCalled();
+    const notice = screen.getByText(/已回退对话和文件/).closest(".timeline-notice") as HTMLElement;
+    expect(notice).toHaveTextContent("恢复了 1 个文件，删除了 1 个之后新建的文件；跳过 1 个：文件被外部修改过");
+    expect(within(notice).getByText("Ctrl+Z")).toBeInTheDocument();
+
+    // The timeline's own undo takes the conversation back; the files are the host's.
+    mainTimeline().focus();
+    await user.keyboard("{Control>}z{/Control}");
+    expect(await screen.findByText("端口已改成 8080")).toBeInTheDocument();
+    expect(screen.getByText("已撤回：回退到这条消息之前")).toBeInTheDocument();
+    await waitFor(() => expect(savedIds()).toEqual(["rw-u1", "rw-a1", "rw-u2", "rw-a2"]));
+    expect(rewindCalls()).toHaveLength(2);
+  });
+
+  it("restores only the files: the timeline and the composer stay as they are", async () => {
+    documentHolding(messages());
+    hostRewinds();
+    const user = userEvent.setup();
+    render(<App />);
+
+    const dialog = await openRewind(user, "把端口改成 8080");
+    runtimeMocks.saveDocument.mockClear();
+    await user.click(within(dialog).getByRole("button", { name: "仅恢复文件" }));
+    await dialogGone();
+
+    expect(rewindCalls().map((request) => request.dryRun)).toEqual([true, false]);
+    expect(await screen.findByText(/已回退文件/)).toHaveTextContent("恢复了 1 个文件，删除了 1 个之后新建的文件；跳过 1 个：文件被外部修改过");
+    expect(screen.getByText("端口已改成 8080")).toBeInTheDocument();
+    expect(composer()).toHaveValue("");
+    expect(runtimeMocks.saveDocument.mock.calls.some(([saved]) => (
+      (saved as AppDocument).workspaces[0].conversations[0].contexts.length < 4
+    ))).toBe(false);
+  });
+
+  it("restores only the conversation without asking the host to touch a file, and without the delete confirmation", async () => {
+    documentHolding(messages(), true);
+    hostRewinds();
+    const user = userEvent.setup();
+    render(<App />);
+    await user.type(await screen.findByLabelText("向 Agent 发送消息"), "顺手记一下");
+
+    const dialog = await openRewind(user, "把端口改成 8080");
+    await user.click(within(dialog).getByRole("button", { name: "仅恢复对话" }));
+    await dialogGone();
+
+    // "Confirm message delete" is for deletes: this window was the question.
+    expect(screen.queryByRole("dialog", { name: "确定删除这条上下文？" })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText("端口已改成 8080")).not.toBeInTheDocument());
+    expect(rewindCalls().map((request) => request.dryRun)).toEqual([true]);
+    // A draft the user had begun is kept, after the message.
+    expect(composer()).toHaveValue("把端口改成 8080\n\n顺手记一下");
+    await waitFor(() => expect(savedIds()).toEqual(["rw-u1", "rw-a1"]));
+    expect(screen.getByText("已回退到这条消息之前")).toBeInTheDocument();
+  });
+
+  it("rewinds to the first message, taking the whole timeline", async () => {
+    documentHolding(messages());
+    rewindMocks.rewindFiles.mockResolvedValue({ files: [] });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const message = (await screen.findByText("先读一下配置")).closest("article") as HTMLElement;
+    await user.click(within(message).getByRole("button", { name: "回退到此消息之前" }));
+    const dialog = await screen.findByRole("dialog", { name: "回退到这条消息之前" });
+    expect(await within(dialog).findByText("这条消息之后没有可恢复的文件改动")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "仅恢复文件" })).toBeDisabled();
+    await user.click(within(dialog).getByRole("button", { name: "仅恢复对话" }));
+    await dialogGone();
+
+    await waitFor(() => expect(savedIds()).toEqual([]));
+    expect(screen.queryByText("配置已读完")).not.toBeInTheDocument();
+    expect(composer()).toHaveValue("先读一下配置");
+  });
+
+  it("keeps the entry off while a model turn is running", async () => {
+    documentHolding(messages());
+    rewindMocks.rewindFiles.mockResolvedValue({ files: [] });
+    runtimeMocks.runModel.mockImplementation(() => new Promise(() => {}));
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByText("配置已读完");
+    await user.type(screen.getByLabelText("向 Agent 发送消息"), "继续");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(runtimeMocks.runModel).toHaveBeenCalled());
+
+    await waitFor(() => {
+      const entries = screen.getAllByRole("button", { name: "回退到此消息之前" });
+      expect(entries.length).toBeGreaterThan(1);
+      for (const entry of entries) expect(entry).toBeDisabled();
+    });
+    expect(screen.getAllByRole("button", { name: "回退到此消息之前" })[0])
+      .toHaveAttribute("title", "模型回合进行中，完成或停止后才能回退");
+    fireEvent.click(screen.getAllByRole("button", { name: "回退到此消息之前" })[0]);
+    expect(screen.queryByRole("dialog", { name: "回退到这条消息之前" })).not.toBeInTheDocument();
+    expect(rewindMocks.rewindFiles).not.toHaveBeenCalled();
+  });
+
+  it("only restores the files when a branch was taken from a message in the range, and explains why", async () => {
+    const conversation = documentHolding([
+      ...messages(),
+      { id: "rw-u3", kind: "user", content: "再加一个日志", createdAt: at(4) },
+      { id: "rw-a3", kind: "assistant", content: "日志已加", createdAt: at(5) }
+    ]);
+    // Two answers were tried from the second message, so it anchors both.
+    conversation.branches = [
+      { id: "rw-branch-old", forkContextId: "rw-u2", active: false, contexts: [], createdAt: at(2), updatedAt: at(3) },
+      { id: "rw-branch-live", forkContextId: "rw-u2", active: true, contexts: [], createdAt: at(3), updatedAt: at(4) }
+    ];
+    hostRewinds();
+    const user = userEvent.setup();
+    render(<App />);
+
+    // From the first message the range holds the anchor.
+    const dialog = await openRewind(user, "先读一下配置");
+    expect(within(dialog).getByText(/有分支从这条消息或其之后的消息开始，不能回退对话/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "仅恢复对话" })).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "恢复对话和文件" })).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "仅恢复文件" })).toBeEnabled();
+    runtimeMocks.saveDocument.mockClear();
+    await user.click(within(dialog).getByRole("button", { name: "仅恢复文件" }));
+    await dialogGone();
+    expect(await screen.findByText(/已回退文件/)).toBeInTheDocument();
+    expect(screen.getByText("日志已加")).toBeInTheDocument();
+    expect(composer()).toHaveValue("");
+
+    // A message after the anchor has no branch in its range and rewinds as usual.
+    const later = await openRewind(user, "再加一个日志");
+    expect(within(later).queryByText(/有分支从这条消息/)).not.toBeInTheDocument();
+    await user.click(within(later).getByRole("button", { name: "仅恢复对话" }));
+    await dialogGone();
+    await waitFor(() => expect(screen.queryByText("日志已加")).not.toBeInTheDocument());
+    expect(screen.getByText("端口已改成 8080")).toBeInTheDocument();
+    expect(composer()).toHaveValue("再加一个日志");
+  });
+
+  it("stays open with the host's error when the files cannot be restored, and leaves the conversation alone", async () => {
+    documentHolding(messages());
+    rewindMocks.rewindFiles.mockImplementation(async (request: { dryRun: boolean }) => {
+      if (request.dryRun) return { files: changedFiles };
+      throw "写入 config.json 失败：拒绝访问";
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const dialog = await openRewind(user, "把端口改成 8080");
+    await user.click(within(dialog).getByRole("button", { name: "恢复对话和文件" }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("写入 config.json 失败：拒绝访问");
+    expect(screen.getByRole("dialog", { name: "回退到这条消息之前" })).toBeInTheDocument();
+    expect(screen.getByText("端口已改成 8080")).toBeInTheDocument();
+    expect(composer()).toHaveValue("");
+    expect(within(dialog).getByRole("button", { name: "恢复对话和文件" })).toBeEnabled();
   });
 });

@@ -10,7 +10,7 @@ vi.mock("@tauri-apps/api/core", async (importOriginal) => ({
 }));
 
 import { DEFAULT_SEARCH_COMPRESSION_CUTOFF } from "./searchProviders";
-import { deleteAgentRole, deleteApiKey, defaultConversationWebSearchSettings, fetchModels, flushDocumentSaves, getStoredApiKeyLength, imageAttachmentData, loadDocument, normalizeAgentRole, normalizeDocument, prepareImageAttachment, refreshCapabilities, resetDocument, revealApiKey, runModel, saveAgentRole, saveApiKey, saveDocument } from "./runtime";
+import { deleteAgentRole, deleteApiKey, defaultConversationWebSearchSettings, fetchModels, flushDocumentSaves, getStoredApiKeyLength, imageAttachmentData, loadDocument, normalizeAgentRole, normalizeDocument, prepareImageAttachment, refreshCapabilities, resetDocument, revealApiKey, rewindFiles, runModel, saveAgentRole, saveApiKey, saveDocument } from "./runtime";
 
 const STORAGE_KEY = "mewrk.document.v1";
 
@@ -2282,5 +2282,42 @@ describe("document normalization", () => {
 
     expect(await getStoredApiKeyLength(removed.id)).toBeUndefined();
     expect(await getStoredApiKeyLength(retained.id)).toBe(12);
+  });
+});
+
+describe("rewinding files", () => {
+  beforeEach(() => {
+    tauriMocks.invoke.mockReset();
+    Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+  });
+
+  it("asks the host with the request as given, and passes its answer on", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    const response = {
+      files: [{ path: "/work/a.ts", displayPath: "a.ts", action: "restore" as const, skipped: null }]
+    };
+    tauriMocks.invoke.mockResolvedValue(response);
+    const request = { conversationId: "conversation-1", contextId: "user-1", dryRun: true };
+
+    await expect(rewindFiles(request)).resolves.toEqual(response);
+
+    expect(tauriMocks.invoke).toHaveBeenCalledWith("rewind_files", { request });
+  });
+
+  it("lets the host's refusal through", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    tauriMocks.invoke.mockRejectedValue("当前对话正在运行，不能回退");
+
+    await expect(rewindFiles({ conversationId: "c", contextId: "u", dryRun: false }))
+      .rejects.toBe("当前对话正在运行，不能回退");
+  });
+
+  it("lists nothing in a browser preview, which has no workspace files", async () => {
+    await expect(rewindFiles({ conversationId: "c", contextId: "u", dryRun: true })).resolves.toEqual({ files: [] });
+    expect(tauriMocks.invoke).not.toHaveBeenCalled();
   });
 });

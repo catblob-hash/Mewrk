@@ -1,9 +1,13 @@
 //! Conversation-scoped background subagent runtime backing the `agent` tool
-//! group: `agent_spawn`, `task_wait`, and `task_list`.
+//! group: `agent_spawn`, `task_wait`, `task_list`, and `task_stop`.
 //!
-//! Only the user can stop a task, through `stop_conversation_task` over IPC;
-//! the model has no entry point for stopping another task. `request_stop` is
-//! called only by user IPC and targeted host paths such as workflow step cancellation.
+//! A task is stopped at one place, [`stop_task_by_address`]: the user's stop
+//! button reaches it through `stop_conversation_task` over IPC and the model's
+//! `task_stop` call reaches it from the run loop, so the two stops are the same
+//! act and settle the same way — a terminal result carrying what the task
+//! produced, delivered like any other. They differ in one thing, who the result
+//! says stopped it ([`StopOrigin`]). `request_stop` is otherwise called only by
+//! targeted host paths such as workflow step cancellation.
 //!
 //! The host never terminates a task for inactivity. A terminal state may result
 //! only from an explicit user stop, a worker return, or cancellation-timeout escalation.
@@ -74,16 +78,16 @@ const QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const QUIESCENCE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The task-runtime tools. They are never user-selectable: the model needs
-/// to be able to wait for and inspect tasks whenever anything can produce one,
-/// and a conversation that can spawn a task but cannot collect it is a dead
-/// state rather than a configuration. `box` is listed with them because it is
-/// derived the same way, though on another rule — see
+/// to be able to wait for, inspect and stop tasks whenever anything can produce
+/// one, and a conversation that can spawn a task but cannot collect or end it
+/// is a dead state rather than a configuration. `box` is listed with them
+/// because it is derived the same way, though on another rule — see
 /// [`apply_task_runtime_tools`]. Same shape as the memory tools — kept in the
 /// catalog, stripped from every persisted enabled list, re-derived by the
 /// trusted request builder. Mirrored by TS `src/lib/taskTools.ts`.
-pub const TASK_RUNTIME_TOOL_NAMES: [&str; 3] = ["task_wait", "task_list", "box"];
-/// The pair that follows a task producer.
-const TASK_COLLECTION_TOOL_NAMES: [&str; 2] = ["task_wait", "task_list"];
+pub const TASK_RUNTIME_TOOL_NAMES: [&str; 4] = ["task_wait", "task_list", "task_stop", "box"];
+/// The tools that follow a task producer.
+const TASK_COLLECTION_TOOL_NAMES: [&str; 3] = ["task_wait", "task_list", "task_stop"];
 
 /// Enabling any of these can put a row in the task list, so the task-runtime
 /// tools above become reachable.
@@ -164,6 +168,7 @@ pub enum AgentToolKind {
     Spawn,
     Wait,
     List,
+    Stop,
 }
 
 pub fn agent_tool_kind(name: &str) -> Option<AgentToolKind> {
@@ -171,7 +176,47 @@ pub fn agent_tool_kind(name: &str) -> Option<AgentToolKind> {
         "agent_spawn" => Some(AgentToolKind::Spawn),
         "task_wait" => Some(AgentToolKind::Wait),
         "task_list" => Some(AgentToolKind::List),
+        "task_stop" => Some(AgentToolKind::Stop),
         _ => None,
+    }
+}
+
+/// Stops the task `address` names in `pool`, the one way a task is stopped.
+///
+/// The user's stop button (`stop_conversation_task`) and the model's `task_stop`
+/// both end here, so a stop settles identically whoever asked: the task lands a
+/// terminal result carrying what it produced before the stop, folds or is waited
+/// for like any other, and wakes an idle conversation. A background shell command
+/// is stopped through its registry row — its own worker sees the flag, kills the
+/// process tree and delivers the output printed so far; every other task is
+/// stopped through its pool entry, which is addressed by name or, for workflow
+/// runs and shell commands the pool keeps under internal names, by label.
+///
+/// `origin` is the caller's own — `User` from the button, `Model` from
+/// `task_stop` — and is passed on rather than assumed, because the result the
+/// model reads names who stopped the task and a wrong name is a false report.
+///
+/// `pool` is `None` for a conversation with no task pool yet. Returns whether
+/// something running was told to stop; an unknown or finished address is `false`.
+pub fn stop_task_by_address(
+    pool: Option<&AgentPool>,
+    shell_tasks: &crate::shell_tasks::ShellTaskRegistry,
+    conversation_id: &str,
+    address: &str,
+    origin: StopOrigin,
+) -> bool {
+    if let Some(shell_task_id) = address.strip_prefix("shell:") {
+        return shell_tasks.request_stop(conversation_id, shell_task_id, origin);
+    }
+    let Some(pool) = pool else {
+        return false;
+    };
+    match pool.find(address).or_else(|| pool.find_by_label(address)) {
+        Some(shared) => {
+            shared.stop_task(origin);
+            true
+        }
+        None => false,
     }
 }
 
@@ -468,15 +513,56 @@ impl SettleObserverSlot {
     }
 }
 
-/// Who asked a task to stop. The distinction is model-visible: only a user's
-/// sidebar close makes the delivered result say the user closed it.
+/// Who asked a task to stop. The distinction is model-visible: the delivered
+/// result names the one who stopped it, and a stop must never be worded as
+/// someone else's — a model told "the user closed it" would conclude the user
+/// intervened, and one told "task_stop stopped it" would not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopOrigin {
     /// The user pressed stop on the task row (IPC `stop_conversation_task`).
     User,
+    /// The model stopped the task with `task_stop`. Same act as the button, but
+    /// nobody intervened, so the result says what was called and not who.
+    Model,
     /// The host cancelled the task for its own reasons — a workflow driver
     /// skipping a step or dropping a race loser.
     Host,
+}
+
+/// The stop attribution a settled result carries: the strongest of the stops that
+/// reached a task, `User` over `Model`. `Host` stops are never recorded, because a
+/// scheduling cancellation has nobody to name.
+///
+/// A task can be asked twice — the model calls `task_stop` and the user presses
+/// the button before the worker has wound down. The user's act is the one the
+/// model must hear about: it is the intervention, and it comes with the advice
+/// not to restart the task unasked. So the mark only ever rises.
+#[derive(Debug, Default)]
+pub struct StopMark(std::sync::atomic::AtomicU8);
+
+impl StopMark {
+    const MODEL: u8 = 1;
+    const USER: u8 = 2;
+
+    /// Notes a stop request. `Host` leaves the mark as it was.
+    pub fn record(&self, origin: StopOrigin) {
+        let rank = match origin {
+            StopOrigin::User => Self::USER,
+            StopOrigin::Model => Self::MODEL,
+            StopOrigin::Host => return,
+        };
+        self.0.fetch_max(rank, Ordering::AcqRel);
+    }
+
+    /// The origin to name in the result: `User`, `Model`, or `None` when no
+    /// attributable stop was requested.
+    pub fn attributed(&self) -> Option<StopOrigin> {
+        match self.0.load(Ordering::Acquire) {
+            Self::USER => Some(StopOrigin::User),
+            Self::MODEL => Some(StopOrigin::Model),
+            _ => None,
+        }
+    }
 }
 
 /// Shared state of one agent, owned jointly by the pool, the dispatching
@@ -490,10 +576,11 @@ pub struct AgentShared {
     /// task turn, including shell processes, hook commands, and approval cards.
     /// Use [`Self::cancel_flag`] to obtain a clone for polling.
     pub cancel: Arc<AtomicBool>,
-    /// Whether the stop request came from the user's sidebar rather than from
-    /// the host's own scheduling. Only the former makes the settled result say
-    /// the task was closed by hand. Set by [`Self::request_stop`].
-    stopped_by_user: AtomicBool,
+    /// Who asked for the stop, when it was somebody the result should name: the
+    /// user's sidebar close or the model's `task_stop`. A host cancellation is
+    /// not recorded, so the settled result never credits anyone with it. Set by
+    /// [`Self::request_stop`] and [`Self::stop_task`].
+    stop_mark: StopMark,
     /// Prototype child request (provider, tools, hooks, depth…) with empty
     /// contexts; the child turn clones it and fills in the transcript.
     pub template: RunModelRequest,
@@ -784,18 +871,16 @@ impl AgentShared {
 
     /// Asks the worker to abort at its next stream event or round boundary.
     ///
-    /// `origin` records who asked. `StopOrigin::User` is the sidebar stop, and
-    /// only it makes the settled result say the user closed the task; the
-    /// workflow driver's own step cancellations are `StopOrigin::Host` and must
-    /// not put words in the user's mouth.
+    /// `origin` records who asked. `StopOrigin::User` is the sidebar stop and
+    /// `StopOrigin::Model` is `task_stop`; each makes the settled result name
+    /// that one. The workflow driver's own step cancellations are
+    /// `StopOrigin::Host` and must not put words in anyone's mouth.
     ///
     /// The worker observes this at its next stream event or round boundary. A
     /// synchronous operation such as a `bash` process or hook command polls the
     /// same flag returned by [`Self::cancel_flag`]. See [`crate::cancel`].
     pub fn request_stop(&self, origin: StopOrigin) {
-        if origin == StopOrigin::User {
-            self.stopped_by_user.store(true, Ordering::Release);
-        }
+        self.stop_mark.record(origin);
         self.cancel.store(true, Ordering::Release);
         self.notify();
     }
@@ -813,9 +898,10 @@ impl AgentShared {
             if core.status != AgentLiveStatus::Running {
                 return;
             }
-            if origin == StopOrigin::User {
-                self.stopped_by_user.store(true, Ordering::Release);
-            }
+            // Recorded before the duplicate check below: a user's stop that
+            // arrives while the model's grace timer runs still has to win the
+            // wording.
+            self.stop_mark.record(origin);
             self.cancel.store(true, Ordering::Release);
             if core.stop_timer == Some(core.identity) {
                 return;
@@ -841,10 +927,11 @@ impl AgentShared {
         }
     }
 
-    /// Whether the user closed this task from the sidebar, as opposed to the
-    /// host cancelling it for its own scheduling reasons.
-    pub fn stopped_by_user(&self) -> bool {
-        self.stopped_by_user.load(Ordering::Acquire)
+    /// Who the settled result should say stopped this task, as opposed to the
+    /// host cancelling it for its own scheduling reasons. `None` when nobody
+    /// attributable did.
+    pub fn stop_attribution(&self) -> Option<StopOrigin> {
+        self.stop_mark.attributed()
     }
 
     /// Stop flag passed by value to synchronous blocking points in the task turn.
@@ -1362,7 +1449,7 @@ impl AgentPool {
             label,
             task,
             cancel: Arc::new(AtomicBool::new(false)),
-            stopped_by_user: AtomicBool::new(false),
+            stop_mark: StopMark::default(),
             template,
             kind,
             core: Mutex::new(AgentCore {
@@ -1925,7 +2012,7 @@ pub(crate) mod tests {
         // No producer: a persisted pair is removed rather than honoured, and
         // so is a persisted `box` where host messages are user messages.
         assert_eq!(
-            derive(&["read", "task_wait", "task_list", "box"]),
+            derive(&["read", "task_wait", "task_list", "task_stop", "box"]),
             vec!["read"]
         );
         assert!(derive(&[]).is_empty());
@@ -1938,7 +2025,8 @@ pub(crate) mod tests {
                 vec![
                     producer.to_owned(),
                     "task_wait".to_owned(),
-                    "task_list".to_owned()
+                    "task_list".to_owned(),
+                    "task_stop".to_owned()
                 ],
                 "{producer} must derive the task-runtime set"
             );
@@ -1963,7 +2051,10 @@ pub(crate) mod tests {
         // Idempotent: deriving over an already-derived list adds nothing.
         let mut enabled = derive(&["agent_spawn"]);
         apply_task_runtime_tools(&mut enabled, HostMessageContainer::User);
-        assert_eq!(enabled, vec!["agent_spawn", "task_wait", "task_list"]);
+        assert_eq!(
+            enabled,
+            vec!["agent_spawn", "task_wait", "task_list", "task_stop"]
+        );
 
         // Where host messages come in `box`, every run declares it — with no
         // producer at all, and once however often it is derived.
@@ -1971,9 +2062,82 @@ pub(crate) mod tests {
         assert_eq!(boxed(&[]), vec!["box"]);
         assert_eq!(boxed(&["read", "box"]), vec!["read", "box"]);
         let mut enabled = boxed(&["agent_spawn"]);
-        assert_eq!(enabled, vec!["agent_spawn", "task_wait", "task_list", "box"]);
+        assert_eq!(
+            enabled,
+            vec!["agent_spawn", "task_wait", "task_list", "task_stop", "box"]
+        );
         apply_task_runtime_tools(&mut enabled, HostMessageContainer::Box);
-        assert_eq!(enabled, vec!["agent_spawn", "task_wait", "task_list", "box"]);
+        assert_eq!(
+            enabled,
+            vec!["agent_spawn", "task_wait", "task_list", "task_stop", "box"]
+        );
+    }
+
+    /// The one stop the sidebar button and `task_stop` share: it reaches only what is
+    /// running in the pool it is given, or the conversation's own command row, and it
+    /// stops the same way whoever asked. What differs is the origin recorded for the
+    /// result's wording: the button is the user, `task_stop` is the model.
+    #[test]
+    fn stopping_by_address_is_one_act_for_the_button_and_the_model() {
+        let shells = crate::shell_tasks::ShellTaskRegistry::default();
+        let pool = AgentPool::new();
+        let stop = |pool: Option<&AgentPool>, conversation: &str, address: &str, origin| {
+            stop_task_by_address(pool, &shells, conversation, address, origin)
+        };
+        assert!(!stop(None, "conv", "reviewer", StopOrigin::User));
+        assert!(!stop(Some(&pool), "conv", "reviewer", StopOrigin::Model));
+        assert!(!stop(None, "conv", "shell:7", StopOrigin::Model));
+
+        let by_button = shells.register("conv", "bash", "sleep 60", true);
+        let by_model = shells.register("conv", "bash", "sleep 60", true);
+        let button_address = format!("shell:{}", by_button.shell_task_id());
+        let model_address = format!("shell:{}", by_model.shell_task_id());
+        assert!(
+            !stop(None, "another", &button_address, StopOrigin::User),
+            "another conversation's row is out of reach"
+        );
+        assert!(!by_button.stop_requested());
+        assert_eq!(by_button.stop_attribution(), None);
+        assert!(stop(None, "conv", &button_address, StopOrigin::User));
+        assert!(stop(None, "conv", &model_address, StopOrigin::Model));
+        // Both raise the same flag the worker polls; only the attribution differs.
+        assert!(by_button.stop_requested() && by_model.stop_requested());
+        assert_eq!(by_button.stop_attribution(), Some(StopOrigin::User));
+        assert_eq!(by_model.stop_attribution(), Some(StopOrigin::Model));
+
+        let reviewer = register(&pool, "reviewer", AgentLiveStatus::Running);
+        let planner = register(&pool, "planner", AgentLiveStatus::Running);
+        assert!(stop(Some(&pool), "conv", "reviewer", StopOrigin::User));
+        assert!(stop(Some(&pool), "conv", "planner", StopOrigin::Model));
+        assert!(reviewer.cancel.load(Ordering::Acquire));
+        assert!(planner.cancel.load(Ordering::Acquire));
+        assert_eq!(reviewer.stop_attribution(), Some(StopOrigin::User));
+        assert_eq!(planner.stop_attribution(), Some(StopOrigin::Model));
+    }
+
+    /// A task asked twice — the model's `task_stop`, then the user's button before the
+    /// worker has wound down — is worded as the user's, in either order: the user's act
+    /// is the intervention the model must hear about, and the mark only ever rises.
+    #[test]
+    fn a_users_stop_outranks_the_models_whichever_came_first() {
+        let pool = AgentPool::new();
+        let model_first = register(&pool, "a1", AgentLiveStatus::Running);
+        model_first.request_stop(StopOrigin::Model);
+        assert_eq!(model_first.stop_attribution(), Some(StopOrigin::Model));
+        model_first.request_stop(StopOrigin::User);
+        assert_eq!(model_first.stop_attribution(), Some(StopOrigin::User));
+
+        let user_first = register(&pool, "a2", AgentLiveStatus::Running);
+        user_first.request_stop(StopOrigin::User);
+        user_first.request_stop(StopOrigin::Model);
+        user_first.request_stop(StopOrigin::Host);
+        assert_eq!(user_first.stop_attribution(), Some(StopOrigin::User));
+
+        // A host cancellation on top of the model's stop does not erase it.
+        let model_then_host = register(&pool, "a3", AgentLiveStatus::Running);
+        model_then_host.request_stop(StopOrigin::Model);
+        model_then_host.request_stop(StopOrigin::Host);
+        assert_eq!(model_then_host.stop_attribution(), Some(StopOrigin::Model));
     }
 
     pub(crate) fn template() -> RunModelRequest {
@@ -2877,9 +3041,10 @@ pub(crate) mod tests {
         assert!(!pool.has_undrained_foldable_results(), "认领后探针归零");
     }
 
-    /// Only the user's sidebar close may put words in the user's mouth. A host
-    /// stop — a workflow driver skipping a step or dropping a race loser — sets
-    /// the same cancel flag but must never make the result claim a person did it.
+    /// Only the user's sidebar close may put words in the user's mouth, and only the
+    /// model's `task_stop` may be worded as the model's. A host stop — a workflow
+    /// driver skipping a step or dropping a race loser — sets the same cancel flag but
+    /// must never make the result credit anyone with it.
     #[test]
     fn a_host_stop_does_not_claim_the_user_closed_the_task() {
         let pool = AgentPool::new();
@@ -2889,15 +3054,21 @@ pub(crate) mod tests {
             host_stopped.cancel.load(Ordering::Acquire),
             "仍然要真的取消"
         );
-        assert!(
-            !host_stopped.stopped_by_user(),
-            "宿主调度的取消不是用户关闭"
+        assert_eq!(
+            host_stopped.stop_attribution(),
+            None,
+            "宿主调度的取消不是用户关闭，也不是模型停止"
         );
 
         let user_stopped = register(&pool, "a2", AgentLiveStatus::Running);
         user_stopped.request_stop(StopOrigin::User);
         assert!(user_stopped.cancel.load(Ordering::Acquire));
-        assert!(user_stopped.stopped_by_user());
+        assert_eq!(user_stopped.stop_attribution(), Some(StopOrigin::User));
+
+        let model_stopped = register(&pool, "a3", AgentLiveStatus::Running);
+        model_stopped.request_stop(StopOrigin::Model);
+        assert!(model_stopped.cancel.load(Ordering::Acquire));
+        assert_eq!(model_stopped.stop_attribution(), Some(StopOrigin::Model));
     }
 
     #[test]
@@ -2919,7 +3090,7 @@ pub(crate) mod tests {
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             SubagentRunStatus::Stopped
         );
-        assert!(stubborn.stopped_by_user());
+        assert_eq!(stubborn.stop_attribution(), Some(StopOrigin::User));
         assert_eq!(stubborn.status(), AgentLiveStatus::Stopped);
         assert!(replacement_started
             .recv_timeout(Duration::from_secs(2))

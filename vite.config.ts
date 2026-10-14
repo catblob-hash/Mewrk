@@ -3,6 +3,8 @@ import react from "@vitejs/plugin-react";
 // The helper is plain ESM so the Node-native CSP regression test can exercise it directly.
 // @ts-expect-error This config-only module intentionally has no browser-facing declaration file.
 import { frontendCspPlugin } from "./scripts/vite-csp.mjs";
+// @ts-expect-error This config-only module intentionally has no browser-facing declaration file.
+import { fileIconsPlugin } from "./scripts/vite-file-icons.mjs";
 
 // The port is chosen by whoever starts this server (scripts/tauri-with-build-tools.mjs
 // or scripts/browser-dev.mjs), which prefers 1420 but takes an operating-system
@@ -16,7 +18,7 @@ const developmentServerHost = "127.0.0.1";
 const developmentServerPort = Number(process.env.MEWRK_DEV_SERVER_PORT ?? 1420);
 
 export default defineConfig({
-  plugins: [react(), frontendCspPlugin()],
+  plugins: [react(), frontendCspPlugin(), fileIconsPlugin()],
   clearScreen: false,
   server: {
     host: developmentServerHost,

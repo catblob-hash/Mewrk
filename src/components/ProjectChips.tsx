@@ -20,6 +20,7 @@ import {
   workspaceMachineLabel
 } from "../lib/workspaces";
 import type { TerminalShell } from "../lib/workspaces";
+import { GlassPlate } from "./GlassPlate";
 import { PathText } from "./PathText";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuItem, PopoverMenuSection } from "./PopoverMenu";
@@ -83,6 +84,7 @@ export function ProjectSelector({
       rootClassName="project-selector"
       triggerClassName="composer-chip"
       trigger={<>
+        <GlassPlate />
         {isTemporaryWorkspace(activeProject) ? <FolderClock size={13} /> : <FolderKanban size={13} />}
         <span className="composer-chip__label">{activeName}</span>
         <ChevronDown size={11} className="composer-chip__caret" />
@@ -222,6 +224,7 @@ export function WorkspaceMemberSelector({
       rootClassName="workspace-member-selector"
       triggerClassName="composer-chip composer-chip--path"
       trigger={<>
+        <GlassPlate />
         {machineIcon(current.machine, 13)}
         {showIndex && <span className="composer-chip__index" aria-hidden="true">{selected}</span>}
         <PathText className="composer-chip__label" path={current.path} title={null} />

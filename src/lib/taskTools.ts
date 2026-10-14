@@ -2,14 +2,14 @@ import { MEMORY_TOOL_NAME_SET } from "./memoryTools";
 
 /**
  * Catalog names for task-runtime tools. They are host-derived, not user settings:
- * conversations that produce tasks must also be able to list and await them, and
- * `box` carries the host's messages wherever a conversation chose it as their
+ * conversations that produce tasks must also be able to list, await and stop
+ * them, and `box` carries the host's messages wherever a conversation chose it as their
  * container (`hostMessageContainer`), so every run of such a conversation
  * declares it. Keep descriptors for timeline rendering, but exclude them from
  * selection and persisted enabled lists. Mirrors Rust
  * `agents::TASK_RUNTIME_TOOL_NAMES`.
  */
-const TASK_RUNTIME_TOOL_NAMES = ["task_wait", "task_list", "box"] as const;
+const TASK_RUNTIME_TOOL_NAMES = ["task_wait", "task_list", "task_stop", "box"] as const;
 
 const TASK_RUNTIME_TOOL_NAME_SET: ReadonlySet<string> = new Set(TASK_RUNTIME_TOOL_NAMES);
 

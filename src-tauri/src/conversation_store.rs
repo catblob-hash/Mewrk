@@ -109,6 +109,66 @@ const FILE_READ_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS file_read_record (
     PRIMARY KEY (conversation_id, path)
 ) STRICT;";
 
+/// The index of a conversation's file checkpoints (`file_checkpoints`): one row
+/// per file a `write` or `edit` was about to change, under the user message the
+/// change belongs to. The content itself lives beside the database, under the
+/// app data directory, named by its hash.
+///
+/// `seq` is the order rows were recorded in, one count per conversation. It is
+/// what a rewind goes by rather than the timeline, which the user may edit: a
+/// message deleted from it leaves its rows behind, and they still sit where they
+/// were recorded. `content_sha256` is NULL for a file that did not exist then,
+/// and empty for one that existed but was too large to keep.
+///
+/// This table was added without raising `STORE_VERSION`: the schema pass below
+/// creates a table a store lacks, and a build that does not know it opens a
+/// store that holds it without trouble, so the release build and the
+/// development build can share one data directory.
+const FILE_CHECKPOINT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS file_checkpoint (
+    conversation_id TEXT NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+    seq             INTEGER NOT NULL,
+    anchor          TEXT NOT NULL,
+    path            TEXT NOT NULL,
+    content_sha256  TEXT,
+    mode            INTEGER,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, seq),
+    UNIQUE (conversation_id, anchor, path)
+) STRICT;";
+
+/// One row of `file_checkpoint`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileCheckpointRecord {
+    pub seq: i64,
+    /// The user message the change belongs to.
+    pub anchor: String,
+    /// The file's canonical path.
+    pub path: String,
+    /// NULL: the file did not exist. Empty: it existed and was not kept.
+    pub content_sha256: Option<String>,
+    pub mode: Option<u32>,
+}
+
+/// What [`ConversationStore::file_checkpoint_slot`] found for one
+/// (anchor, path) pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileCheckpointSlot {
+    /// The conversation has no row, so nothing can be filed under it.
+    NoConversation,
+    /// The file was already recorded under this anchor; the first record is the one that counts.
+    Taken,
+    Free,
+}
+
+/// What [`ConversationStore::put_file_checkpoint`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileCheckpointWrite {
+    pub inserted: bool,
+    /// Content hashes of the rows dropped to stay within the retention limit.
+    /// Another row may still name one of them.
+    pub dropped_hashes: Vec<String>,
+}
+
 /// One row per answered fork request, for the source conversation's task bar.
 /// The model never reads this table: `fork` returns before the user decides.
 /// A decision only means anything beside the conversation that raised it, so it
@@ -706,7 +766,7 @@ CREATE TABLE IF NOT EXISTS aborted_task (
 /// Every creation statement the store is built from, in the order a fresh store
 /// runs them. Repair walks the same list, so "what a new store gets" and "what an
 /// old store is brought up to" cannot drift apart.
-const SCHEMAS: [&str; 9] = [
+const SCHEMAS: [&str; 10] = [
     SCHEMA_SQL,
     FORK_START_SCHEMA,
     PLAN_SCHEMA,
@@ -716,6 +776,7 @@ const SCHEMAS: [&str; 9] = [
     TOOL_EXPLANATION_SCHEMA,
     TOOL_ALLOWANCE_SCHEMA,
     FILE_READ_SCHEMA,
+    FILE_CHECKPOINT_SCHEMA,
 ];
 
 /// Columns bolted onto a table after that table had already shipped, as
@@ -2490,6 +2551,226 @@ impl ConversationStore {
             .map_err(|error| error.to_string())?;
             Ok(())
         })
+    }
+
+    // ------------------------------------------------------ File checkpoints
+
+    /// Whether `path` can still be filed under `anchor`: it cannot when the
+    /// conversation has no row, nor when the file was already recorded there.
+    pub fn file_checkpoint_slot(
+        &self,
+        conversation_id: &str,
+        anchor: &str,
+        path: &str,
+    ) -> Result<FileCheckpointSlot, String> {
+        let conn = self.lock()?;
+        let known: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM conversation WHERE id = ?1)",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("无法查询对话：{error}"))?;
+        if !known {
+            return Ok(FileCheckpointSlot::NoConversation);
+        }
+        let taken: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM file_checkpoint
+                 WHERE conversation_id = ?1 AND anchor = ?2 AND path = ?3)",
+                rusqlite::params![conversation_id, anchor, path],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("无法查询文件检查点：{error}"))?;
+        Ok(if taken {
+            FileCheckpointSlot::Taken
+        } else {
+            FileCheckpointSlot::Free
+        })
+    }
+
+    /// Files `path` under `anchor` as the next record of the conversation, unless
+    /// the pair is already recorded. When this opens a new anchor, the anchors
+    /// beyond the `keep_anchors` most recent ones are dropped in the same
+    /// transaction, so the index never holds more than the limit between two
+    /// writes.
+    pub fn put_file_checkpoint(
+        &self,
+        conversation_id: &str,
+        anchor: &str,
+        path: &str,
+        content_sha256: Option<&str>,
+        mode: Option<u32>,
+        keep_anchors: usize,
+    ) -> Result<FileCheckpointWrite, String> {
+        self.with_write_tx(|tx| {
+            let new_anchor: bool = tx
+                .query_row(
+                    "SELECT NOT EXISTS (SELECT 1 FROM file_checkpoint
+                     WHERE conversation_id = ?1 AND anchor = ?2)",
+                    rusqlite::params![conversation_id, anchor],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("无法查询文件检查点：{error}"))?;
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO file_checkpoint
+                         (conversation_id, seq, anchor, path, content_sha256, mode, created_at)
+                     VALUES (?1,
+                         (SELECT COALESCE(MAX(seq), 0) + 1 FROM file_checkpoint WHERE conversation_id = ?1),
+                         ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        conversation_id,
+                        anchor,
+                        path,
+                        content_sha256,
+                        mode.map(i64::from),
+                        now(),
+                    ],
+                )
+                .map_err(|error| format!("无法写入文件检查点：{error}"))?
+                > 0;
+            let mut dropped_hashes = Vec::new();
+            if inserted && new_anchor {
+                // Anchors are ordered by when each first recorded something, so
+                // a message that keeps getting edits under it does not age.
+                let stale = {
+                    let mut statement = tx
+                        .prepare(
+                            "SELECT anchor FROM file_checkpoint WHERE conversation_id = ?1
+                             GROUP BY anchor ORDER BY MIN(seq) DESC LIMIT -1 OFFSET ?2",
+                        )
+                        .map_err(|error| format!("无法查询文件检查点：{error}"))?;
+                    let rows = statement
+                        .query_map(
+                            rusqlite::params![conversation_id, keep_anchors as i64],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .map_err(|error| format!("无法查询文件检查点：{error}"))?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| format!("无法读取文件检查点：{error}"))?
+                };
+                for old in stale {
+                    let mut statement = tx
+                        .prepare(
+                            "SELECT DISTINCT content_sha256 FROM file_checkpoint
+                             WHERE conversation_id = ?1 AND anchor = ?2
+                               AND content_sha256 IS NOT NULL AND content_sha256 != ''",
+                        )
+                        .map_err(|error| format!("无法查询文件检查点：{error}"))?;
+                    let hashes = statement
+                        .query_map(rusqlite::params![conversation_id, old], |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .map_err(|error| format!("无法查询文件检查点：{error}"))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| format!("无法读取文件检查点：{error}"))?;
+                    dropped_hashes.extend(hashes);
+                    tx.execute(
+                        "DELETE FROM file_checkpoint WHERE conversation_id = ?1 AND anchor = ?2",
+                        rusqlite::params![conversation_id, old],
+                    )
+                    .map_err(|error| format!("无法清理文件检查点：{error}"))?;
+                }
+            }
+            Ok(FileCheckpointWrite {
+                inserted,
+                dropped_hashes,
+            })
+        })
+    }
+
+    /// Every file checkpoint of the conversation, in the order recorded.
+    pub fn file_checkpoints(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<FileCheckpointRecord>, String> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT seq, anchor, path, content_sha256, mode FROM file_checkpoint
+                 WHERE conversation_id = ?1 ORDER BY seq",
+            )
+            .map_err(|error| format!("无法查询文件检查点：{error}"))?;
+        let rows = statement
+            .query_map([conversation_id], |row| {
+                Ok(FileCheckpointRecord {
+                    seq: row.get(0)?,
+                    anchor: row.get(1)?,
+                    path: row.get(2)?,
+                    content_sha256: row.get(3)?,
+                    mode: row.get::<_, Option<i64>>(4)?.and_then(|mode| u32::try_from(mode).ok()),
+                })
+            })
+            .map_err(|error| format!("无法查询文件检查点：{error}"))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|error| format!("无法读取文件检查点：{error}"))
+    }
+
+    /// Every content hash some checkpoint of the conversation still names.
+    pub fn file_checkpoint_hashes(&self, conversation_id: &str) -> Result<HashSet<String>, String> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT content_sha256 FROM file_checkpoint
+                 WHERE conversation_id = ?1 AND content_sha256 IS NOT NULL AND content_sha256 != ''",
+            )
+            .map_err(|error| format!("无法查询文件检查点：{error}"))?;
+        let rows = statement
+            .query_map([conversation_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("无法查询文件检查点：{error}"))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|error| format!("无法读取文件检查点：{error}"))
+    }
+
+    /// Deletes the checkpoints with these `seq`s.
+    pub fn delete_file_checkpoints(&self, conversation_id: &str, seqs: &[i64]) -> Result<(), String> {
+        if seqs.is_empty() {
+            return Ok(());
+        }
+        self.with_write_tx(|tx| {
+            for seq in seqs {
+                tx.execute(
+                    "DELETE FROM file_checkpoint WHERE conversation_id = ?1 AND seq = ?2",
+                    rusqlite::params![conversation_id, seq],
+                )
+                .map_err(|error| format!("无法删除文件检查点：{error}"))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The id of the newest user message on the conversation's timeline that
+    /// `accept` takes. The timeline is the trunk, as saved; a message waiting in
+    /// a branch is not on it.
+    pub fn latest_user_context_id(
+        &self,
+        conversation_id: &str,
+        accept: impl Fn(&str) -> bool,
+    ) -> Result<Option<String>, String> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT id FROM context
+                 WHERE conversation_id = ?1 AND branch_id IS NULL AND kind = 'user'
+                 ORDER BY order_key DESC, rowid DESC",
+            )
+            .map_err(|error| format!("无法查询时间线正文：{error}"))?;
+        let mut rows = statement
+            .query([conversation_id])
+            .map_err(|error| format!("无法查询时间线正文：{error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("无法读取时间线正文行：{error}"))?
+        {
+            let id: String = row
+                .get(0)
+                .map_err(|error| format!("无法读取时间线正文行：{error}"))?;
+            if accept(&id) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     /// Records one answered fork request.
@@ -6936,6 +7217,161 @@ mod tests {
         );
     }
 
+    /// `file_checkpoint` was added without a new stamp, so that a release build and a
+    /// development build can share one data directory: a store that predates the table
+    /// reads as current by its number alone, and it is the shape pass that has to add
+    /// the table. The store keeps its history, is not set aside, and keeps its stamp.
+    #[test]
+    fn the_file_checkpoint_table_is_added_to_an_existing_store_without_a_new_stamp() {
+        let (dir, store) = temp_store();
+        let mut source = conversation("before_checkpoints");
+        source.contexts.push(user("history", "保留的历史"));
+        store.put_conversation("ws", &source).expect("seed history");
+        store
+            .lock()
+            .expect("lock")
+            .execute_batch("DROP TABLE file_checkpoint")
+            .expect("the shape of a store written before the table existed");
+        let stamp = |store: &ConversationStore| -> i32 {
+            store
+                .lock()
+                .expect("lock")
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("version")
+        };
+        assert_eq!(stamp(&store), STORE_VERSION, "the old store already reads as current");
+        drop(store);
+
+        let store = ConversationStore::open(&dir.path().join(DATABASE_FILE_NAME)).expect("upgrade");
+        assert_eq!(stamp(&store), STORE_VERSION, "adding the table must not raise the stamp");
+        assert!(quarantined_nothing(dir.path()), "补一张表不得隔离原数据库");
+        assert_eq!(
+            store
+                .conversation(&source.id)
+                .expect("read history")
+                .expect("preserved row")
+                .contexts,
+            source.contexts
+        );
+        assert!(store.file_checkpoints(&source.id).expect("read").is_empty());
+        let write = store
+            .put_file_checkpoint(&source.id, "history", "/w/a.txt", Some("abc"), Some(0o644), 100)
+            .expect("write into the new table");
+        assert!(write.inserted);
+        assert_eq!(store.file_checkpoints(&source.id).expect("read").len(), 1);
+    }
+
+    #[test]
+    fn a_file_is_recorded_once_per_anchor_and_old_anchors_age_out_of_the_index() {
+        let (_dir, store) = temp_store();
+        let source = conversation("checkpointed");
+        store.put_conversation("ws", &source).expect("seed");
+        let id = source.id.as_str();
+        assert_eq!(
+            store.file_checkpoint_slot("nobody", "u1", "/w/a").expect("slot"),
+            FileCheckpointSlot::NoConversation
+        );
+        assert_eq!(
+            store.file_checkpoint_slot(id, "u1", "/w/a").expect("slot"),
+            FileCheckpointSlot::Free
+        );
+
+        let first = store
+            .put_file_checkpoint(id, "u1", "/w/a", Some("h1"), None, 3)
+            .expect("first");
+        assert!(first.inserted && first.dropped_hashes.is_empty());
+        assert_eq!(
+            store.file_checkpoint_slot(id, "u1", "/w/a").expect("slot"),
+            FileCheckpointSlot::Taken
+        );
+        // The first record wins; a second one for the same pair is ignored.
+        let again = store
+            .put_file_checkpoint(id, "u1", "/w/a", Some("h2"), None, 3)
+            .expect("again");
+        assert!(!again.inserted);
+        // Another file under the same anchor, and a file that did not exist.
+        store.put_file_checkpoint(id, "u1", "/w/b", None, None, 3).expect("b");
+        let records = store.file_checkpoints(id).expect("records");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.seq, record.anchor.as_str(), record.path.as_str(), record.content_sha256.as_deref()))
+                .collect::<Vec<_>>(),
+            [(1, "u1", "/w/a", Some("h1")), (2, "u1", "/w/b", None)]
+        );
+
+        // Three more anchors: the limit of 3 keeps the newest three, and says
+        // which contents the dropped rows named.
+        store.put_file_checkpoint(id, "u2", "/w/a", Some("h3"), None, 3).expect("u2");
+        store.put_file_checkpoint(id, "u3", "/w/a", Some("h1"), None, 3).expect("u3");
+        let aged = store
+            .put_file_checkpoint(id, "u4", "/w/c", Some("h4"), Some(0o755), 3)
+            .expect("u4");
+        assert!(aged.inserted);
+        assert_eq!(aged.dropped_hashes, ["h1"], "u1 held h1 and a file that did not exist");
+        let kept = store.file_checkpoints(id).expect("records");
+        assert_eq!(
+            kept.iter().map(|record| record.anchor.as_str()).collect::<Vec<_>>(),
+            ["u2", "u3", "u4"]
+        );
+        assert_eq!(kept[2].mode, Some(0o755));
+        assert!(kept[0].seq < kept[1].seq && kept[1].seq < kept[2].seq);
+        // u3 still names h1, so the hash is not free to go.
+        assert_eq!(
+            store.file_checkpoint_hashes(id).expect("hashes"),
+            HashSet::from(["h1".to_owned(), "h3".to_owned(), "h4".to_owned()])
+        );
+        // More files under an anchor already held do not age anything.
+        let more = store.put_file_checkpoint(id, "u4", "/w/d", Some("h5"), None, 3).expect("d");
+        assert!(more.inserted && more.dropped_hashes.is_empty());
+
+        let doomed = kept.iter().map(|record| record.seq).take(2).collect::<Vec<_>>();
+        store.delete_file_checkpoints(id, &doomed).expect("delete");
+        assert_eq!(
+            store.file_checkpoints(id).expect("records").iter().map(|record| record.anchor.as_str()).collect::<Vec<_>>(),
+            ["u4", "u4"]
+        );
+    }
+
+    #[test]
+    fn deleting_a_conversation_takes_its_file_checkpoints_with_it() {
+        let (_dir, store) = temp_store();
+        store.put_conversation("ws", &conversation("gone")).expect("seed");
+        store.put_conversation("ws", &conversation("kept")).expect("seed");
+        for id in ["gone", "kept"] {
+            store.put_file_checkpoint(id, "u1", "/w/a", Some("h"), None, 100).expect("record");
+        }
+        store.delete_conversation("gone").expect("delete");
+        assert!(store.file_checkpoints("gone").expect("records").is_empty());
+        assert_eq!(store.file_checkpoints("kept").expect("records").len(), 1);
+    }
+
+    /// The anchor of a change nobody typed a message for: the newest user message
+    /// on the timeline that the caller takes, wherever it sits among other rows.
+    #[test]
+    fn the_latest_user_context_is_the_newest_one_the_caller_accepts() {
+        let (_dir, store) = temp_store();
+        let mut source = conversation("anchors");
+        source.contexts = vec![
+            user("u1", "first"),
+            assistant_at("a1", "2026-08-25T00:00:02.000Z"),
+            user("u2", "second"),
+            user("ctx_agent-result_late", "a delivery card"),
+        ];
+        store.put_conversation("ws", &source).expect("seed");
+        let genuine = |id: &str| !id.starts_with("ctx_agent-result_");
+        assert_eq!(
+            store.latest_user_context_id("anchors", genuine).expect("latest").as_deref(),
+            Some("u2")
+        );
+        assert_eq!(
+            store.latest_user_context_id("anchors", |_| true).expect("latest").as_deref(),
+            Some("ctx_agent-result_late")
+        );
+        assert_eq!(store.latest_user_context_id("anchors", |_| false).expect("latest"), None);
+        assert_eq!(store.latest_user_context_id("nobody", genuine).expect("latest"), None);
+    }
+
     /// Quarantine sets a store aside; it must not empty it on the way. A store in
     /// WAL mode that was never checkpointed keeps its rows in the log and only a
     /// header in the main file, so the log has to travel with the file it belongs
@@ -7088,13 +7524,14 @@ mod tests {
             "tool_error_explanation",
             "tool_allowance",
             "file_read_record",
+            "file_checkpoint",
         ] {
             assert!(
                 declared.contains(&expected),
                 "{expected} 必须能从建表语句里读出来：{declared:?}"
             );
         }
-        assert_eq!(declared.len(), 19, "读出的表名与实际建的表不符：{declared:?}");
+        assert_eq!(declared.len(), 20, "读出的表名与实际建的表不符：{declared:?}");
         for table in LEGACY_HISTORY_TABLES {
             assert!(
                 !declared.contains(&table),

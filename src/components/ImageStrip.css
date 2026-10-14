@@ -180,21 +180,11 @@
   color: var(--muted);
 }
 
-.image-strip__file-icon svg {
-  width: 20px;
-  height: 20px;
-}
-
 .image-strip__item--compact .image-strip__file-icon {
   width: 30px;
   height: 30px;
   border-radius: 7px;
   background: var(--panel);
-}
-
-.image-strip__item--compact .image-strip__file-icon svg {
-  width: 16px;
-  height: 16px;
 }
 
 .image-strip__file-text {

@@ -9,7 +9,7 @@
 
 export interface WordDiffSegment {
   text: string;
-  /** True when this run is absent from the other side. */
+  /** True when this run is absent from the other side, or is whitespace joining two such runs. */
   changed: boolean;
 }
 
@@ -198,13 +198,23 @@ export function wordDiff(
     middle: readonly string[],
     kept: readonly boolean[]
   ): WordDiffSegment[] => {
+    // Whitespace never carries a change on its own when it is being ignored:
+    // marking it would draw a highlight on the very thing the setting hides.
+    const changed = middle.map((token, index) => (
+      !kept[index] && !(ignoreWhitespace && isWhitespace(token))
+    ));
+    // Whitespace between two changed runs joins them. A rewritten phrase still has
+    // spaces where the old one did, and they are all the alignment finds in common;
+    // left unmarked, they cut one edit into a highlight per word.
+    for (let index = 1; index < middle.length - 1; index += 1) {
+      if (isWhitespace(middle[index]) && changed[index - 1] && changed[index + 1]) {
+        changed[index] = true;
+      }
+    }
     const segments: WordDiffSegment[] = [];
     for (let index = 0; index < head; index += 1) push(segments, tokens[index], false);
     for (let index = 0; index < middle.length; index += 1) {
-      // Whitespace never carries a change on its own when it is being ignored:
-      // marking it would draw a highlight on the very thing the setting hides.
-      const changed = !kept[index] && !(ignoreWhitespace && isWhitespace(middle[index]));
-      push(segments, middle[index], changed);
+      push(segments, middle[index], changed[index]);
     }
     for (let index = tokens.length - tail; index < tokens.length; index += 1) {
       push(segments, tokens[index], false);

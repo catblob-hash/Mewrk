@@ -48,10 +48,58 @@
   --scrollbar-thumb: var(--color-c8c8c1);
   --scrollbar-thumb-hover: var(--color-aaaaaa);
   --mono: "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  /* The code theme (Appearance → Code appearance). `applyAppearance` sets one per scheme on
+     the root, as `--code-day-*` and `--code-night-*`, and code is drawn from the set the
+     theme on screen names. A theme that keeps the app's own surface leaves `bg`, `fg`,
+     `border` and `line-number` unset, and each code surface names what it falls back to. */
+  --code-bg: var(--code-day-bg);
+  --code-fg: var(--code-day-fg);
+  --code-border: var(--code-day-border);
+  --code-line-number: var(--code-day-line-number);
+  --code-comment: var(--code-day-comment);
+  --code-comment-style: var(--code-day-comment-style);
+  --code-string: var(--code-day-string);
+  --code-number: var(--code-day-number);
+  --code-keyword: var(--code-day-keyword);
+  --code-function: var(--code-day-function);
+  --code-type: var(--code-day-type);
+  --code-meta: var(--code-day-meta);
+  --code-tag: var(--code-day-tag);
+  --code-attribute: var(--code-day-attribute);
+  --code-property: var(--code-day-property);
+  --code-variable: var(--code-day-variable);
+  --code-added: var(--code-day-added);
+  --code-added-line: var(--code-day-added-line);
+  --code-added-word: var(--code-day-added-word);
+  --code-removed: var(--code-day-removed);
+  --code-removed-line: var(--code-day-removed-line);
+  --code-removed-word: var(--code-day-removed-word);
 }
 
 :root[data-theme="night"] {
   --gutter: var(--color-fbfbf9);
+  --code-bg: var(--code-night-bg);
+  --code-fg: var(--code-night-fg);
+  --code-border: var(--code-night-border);
+  --code-line-number: var(--code-night-line-number);
+  --code-comment: var(--code-night-comment);
+  --code-comment-style: var(--code-night-comment-style);
+  --code-string: var(--code-night-string);
+  --code-number: var(--code-night-number);
+  --code-keyword: var(--code-night-keyword);
+  --code-function: var(--code-night-function);
+  --code-type: var(--code-night-type);
+  --code-meta: var(--code-night-meta);
+  --code-tag: var(--code-night-tag);
+  --code-attribute: var(--code-night-attribute);
+  --code-property: var(--code-night-property);
+  --code-variable: var(--code-night-variable);
+  --code-added: var(--code-night-added);
+  --code-added-line: var(--code-night-added-line);
+  --code-added-word: var(--code-night-added-word);
+  --code-removed: var(--code-night-removed);
+  --code-removed-line: var(--code-night-removed-line);
+  --code-removed-word: var(--code-night-removed-word);
 }
 
 
@@ -86,8 +134,9 @@ textarea { resize: vertical; overflow-y: scroll; }
    up never narrows what sits beside it. With nothing to scroll the track is empty and invisible.
    Not `scrollbar-gutter: stable`: WebKit sizes that gutter as the system's scrollbar (17px) until
    the box overflows and only then as the 10px one below, so the content still jumps on macOS.
-   Two kinds go without: a box that only scrolls sideways, where the track would be a blank band
-   under every code block, and a menu, which neither grows nor shrinks while it is open. */
+   Three kinds go without: a box that only scrolls sideways, where the track would be a blank band
+   under every code block, a menu, which neither grows nor shrinks while it is open, and a tool's
+   card, whose result is settled by the time it is opened. */
 ::-webkit-scrollbar { width: var(--scrollbar-size); height: var(--scrollbar-size); }
 ::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border: 3px solid transparent; border-radius: 99px; background-clip: padding-box; }
 ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); border: 2px solid transparent; background-clip: padding-box; }

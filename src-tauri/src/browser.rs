@@ -166,9 +166,9 @@ const DEFAULT_URL: &str = "about:blank";
 /// and therefore its own WebView2 environment, so these never reach the trusted main window.
 /// `CalculateNativeWinOcclusion` is what marks a parked (off-screen) page as hidden; disabling
 /// it keeps its compositor producing frames, which is what input acknowledgements wait on.
-/// `--disable-direct-composition` keeps the page off overlay planes, as for the main window (see
-/// `MAIN_WEBVIEW_BROWSER_ARGS`), so cursors over a page draw like cursors over the app.
-const BROWSER_PAGE_BROWSER_ARGS: &str = "--disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-direct-composition --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion";
+/// DirectComposition stays on, as for the main window (see `main_window_chrome` in `lib.rs`), so
+/// a page scrolls and draws its cursors like the app around it.
+const BROWSER_PAGE_BROWSER_ARGS: &str = "--disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion";
 const MAIN_WINDOW_LABEL: &str = "main";
 const DEFAULT_WIDTH: f64 = 1200.0;
 const DEFAULT_HEIGHT: f64 = 800.0;

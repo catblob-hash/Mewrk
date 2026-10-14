@@ -4167,6 +4167,9 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         ".{file_name}.tmp-{}-{sequence}",
         std::process::id()
     ));
+    // Read before the temporary exists: it is the file being replaced whose
+    // mode has to survive, and nothing of that file is left after the rename.
+    let replaced_mode = replaced_file_mode(path);
 
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -4178,6 +4181,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .map_err(|error| format!("无法写入临时数据文档: {error}"))?;
         file.flush()
             .map_err(|error| format!("无法刷新临时数据文档: {error}"))?;
+        carry_over_mode(&file, replaced_mode);
         file.sync_all()
             .map_err(|error| format!("无法同步临时数据文档: {error}"))?;
         drop(file);
@@ -4189,6 +4193,45 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     result
 }
+
+/// The permission bits of the regular file at `path`, if there is one.
+///
+/// The temporary file is created with the default mode, so renaming it over
+/// an existing file would otherwise turn an executable script into a plain
+/// one. A path that does not exist (a new file) has nothing to keep, and the
+/// default mode applies, as it does for a data document written for the first
+/// time.
+#[cfg(unix)]
+fn replaced_file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::metadata(path).ok()?;
+    metadata
+        .is_file()
+        .then(|| metadata.permissions().mode() & 0o7777)
+}
+
+/// Windows needs no counterpart: `ReplaceFileW` keeps the replaced file's
+/// attributes and ACL itself (see [`replace_file`]).
+#[cfg(not(unix))]
+fn replaced_file_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Gives the temporary file the mode of the file it is about to replace.
+///
+/// Best effort on purpose. The write itself has succeeded by now, and a
+/// filesystem that cannot chmod (FAT, some network mounts) is better served by
+/// the default mode than by a refusal to save.
+#[cfg(unix)]
+fn carry_over_mode(file: &File, mode: Option<u32>) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(mode) = mode {
+        let _ = file.set_permissions(fs::Permissions::from_mode(mode));
+    }
+}
+
+#[cfg(not(unix))]
+fn carry_over_mode(_file: &File, _mode: Option<u32>) {}
 
 #[cfg(not(windows))]
 fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
@@ -6039,6 +6082,82 @@ b"
         let error = validate_shape(&invalid).unwrap_err();
         assert!(error.contains("用户上下文 invalid-user-image"), "{error}");
         assert!(error.contains("has an invalid image attachment"), "{error}");
+    }
+
+    /// `atomic_write` replaces a file by renaming a temporary over it, and the
+    /// temporary starts out with the default mode. The file tools write through
+    /// it, so without the carry-over an edit would turn an executable script
+    /// into a plain file.
+    ///
+    /// Unix only, and not run on the Windows development machine: Windows has no
+    /// mode bits to compare (`ReplaceFileW` keeps the replaced file's attributes
+    /// and ACL itself).
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_the_mode_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        let directory = tempfile::tempdir().unwrap();
+
+        let script = directory.path().join("run.sh");
+        fs::write(&script, "#!/bin/sh\necho old\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        atomic_write(&script, b"#!/bin/sh\necho new\n").unwrap();
+        assert_eq!(fs::read(&script).unwrap(), b"#!/bin/sh\necho new\n");
+        assert_eq!(mode_of(&script), 0o755, "the executable bit survives");
+
+        let private = directory.path().join("secret.txt");
+        fs::write(&private, "old").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        atomic_write(&private, b"new").unwrap();
+        assert_eq!(mode_of(&private), 0o600, "a private file stays private");
+
+        // A file that does not exist yet has nothing to keep: it gets what a
+        // plain create gives under the same umask, as it always did.
+        let fresh = directory.path().join("fresh.txt");
+        atomic_write(&fresh, b"first").unwrap();
+        let baseline = directory.path().join("baseline.txt");
+        fs::File::create(&baseline).unwrap();
+        assert_eq!(mode_of(&fresh), mode_of(&baseline));
+
+        // A symlink at the destination is replaced by a regular file, as before;
+        // the mode that carries over is the one the link led to.
+        let target = directory.path().join("target.sh");
+        fs::write(&target, "x").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = directory.path().join("link.sh");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        atomic_write(&link, b"through the link").unwrap();
+        assert!(!fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(mode_of(&link), 0o700);
+        assert_eq!(fs::read(&target).unwrap(), b"x", "the link's old target is untouched");
+
+        // Nothing is left behind next to the files.
+        let leftovers: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// The same promise on every platform: content replaced, no temporary
+    /// left, a missing parent directory created. This is the part of the
+    /// contract the Windows development machine can check.
+    #[test]
+    fn atomic_write_replaces_content_and_leaves_no_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested").join("document.json");
+        atomic_write(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        atomic_write(&path, b"second, longer").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second, longer");
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["document.json".to_owned()]);
     }
 
     #[test]

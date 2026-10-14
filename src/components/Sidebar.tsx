@@ -17,6 +17,7 @@ import type {
 import { useI18n } from "../i18n";
 import type { Conversation, SshMachineConfig, Workspace } from "../types";
 import { ConfirmDeleteButton, IconButton } from "./Common";
+import { GlassPlate } from "./GlassPlate";
 import { WorkspaceOptionsMenu } from "./WorkspaceOptionsMenu";
 import type { WorkspacePresetOption } from "./WorkspaceOptionsMenu";
 import { visibleConversations } from "../lib/draftConversation";
@@ -173,7 +174,7 @@ function getSidebarDropTarget(point: DragPoint, item: DragItem): DropTarget | nu
  * The brand mark as a status light: an outline while idle, a blinking cursor while working,
  * amber while it waits on the user and blue once a run finished unseen.
  */
-function ConversationStatusMark({ status }: { status: ConversationStatus }) {
+export function ConversationStatusMark({ status }: { status: ConversationStatus }) {
   const { t } = useI18n();
   const label = status === "running" ? t("正在进行", "In progress")
     : status === "blocked" ? t("等待你处理", "Waiting for you")
@@ -361,6 +362,7 @@ export function Sidebar({
       aria-hidden={!open || undefined}
       {...(!open ? { inert: true } : {})}
     >
+      <GlassPlate />
       {/* The window's top row. The traffic lights and the shell's navigation float over it
         * (`ShellNav` in App), so it only holds their room and moves the window. */}
       <div className="sidebar__chrome-row" data-tauri-drag-region="deep" />

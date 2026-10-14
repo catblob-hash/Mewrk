@@ -3,12 +3,10 @@ import {
   Bot,
   Box,
   CircleAlert,
-  CircleCheck,
   CircleHelp,
   ClipboardCheck,
   Code2,
   Crosshair,
-  File,
   FilePenLine,
   FileSearch,
   FileText,
@@ -29,6 +27,7 @@ import {
   Network,
   NotebookPen,
   NotebookText,
+  OctagonX,
   Plug,
   ScanSearch,
   Search,
@@ -42,18 +41,21 @@ import {
   Wrench
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { t as globalT, useI18n } from "../i18n";
 import { stripAnsi } from "../lib/ansi";
+import { highlightCodeLines } from "../lib/codeHighlight";
+import { codeLanguage } from "../lib/fileViewers";
 import { backendOfTool, shellBackendLabel } from "../lib/machineShells";
 import { parseWaitOutput, questionsFromInput } from "../lib/orchestration";
 import { webSourceIcon as siteIcon } from "../lib/runtime";
 import { agentTimelineRunStatus, initialMessage, isChildMainMessageContext } from "../lib/subagents";
 import type { JsonValue, SubagentUpdate, ToolContext, ToolDescriptor } from "../types";
+import { CodeTokens } from "./CodeBlock";
 import { DiffOutput, parseUnifiedDiff } from "./DiffOutput";
+import { FileIcon } from "./FileIcon";
 import { ImageStrip } from "./ImageStrip";
-import { PathText } from "./PathText";
 import "./ToolRenderers.css";
 
 export type ToolSurface = "group" | "question" | "workflow";
@@ -183,8 +185,6 @@ export interface ToolPresentation {
   counts?: { additions: number; deletions: number };
   /** A figure the title carries after its subject: "12 matches". */
   note?: string;
-  /** A failed call's title without its reason: what failed. */
-  failure?: string;
   target?: string;
   /** See `ToolViewConfig.targetIsPath`. */
   targetIsPath?: boolean;
@@ -298,14 +298,55 @@ function browserDuration(item: ToolContext): string | undefined {
   return item.result.durationMs > 0 ? `${item.result.durationMs} ms` : undefined;
 }
 
+/**
+ * What the file tools answer with when they found nothing: the built-in
+ * profile's sentences, and the Chinese ones older transcripts carry. They are
+ * the tool's words, not an entry it found.
+ */
+const FILE_LIST_EMPTY_ANSWERS = ["(empty directory)", "No matching files", "（目录为空）", "未找到匹配文件"]; // i18n-audit-ignore: parses backend sentinels
+const GREP_EMPTY_ANSWERS = ["No matches found", "未找到匹配内容"]; // i18n-audit-ignore: parses backend sentinels
+/** A page asked for past the last entry: the tool's answer, not an entry. */
+const GREP_PAST_END = /^No matches at offset \d+; there are \d+\.$/;
+/**
+ * What `read` says in place of text: an empty file, a start past the last line.
+ * They are the tool's sentences, not lines of the file.
+ */
+const READ_EMPTY_FILE = "(The file exists but is empty)";
+const READ_PAST_END = /^\(The file has only \d+ lines?, so the requested start_line is out of range\)$/;
+/**
+ * The note `read` ends with when it decoded the bytes for the model: lossily, or from
+ * UTF-16. It follows the text on a line of its own, like the continuation note.
+ */
+const READ_DECODE_NOTE = /^\(This file is (?:not valid UTF-8|UTF-16(?:LE|BE) text), .*\)$/;
+
 function fileListStat(item: ToolContext, t: Translate): string {
-  const count = meaningfulCount(item.result.output, ["（目录为空）", "未找到匹配文件"]); // i18n-audit-ignore: parses legacy backend sentinels
+  const count = meaningfulCount(item.result.output, FILE_LIST_EMPTY_ANSWERS);
   return t("{count} 项", "{count} items", { count });
 }
 
 function grepStat(item: ToolContext, t: Translate): string {
-  const count = meaningfulCount(item.result.output, ["未找到匹配内容"]); // i18n-audit-ignore: parses a legacy backend sentinel
-  return t("{count} 条", "{count} entries", { count });
+  const { mode, count } = grepCount(item);
+  return mode === "content"
+    ? t("{count} 处匹配", "{count} matches", { count })
+    : t("{count} 个文件", "{count} files", { count });
+}
+
+/** Past this many lines a `read` is shown uncoloured, as a file is (`CodeBlock.tsx`). */
+const READ_HIGHLIGHT_LINES = 8000;
+
+/** A line of `read` output that is the tool talking about the text rather than the text. */
+function isReadNote(line: string): boolean {
+  return line.startsWith("… ") || READ_DECODE_NOTE.test(line.trim());
+}
+
+/**
+ * The lines of the file a `read` returned. An empty file and a start past the end
+ * come back as a sentence, and the notes trail the text; none of them is a line.
+ */
+function readTextLines(output: string): string[] {
+  const lines = outputLines(output);
+  if (lines.length === 1 && (lines[0].trim() === READ_EMPTY_FILE || READ_PAST_END.test(lines[0].trim()))) return [];
+  return lines.filter((line) => !isReadNote(line));
 }
 
 function readStat(item: ToolContext, t: Translate): string | undefined {
@@ -316,7 +357,7 @@ function readStat(item: ToolContext, t: Translate): string | undefined {
   }
   const start = Math.max(1, Math.floor(inputNumber(item, "start_line") ?? 1));
   const requestedEnd = inputNumber(item, "end_line");
-  const lineCount = outputLines(item.result.output).length;
+  const lineCount = readTextLines(item.result.output).length;
   const end = requestedEnd === undefined ? (lineCount ? start + lineCount - 1 : start) : Math.floor(requestedEnd);
   return lineCount ? t("{start}–{end} 行", "{start}–{end} lines", { start, end: Math.max(start, end) }) : undefined;
 }
@@ -405,18 +446,17 @@ function writeSubject(item: ToolContext, t: Translate): SubjectTitle | undefined
  */
 function findCount(item: ToolContext): { count: number; more: boolean } {
   const lines = outputLines(item.result.output).map((line) => line.trim()).filter(Boolean);
-  const empty = ["No matching files", "未找到匹配文件"]; // i18n-audit-ignore: parses backend sentinels
-  const entries = lines.filter((line) => !line.startsWith("(") && !line.startsWith("… ") && !empty.includes(line));
+  const entries = lines.filter((line) => !line.startsWith("(") && !line.startsWith("… ") && !FILE_LIST_EMPTY_ANSWERS.includes(line));
   return { count: entries.length, more: lines.some((line) => /^\(Showing \d+ of \d+/.test(line)) };
 }
 
-/** The matching lines `grep` returned, past its notes and the entries it could not read. */
-function grepCount(item: ToolContext): { count: number; more: boolean } {
-  const lines = outputLines(item.result.output);
-  return {
-    count: lines.filter((line) => parseGrepLine(line).path !== undefined).length,
-    more: lines.some((line) => line.startsWith("… "))
-  };
+/**
+ * What `grep` returned in the unit its mode counts — files, matching lines, or files with
+ * their counts — past its notes, its context lines and the entries it could not read.
+ */
+function grepCount(item: ToolContext): { mode: GrepMode; count: number; more: boolean } {
+  const { mode, count, more } = parseGrepOutput(item);
+  return { mode, count, more };
 }
 
 function findSubject(item: ToolContext, t: Translate): SubjectTitle | undefined {
@@ -434,13 +474,34 @@ function findSubject(item: ToolContext, t: Translate): SubjectTitle | undefined 
 function grepSubject(item: ToolContext, t: Translate): SubjectTitle | undefined {
   const pattern = compact(inputString(item, "pattern"));
   if (!pattern) return undefined;
-  const { count, more } = grepCount(item);
-  return {
-    subject: subjectTitle(t("已搜索：{pattern}", "Searched for {pattern}", { pattern: SUBJECT_MARK }), pattern, { code: true }),
-    note: more
+  const { mode, count, more } = grepCount(item);
+  // The default mode answers with files, so a figure of "matches" would count the wrong thing.
+  const note = mode === "content"
+    ? more
       ? t("{count}+ 处匹配", "{count}+ matches", { count })
       : t("{count} 处匹配", "{count} matches", { count })
+    : more
+      ? t("{count}+ 个文件", "{count}+ files", { count })
+      : t("{count} 个文件", "{count} files", { count });
+  return {
+    subject: subjectTitle(t("已搜索：{pattern}", "Searched for {pattern}", { pattern: SUBJECT_MARK }), pattern, { code: true }),
+    note
   };
+}
+
+/**
+ * The pattern a search looked for, then what narrowed it: the files it was limited to
+ * and a mode other than the default. It is what the card and the waiting line name the call by.
+ */
+function grepTarget(item: ToolContext, t: Translate): string | undefined {
+  const pattern = compact(inputString(item, "pattern"));
+  if (!pattern) return undefined;
+  const mode = inputString(item, "output_mode");
+  return [
+    pattern,
+    compact(inputString(item, "glob"), 48),
+    mode === "content" ? t("内容", "content") : mode === "count" ? t("计数", "count") : undefined
+  ].filter(Boolean).join(" · ");
 }
 
 /** How much of an error's line a title carries; the row ellipsizes what does not fit. */
@@ -654,7 +715,7 @@ function webSearchTitle(
  */
 export const TOOL_VIEW_REGISTRY = {
   ls: { surface: "group", family: "file-list", icon: FolderTree, doneTitle: (t) => t("查看了目录", "Viewed directory"), runningTitle: (t) => t("正在查看目录", "Viewing directory"), failedTitle: (t) => t("查看目录失败", "Failed to view directory"), target: (item) => pathTarget(inputString(item, "path") ?? "."), targetIsPath: true, stat: fileListStat, summaryKind: "files" },
-  grep: { surface: "group", family: "grep", icon: Search, doneTitle: (t) => t("搜索了文件内容", "Searched file contents"), resolveSubject: grepSubject, runningTitle: (t) => t("正在搜索文件内容", "Searching file contents"), failedTitle: (t) => t("搜索文件内容失败", "File-content search failed"), target: (item) => compact(inputString(item, "pattern")), stat: grepStat, summaryKind: "search" },
+  grep: { surface: "group", family: "grep", icon: Search, doneTitle: (t) => t("搜索了文件内容", "Searched file contents"), resolveSubject: grepSubject, runningTitle: (t) => t("正在搜索文件内容", "Searching file contents"), failedTitle: (t) => t("搜索文件内容失败", "File-content search failed"), target: grepTarget, stat: grepStat, summaryKind: "search" },
   pwsh: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 PowerShell 7 命令", "Ran PowerShell 7 command"), runningTitle: (t) => t("正在运行 PowerShell 7 命令", "Running PowerShell 7 command"), failedTitle: (t) => t("PowerShell 7 命令失败", "PowerShell 7 command failed"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
   powershell: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 Windows PowerShell 命令", "Ran Windows PowerShell command"), runningTitle: (t) => t("正在运行 Windows PowerShell 命令", "Running Windows PowerShell command"), failedTitle: (t) => t("Windows PowerShell 命令失败", "Windows PowerShell command failed"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
   bash: { surface: "group", family: "terminal", icon: SquareTerminal, doneTitle: (t) => t("运行了 Bash 命令", "Ran Bash command"), runningTitle: (t) => t("正在运行 Bash 命令", "Running Bash command"), failedTitle: (t) => t("Bash 命令失败", "Bash command failed"), target: (item) => compact(inputString(item, "command")), stat: browserDuration, summaryKind: "commands" },
@@ -741,6 +802,10 @@ export const TOOL_VIEW_REGISTRY = {
   followup_task: { surface: "group", family: "agent-run", icon: MessageCircleMore, doneTitle: (t) => t("向子代理追加了任务", "Sent follow-up to subagent"), runningTitle: (t) => t("正在追加子代理任务", "Sending subagent follow-up"), failedTitle: (t) => t("追加子代理任务失败", "Failed to follow up with subagent"), target: (item) => compact(inputString(item, "target")), summaryKind: "agents" },
   task_wait: { surface: "group", family: "agent-wait", icon: Timer, doneTitle: (t) => t("等待了任务", "Waited for tasks"), runningTitle: (t) => t("正在等待任务", "Waiting for tasks"), failedTitle: (t) => t("等待任务失败", "Failed to wait for tasks"), stat: waitStat, summaryKind: "agents" },
   task_list: { surface: "group", family: "agent-note", icon: ListChecks, doneTitle: (t) => t("查看了任务列表", "Viewed task list"), runningTitle: (t) => t("正在查看任务列表", "Viewing task list"), failedTitle: (t) => t("查看任务列表失败", "Failed to view task list"), summaryKind: "agents" },
+  // Unlike `task_list`, this call names the task it acts on, so it takes the raw
+  // card: the address shows as an argument beside the host's receipt, and the
+  // row keeps its phrase instead of trading it for a note's own text.
+  task_stop: { surface: "group", family: "raw", icon: OctagonX, doneTitle: (t) => t("停止了任务", "Stopped a task"), runningTitle: (t) => t("正在停止任务", "Stopping a task"), failedTitle: (t) => t("停止任务失败", "Failed to stop a task"), target: (item) => compact(inputString(item, "task")), keys: ["task"], summaryKind: "agents" },
   // A message the host handed the model (Rust `wire_history::HOST_CARD_TOOL`):
   // a user-role message on the wire, or a deferred call's output. The host owns
   // the body, so the row only ever settles as done; the message is the result,
@@ -1080,7 +1145,6 @@ export function getToolPresentation(
           : phase === "failed"
             ? failureTitle(t("MCP 工具 {label} 调用失败", "MCP tool {label} failed", { label: tool }), reason, t)
             : t("调用了 MCP 工具 {label}", "Called MCP tool {label}", { label: tool }),
-        ...(phase === "failed" ? { failure: t("MCP 工具 {label} 调用失败", "MCP tool {label} failed", { label: tool }) } : {}),
         ...(target ? { target } : {}),
         ...(duration ? { stat: duration } : {})
       };
@@ -1095,7 +1159,6 @@ export function getToolPresentation(
         : phase === "failed"
           ? failureTitle(t("{label}执行失败", "{label} failed", { label }), reason, t)
           : t("使用了 {label}", "Used {label}", { label }),
-      ...(phase === "failed" ? { failure: t("{label}执行失败", "{label} failed", { label }) } : {}),
       stat: duration
     };
   }
@@ -1123,7 +1186,6 @@ export function getToolPresentation(
     ...(named && !explained ? { subject: named.subject } : {}),
     ...(named?.counts ? { counts: named.counts } : {}),
     ...(named?.note ? { note: named.note } : {}),
-    ...(phase === "failed" ? { failure: phrase } : {}),
     ...(target ? { target } : {}),
     ...(target && config.targetIsPath ? { targetIsPath: true } : {}),
     ...(stat ? { stat } : {}),
@@ -1248,25 +1310,48 @@ function RawDataDisclosure({ item }: { item: ToolContext }) {
 
 function EmptyResult({ children }: { children?: ReactNode }) {
   const { t } = useI18n();
-  return <div className="tool-renderer__empty">{children ?? t("没有可显示的结果", "No results to display")}</div>;
+  return <div className="tool-renderer__lines tool-renderer__note">{children ?? t("没有可显示的结果", "No results to display")}</div>;
+}
+
+/**
+ * A line the tool wrote about its answer — what it left out, how much of it it
+ * showed — rather than one of the entries: `… 12 more`, `(Showing 6 of 14)`.
+ */
+function isNoteLine(line: string): boolean {
+  const text = line.trim();
+  return text.startsWith("… ") || /^\(.*\)$/.test(text);
+}
+
+/** What the tool sets after an entry's path to say something of it: `target/ (ignored)`. */
+const ENTRY_MARK = / \([^()]*\)$/;
+/** How a line opens when it is the tool's remark on the list and not an entry of it. */
+const ENTRY_REMARK = /^(?:\(|… |\[skipped\] )/; // i18n-audit-ignore: parses backend sentinels
+
+/**
+ * The icon ahead of a listed path: its type's, or a folder for a path the tool closed
+ * with a slash. A line that is the tool's own remark has none.
+ */
+function EntryIcon({ line }: { line: string }) {
+  const path = line.trim().replace(ENTRY_MARK, "");
+  if (!path || ENTRY_REMARK.test(path)) return null;
+  return path.endsWith("/")
+    ? <Folder className="tool-renderer__entry-icon" size={12} aria-hidden="true" />
+    : <FileIcon path={path} size={12} inline />;
 }
 
 function FileListView({ item }: { item: ToolContext }) {
   const { t } = useI18n();
   const lines = outputLines(item.result.output).filter((line) => line.trim());
-  const empty = !lines.length || (lines.length === 1 && ["（目录为空）", "未找到匹配文件"].includes(lines[0].trim())); // i18n-audit-ignore: parses legacy backend sentinels
+  const empty = !lines.length || (lines.length === 1 && FILE_LIST_EMPTY_ANSWERS.includes(lines[0].trim()));
   if (empty) return <EmptyResult>{lines[0]?.trim() || t("没有文件", "No files")}</EmptyResult>;
   return (
-    <ul className="tool-renderer__file-list" aria-label={t("文件结果", "File results")}>
+    <ul className="tool-renderer__lines" aria-label={t("文件结果", "File results")}>
       {lines.map((line, index) => {
         const value = line.trimEnd();
-        const meta = value.startsWith("… ");
-        const directory = value.endsWith("/");
-        const Icon = directory ? Folder : File;
         return (
-          <li key={`${index}:${value}`} className={meta ? "tool-renderer__file-meta" : undefined}>
-            {!meta && <Icon size={13} aria-hidden="true" />}
-            <code>{value}</code>
+          <li key={`${index}:${value}`} className={isNoteLine(value) ? "tool-renderer__note" : undefined}>
+            <EntryIcon line={value} />
+            {value}
           </li>
         );
       })}
@@ -1274,44 +1359,196 @@ function FileListView({ item }: { item: ToolContext }) {
   );
 }
 
-interface GrepLine {
-  raw: string;
-  path?: string;
-  line?: number;
-  content?: string;
+type GrepMode = "files_with_matches" | "content" | "count";
+
+/**
+ * One line of what `grep` printed, read by the mode the call asked for. `location` is
+ * where a line was found (`path:12:`, `path-13-` for context, `path:`), set back from
+ * `content`, what was found there.
+ */
+type GrepRow =
+  | { kind: "file" | "separator" | "note"; raw: string }
+  | { kind: "match" | "context" | "count"; raw: string; location: string; content: string };
+
+const GREP_MATCH_LINE = /^(.+?):(\d+):(.*)$/;
+const GREP_CONTEXT_LINE = /^(.+?)-(\d+)-(.*)$/;
+const GREP_COUNT_LINE = /^(.+):(\d+)$/;
+
+/**
+ * The mode a call asked for. One that named none, or a name this card does not know,
+ * got the tool's default: the mode alone says how a line reads, because a path may
+ * itself hold `:12:` or `-3-`.
+ */
+function grepMode(item: ToolContext): GrepMode {
+  const requested = inputString(item, "output_mode");
+  if (requested === "content" || requested === "count") return requested;
+  // A search recorded before `output_mode` existed names no mode and was answered in the old
+  // `path:line:text` lines. Only an answer in which every single entry reads that way is taken
+  // for one, and only when no mode was named: a list of files whose every path holds `:12:`
+  // is not a thing, whereas the old transcripts are.
+  if (requested === undefined) {
+    const entries = outputLines(item.result.output).filter((line) => line.trim() && !isGrepNote(line));
+    if (entries.length > 0 && entries.every((line) => GREP_MATCH_LINE.test(line))) return "content";
+  }
+  return "files_with_matches";
 }
 
-function parseGrepLine(raw: string): GrepLine {
-  const match = /^(.+?):(\d+):(.*)$/.exec(raw);
-  if (!match) return { raw };
-  return { raw, path: match[1], line: Number(match[2]), content: match[3] };
+/**
+ * A line the tool wrote about its answer rather than an entry of it: how much is left
+ * (`… more matches follow`), what it could not read, or that there was nothing to give.
+ */
+function isGrepNote(line: string): boolean {
+  const text = line.trim();
+  return line.startsWith("… ")
+    || line.startsWith("[skipped] ")
+    || GREP_EMPTY_ANSWERS.includes(text)
+    || GREP_PAST_END.test(text);
 }
 
+function isGrepEmptyAnswer(line: string): boolean {
+  const text = line.trim();
+  return GREP_EMPTY_ANSWERS.includes(text) || GREP_PAST_END.test(text);
+}
+
+/** The line as `path:12:text`, split where the leftmost `:digits:` falls — the text may hold more of them. */
+function matchRow(raw: string): GrepRow | undefined {
+  const match = GREP_MATCH_LINE.exec(raw);
+  return match ? { kind: "match", raw, location: raw.slice(0, raw.length - match[3].length), content: match[3] } : undefined;
+}
+
+function contextRow(raw: string): GrepRow | undefined {
+  const match = GREP_CONTEXT_LINE.exec(raw);
+  return match ? { kind: "context", raw, location: raw.slice(0, raw.length - match[3].length), content: match[3] } : undefined;
+}
+
+/** The line as `path<separator>12<separator>text` for a path already known. */
+function rowOfPath(raw: string, path: string, separator: ":" | "-"): GrepRow | undefined {
+  if (!raw.startsWith(path + separator)) return undefined;
+  const number = /^\d+/.exec(raw.slice(path.length + 1))?.[0];
+  if (number === undefined || raw[path.length + 1 + number.length] !== separator) return undefined;
+  const cut = path.length + number.length + 2;
+  return { kind: separator === ":" ? "match" : "context", raw, location: raw.slice(0, cut), content: raw.slice(cut) };
+}
+
+/**
+ * One group of content lines: the run between two `--` lines, which is one file's.
+ *
+ * With context on, a matching line and a context line differ only by the character
+ * after the path, and a path or a line's own text may hold `:12:` or `-3-` too. The
+ * group's file settles it: a matching line cuts at its first `:digits:`, and a context
+ * line's text can only make that cut later, never earlier, so the shortest such path
+ * in the group is the file. Lines are then read against it.
+ */
+function grepGroupRows(group: string[], withContext: boolean): GrepRow[] {
+  let path: string | undefined;
+  if (withContext) {
+    for (const raw of group) {
+      if (isGrepNote(raw)) continue;
+      const found = GREP_MATCH_LINE.exec(raw)?.[1];
+      if (found !== undefined && (path === undefined || found.length < path.length)) path = found;
+    }
+  }
+  return group.map((raw): GrepRow => {
+    if (isGrepNote(raw)) return { kind: "note", raw };
+    return (path !== undefined ? rowOfPath(raw, path, ":") ?? rowOfPath(raw, path, "-") : undefined)
+      ?? matchRow(raw)
+      ?? (withContext ? contextRow(raw) : undefined)
+      ?? { kind: "note", raw };
+  });
+}
+
+function grepContentRows(lines: string[], withContext: boolean): GrepRow[] {
+  const rows: GrepRow[] = [];
+  let group: string[] = [];
+  const close = () => {
+    rows.push(...grepGroupRows(group, withContext));
+    group = [];
+  };
+  for (const raw of lines) {
+    if (raw !== "--") {
+      group.push(raw);
+      continue;
+    }
+    close();
+    rows.push({ kind: "separator", raw });
+  }
+  close();
+  return rows;
+}
+
+/**
+ * What `grep` printed, row by row, and how many entries of the mode's own unit it holds:
+ * files, matching lines (never the context around them) or files with their counts.
+ * `more` says the tool left entries for a later page.
+ */
+function parseGrepOutput(item: ToolContext): { mode: GrepMode; rows: GrepRow[]; count: number; more: boolean } {
+  const mode = grepMode(item);
+  const lines = outputLines(item.result.output).filter((line) => line.trim());
+  let rows: GrepRow[];
+  if (mode === "content") {
+    // Context was asked for, or the tool's own `--` between groups says it was given.
+    const withContext = ["context", "before", "after"].some((name) => (inputNumber(item, name) ?? 0) > 0)
+      || lines.includes("--");
+    rows = grepContentRows(lines, withContext);
+  } else {
+    rows = lines.map((raw): GrepRow => {
+      if (isGrepNote(raw)) return { kind: "note", raw };
+      if (mode === "files_with_matches") return { kind: "file", raw };
+      const counted = raw.startsWith("Total: ") ? null : GREP_COUNT_LINE.exec(raw);
+      return counted
+        ? { kind: "count", raw, location: `${counted[1]}:`, content: counted[2] }
+        : { kind: "note", raw };
+    });
+  }
+  return {
+    mode,
+    rows,
+    count: rows.filter((row) => row.kind === "file" || row.kind === "match" || row.kind === "count").length,
+    more: rows.some((row) => row.kind === "note" && row.raw.startsWith("… "))
+  };
+}
+
+/**
+ * `grep` as the tool printed it, a line to an entry: the files that matched, or the
+ * matching lines with where each was found set back from what was found (and the lines
+ * around them, further back still), or a count per file.
+ */
 function GrepView({ item }: { item: ToolContext }) {
   const { t } = useI18n();
-  const lines = outputLines(item.result.output).filter((line) => line.trim());
-  if (!lines.length || (lines.length === 1 && lines[0].trim() === "未找到匹配内容")) { // i18n-audit-ignore: parses a legacy backend sentinel
-    return <EmptyResult>{lines[0]?.trim() || t("未找到匹配内容", "No matching content found")}</EmptyResult>;
+  const { rows } = parseGrepOutput(item);
+  if (!rows.length || (rows.length === 1 && isGrepEmptyAnswer(rows[0].raw))) {
+    return <EmptyResult>{rows[0]?.raw.trim() || t("未找到匹配内容", "No matching content found")}</EmptyResult>;
   }
   return (
-    <ol className="tool-renderer__grep-list" aria-label={t("搜索结果", "Search results")}>
-      {lines.map((raw, index) => {
-        const match = parseGrepLine(raw);
-        if (!match.path || match.line === undefined) {
-          return <li key={`${index}:${raw}`} className="tool-renderer__grep-meta"><code>{raw}</code></li>;
+    <ol className="tool-renderer__lines" aria-label={t("搜索结果", "Search results")}>
+      {rows.map((row, index) => {
+        const key = `${index}:${row.raw}`;
+        switch (row.kind) {
+          case "match":
+          case "count":
+            return (
+              <li key={key}>
+                <span className="tool-renderer__dim">{row.location}</span>
+                {row.content}
+              </li>
+            );
+          case "context":
+            return (
+              <li key={key} className="tool-renderer__dim">
+                <span className="tool-renderer__note">{row.location}</span>
+                {row.content}
+              </li>
+            );
+          case "file":
+            return (
+              <li key={key}>
+                <EntryIcon line={row.raw} />
+                {row.raw}
+              </li>
+            );
+          default:
+            return <li key={key} className="tool-renderer__note">{row.raw}</li>;
         }
-        return (
-          <li key={`${index}:${raw}`}>
-            <span className="tool-renderer__grep-location">
-              <PathText className="tool-renderer__grep-path" path={match.path} />
-              <span
-                className="tool-renderer__grep-line"
-                aria-label={t("第 {line} 行", "Line {line}", { line: match.line })}
-              >{match.line}</span>
-            </span>
-            <code className="tool-renderer__grep-content">{match.content}</code>
-          </li>
-        );
       })}
     </ol>
   );
@@ -1320,24 +1557,37 @@ function GrepView({ item }: { item: ToolContext }) {
 function ReadView({ item }: { item: ToolContext }) {
   const { t } = useI18n();
   const start = Math.max(1, Math.floor(inputNumber(item, "start_line") ?? 1));
-  const lines = outputLines(item.result.output);
+  const path = inputString(item, "path");
+  const lines = useMemo(() => outputLines(item.result.output), [item.result.output]);
+  // The excerpt starts wherever the read did, so what was open above it is not known and
+  // it is coloured from clean.
+  const tokens = useMemo(
+    () => (path && lines.length <= READ_HIGHLIGHT_LINES ? highlightCodeLines(codeLanguage(path), lines) : null),
+    [path, lines]
+  );
   if ((!lines.length || !item.result.output) && !item.result.images?.length) {
     return <EmptyResult>{t("文件内容为空", "File is empty")}</EmptyResult>;
   }
   if (!item.result.output) return null;
+  // An empty file and a start past the end are answered with a sentence, which has no line to number.
+  const sentence = lines.length === 1 ? lines[0].trim() : "";
+  if (sentence === READ_EMPTY_FILE) return <EmptyResult>{t("文件内容为空", "File is empty")}</EmptyResult>;
+  if (READ_PAST_END.test(sentence)) return <EmptyResult>{sentence}</EmptyResult>;
   const gutter = String(start + Math.max(0, lines.length - 1)).length;
   return (
     <div
       className="diff-output"
       role="region"
-      aria-label={t("{path} 内容", "{path} contents", { path: inputString(item, "path") ?? t("文件", "File") })}
+      aria-label={t("{path} 内容", "{path} contents", { path: path ?? t("文件", "File") })}
       style={{ "--diff-gutter": `${gutter}ch` } as CSSProperties}
     >
       <div className="diff-output__body">
         {lines.map((line, index) => (
-          <div key={`${start + index}:${line}`} className={line.startsWith("… ") ? "diff-output__line diff-output__line--meta" : "diff-output__line diff-output__line--context"}>
+          <div key={`${start + index}:${line}`} className={isReadNote(line) ? "diff-output__line diff-output__line--meta" : "diff-output__line diff-output__line--context"}>
             <span className="diff-output__line-number" aria-hidden="true">{start + index}</span>
-            <span className="diff-output__content">{line || " "}</span>
+            <span className="diff-output__content">
+              {isReadNote(line) ? line : <CodeTokens tokens={tokens?.[index]} fallback={line || " "} />}
+            </span>
           </div>
         ))}
       </div>
@@ -1356,9 +1606,8 @@ function DiffView({ item }: { item: ToolContext }) {
     );
   }
   return (
-    <div className="tool-renderer__notice tool-renderer__notice--success">
-      <CircleCheck size={14} aria-hidden="true" />
-      <span>{item.result.output || t("操作成功，没有行级变化", "Operation succeeded with no line-level changes")}</span>
+    <div className="tool-renderer__lines">
+      {item.result.output || t("操作成功，没有行级变化", "Operation succeeded with no line-level changes")}
     </div>
   );
 }
@@ -1384,31 +1633,12 @@ function scalarText(value: unknown, t: Translate = globalT): string {
   return safeStringify(value);
 }
 
-function InfoGrid({ rows }: { rows: Array<[string, unknown]> }) {
-  const { t } = useI18n();
-  const visible = rows.filter(([, value]) => value !== undefined && value !== "");
-  if (!visible.length) return null;
-  return (
-    <dl className="tool-renderer__info-grid">
-      {visible.map(([label, value]) => (
-        <div key={label}>
-          <dt>{label}</dt>
-          <dd>{scalarText(value, t)}</dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
-
 function JsonFallback({ item, parsed }: { item: ToolContext; parsed: ParsedJson }) {
   const { t } = useI18n();
   return (
-    <div className="tool-renderer__fallback">
-      <CircleAlert size={14} aria-hidden="true" />
-      <div>
-        <strong>{parsed.parsed ? t("结果结构无法识别", "Unrecognized result structure") : t("结果不是有效 JSON", "Result is not valid JSON")}</strong>
-        <pre>{item.result.output || t("没有返回内容", "No content returned")}</pre>
-      </div>
+    <div className="tool-renderer__lines">
+      <div className="tool-renderer__note">{parsed.parsed ? t("结果结构无法识别", "Unrecognized result structure") : t("结果不是有效 JSON", "Result is not valid JSON")}</div>
+      <div>{item.result.output || t("没有返回内容", "No content returned")}</div>
     </div>
   );
 }
@@ -1423,7 +1653,7 @@ function BrowserSnapshotView({ item }: { item: ToolContext }) {
   const text = item.result.output.trim();
   if (!text) return <EmptyResult>{t("快照中没有可读内容", "The snapshot has no readable content")}</EmptyResult>;
   return (
-    <pre className="tool-renderer__snapshot-tree" aria-label={t("页面快照", "Page snapshot")}>{text}</pre>
+    <pre className="tool-renderer__lines" aria-label={t("页面快照", "Page snapshot")}>{text}</pre>
   );
 }
 
@@ -1443,52 +1673,28 @@ function BrowserScreenshotView({ item }: { item: ToolContext }) {
   const value = parsed.parsed ? object(parsed.value) : null;
   if (!value) return <JsonFallback item={item} parsed={parsed} />;
   return (
-    <div className="tool-renderer__screenshot">
-      <Image size={22} aria-hidden="true" />
-      <InfoGrid rows={[
-        [t("尺寸", "Dimensions"), value.width !== undefined && value.height !== undefined ? `${scalarText(value.width)}×${scalarText(value.height)}` : undefined]
-      ]} />
-    </div>
+    <KeyValueCard rows={[
+      [t("尺寸", "Dimensions"), value.width !== undefined && value.height !== undefined ? `${scalarText(value.width)}×${scalarText(value.height)}` : undefined]
+    ]} />
   );
 }
 
-/**
- * The trailing `(Showing last N of M entries.)` note the log tools append. It is
- * a sentence about the read, not one of the entries, so it is lifted out of the
- * list instead of being rendered as a row.
- */
-function splitLogFooter(output: string): { lines: string[]; footer?: string } {
-  const lines = outputLines(output.trim()).filter((line) => line.trim());
-  const last = lines[lines.length - 1];
-  return last && /^\(.*\)$/.test(last.trim())
-    ? { lines: lines.slice(0, -1), footer: last.trim() }
-    : { lines };
-}
-
-/** `preview_console_logs`. Each entry arrives as one `[level] text` line. */
+/** `preview_console_logs`, as the tool printed it: one `[level] text` to a line. */
 function BrowserConsoleView({ item }: { item: ToolContext }) {
   const { t } = useI18n();
   const output = item.result.output.trim();
   if (!output || output === "No console logs.") { // i18n-audit-ignore: the tool's own English answer, copied from Claude Code
     return <EmptyResult>{t("没有 Console 日志", "No Console logs")}</EmptyResult>;
   }
-  const { lines, footer } = splitLogFooter(output);
+  const lines = outputLines(output).filter((line) => line.trim());
   return (
-    <div className="tool-renderer__browser-logs">
-      <ol className="tool-renderer__log-list" aria-label={t("Console 日志", "Console logs")}>
-        {lines.map((line, index) => {
-          const match = /^\[([a-z]+)\]\s?([\s\S]*)$/i.exec(line);
-          const level = match ? match[1] : "log";
-          return (
-            <li key={`${index}:${line}`} className={`tool-renderer__log tool-renderer__log--${level}`}>
-              <span>{level}</span>
-              <code>{match ? match[2] : line}</code>
-            </li>
-          );
-        })}
-      </ol>
-      {footer && <p className="tool-renderer__log-footer">{footer}</p>}
-    </div>
+    <ol className="tool-renderer__lines" aria-label={t("Console 日志", "Console logs")}>
+      {lines.map((line, index) => {
+        const level = /^\[([a-z]+)\]/i.exec(line)?.[1].toLowerCase();
+        const tone = isNoteLine(line) ? "tool-renderer__note" : level ? `tool-renderer__log--${level}` : undefined;
+        return <li key={`${index}:${line}`} className={tone}>{line}</li>;
+      })}
+    </ol>
   );
 }
 
@@ -1496,14 +1702,15 @@ const NETWORK_ENTRY = /^\[([^\]]+)]\s+([A-Z]+)\s+(\S+)(?:\s+→\s+(\d+)\s*(.*?))
 
 /**
  * `preview_network`. Without `requestId` the answer is the request ledger, one
- * line each; with one it is a response body, which is text and stays text.
+ * line each, and stays as the tool printed it — the id a line leads with is what
+ * a later call asks for a body by. With one it is that body, which is text.
  */
 function BrowserNetworkView({ item }: { item: ToolContext }) {
   const { t } = useI18n();
   const output = item.result.output.trim();
   if (inputString(item, "requestId")) {
     return output
-      ? <pre className="tool-renderer__plain-output">{output}</pre>
+      ? <pre className="tool-renderer__lines">{output}</pre>
       : <EmptyResult>{t("没有响应正文", "No response body")}</EmptyResult>;
   }
   const lines = outputLines(output).filter((line) => line.trim());
@@ -1511,19 +1718,11 @@ function BrowserNetworkView({ item }: { item: ToolContext }) {
     return <EmptyResult>{lines[0] ?? t("没有网络记录", "No network records")}</EmptyResult>;
   }
   return (
-    <ol className="tool-renderer__network-list" aria-label={t("网络请求", "Network requests")}>
+    <ol className="tool-renderer__lines" aria-label={t("网络请求", "Network requests")}>
       {lines.map((line, index) => {
-        const match = NETWORK_ENTRY.exec(line);
-        if (!match) return <li key={`${index}:${line}`}><code>{line}</code></li>;
-        const [, requestId, method, url, status, statusText, failure] = match;
-        return (
-          <li key={`${index}:${requestId}`}>
-            <span className="tool-renderer__network-method">{method}</span>
-            <span className="tool-renderer__network-status">{status ? `${status} ${statusText ?? ""}`.trim() : ""}</span>
-            <code>{url}</code>
-            {failure && <em>{failure}</em>}
-          </li>
-        );
+        const failed = Boolean(NETWORK_ENTRY.exec(line)?.[6]);
+        const tone = failed ? "tool-renderer__log--error" : isNoteLine(line) ? "tool-renderer__note" : undefined;
+        return <li key={`${index}:${line}`} className={tone}>{line}</li>;
       })}
     </ol>
   );
@@ -1600,11 +1799,11 @@ type KvRow = [label: string, value: unknown];
 /**
  * The one shape a card takes when it has no picture to draw.
  *
- * Everything worth knowing is named on the left with its value boxed beside it,
- * and whatever the call answered with is a last box of its own spanning the
+ * Everything worth knowing is a line: its name at the left, its value beside
+ * it. Whatever the call answered with comes last, under a rule and across the
  * card — the result is the one thing every card has, so it needs no label to
- * say which it is. Families that answer with a diff, a terminal, a file list or
- * pixels keep drawing those; everything else is rows and a result, so a reader
+ * say which it is. Families that answer with a diff, a terminal, a listing or
+ * pixels keep drawing those; everything else is lines and a result, so a reader
  * who has learned one card has learned all of them.
  */
 function KeyValueCard({ rows, result }: { rows: KvRow[]; result?: string }) {
@@ -1630,15 +1829,7 @@ function KeyValueCard({ rows, result }: { rows: KvRow[]; result?: string }) {
   );
 }
 
-function MemoryView({
-  item,
-  presentation,
-  failed = false
-}: {
-  item: ToolContext;
-  presentation: ToolPresentation;
-  failed?: boolean;
-}) {
+function MemoryView({ item }: { item: ToolContext }) {
   const { t } = useI18n();
   const tier = item.toolName.includes("_global_")
     ? t("全局记忆", "Global memory")
@@ -1654,17 +1845,6 @@ function MemoryView({
     [t("原文", "Old text"), inputString(item, "old_text")],
     [t("新文", "New text"), inputString(item, "new_text")]
   ];
-  if (failed) {
-    return (
-      <div className="tool-renderer__error" role="alert">
-        <CircleAlert size={16} aria-hidden="true" />
-        <div>
-          <strong>{presentation.title}</strong>
-          <KeyValueCard rows={rows} result={item.result.output} />
-        </div>
-      </div>
-    );
-  }
   return <KeyValueCard rows={rows} result={item.result.output} />;
 }
 
@@ -1736,7 +1916,11 @@ function AgentRunView({ item }: { item: ToolContext }) {
   );
 }
 
-/** `task_wait` output split back into the `[name · status]` envelopes it drained. */
+/**
+ * `task_wait` output split back into the `[name · status]` envelopes it
+ * drained: who answered and how it stands on a line of its own, over what it
+ * said. A name is as long as its author made it, so it is not a column.
+ */
 function AgentWaitView({ item }: { item: ToolContext }) {
   const { t } = useI18n();
   const { envelopes, statusLine, notice } = parseWaitOutput(item.result.output);
@@ -1746,13 +1930,16 @@ function AgentWaitView({ item }: { item: ToolContext }) {
       : <EmptyResult>{t("等待已结束，没有可显示的更新", "The wait finished with no updates to show")}</EmptyResult>;
   }
   return (
-    <KeyValueCard
-      rows={[
-        ...(notice ? [[t("说明", "Note"), notice] as KvRow] : []),
-        ...envelopes.map<KvRow>((envelope) => [`${envelope.agent} · ${envelope.status}`, envelope.body])
-      ]}
-      result={statusLine}
-    />
+    <div className="tool-renderer__lines">
+      {notice && <p className="tool-renderer__note">{notice}</p>}
+      {envelopes.map((envelope, index) => (
+        <section key={`${index}:${envelope.agent}`}>
+          <div className="tool-renderer__dim">{`${envelope.agent} · ${envelope.status}`}</div>
+          {envelope.body}
+        </section>
+      ))}
+      {statusLine && <p className="tool-renderer__note">{statusLine}</p>}
+    </div>
   );
 }
 
@@ -1879,18 +2066,25 @@ function runningLabel(item: ToolContext, t: Translate): string {
   return t("正在执行", "Running");
 }
 
-function ErrorView({ item, presentation }: { item: ToolContext; presentation: ToolPresentation }) {
-  const { t } = useI18n();
-  return (
-    <div className="tool-renderer__error" role="alert">
-      <CircleAlert size={16} aria-hidden="true" />
-      <div>
-        <strong>{presentation.failure ?? presentation.title}</strong>
-        <pre>{item.result.output || t("工具执行失败，未返回错误详情", "The tool failed without returning error details")}</pre>
-      </div>
-    </div>
-  );
-}
+/**
+ * The families whose card is a picture of what a call that worked returned: a
+ * file's numbered lines, a diff, a listing, a parsed report. An error message
+ * is none of those — drawn as one it would be a file one line long, or a
+ * directory holding a sentence — so a failed call of these opens to the shared
+ * card instead: what it was asked, then what it answered.
+ */
+const RESULT_PICTURE_FAMILIES: ReadonlySet<ToolViewFamily> = new Set<ToolViewFamily>([
+  "file-list",
+  "grep",
+  "read",
+  "diff",
+  "browser-snapshot",
+  "browser-screenshot",
+  "browser-console",
+  "browser-network",
+  "browser-page",
+  "agent-wait"
+]);
 
 function detailBody(
   item: ToolContext,
@@ -1909,7 +2103,7 @@ function detailBody(
     case "browser-network": return <BrowserNetworkView item={item} />;
     case "browser-json": return <BrowserJsonView item={item} presentation={presentation} />;
     case "browser-page": return <BrowserPageView item={item} />;
-    case "memory": return <MemoryView item={item} presentation={presentation} />;
+    case "memory": return <MemoryView item={item} />;
     case "agent-run": return <AgentRunView item={item} />;
     case "agent-wait": return <AgentWaitView item={item} />;
     case "agent-note": return <AgentNoteView item={item} />;
@@ -1932,10 +2126,16 @@ export function ToolDetailRenderer({
   // metadata only repeat the thumbnail and collapsed summary. Render only the
   // thumbnail and let its viewer carry detail. Failures retain their messages.
   const imageOnly = phase === "done" && (item.result.images?.length ?? 0) > 0;
+  // A failed call opens to an ordinary card, not to an alert: the row's title
+  // is what says it failed, and the card is the account of it — a command and
+  // what it printed, the arguments and the error they met.
+  const answered = phase === "failed" && RESULT_PICTURE_FAMILIES.has(presentation.family)
+    ? <RawView item={item} presentation={presentation} />
+    : detailBody(item, presentation);
   const label = `${presentation.title}${presentation.target ? `：${presentation.target}` : ""}`;
   return (
     <section
-      className={`tool-renderer tool-renderer--${presentation.family}${phase === "failed" ? " tool-renderer--failed" : ""}`}
+      className={`tool-renderer tool-renderer--${presentation.family}`}
       aria-label={label}
       data-tool-name={item.toolName}
       data-tool-family={presentation.family}
@@ -1946,13 +2146,9 @@ export function ToolDetailRenderer({
         )}
         {phase === "running"
           ? <RunningView item={item} />
-          : phase === "failed"
-            ? presentation.family === "memory"
-              ? <MemoryView item={item} presentation={presentation} failed />
-              : <ErrorView item={item} presentation={presentation} />
-            : imageOnly
-              ? null
-              : detailBody(item, presentation)}
+          : imageOnly
+            ? null
+            : answered}
       </div>
       <RawDataDisclosure item={item} />
     </section>

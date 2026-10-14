@@ -236,7 +236,8 @@
 .notebook__body { flex: 1; min-width: 0; }
 .notebook__code {
   margin: 0; padding: 6px 10px; overflow-x: auto;
-  border: 1px solid var(--color-e0e0db); border-radius: 6px; background: var(--color-f1f1ee);
+  border: 1px solid var(--code-border, var(--color-e0e0db)); border-radius: 6px;
+  background: var(--code-bg, var(--color-f1f1ee)); color: var(--code-fg, inherit);
   font: 11.5px/1.55 var(--mono); white-space: pre;
 }
 .notebook__text {

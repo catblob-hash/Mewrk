@@ -105,4 +105,66 @@ describe("DiffOutput", () => {
     expect(omissionRow).not.toBeNull();
     expect(metaRow).not.toBeNull();
   });
+
+  describe("code colour", () => {
+    const typedDiff = [
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,2 +1,3 @@",
+      " const kept = 1;",
+      "+const added = 2;",
+      " done();",
+      ""
+    ].join("\n");
+    const replacedDiff = [
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,3 +1,3 @@",
+      " keep();",
+      "-const old = 2;",
+      "+const next = 2;",
+      " done();",
+      ""
+    ].join("\n");
+
+    it("colours a context or added line by the language of its file", () => {
+      const { container } = render(<DiffOutput value={typedDiff} path="src/a.ts" />);
+
+      expect(container.querySelector(".diff-output__line--context .code-token--keyword")?.textContent).toBe("const");
+      expect(container.querySelector(".diff-output__line--addition .code-token--keyword")?.textContent).toBe("const");
+    });
+
+    it("draws no syntax colour without a path, or with one whose extension has no grammar", () => {
+      const withoutPath = render(<DiffOutput value={"@@ -1,2 +1,3 @@\n const kept = 1;\n+const added = 2;\n done();\n"} />);
+      expect(withoutPath.container.querySelector(".code-token")).toBeNull();
+      withoutPath.unmount();
+
+      const unknownExtension = render(<DiffOutput value={typedDiff} path="notes.xyz" />);
+      expect(unknownExtension.container.querySelector(".code-token")).toBeNull();
+    });
+
+    it("marks only the words that changed in a replaced line, on each side", () => {
+      const { container } = render(<DiffOutput value={replacedDiff} path="src/a.ts" />);
+
+      expect(container.querySelector(".diff-output__word--deletion")?.textContent).toBe("old");
+      expect(container.querySelector(".diff-output__word--addition")?.textContent).toBe("next");
+      expect(container.querySelectorAll(".diff-output__word")).toHaveLength(2);
+    });
+
+    it("marks no words in an added line that replaces nothing", () => {
+      const { container } = render(
+        <DiffOutput value={["--- a/x.ts", "+++ b/x.ts", "@@ -1 +1,2 @@", " keep();", "+added();", ""].join("\n")} />
+      );
+
+      expect(container.querySelector(".diff-output__line--addition")).toHaveTextContent("added();");
+      expect(container.querySelector(".diff-output__word")).toBeNull();
+    });
+
+    it("keeps each line's text whole once it is coloured and marked", () => {
+      const { container } = render(<DiffOutput value={replacedDiff} path="src/a.ts" />);
+      const texts = [...container.querySelectorAll(".diff-output__content")].map((content) => content.textContent);
+
+      expect(texts).toEqual(["keep();", "const old = 2;", "const next = 2;", "done();"]);
+    });
+  });
 });

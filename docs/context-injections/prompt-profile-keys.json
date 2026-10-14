@@ -1,5 +1,5 @@
 {
-  "keyCount": 421,
+  "keyCount": 443,
   "keys": [
     {
       "description": "Frame of the environment block at the head of the host system prompt: the heading and the sentence introducing the fact list. `{facts}` is the list, one ` - ` item per `system.environment.*` line. Emptying this key removes the whole block, facts included.",
@@ -274,6 +274,31 @@
     {
       "description": "Description of `grep`'s `offset` parameter.",
       "id": "tool.grep.param.offset",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `grep`'s `output_mode` parameter.",
+      "id": "tool.grep.param.output_mode",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `grep`'s `context` parameter.",
+      "id": "tool.grep.param.context",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `grep`'s `before` parameter.",
+      "id": "tool.grep.param.before",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `grep`'s `after` parameter.",
+      "id": "tool.grep.param.after",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `grep`'s `glob` parameter.",
+      "id": "tool.grep.param.glob",
       "placeholders": []
     },
     {
@@ -839,6 +864,16 @@
     {
       "description": "Root description of the `task_list` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `task_list` overrides this key.",
       "id": "tool.task_list.description",
+      "placeholders": []
+    },
+    {
+      "description": "Root description of the `task_stop` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `task_stop` overrides this key.",
+      "id": "tool.task_stop.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `task_stop`'s `task` parameter.",
+      "id": "tool.task_stop.param.task",
       "placeholders": []
     },
     {
@@ -1658,6 +1693,15 @@
       ]
     },
     {
+      "description": "Result envelope body of a background command the model itself stopped with `task_stop`, carrying whatever it printed first.",
+      "id": "task.shell_stopped_by_model",
+      "placeholders": [
+        "shell_ref",
+        "tool_name",
+        "body"
+      ]
+    },
+    {
       "description": "Result envelope body of a background command that failed to execute.",
       "id": "task.shell_failed_to_run",
       "placeholders": [
@@ -1674,6 +1718,52 @@
       ]
     },
     {
+      "description": "Same receipt when the command's output is being written to a file, which it names.",
+      "id": "task.shell_timeout_backgrounded_file",
+      "placeholders": [
+        "shell_ref",
+        "seconds",
+        "path"
+      ]
+    },
+    {
+      "description": "Receipt of a command started with `run_in_background`: its task address, and the file its output is written to while it runs.",
+      "id": "task.shell_background_receipt",
+      "placeholders": [
+        "shell_ref",
+        "path"
+      ]
+    },
+    {
+      "description": "Names the file a still-running background command writes its output to, in a `task_wait` timeout and under its `task_list` row.",
+      "id": "task.shell_output_file",
+      "placeholders": [
+        "path"
+      ]
+    },
+    {
+      "description": "First line of a command's output file when the command was moved to the background after the live buffer had already dropped its earliest output.",
+      "id": "task.shell_output_file_earlier_lost",
+      "placeholders": [
+        "size"
+      ]
+    },
+    {
+      "description": "Last line of a command's output file once it has reached its size limit.",
+      "id": "task.shell_output_file_limit",
+      "placeholders": [
+        "size"
+      ]
+    },
+    {
+      "description": "Result of a `task_stop` call that stopped a task: the task's address and what it was running.",
+      "id": "task.stop_stopped",
+      "placeholders": [
+        "task",
+        "detail"
+      ]
+    },
+    {
       "description": "Suffix appended when a task result was cut to the output limit.",
       "id": "task.output_truncated",
       "placeholders": []
@@ -1681,6 +1771,11 @@
     {
       "description": "Sentence appended to a task's result when the user closed that task from the sidebar.",
       "id": "task.stopped_by_user",
+      "placeholders": []
+    },
+    {
+      "description": "Sentence appended to a task's result when the model itself stopped that task with `task_stop`.",
+      "id": "task.stopped_by_model",
       "placeholders": []
     },
     {
@@ -2211,6 +2306,19 @@
       ]
     },
     {
+      "description": "Last line of a `grep` result in `count` mode: the matching lines and files of the whole search, not only of the page.",
+      "id": "tool.grep_count_total",
+      "placeholders": [
+        "matches",
+        "files"
+      ]
+    },
+    {
+      "description": "Line of a remote `grep` result that was asked for context lines but ran on a machine whose grep cannot print them unambiguously.",
+      "id": "tool.grep_context_unavailable",
+      "placeholders": []
+    },
+    {
       "description": "Line of a `find` result that returned only some of its matches.",
       "id": "tool.find_limit",
       "placeholders": [
@@ -2249,9 +2357,16 @@
       ]
     },
     {
-      "description": "`read` result when the requested line range is past the end of the file.",
-      "id": "tool.read_range_out_of_bounds",
+      "description": "`read` result for a file with no content.",
+      "id": "tool.read_empty_file",
       "placeholders": []
+    },
+    {
+      "description": "`read` result when the requested start line is past the end of the file, with the file's line count.",
+      "id": "tool.read_range_out_of_bounds",
+      "placeholders": [
+        "total"
+      ]
     },
     {
       "description": "Last line of a `read` result that stopped before the end of the file or of the requested range.",
@@ -2264,11 +2379,38 @@
       ]
     },
     {
-      "description": "`read` error when a single line is longer than one read can return.",
-      "id": "tool.read_line_too_long",
+      "description": "Last line of a `read` result that stopped early in a file too large to count the lines of.",
+      "id": "tool.read_limit_uncounted",
       "placeholders": [
-        "line",
-        "size"
+        "from",
+        "to",
+        "next"
+      ]
+    },
+    {
+      "description": "Marker closing a line of a `read` result that was cut because the line alone is more than one read can return.",
+      "id": "tool.read_line_truncated",
+      "placeholders": [
+        "omitted"
+      ]
+    },
+    {
+      "description": "Last line of a `read` result decoded lossily because the file is not valid UTF-8.",
+      "id": "tool.read_lossy_note",
+      "placeholders": []
+    },
+    {
+      "description": "Last line of a `read` result decoded from UTF-16, which `edit` cannot modify.",
+      "id": "tool.read_utf16_note",
+      "placeholders": [
+        "encoding"
+      ]
+    },
+    {
+      "description": "`read` error for a file that holds binary data rather than text.",
+      "id": "tool.read_binary",
+      "placeholders": [
+        "path"
       ]
     },
     {

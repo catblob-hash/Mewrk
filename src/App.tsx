@@ -2,7 +2,6 @@ import {
   ArrowUp,
   ChevronDown,
   CircleAlert,
-  FileText,
   Folder,
   FolderPlus,
   GitBranch,
@@ -35,6 +34,7 @@ import { ImageStrip } from "./components/ImageStrip";
 import { queueIsPaused, withQueuePaused } from "./lib/conversationQueue";
 import { selectedAgentRoleCount } from "./lib/agentRoles";
 import { PdfReadingContext } from "./components/FileAttachmentPreview";
+import { FileIcon } from "./components/FileIcon";
 import { usePastedTextTags } from "./components/PastedTextTags";
 import { SelectedElementChips } from "./components/SelectedElementChips";
 import { imagesWithoutElementCrops, selectedElementImageFile, selectedElementsFromText } from "./lib/selectedElement";
@@ -51,6 +51,8 @@ import { ToolApprovalDock } from "./components/ToolApprovalDock";
 import { QueuedMessageList } from "./components/QueuedMessageList";
 import { Dialog, IconButton } from "./components/Common";
 import { ConfirmDialog, type ConfirmationRequest } from "./components/ConfirmDialog";
+import { RewindDialog } from "./components/RewindDialog";
+import type { RewindScope } from "./components/RewindDialog";
 import { GlobalSettings } from "./components/GlobalSettings";
 import { WindowLayerOutlet, WindowLayerProvider } from "./components/WindowLayer";
 import {
@@ -61,6 +63,8 @@ import {
 import type { ConversationStatus } from "./components/Sidebar";
 import { ShellNav, useWindowFullscreen, WindowFrame } from "./components/WindowChrome";
 import { ConversationSearch } from "./components/ConversationSearch";
+import { DRAFT_LANDING_TASK_LIMIT, DraftLanding } from "./components/DraftLanding";
+import type { DraftLandingTask } from "./components/DraftLanding";
 import { windowChromeKind } from "./lib/windowChrome";
 import {
   conversationHistoryTarget,
@@ -87,6 +91,7 @@ import { WorkspaceSettingsDialog } from "./components/WorkspaceSettings";
 import { ForkRequestTray } from "./components/ForkRequestTray";
 import { detachAbsentParents, reparentChildren } from "./lib/conversationTree";
 import { GitStatusCard } from "./components/GitStatusCard";
+import { GlassPlate } from "./components/GlassPlate";
 import {
   TasksPane,
   taskContainerMessages,
@@ -202,7 +207,7 @@ import { memoryPool } from "./lib/memoryPool";
 import { hasConversationCommands, listWslDistros, settleConversationTitle } from "./lib/runtime";
 import { DEFAULT_REASONING_EFFORT, REASONING_EFFORTS } from "./lib/reasoningEffort";
 import { loadToolExplanations } from "./lib/localModel";
-import { applyConversationTemplate, attestEditedToolContext, attestInsertedToolContext, cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, deleteAgentRole, deleteConversationTemplate, deleteHook, deleteMcpServer, deleteSkill, executeTool, forkConversationContexts, captureConversationTemplate, listConversationTemplates, listForkDecisions, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, previewConversationTemplate, probeMcpServer, refreshCapabilities, capabilityFingerprint, revealCapabilityLocation, saveAgentRole, type SaveAgentRoleTarget, updateConversationTemplate, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, controlWorkflowStep, workflowStepRecord } from "./lib/runtime";
+import { applyConversationTemplate, attestCopiedToolContexts, attestEditedToolContext, attestInsertedToolContext, cancelConversationRun, cancelModelRun, defaultConversationWebSearchSettings, deleteAgentRole, deleteConversationTemplate, deleteHook, deleteMcpServer, deleteSkill, executeTool, forkConversationContexts, captureConversationTemplate, listConversationTemplates, listForkDecisions, listPendingForkStarts, listPendingForkRequests, listPendingToolPrompts, listWakePendingConversations, loadConversationPlan, loadConversationRemote, loadDocument, previewConversationTemplate, probeMcpServer, refreshCapabilities, capabilityFingerprint, revealCapabilityLocation, saveAgentRole, type SaveAgentRoleTarget, updateConversationTemplate, requestToolApproval, resetDocument, resolveForkRequest, resolveToolPrompt, controlWorkflowStep, workflowStepRecord } from "./lib/runtime";
 import { SECURITY_LEVEL_OPTIONS, securityLevelLabel } from "./lib/securityLevels";
 import {
   answersFromFormattedContent,
@@ -239,6 +244,8 @@ import {
   sameBrowseMachine
 } from "./lib/fileBrowser";
 import type { BrowseMachine, BrowseProbeResult } from "./lib/fileBrowser";
+import { draftWithMention, fileMentionText } from "./lib/fileMention";
+import type { FileMention } from "./lib/fileMention";
 import { setPathOpenHandler, setPathPrefetchHandler } from "./lib/pathLinks";
 import type { PathOpenRequest } from "./lib/pathLinks";
 import { workspaceRelativePath } from "./lib/workspaceFiles";
@@ -403,17 +410,29 @@ import {
   isConversationBranchFork,
   switchConversationBranch
 } from "./lib/conversationBranches";
+import { rewindRange, rewindResultSummary, summarizeRewindFiles } from "./lib/conversationRewind";
 import {
   EMPTY_TIMELINE_PATCH,
   TimelineHistory,
   applyTimelinePatch,
   insertionPatch,
   invertTimelinePatch,
+  movePatch,
+  pastePatch,
   placedContexts,
   removedIds,
   timelineHistoryShortcut
 } from "./lib/timelineHistory";
 import type { TimelinePatch } from "./lib/timelineHistory";
+import {
+  copiesForPaste,
+  timelineClipboardText,
+  timelineCopyable,
+  timelineMovable,
+  withCopiedToolProofs
+} from "./lib/timelineClipboard";
+import type { TimelineClipboard } from "./lib/timelineClipboard";
+import { writeClipboardText } from "./lib/clipboard";
 import { forkOrigin, forkTitle, nextForkNumber, staleForkTitles } from "./lib/conversationForks";
 import {
   TIMELINE_START_ANCHOR,
@@ -457,6 +476,7 @@ import type {
   PendingToolPrompt,
   QuestionResponse,
   ResourceDescriptor,
+  RewindFilesResponse,
   RunTarget as RunTargetType,
   SandboxSettings,
   SecurityLevel,
@@ -1094,8 +1114,13 @@ function App() {
   const timelineHistoryRef = useRef<TimelineHistory | null>(null);
   if (!timelineHistoryRef.current) timelineHistoryRef.current = new TimelineHistory();
   const [timelineNotice, setTimelineNotice] = useState<TimelineNoticeState | null>(null);
+  /* What was last copied off a timeline. One for the whole app, so what is copied in one
+     conversation pastes into another; in memory only, like the history above. */
+  const [timelineClipboard, setTimelineClipboard] = useState<TimelineClipboard | null>(null);
   /** The question on screen before an irreversible action, if any (`ConfirmDialog`). */
   const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
+  /** The user message whose "rewind to before it" window is open (`RewindDialog`), if any. */
+  const [rewindTarget, setRewindTarget] = useState<{ conversationId: string; contextId: string } | null>(null);
   const timelineNoticeTimerRef = useRef<number | null>(null);
   const contextScrollRef = useRef<Record<string, number>>({});
   const conversationTurnsRef = useRef<ConversationTurns>(conversationTurns);
@@ -3578,7 +3603,7 @@ function App() {
           descriptionIsPath: true,
           icon: result.kind === "directory"
             ? <Folder size={13} aria-hidden="true" />
-            : <FileText size={13} aria-hidden="true" />,
+            : <FileIcon path={result.path} size={13} />,
           onSelect: () => showInFiles(candidate.machine, result.path, line, newPage)
         };
       })
@@ -4490,6 +4515,24 @@ function App() {
   const forkDisabledReason = activeWorkspaceDeletionRunning
     ? t("项目正在删除，无法分叉会话", "Cannot fork the conversation while the project is being deleted")
     : null;
+  // A rewind changes the timeline and the files under it, so it waits for everything that writes
+  // either to be done: the model turn, a Git write, or the project going away.
+  const rewindDisabledReason = activeModelRunBusy
+    ? t("模型回合进行中，完成或停止后才能回退", "Wait for the model turn to finish or stop before rewinding")
+    : activeWorkspaceDeletionRunning
+      ? t("项目正在删除，无法回退", "Cannot rewind while the project is being deleted")
+      : activeWorkspaceGitMutationRunning
+        ? t("Git 写操作进行中，完成后才能回退", "Wait for the Git operation to finish before rewinding")
+        : null;
+  // What the open rewind window would take off the timeline. Without a range the message, or the
+  // conversation it was asked about, is no longer on screen, and the window goes with it.
+  const rewindTargetRange = rewindTarget && activeConversation?.id === rewindTarget.conversationId
+    ? rewindRange(activeConversation, rewindTarget.contextId)
+    : null;
+  const rewindTargetGone = Boolean(rewindTarget) && !rewindTargetRange;
+  useEffect(() => {
+    if (rewindTargetGone) setRewindTarget(null);
+  }, [rewindTargetGone]);
 
   const syncBrowserPanelBounds = useCallback((bounds: SidePaneBounds) => {
     const sessionId = browserController.visibleSession();
@@ -5683,6 +5726,50 @@ function App() {
         : unseenCompletions.has(conversationId) ? "completed"
           : "idle"
   ), [blockedConversationIds, conversationHasLiveActivity, unseenCompletions]);
+
+  /**
+   * What a task nothing has been sent in shows where its timeline will be (`DraftLanding`): the
+   * project's tasks, most recently updated first — the sidebar lists them in the user's own
+   * order — and the keys that work there.
+   */
+  const draftLandingTasks = useMemo<DraftLandingTask[]>(() => (
+    composerIsUnsentTask && activeWorkspace
+      ? visibleConversations(activeWorkspace.conversations)
+        .map((conversation) => ({
+          id: conversation.id,
+          title: conversation.title,
+          updatedAt: conversation.updatedAt,
+          status: conversationStatus(conversation.id)
+        }))
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+        .slice(0, DRAFT_LANDING_TASK_LIMIT)
+      : []
+  ), [activeWorkspace, composerIsUnsentTask, conversationStatus]);
+  const draftLandingWorkspaceId = activeWorkspace?.id ?? null;
+  const openDraftLandingTask = useCallback((conversationId: string) => {
+    if (draftLandingWorkspaceId) selectConversationRef.current(draftLandingWorkspaceId, conversationId);
+  }, [draftLandingWorkspaceId]);
+  const draftLandingShortcuts = document?.globalSettings.shortcuts;
+  // One element for as long as nothing it shows changes: the timeline is memoized, and a fresh
+  // element on every render here would redraw it with each key typed into the composer.
+  const draftLanding = useMemo(() => (composerIsUnsentTask ? (
+    <DraftLanding
+      recentTasks={draftLandingTasks}
+      onOpenTask={openDraftLandingTask}
+      shortcuts={draftLandingShortcuts ?? {}}
+      sendShortcut={appearance.sendShortcut}
+      newlineShortcut={appearance.newlineShortcut}
+      canInsert={!activeTimelineMutationBlocked}
+    />
+  ) : undefined), [
+    activeTimelineMutationBlocked,
+    appearance.newlineShortcut,
+    appearance.sendShortcut,
+    composerIsUnsentTask,
+    draftLandingShortcuts,
+    draftLandingTasks,
+    openDraftLandingTask
+  ]);
 
   /**
    * Drafts and persisted conversations must resolve settings identically so materialization preserves draft edits.
@@ -7500,6 +7587,236 @@ function App() {
   timelineDeletesRef.current = { deleteContext, deleteTimelineContexts };
 
   /**
+   * Opens the "rewind to before this message" window. Nothing is touched until
+   * the user picks what to put back in it.
+   */
+  const openRewindDialog = (item: ContextItem) => {
+    if (!activeConversation || draftActive || item.kind !== "user" || rewindDisabledReason) return;
+    const target = { conversationId: activeConversation.id, contextId: item.id };
+    // The host puts the files back from the timeline it has saved, and the renderer's
+    // conversation commands are debounced: a message added or removed a moment ago may not
+    // be there yet. The window is modal, so what is saved when it opens holds for the preview
+    // and for the rewind that follows. A write that failed is the host's to report; the
+    // window still opens and says what the host makes of it.
+    void flushLatestDocument().catch(() => undefined).then(() => setRewindTarget(target));
+  };
+
+  /**
+   * The rest of a rewind, once the window has put the files back (`restored`, when
+   * the scope has them): the message and all that followed leave the timeline and
+   * the message goes back to the composer. It is an ordinary timeline edit, so it
+   * lands through the same guarded write as a delete and the undo keys take it
+   * back — the files are not part of that. The "confirm message delete" setting
+   * does not ask again: the window it comes from is the question.
+   */
+  const rewindToBeforeMessage = (scope: RewindScope, restored: RewindFilesResponse | null) => {
+    const target = rewindTarget;
+    if (!target) return;
+    const { conversationId, contextId } = target;
+    const filesResult = restored ? rewindResultSummary(summarizeRewindFiles(restored.files), t) : "";
+    if (scope === "files") {
+      showTimelineNotice(conversationId, t("已回退文件：{result}", "Files rewound: {result}", { result: filesResult }));
+      return;
+    }
+    const conversation = activeWorkspaceId
+      ? findConversation(documentStore.current(), activeWorkspaceId, conversationId).conversation
+      : undefined;
+    const range = conversation ? rewindRange(conversation, contextId) : null;
+    const message = conversation?.contexts.find((context) => context.id === contextId);
+    // The files, if the scope had them, are back already; the notice says the conversation is not.
+    const refuse = (reason: string) => showTimelineNotice(conversationId, scope === "both"
+      ? t("文件已回退（{result}），但对话没有回退：{reason}", "Files rewound ({result}), but the conversation was not: {reason}", {
+        result: filesResult,
+        reason
+      })
+      : t("对话没有回退：{reason}", "The conversation was not rewound: {reason}", { reason }));
+    if (!conversation || !range || message?.kind !== "user") {
+      return refuse(t("这条消息已不在时间线上", "That message is no longer on the timeline"));
+    }
+    if (range.anchored) return refuse(t("有分支从这些消息开始", "A branch starts at one of these messages"));
+    if (contextMutationIsBlocked(conversationId)) return refuse(t("模型回合进行中", "A model turn is in progress"));
+    closeTimelineEditors();
+    const committed = commitTimelineEdit(
+      conversationId,
+      { ...EMPTY_TIMELINE_PATCH, removed: placedContexts(conversation.contexts, new Set(range.ids)) },
+      t("回退到这条消息之前", "Rewind to before this message")
+    );
+    if (!committed) return refuse(t("无法修改时间线", "The timeline could not be changed"));
+    putMessageInComposer(conversationId, message);
+    showTimelineNotice(
+      conversationId,
+      scope === "both"
+        ? t("已回退对话和文件：{result}", "Conversation and files rewound: {result}", { result: filesResult })
+        : t("已回退到这条消息之前", "Rewound to before this message"),
+      {
+        keys: timelineHistoryShortcut("undo"),
+        action: scope === "both" ? t("撤回对话", "to undo the conversation") : t("撤回", "to undo")
+      }
+    );
+  };
+
+  /**
+   * Moves what a selection picked out to the insertion line at `index`, gathered
+   * together in timeline order, as one edit with one undo. A message a branch
+   * was taken from stays where it is, as it does under a delete, and so does a
+   * compaction, which every request starts from.
+   */
+  const moveTimelineContexts = (ids: string[], index: number) => {
+    if (
+      !activeConversation
+      || (!activeWorkspaceId && !draftActive)
+      || contextMutationIsBlocked(activeConversation.id)
+    ) return;
+    const picked = new Set(ids);
+    const chosen = activeConversation.contexts.filter((context) => picked.has(context.id));
+    const moving = new Set(chosen
+      .filter((context) => timelineMovable(context) && !isConversationBranchFork(activeConversation, context.id))
+      .map((context) => context.id));
+    const patch = movePatch(activeConversation.contexts, moving, index);
+    if (!patch) {
+      if (moving.size < chosen.length) {
+        showTimelineNotice(activeConversation.id, t("这些消息不能移动", "These messages cannot be moved"));
+      }
+      return;
+    }
+    // A card being placed is placed by index, and the indexes are about to change.
+    setEditor((current) => (current?.mode === "insert" ? null : current));
+    const held = chosen.length - moving.size;
+    commitTimelineEdit(
+      activeConversation.id,
+      patch,
+      moving.size === 1
+        ? t("移动 1 条消息", "Move 1 message")
+        : t("移动 {count} 条消息", "Move {count} messages", { count: moving.size }),
+      held
+        ? t("已移动 {count} 条消息，{held} 条不能移动", "Moved {count} messages; {held} cannot be moved", { count: moving.size, held })
+        : moving.size === 1
+          ? t("已移动 1 条消息", "Moved 1 message")
+          : t("已移动 {count} 条消息", "Moved {count} messages", { count: moving.size })
+    );
+  };
+
+  /**
+   * Copies what a selection picked out: the cards themselves for a paste on a
+   * timeline, and their text for a paste anywhere else. What cannot be copied
+   * (`timelineCopyable`) is left out, and said to be.
+   */
+  const copyTimelineContexts = (ids: string[]) => {
+    if (!activeConversation) return;
+    const picked = new Set(ids);
+    const chosen = activeConversation.contexts.filter((context) => picked.has(context.id));
+    const contexts = chosen.filter((context) => timelineCopyable(context, activeTimelineTools));
+    if (!contexts.length) {
+      showTimelineNotice(activeConversation.id, t("选中的消息不能复制", "The selected messages cannot be copied"));
+      return;
+    }
+    setTimelineClipboard({ conversationId: activeConversation.id, contexts });
+    void writeClipboardText(timelineClipboardText(contexts));
+    const left = chosen.length - contexts.length;
+    showTimelineNotice(activeConversation.id, left
+      ? t("已复制 {count} 条消息，{left} 条不能复制", "Copied {count} messages; {left} cannot be copied", { count: contexts.length, left })
+      : contexts.length === 1
+        ? t("已复制 1 条消息", "Copied 1 message")
+        : t("已复制 {count} 条消息", "Copied {count} messages", { count: contexts.length }));
+  };
+
+  /**
+   * Pastes what was copied as new cards: at the insertion line at `index`, or,
+   * given contexts to replace, where the first of them sat as they go. One edit,
+   * one undo.
+   *
+   * A copied tool card is only kept by the host with a proof issued for its new
+   * id in this conversation, so the host is asked for one per card first; a
+   * draft becomes a conversation for that, as it does to run a tool.
+   */
+  const pasteTimelineContexts = async (index: number, replacedIds: string[]) => {
+    const clipboard = timelineClipboard;
+    if (
+      !clipboard?.contexts.length
+      || !activeConversation
+      || (!activeWorkspaceId && !draftActive)
+      || contextMutationIsBlocked(activeConversation.id)
+    ) return;
+    let conversationId = activeConversation.id;
+    // The line is remembered by the context above it: the wait below can outlast an index.
+    const above = index > 0
+      ? activeConversation.contexts[Math.min(index, activeConversation.contexts.length) - 1]?.id
+      : undefined;
+    try {
+      let conversation: Conversation = activeConversation;
+      /** The conversation as it stands now, read past the render this paste began in. */
+      let latest = (): Conversation | undefined => conversation;
+      if (clipboard.contexts.some((context) => context.kind === "tool")) {
+        const home = await conversationForTimelineTool();
+        conversationId = home.conversationId;
+        latest = () => (
+          findConversation(documentStore.current(), home.workspaceId, home.conversationId).conversation ?? undefined
+        );
+        const held = latest();
+        if (!held || contextMutationIsBlocked(conversationId)) return;
+        conversation = held;
+      }
+      const copies = copiesForPaste(
+        clipboard,
+        conversationId,
+        reserveQueuedMessageIds(imageShortIdsInUse(conversation.contexts), conversation.queuedMessages),
+        createId
+      );
+      if (!copies.contexts.length) {
+        showTimelineNotice(conversationId, t(
+          "复制的工具卡带有与这段对话冲突的图片编号，不能粘贴到这里",
+          "The copied tool cards carry image numbers this conversation already uses, so they cannot be pasted here"
+        ));
+        return;
+      }
+      let pasted = copies.contexts;
+      if (copies.tools.length) {
+        pasted = withCopiedToolProofs(copies, await attestCopiedToolContexts({
+          conversationId,
+          copies: copies.tools.map((tool) => ({
+            sourceConversationId: clipboard.conversationId,
+            source: tool.source,
+            contextId: tool.contextId
+          }))
+        }));
+        const held = latest();
+        if (!held || contextMutationIsBlocked(conversationId)) return;
+        conversation = held;
+      }
+      const target = conversation;
+      const replaced = new Set(replacedIds.filter((id) => !isConversationBranchFork(target, id)));
+      const aboveAt = above === undefined ? -1 : target.contexts.findIndex((context) => context.id === above);
+      const patch = pastePatch(
+        target.contexts,
+        pasted,
+        index <= 0 ? 0 : aboveAt >= 0 ? aboveAt + 1 : Math.min(index, target.contexts.length),
+        replaced
+      );
+      if (!patch) return;
+      setEditor((current) => (
+        current?.mode === "insert" || (current?.mode === "edit" && replaced.has(current.item.id)) ? null : current
+      ));
+      setQuestionEditor((current) => (current && replaced.has(current.item.id) ? null : current));
+      commitTimelineEdit(
+        conversationId,
+        patch,
+        pasted.length === 1
+          ? t("粘贴 1 条消息", "Paste 1 message")
+          : t("粘贴 {count} 条消息", "Paste {count} messages", { count: pasted.length }),
+        copies.skipped
+          ? t("已粘贴 {count} 条消息，{skipped} 条不能粘贴到这里", "Pasted {count} messages; {skipped} cannot be pasted here", { count: pasted.length, skipped: copies.skipped })
+          : pasted.length === 1
+            ? t("已粘贴 1 条消息", "Pasted 1 message")
+            : t("已粘贴 {count} 条消息", "Pasted {count} messages", { count: pasted.length })
+      );
+    } catch (reason) {
+      showTimelineNotice(conversationId, t("没有粘贴：{reason}", "Nothing was pasted: {reason}", {
+        reason: failureMessage(reason, t("原因不明", "unknown reason"))
+      }));
+    }
+  };
+
+  /**
    * Files picked, pasted or dropped into a user message on the timeline — one
    * being edited, or one being written from the context menu.
    *
@@ -8220,6 +8537,61 @@ function App() {
   }, [dispatchNextQueuedMessage, document, modelRunSummaries, resumableRunsAdopted]);
 
   /**
+   * Hands a sent user message back to a conversation's composer as it was
+   * written: its picked elements as chips, its images and files as
+   * attachments, and its text without the `[Image #N]` the send added for the
+   * model. A draft the composer already holds is kept, after the message.
+   */
+  const putMessageInComposer = (conversationId: string, item: UserContext) => {
+    const written = selectedElementsFromText(item.content ?? "", item.images);
+    const text = textWithoutAppendedImagePlaceholders(written.text, item.images);
+    composerController.updateDrafts((current) => ({
+      ...current,
+      [conversationId]: current[conversationId]?.trim() ? `${text}\n\n${current[conversationId]}` : text
+    }));
+    if (item.images?.length) {
+      composerController.updateImageDrafts((current) => ({
+        ...current,
+        [conversationId]: [...(current[conversationId] ?? []), ...item.images!]
+      }));
+    }
+    if (item.files?.length) {
+      composerController.updateFileDrafts((current) => ({
+        ...current,
+        [conversationId]: [...(current[conversationId] ?? []), ...item.files!]
+      }));
+    }
+    if (written.elements.length) {
+      composerController.updateElementPicks((current) => ({
+        ...current,
+        [conversationId]: [...(current[conversationId] ?? []), ...written.elements]
+      }));
+    }
+    window.requestAnimationFrame(() => composerTextareaRef.current?.focus());
+  };
+
+  /**
+   * What "mention in the conversation" does in the file and review panes: the line goes on a
+   * line of its own at the end of the conversation's composer, and the caret after it, ready
+   * for what there is to say about it. A draft the composer already holds is kept.
+   */
+  const mentionFileInComposer = (conversationId: string, mention: FileMention) => {
+    const text = fileMentionText(mention, activeConversationWorkspaces.length > 1);
+    composerController.updateDrafts((current) => ({
+      ...current,
+      [conversationId]: draftWithMention(current[conversationId] ?? "", text)
+    }));
+    // After the menu has closed and handed focus back to where it was opened from.
+    window.requestAnimationFrame(() => {
+      const textarea = composerTextareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      textarea.scrollTop = textarea.scrollHeight;
+    });
+  };
+
+  /**
    * Branching starts a genuinely independent conversation that owns a full copy
    * of the history preceding the branch point. The branched user message itself
    * is handed to the new composer as a draft, so the branch only begins once
@@ -8270,24 +8642,7 @@ function App() {
       forkIndex > 0 ? source.settings.toolLock : undefined
     );
     if (!created) return;
-    // The message goes back into the composer as it was written: its picked
-    // elements as chips, its images and files as attachments, and its text
-    // without the `[Image #N]` the send added for the model.
-    const written = selectedElementsFromText(item.content ?? "", item.images);
-    composerController.updateDrafts((current) => ({
-      ...current,
-      [created]: textWithoutAppendedImagePlaceholders(written.text, item.images)
-    }));
-    if (item.images?.length) {
-      composerController.updateImageDrafts((current) => ({ ...current, [created]: [...(item.images ?? [])] }));
-    }
-    if (item.files?.length) {
-      composerController.updateFileDrafts((current) => ({ ...current, [created]: [...(item.files ?? [])] }));
-    }
-    if (written.elements.length) {
-      composerController.updateElementPicks((current) => ({ ...current, [created]: written.elements }));
-    }
-    window.requestAnimationFrame(() => composerTextareaRef.current?.focus());
+    putMessageInComposer(created, item);
 
     // Everything before the branch point carries over. The branched message
     // stays in the composer instead, so the user can edit it before sending.
@@ -9064,6 +9419,7 @@ function App() {
             : null}
           onRevealRequestHandled={onReviewPaneRequestHandled}
           mutationDisabledReason={gitMutationDisabledReasonFor(page.member)}
+          onMentionLine={(path, line) => mentionFileInComposer(conversationId, { path, workspace: page.member, line })}
           paneExpanded={expanded}
           onPaneToggleExpand={onToggleExpand}
           onPaneFocus={onFocus}
@@ -9097,6 +9453,7 @@ function App() {
           active
           openRequest={filesPaneRequest?.conversationId === conversationId ? filesPaneRequest : null}
           onOpenRequestHandled={onFilesPaneRequestHandled}
+          onMention={(mention) => mentionFileInComposer(conversationId, mention)}
           expanded={expanded}
           onToggleExpand={onToggleExpand}
           onPaneFocus={onFocus}
@@ -9689,6 +10046,7 @@ function App() {
                 enabledTools={activeEnabledTools}
                 pathBaseDir={timelinePathBaseDir}
                 timelineMutationLocked={activeTimelineMutationBlocked}
+                emptyState={draftLanding}
                 onEdit={handleContextEdit}
                 onDelete={(item) => deleteContext(item)}
                 onEditQuestion={handleQuestionEdit}
@@ -9708,6 +10066,8 @@ function App() {
                 onSaveQuestion={saveQuestionContext}
                 onBranchFrom={(item) => void branchFromUserContext(item)}
                 branchFromDisabledReason={branchFromDisabledReason}
+                onRewindTo={draftActive ? undefined : openRewindDialog}
+                rewindDisabledReason={rewindDisabledReason}
                 onForkAt={draftActive ? undefined : (index) => void forkConversationAt(index)}
                 forkDisabledReason={forkDisabledReason}
                 branchNavigations={activeBranchNavigations}
@@ -9715,6 +10075,10 @@ function App() {
                 branchSwitchDisabledReason={branchSwitchDisabledReason}
                 onInsert={handleContextInsert}
                 onDeleteContexts={(ids) => deleteTimelineContexts(ids)}
+                onMoveContexts={moveTimelineContexts}
+                onCopyContexts={copyTimelineContexts}
+                onPasteContexts={(index, replacedIds) => void pasteTimelineContexts(index, replacedIds)}
+                pasteCount={timelineClipboard?.contexts.length ?? 0}
                 onUndo={() => stepTimelineHistory(activeConversation.id, "undo")}
                 onRedo={() => stepTimelineHistory(activeConversation.id, "redo")}
                 onOpenSubagent={(subagentId) => openSubagentPanel(subagentId)}
@@ -9838,6 +10202,7 @@ function App() {
                         once the conversation has content it runs where it began, and the group goes. */}
                     {activeGitSnapshot && !activeConversationStarted && (
                       <div className="composer-chip-group">
+                        <GlassPlate />
                         <PopoverMenu
                           triggerClassName="composer-chip composer-chip--flush"
                           trigger={<>
@@ -9931,6 +10296,7 @@ function App() {
                           document.globalSettings.executionEnvironments.sshMachines
                         )}
                       >
+                        <GlassPlate />
                         <WorkspaceMachineIcon machine={workspace.machine} />
                         <span className="composer-chip__index" aria-hidden="true">{position + activeProjectWorkspaceCount + 1}</span>
                         <PathText className="composer-chip__label" path={workspace.path} title={null} />
@@ -9965,7 +10331,7 @@ function App() {
                     {hasNativeWorkspacePicker() && (
                       <PopoverMenu
                         triggerClassName="composer-chip composer-chip--icon"
-                        trigger={<FolderPlus size={13} />}
+                        trigger={<><GlassPlate /><FolderPlus size={13} /></>}
                         triggerLabel={t("附加工作区", "Attach a workspace")}
                         disabled={activeModelRunning}
                         menuLabel={t("在哪台机器上选目录", "Which machine to pick a directory on")}
@@ -10438,6 +10804,21 @@ function App() {
         )}
 
         {confirmation && <ConfirmDialog request={confirmation} onClose={() => setConfirmation(null)} />}
+        {rewindTarget && rewindTargetRange && (
+          <RewindDialog
+            conversationId={rewindTarget.conversationId}
+            contextId={rewindTarget.contextId}
+            blockedReason={rewindDisabledReason}
+            conversationBlockedReason={rewindTargetRange.anchored
+              ? t(
+                "有分支从这条消息或其之后的消息开始，不能回退对话；仍可以只恢复文件。",
+                "A branch starts at this message or one after it, so the conversation cannot be rewound. The files can still be restored."
+              )
+              : null}
+            onRewind={rewindToBeforeMessage}
+            onClose={() => setRewindTarget(null)}
+          />
+        )}
         {workspaceDialogOpen && <ProjectDialog
           mode="create"
           sshMachines={document.globalSettings.executionEnvironments.sshMachines}

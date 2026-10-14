@@ -3,6 +3,7 @@ import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent a
 import { useI18n } from "../i18n";
 import { CHAT_TILE_FLEX, defaultSideFlexForKind, MAX_SIDE_FLEX, MIN_SIDE_FLEX, NEW_COLUMN_FLEX, paneKind } from "../lib/sidePanes";
 import type { SidePaneId } from "../lib/sidePanes";
+import { GlassPlate } from "./GlassPlate";
 import { PaneTileGeometryContext } from "./paneTileGeometry";
 import "./PaneTiles.css";
 
@@ -404,7 +405,7 @@ export function PaneTiles({
         data-edges={edgesOf(true, visiblePanes.length === 0, true, true)}
         inert={solo ? true : undefined}
         style={{ flex: `${CHAT_TILE_FLEX} 1 0px` }}
-      >{chat}</div>
+      ><GlassPlate />{chat}</div>
       {panes.length > 0 && <>
         {firstPane !== undefined && !solo && <div
           className={handleClass("side", true)} data-handle="side"

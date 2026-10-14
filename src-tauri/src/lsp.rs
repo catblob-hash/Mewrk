@@ -21,6 +21,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
@@ -28,7 +29,9 @@ use serde_json::{json, Value};
 
 use crate::{
     lsp_config::LspServerConfig,
-    lsp_servers::{uri_to_path, LspRegistry, ServerHost},
+    lsp_servers::{server_root, uri_to_path, LspRegistry, ServerHost, ServerRoot},
+    model::{JsonObject, LiveSecurityLevel, SecurityLevel, ToolExecutionRequest},
+    workspace_set::WorkspaceSet,
 };
 
 /// Largest file handed to a language server, matching the source's limit.
@@ -282,6 +285,151 @@ pub fn execute(
 
     let result = filter_ignored(result, call.operation, workspace, files);
     Ok(format_result(call.operation, &result, workspace))
+}
+
+// ---------------------------------------------------------------------------
+// After an edit
+// ---------------------------------------------------------------------------
+
+/// Whether an edit may start a language server: exactly when an `lsp` call on
+/// the edited file would run *now* without asking for approval.
+///
+/// That is the classifier's own answer ([`crate::security`]), not a copy of its
+/// rule, because it is the same question. A workspace that ships its own
+/// `.mewrk/lsp.json` names the command a language server is launched with, so
+/// below full access an `lsp` call there raises a card — and an edit has no
+/// card to raise. Everything the classifier would ask about (that file, that
+/// workspace, a file outside it, a machine that cannot be asked) is therefore a
+/// "no" here, and the caller falls back to what edits always did: re-sync a
+/// server that is already up.
+///
+/// Owned, because the question is put from a background thread, and on a
+/// workspace on another machine answering it is a round trip.
+pub struct StartGate {
+    level: SecurityLevel,
+    live_level: Option<Arc<LiveSecurityLevel>>,
+    workspaces: WorkspaceSet,
+    workspace_path: String,
+    app_data_path: String,
+    additional_directories: Vec<String>,
+    probe: ToolExecutionRequest,
+}
+
+impl StartGate {
+    /// `edit_input` is the input of the `write` or `edit` call that changed the
+    /// file: its `path` is what an `lsp` call on it would name, and its
+    /// `workspace` selects the workspace both act in. `None` when the edit
+    /// carries no path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        level: SecurityLevel,
+        live_level: Option<Arc<LiveSecurityLevel>>,
+        workspaces: WorkspaceSet,
+        workspace_path: String,
+        app_data_path: String,
+        additional_directories: Vec<String>,
+        conversation_id: &str,
+        edit_input: &JsonObject,
+    ) -> Option<Self> {
+        let path = edit_input.get("path").and_then(Value::as_str)?;
+        let mut input = JsonObject::new();
+        input.insert("operation".into(), json!("hover"));
+        input.insert("filePath".into(), json!(path));
+        input.insert("line".into(), json!(1));
+        input.insert("character".into(), json!(1));
+        if let Some(workspace) = edit_input.get("workspace") {
+            input.insert("workspace".into(), workspace.clone());
+        }
+        Some(Self {
+            level,
+            live_level,
+            workspaces,
+            probe: ToolExecutionRequest {
+                conversation_id: conversation_id.to_owned(),
+                workspace_path: workspace_path.clone(),
+                tool_name: "lsp".into(),
+                input,
+            },
+            workspace_path,
+            app_data_path,
+            additional_directories,
+        })
+    }
+
+    /// The conversation's security level now, which the user can change while a
+    /// run is live.
+    pub fn level(&self) -> SecurityLevel {
+        match &self.live_level {
+            Some(cell) => cell.get(),
+            None => self.level,
+        }
+    }
+
+    pub fn permits_start(&self) -> bool {
+        // A classification that fails is a "no": the same call would be
+        // refused, and nothing may start on the strength of an answer that
+        // could not be had.
+        crate::security::classify_model_call_in_workspaces(
+            self.level(),
+            &self.workspaces,
+            Path::new(&self.workspace_path),
+            Path::new(&self.app_data_path),
+            &self.additional_directories,
+            &self.probe,
+        )
+        .is_ok_and(|decision| !decision.requires_approval)
+    }
+}
+
+/// Claude Code's `changeFile` for a file the model just wrote on this machine,
+/// the part that is not a quick re-sync: make sure the server that claims the
+/// file is up — starting it if it is not — and holds the file as it is on disk.
+///
+/// For a background thread, with the configuration already read. `may_start`
+/// is asked after the configuration was read and not before: a project
+/// configuration that appeared in between is then either in `configs` and seen
+/// by the gate (the file exists), or not in `configs` and never launched.
+/// Whatever it answers, nothing is reported to the caller — an edit does not
+/// fail because a language server could not be had.
+pub fn open_after_local_edit(
+    registry: &LspRegistry,
+    configs: &[LspServerConfig],
+    workspace: &Path,
+    path: &Path,
+    conversation_id: &str,
+    may_start: &dyn Fn() -> bool,
+) {
+    let Some((config, language_id)) = LspRegistry::config_for_path(configs, path) else {
+        return;
+    };
+    // A file the tool would refuse is not one to start a server for.
+    if !readable_text_file(path) || !may_start() {
+        return;
+    }
+    let root = ServerRoot::local(server_root(config, workspace));
+    let source = path.to_path_buf();
+    registry.open_after_edit(
+        &ServerHost::Local,
+        config,
+        &language_id,
+        &root,
+        path,
+        conversation_id,
+        Arc::new(move || local_text(&source)),
+    );
+}
+
+fn readable_text_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_FILE_BYTES)
+}
+
+/// The file's text as it is on disk now, under the same ceiling `lsp` has.
+fn local_text(path: &Path) -> Option<String> {
+    if !readable_text_file(path) {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
 }
 
 /// Operation to LSP method and params, including the 1-based to 0-based
@@ -1443,6 +1591,113 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// An edit has no approval card to raise, so it may start a server only
+    /// where the classifier says an `lsp` call on that file would not raise
+    /// one either: its answer, not a copy of its rule.
+    #[test]
+    fn an_edit_may_start_a_server_exactly_when_an_lsp_call_would_run_without_asking() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let base = std::fs::canonicalize(root.path()).expect("temp dir resolves");
+        let workspace = base.join("project");
+        let app_data = base.join("app-data");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::create_dir_all(&app_data).unwrap();
+        std::fs::write(workspace.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(base.join("outside.rs"), "fn outside() {}\n").unwrap();
+        let gate = |level: SecurityLevel, path: &str| {
+            let input: JsonObject = serde_json::from_value(json!({ "path": path })).unwrap();
+            StartGate::new(
+                level,
+                None,
+                WorkspaceSet::default(),
+                workspace.to_string_lossy().into_owned(),
+                app_data.to_string_lossy().into_owned(),
+                Vec::new(),
+                "c1",
+                &input,
+            )
+            .expect("the edit named a path")
+        };
+        let ask = |level, path: &str| gate(level, path).permits_start();
+
+        // Nothing in the workspace names a command: the servers are the user's
+        // own presets and file, and starting one asks nobody.
+        for level in [
+            SecurityLevel::RequestApproval,
+            SecurityLevel::AllowEdits,
+            SecurityLevel::FullAccess,
+        ] {
+            assert!(ask(level, "src/main.rs"), "{level:?}");
+        }
+        // A file outside the workspace is the "read outside the workspace" card.
+        assert!(!ask(SecurityLevel::RequestApproval, "../outside.rs"));
+
+        // The project ships its own configuration, which names the command that
+        // gets launched: a card below full access, under either directory name.
+        let spellings = crate::capabilities::relative_config_paths(
+            crate::capabilities::CapabilityKind::Lsp,
+        );
+        for spelling in &spellings {
+            let config = workspace.join(spelling);
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(&config, "{}").unwrap();
+            for level in [SecurityLevel::RequestApproval, SecurityLevel::AllowEdits] {
+                assert!(!ask(level, "src/main.rs"), "{spelling} at {level:?}");
+            }
+            assert!(
+                ask(SecurityLevel::FullAccess, "src/main.rs"),
+                "full access never asks ({spelling})"
+            );
+            std::fs::remove_file(&config).unwrap();
+        }
+        assert!(ask(SecurityLevel::RequestApproval, "src/main.rs"), "and it is lifted with the file");
+    }
+
+    /// The level is read when the question is put, not when the edit happened:
+    /// the user can change it while a run is live.
+    #[test]
+    fn the_gate_follows_the_live_security_level() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let workspace = std::fs::canonicalize(root.path()).expect("temp dir resolves");
+        std::fs::write(workspace.join("a.rs"), "").unwrap();
+        let config = workspace.join(
+            &crate::capabilities::relative_config_paths(crate::capabilities::CapabilityKind::Lsp)[0],
+        );
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "{}").unwrap();
+
+        let cell = Arc::new(LiveSecurityLevel::new(SecurityLevel::RequestApproval));
+        let input: JsonObject = serde_json::from_value(json!({ "path": "a.rs" })).unwrap();
+        let gate = StartGate::new(
+            SecurityLevel::RequestApproval,
+            Some(Arc::clone(&cell)),
+            WorkspaceSet::default(),
+            workspace.to_string_lossy().into_owned(),
+            workspace.to_string_lossy().into_owned(),
+            Vec::new(),
+            "c1",
+            &input,
+        )
+        .unwrap();
+        assert!(!gate.permits_start());
+        cell.set(SecurityLevel::FullAccess);
+        assert_eq!(gate.level(), SecurityLevel::FullAccess);
+        assert!(gate.permits_start());
+
+        // An edit that names no path has nothing to ask about.
+        assert!(StartGate::new(
+            SecurityLevel::FullAccess,
+            None,
+            WorkspaceSet::default(),
+            String::new(),
+            String::new(),
+            Vec::new(),
+            "c1",
+            &JsonObject::new(),
+        )
+        .is_none());
     }
 
     #[test]

@@ -1,23 +1,16 @@
-import {
-  ChevronDown,
-  Database,
-  File,
-  FileArchive,
-  FileCode2,
-  FileImage,
-  MoreVertical,
-  Presentation,
-  Scroll,
-  Sheet,
-  UnfoldVertical
-} from "lucide-react";
+import { ChevronDown, MoreVertical, UnfoldVertical } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useI18n } from "../i18n";
-import { fileIconKind } from "../lib/fileIcons";
+import type { CodeToken } from "../lib/codeHighlight";
+import { highlightDiffLines } from "../lib/diffHighlight";
+import { lineAtTarget } from "../lib/fileMention";
+import { codeLanguage } from "../lib/fileViewers";
 import type { DiffFile, DiffHunk, DiffLine } from "../lib/unifiedDiff";
 import { wordDiff } from "../lib/wordDiff";
 import type { WordDiffSegment } from "../lib/wordDiff";
+import { DiffLineTokens } from "./CodeBlock";
+import { FileIcon } from "./FileIcon";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuSection } from "./PopoverMenu";
 import "./DiffViewer.css";
@@ -102,6 +95,11 @@ export interface DiffViewerProps {
   expandingPaths?: ReadonlySet<string>;
   /** Paths whose patch already carries the whole file, so expanding is done. */
   fullyExpandedPaths?: ReadonlySet<string>;
+  /**
+   * Given, a right click on a line of a file is the caller's to answer: it is told the file,
+   * the number the line shows in the gutter, and where the pointer was.
+   */
+  onLineMenu?: (path: string, line: number, point: { x: number; y: number }) => void;
   emptyLabel: string;
 }
 
@@ -150,20 +148,6 @@ function collapseChains(nodes: TreeNode[]): TreeNode[] {
     }
     return { ...node, children };
   });
-}
-
-export function EntryIcon({ path, className }: { path: string; className?: string }) {
-  const props = { size: 13, "aria-hidden": true as const, className };
-  switch (fileIconKind(path)) {
-    case "code": return <FileCode2 {...props} />;
-    case "data": return <Database {...props} />;
-    case "sheet": return <Sheet {...props} />;
-    case "preso": return <Presentation {...props} />;
-    case "image": return <FileImage {...props} />;
-    case "archive": return <FileArchive {...props} />;
-    case "skill": return <Scroll {...props} />;
-    default: return <File {...props} />;
-  }
 }
 
 /** `−` is the typographic minus the reference shell uses; a hyphen reads as a dash here. */
@@ -253,14 +237,6 @@ function suppressWhitespaceOnly(hunk: DiffHunk): DiffHunk | null {
   return changed ? { ...hunk, lines: kept } : null;
 }
 
-function renderSegments(segments: readonly WordDiffSegment[], tone: "addition" | "deletion"): ReactNode {
-  return segments.map((segment, index) => (
-    segment.changed
-      ? <span className={`diff-viewer__word diff-viewer__word--${tone}`} key={index}>{segment.text}</span>
-      : <Fragment key={index}>{segment.text}</Fragment>
-  ));
-}
-
 /**
  * The reference shell's continuous diff: one scroller holding every file, each
  * behind a sticky 32px header, with the file column beside it.
@@ -287,6 +263,7 @@ export function DiffViewer({
   onExpandContext,
   expandingPaths,
   fullyExpandedPaths,
+  onLineMenu,
   emptyLabel
 }: DiffViewerProps) {
   const { t } = useI18n();
@@ -519,7 +496,7 @@ export function DiffViewer({
           data-drag-exclude
           onClick={() => scrollToFile(node.path)}
         >
-          <EntryIcon path={node.path} className="diff-viewer__tree-icon" />
+          <FileIcon path={node.path} />
           <span className="diff-viewer__tree-name">{node.name}</span>
           <StatCounts additions={node.entry.additions} deletions={node.entry.deletions} />
         </button>
@@ -611,7 +588,7 @@ export function DiffViewer({
                       aria-hidden="true"
                       className={`diff-viewer__file-chevron${collapsed ? " diff-viewer__file-chevron--collapsed" : ""}`}
                     />
-                    <EntryIcon path={entry.path} className="diff-viewer__file-icon" />
+                    <FileIcon path={entry.path} />
                     <span className="diff-viewer__file-path" title={entry.path}>
                       {entry.oldPath && entry.oldPath !== entry.path && (
                         <span className="diff-viewer__file-old">{`${entry.oldPath} → `}</span>
@@ -675,6 +652,7 @@ export function DiffViewer({
                         onExpandContext={onExpandContext}
                         expanding={expandingPaths?.has(entry.path) ?? false}
                         fullyExpanded={fullyExpandedPaths?.has(entry.path) ?? false}
+                        onLineMenu={onLineMenu}
                       />
                     )}
                     {patch?.incomplete && (
@@ -702,6 +680,7 @@ interface DiffFileBodyProps {
   onExpandContext?: (path: string) => void;
   expanding: boolean;
   fullyExpanded: boolean;
+  onLineMenu?: DiffViewerProps["onLineMenu"];
 }
 
 /**
@@ -723,11 +702,21 @@ function DiffFileBody({
   wordDiff: wordDiffEnabled,
   onExpandContext,
   expanding,
-  fullyExpanded
+  fullyExpanded,
+  onLineMenu
 }: DiffFileBodyProps) {
   const { t } = useI18n();
+  const codeRef = useRef<HTMLDivElement>(null);
+  const language = useMemo(() => codeLanguage(path), [path]);
   const canExpand = onExpandContext !== undefined && !fullyExpanded;
   const expand = () => onExpandContext?.(path);
+
+  // Wrapping, or the other layout, can put the code back at its left edge with no scroll to say so.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the layout is what moves the code, though nothing here reads it.
+  useEffect(() => {
+    const code = codeRef.current;
+    code?.toggleAttribute("data-scrolled", !wordWrap && code.scrollLeft > 0);
+  }, [style, wordWrap]);
 
   const separator = (key: string, unmodified: number | null, heading: string) => {
     const label = unmodified === null
@@ -767,9 +756,23 @@ function DiffFileBody({
   };
 
   return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: a right click on a line is the pointer's shortcut to that line's menu; the code itself is read, not operated.
+    // biome-ignore lint/a11y/noNoninteractiveElementInteractions: as above.
     <div
+      ref={codeRef}
       className={`diff-viewer__code diff-viewer__code--${style}${wordWrap ? " diff-viewer__code--wrap" : ""}`}
       data-selection-columns={style === "split" || undefined}
+      // The number column stays put while the code moves under it, and only then needs a
+      // ground of its own to hide what passes (backdrop.css). Wrapped code never moves.
+      onScroll={wordWrap ? undefined : (event) => {
+        event.currentTarget.toggleAttribute("data-scrolled", event.currentTarget.scrollLeft > 0);
+      }}
+      onContextMenu={onLineMenu && ((event) => {
+        const line = lineAtTarget(event.target);
+        if (line === null) return;
+        event.preventDefault();
+        onLineMenu(path, line, { x: event.clientX, y: event.clientY });
+      })}
     >
       {hunks.map((hunk, index) => {
         const previous = index === 0 ? null : hunks[index - 1];
@@ -781,8 +784,8 @@ function DiffFileBody({
             {gap > 0 && separator(`gap:${index}`, gap, hunk.heading)}
             {gap <= 0 && hunk.heading !== "" && separator(`head:${index}`, 0, hunk.heading)}
             {style === "split"
-              ? <SplitHunk hunk={hunk} wordDiff={wordDiffEnabled} />
-              : <UnifiedHunk hunk={hunk} wordDiff={wordDiffEnabled} />}
+              ? <SplitHunk hunk={hunk} wordDiff={wordDiffEnabled} language={language} />
+              : <UnifiedHunk hunk={hunk} wordDiff={wordDiffEnabled} language={language} />}
           </Fragment>
         );
       })}
@@ -808,14 +811,36 @@ function wordSegmentsFor(
   return segments;
 }
 
+/** The side of the file a line is read on, for colouring it as that file's code. */
+function describeLine(line: DiffLine): { side: "old" | "new" | "both"; text: string } {
+  return {
+    side: line.kind === "addition" ? "new" : line.kind === "deletion" ? "old" : "both",
+    text: line.text
+  };
+}
+
+/** A hunk's lines as code, and the words that changed within its paired lines. */
+function useHunkMarks(hunk: DiffHunk, wordDiffEnabled: boolean, language: string | null) {
+  const pairs = useMemo(() => pairHunkLines(hunk.lines), [hunk]);
+  const segments = useMemo(() => wordSegmentsFor(pairs, wordDiffEnabled), [pairs, wordDiffEnabled]);
+  const tokens = useMemo(() => highlightDiffLines(language, hunk.lines, describeLine), [language, hunk]);
+  return { pairs, segments, tokens };
+}
+
 function lineContent(
   line: DiffLine,
-  segments: Map<DiffLine, WordDiffSegment[]>,
-  tone: "addition" | "deletion"
+  tokens: Map<DiffLine, CodeToken[]>,
+  segments?: Map<DiffLine, WordDiffSegment[]>,
+  tone?: "addition" | "deletion"
 ): ReactNode {
-  const marked = segments.get(line);
-  if (!marked) return line.text;
-  return renderSegments(marked, tone);
+  return (
+    <DiffLineTokens
+      text={line.text}
+      tokens={tokens.get(line)}
+      segments={segments?.get(line)}
+      wordClassName={`diff-viewer__word diff-viewer__word--${tone}`}
+    />
+  );
 }
 
 /**
@@ -826,13 +851,25 @@ function lineContent(
  * The other side's number rides along as an attribute rather than a second column
  * nobody reads.
  */
-function UnifiedHunk({ hunk, wordDiff: enabled }: { hunk: DiffHunk; wordDiff: boolean }) {
-  const pairs = useMemo(() => pairHunkLines(hunk.lines), [hunk]);
-  const segments = useMemo(() => wordSegmentsFor(pairs, enabled), [pairs, enabled]);
+export function UnifiedHunk({
+  hunk,
+  wordDiff: enabled,
+  language
+}: {
+  hunk: DiffHunk;
+  wordDiff: boolean;
+  /** Grammar id the lines are coloured with, or null to draw them plain. */
+  language: string | null;
+}) {
+  const { segments, tokens } = useHunkMarks(hunk, enabled, language);
   return (
     <>
       {hunk.lines.map((line, index) => (
-        <div className={`diff-viewer__line diff-viewer__line--${line.kind}`} key={index}>
+        <div
+          className={`diff-viewer__line diff-viewer__line--${line.kind}`}
+          data-line={line.newLine ?? line.oldLine ?? undefined}
+          key={index}
+        >
           <span className="diff-viewer__number" aria-hidden="true">
             {line.newLine ?? line.oldLine ?? ""}
           </span>
@@ -841,10 +878,10 @@ function UnifiedHunk({ hunk, wordDiff: enabled }: { hunk: DiffHunk; wordDiff: bo
             data-alt-line={line.kind === "addition" ? undefined : line.oldLine ?? undefined}
           >
             {line.kind === "addition"
-              ? lineContent(line, segments, "addition")
+              ? lineContent(line, tokens, segments, "addition")
               : line.kind === "deletion"
-                ? lineContent(line, segments, "deletion")
-                : line.text}
+                ? lineContent(line, tokens, segments, "deletion")
+                : lineContent(line, tokens)}
             {line.noNewline && <span className="diff-viewer__no-newline">{"↵"}</span>}
           </span>
         </div>
@@ -859,18 +896,27 @@ function UnifiedHunk({ hunk, wordDiff: enabled }: { hunk: DiffHunk; wordDiff: bo
  * the new file's number, or the old one on a row with nothing on the new side —
  * and the old side's own number rides along as an attribute.
  */
-function SplitHunk({ hunk, wordDiff: enabled }: { hunk: DiffHunk; wordDiff: boolean }) {
-  const pairs = useMemo(() => pairHunkLines(hunk.lines), [hunk]);
-  const segments = useMemo(() => wordSegmentsFor(pairs, enabled), [pairs, enabled]);
+function SplitHunk({
+  hunk,
+  wordDiff: enabled,
+  language
+}: {
+  hunk: DiffHunk;
+  wordDiff: boolean;
+  language: string | null;
+}) {
+  const { pairs, segments, tokens } = useHunkMarks(hunk, enabled, language);
   return (
     <>
       {pairs.map((pair, index) => {
         const left = pair.deletion;
         const right = pair.addition;
         const context = left !== null && left === right;
+        // The band the number continues: the old side's beside it, or the new side's alone.
+        const tone = context ? "" : left !== null ? " diff-viewer__number--deletion" : " diff-viewer__number--addition";
         return (
-          <div className="diff-viewer__row" key={index}>
-            <span className="diff-viewer__number" aria-hidden="true">
+          <div className="diff-viewer__row" data-line={right?.newLine ?? left?.oldLine ?? undefined} key={index}>
+            <span className={`diff-viewer__number${tone}`} aria-hidden="true">
               {right?.newLine ?? left?.oldLine ?? ""}
             </span>
             <span
@@ -878,14 +924,14 @@ function SplitHunk({ hunk, wordDiff: enabled }: { hunk: DiffHunk; wordDiff: bool
               data-alt-line={left?.oldLine ?? undefined}
               data-selection-column="old"
             >
-              {left === null ? "" : context ? left.text : lineContent(left, segments, "deletion")}
+              {left === null ? "" : context ? lineContent(left, tokens) : lineContent(left, tokens, segments, "deletion")}
               {left?.noNewline && <span className="diff-viewer__no-newline">{"↵"}</span>}
             </span>
             <span
               className={`diff-viewer__text diff-viewer__text--right${right === null ? " diff-viewer__text--absent" : context ? "" : " diff-viewer__text--addition"}`}
               data-selection-column="new"
             >
-              {right === null ? "" : context ? right.text : lineContent(right, segments, "addition")}
+              {right === null ? "" : context ? lineContent(right, tokens) : lineContent(right, tokens, segments, "addition")}
               {right?.noNewline && right !== left && <span className="diff-viewer__no-newline">{"↵"}</span>}
             </span>
           </div>

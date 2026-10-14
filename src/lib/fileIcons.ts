@@ -1,58 +1,47 @@
 /**
  * Which icon stands for a file.
  *
- * The reference shell sorts every path into one of eight buckets and draws one
- * glyph per bucket rather than one per language, so a tree of mixed sources reads
- * as shape rather than as a colour field. The buckets are reproduced here; the
- * glyphs are this app's icon set, which is not the reference's, so only the
- * grouping is shared.
+ * Icons and the rules that choose between them are Material Icon Theme's: the set
+ * most editors' file trees wear, so a Rust source, a lockfile or a mesh is drawn here
+ * the way it is everywhere else. `scripts/vite-file-icons.mjs` distills the theme's
+ * manifest into the tables read below and publishes the icons they name.
  */
-export type FileIconKind =
-  | "doc"
-  | "code"
-  | "data"
-  | "sheet"
-  | "preso"
-  | "image"
-  | "archive"
-  | "skill";
+import manifest from "virtual:mewrk-file-icons";
 
-const CODE_EXTENSIONS = new Set([
-  "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts",
-  "rs", "go", "py", "pyi", "rb", "java", "kt", "kts", "scala", "swift",
-  "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "m", "mm",
-  "cs", "fs", "fsx", "vb", "php", "pl", "pm", "lua", "r", "jl", "dart", "ex", "exs",
-  "erl", "hrl", "hs", "elm", "clj", "cljs", "nim", "zig", "v", "sol",
-  "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd",
-  "html", "htm", "xhtml", "vue", "svelte", "astro",
-  "css", "scss", "sass", "less", "styl",
-  "sql", "graphql", "gql", "proto", "tla", "cfg", "csp",
-  "json", "json5", "jsonc", "yaml", "yml", "toml", "ini", "xml", "plist",
-  "gradle", "cmake", "mk", "dockerfile", "tf", "tfvars", "hcl"
-]);
+const NAMES = new Map(Object.entries(manifest.names));
+const EXTENSIONS = new Map(Object.entries(manifest.extensions));
+const LIGHT = new Set(manifest.light);
 
-const DATA_EXTENSIONS = new Set(["jsonl", "ndjson", "parquet", "db", "sqlite", "sqlite3", "avro", "orc"]);
-const SHEET_EXTENSIONS = new Set(["csv", "tsv", "xls", "xlsx", "ods", "numbers"]);
-const PRESO_EXTENSIONS = new Set(["ppt", "pptx", "odp", "key"]);
-const IMAGE_EXTENSIONS = new Set([
-  "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tif", "tiff", "ico", "icns", "svg"
-]);
-const ARCHIVE_EXTENSIONS = new Set([
-  "zip", "tar", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "jar", "war", "asar", "dmg", "iso"
-]);
-const DOC_EXTENSIONS = new Set([
-  "pdf", "md", "markdown", "mdx", "txt", "log", "rtf", "doc", "docx", "odt", "pages",
-  "rst", "tex", "epub", "adoc",
-  "mp4", "mov", "webm", "mkv", "avi", "m4v", "ogv", "3gp",
-  "mp3", "wav", "ogg", "flac", "aac", "m4a", "wma", "aiff"
-]);
+/**
+ * Types the theme has no rule for, drawn with the icon it gives their nearest kin.
+ *
+ * Only consulted once the theme's own tables have missed, so a later release of the
+ * theme that learns one of these takes over without an edit here.
+ */
+export const KINDRED_ICONS: Record<string, readonly string[]> = {
+  video: ["3gp", "3g2", "f4v", "rmvb", "mxf"],
+  audio: ["midi", "amr", "ape", "ac3", "dsf", "caf"],
+  image: ["hdr", "jxl", "jp2", "pcx", "arw", "orf", "rw2"],
+  "3d": ["usda", "usdc", "x3d", "max", "ma", "mb", "c4d", "splat", "ifc", "vrm", "lwo"],
+  zip: ["war", "ear", "asar", "lz", "lz4", "lzma", "cab", "cpio"],
+  database: ["avro", "mdb", "accdb", "duckdb", "feather", "arrow"],
+  table: ["numbers", "xlsm", "xlsb"],
+  word: ["pages", "wps"],
+  epub: ["mobi", "azw", "azw3", "fb2"],
+  key: ["p12", "pfx", "jks", "keystore"],
+  dll: ["dylib"]
+};
+
+const KINDRED_EXTENSIONS = new Map(
+  Object.entries(KINDRED_ICONS).flatMap(([icon, extensions]) => extensions.map((extension) => [extension, icon] as const))
+);
 
 /**
  * Extension of a file name, lowercased.
  *
  * A dotfile with no second dot — `.gitignore`, `.env` — is all name and no
  * extension; treating its name as one would file every dotfile under whatever
- * bucket its name happened to land in.
+ * type its name happened to spell.
  */
 export function fileExtension(name: string): string {
   const separator = name.lastIndexOf(".");
@@ -60,17 +49,37 @@ export function fileExtension(name: string): string {
   return name.slice(separator + 1).toLowerCase();
 }
 
-export function fileIconKind(path: string): FileIconKind {
-  const name = path.slice(path.lastIndexOf("/") + 1);
-  if (name === "SKILL.md") return "skill";
-  const extension = fileExtension(name);
-  if (!extension) return "doc";
-  if (ARCHIVE_EXTENSIONS.has(extension)) return "archive";
-  if (PRESO_EXTENSIONS.has(extension)) return "preso";
-  if (DATA_EXTENSIONS.has(extension)) return "data";
-  if (SHEET_EXTENSIONS.has(extension)) return "sheet";
-  if (IMAGE_EXTENSIONS.has(extension)) return "image";
-  if (CODE_EXTENSIONS.has(extension)) return "code";
-  if (DOC_EXTENSIONS.has(extension)) return "doc";
-  return "doc";
+/**
+ * Name of the icon for a path, by the theme's own precedence.
+ *
+ * A whole file name outranks any extension, and may be qualified by the directories
+ * above it (`.github/dependabot.yml`). Among extensions the longest wins, so
+ * `index.d.ts` is a declaration file before it is TypeScript. Here a dotfile's name
+ * does count as an extension — the theme's tables are written that way, `.env` being
+ * listed under `env`.
+ */
+export function fileIconName(path: string): string {
+  const segments = path.toLowerCase().split(/[\\/]+/).filter(Boolean);
+  for (let depth = Math.min(manifest.nameDepth, segments.length); depth > 0; depth -= 1) {
+    const icon = NAMES.get(segments.slice(-depth).join("/"));
+    if (icon) return icon;
+  }
+  const name = segments.at(-1) ?? "";
+  for (let dot = name.indexOf("."); dot !== -1; dot = name.indexOf(".", dot + 1)) {
+    const icon = EXTENSIONS.get(name.slice(dot + 1));
+    if (icon) return icon;
+  }
+  return KINDRED_EXTENSIONS.get(fileExtension(name)) ?? manifest.fallback;
+}
+
+/**
+ * The same icon redrawn for a light background, for the few whose usual drawing is
+ * too pale to read on one.
+ */
+export function lightFileIconName(icon: string): string | null {
+  return LIGHT.has(icon) ? `${icon}_light` : null;
+}
+
+export function fileIconUrl(icon: string): string {
+  return `${import.meta.env.BASE_URL}file-icons/${icon}.svg`;
 }

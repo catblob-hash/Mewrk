@@ -161,7 +161,7 @@ $$\\int_0^1 x^2\\,dx=\\frac{1}{3}$$
     expect(container.querySelector("pre")).toHaveTextContent("const x = 1;");
   });
 
-  it("defers historical Markdown outside the viewport and releases it again after scrolling away", () => {
+  it("defers historical Markdown outside the viewport and releases it a while after scrolling away", () => {
     let callback: IntersectionObserverCallback | null = null;
     let observed: Element | null = null;
     class IntersectionObserverMock {
@@ -175,18 +175,38 @@ $$\\int_0^1 x^2\\,dx=\\frac{1}{3}$$
       takeRecords(): IntersectionObserverEntry[] { return []; }
     }
     vi.stubGlobal("IntersectionObserver", IntersectionObserverMock);
-    const { container } = render(<MarkdownContent content="# 屏外标题" deferOffscreen />);
-    const host = container.querySelector<HTMLElement>(".markdown-content")!;
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<MarkdownContent content="# 屏外标题" deferOffscreen />);
+      const host = container.querySelector<HTMLElement>(".markdown-content")!;
+      const report = (isIntersecting: boolean) => act(() => callback?.(
+        [{ target: observed!, isIntersecting } as IntersectionObserverEntry],
+        {} as IntersectionObserver
+      ));
+      const heading = () => screen.queryByRole("heading", { name: "屏外标题" });
 
-    expect(host).toHaveAttribute("data-markdown-deferred", "true");
-    expect(screen.queryByRole("heading", { name: "屏外标题" })).not.toBeInTheDocument();
+      expect(host).toHaveAttribute("data-markdown-deferred", "true");
+      expect(heading()).not.toBeInTheDocument();
 
-    act(() => callback?.([{ target: observed!, isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver));
-    expect(screen.getByRole("heading", { name: "屏外标题" })).toBeInTheDocument();
+      report(true);
+      expect(heading()).toBeInTheDocument();
 
-    act(() => callback?.([{ target: observed!, isIntersecting: false } as IntersectionObserverEntry], {} as IntersectionObserver));
-    expect(screen.queryByRole("heading", { name: "屏外标题" })).not.toBeInTheDocument();
-    expect(host).toHaveAttribute("data-markdown-deferred", "true");
+      // Scrolled away and back before the wait is over: it was never torn down, and the
+      // earlier wait does not release it afterwards.
+      report(false);
+      act(() => { vi.advanceTimersByTime(5_000); });
+      expect(heading()).toBeInTheDocument();
+      report(true);
+      act(() => { vi.advanceTimersByTime(60_000); });
+      expect(heading()).toBeInTheDocument();
+
+      report(false);
+      act(() => { vi.advanceTimersByTime(60_000); });
+      expect(heading()).not.toBeInTheDocument();
+      expect(host).toHaveAttribute("data-markdown-deferred", "true");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

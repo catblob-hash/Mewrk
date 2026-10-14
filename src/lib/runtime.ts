@@ -8,6 +8,7 @@ import {
 } from "./workspaces";
 import { createSeedDocument } from "../seed";
 import { normalizeBackground } from "./background";
+import { normalizeCodeTheme } from "./codeThemes";
 import { isRegistered, isShellBackend } from "./machineShells";
 import {
   emptyConversationPresetSettings
@@ -82,9 +83,12 @@ import type {
   SshMachineConfig,
   ThemePreference,
   ToolDescriptor,
+  AttestCopiedToolContextsRequest,
   AttestEditedToolContextRequest,
   AttestInsertedToolContextRequest,
   AttestEditedToolContextResponse,
+  RewindFilesRequest,
+  RewindFilesResponse,
   ToolExecutionRequest,
   WslDistro,
   Workspace,
@@ -1248,6 +1252,8 @@ function normalizeAppearance(
     customCss: typeof input.customCss === "string" ? input.customCss : "",
     liquidGlass: input.liquidGlass === true || legacyPicture !== null,
     background: normalizeBackground(legacyPicture ?? input.background),
+    codeThemeDay: normalizeCodeTheme(input.codeThemeDay, "day"),
+    codeThemeNight: normalizeCodeTheme(input.codeThemeNight, "night"),
     localModel: normalizeLocalModelPreferences(input.localModel)
   };
 }
@@ -2677,6 +2683,28 @@ export async function attestInsertedToolContext(
 ): Promise<AttestEditedToolContextResponse> {
   if (hasBackendRuntime()) {
     return invoke<AttestEditedToolContextResponse>("attest_inserted_tool_context", { request });
+  }
+  throw new Error("浏览器预览无法签发工具记录凭证，请连接应用后端");
+}
+
+/**
+ * Puts the files the write and edit tools changed back as they were before a
+ * user message, or with `dryRun` only lists what that would do. A browser-only
+ * preview has no workspace files of its own, so it lists none.
+ */
+export async function rewindFiles(request: RewindFilesRequest): Promise<RewindFilesResponse> {
+  if (hasBackendRuntime()) {
+    return invoke<RewindFilesResponse>("rewind_files", { request });
+  }
+  return { files: [] };
+}
+
+/** The proofs for copies of tool cards, one per copy and in their order. */
+export async function attestCopiedToolContexts(
+  request: AttestCopiedToolContextsRequest
+): Promise<string[]> {
+  if (hasBackendRuntime()) {
+    return invoke<string[]>("attest_copied_tool_contexts", { request });
   }
   throw new Error("浏览器预览无法签发工具记录凭证，请连接应用后端");
 }

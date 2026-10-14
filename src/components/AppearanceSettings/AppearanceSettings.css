@@ -383,6 +383,43 @@
 }
 .theme-sample[data-glass] :is(.theme-sample__bubble, .theme-sample__task) { background: color-mix(in srgb, var(--s-text) 8%, transparent); }
 
+/* Code appearance: the light theme's choice on the left, the dark theme's on the right, each
+   over a sample drawn in it. The two sit side by side while each has room for a line of the
+   sample, and stack when they do not. */
+.appearance-settings-page__code-themes {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  gap: 12px;
+}
+
+.appearance-settings-page__code-theme {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.appearance-settings-page__code-theme > .input { width: 100%; }
+
+/* A code theme in miniature (CodeThemePreview.tsx): the review pane's diff, with the theme's
+   variables set on the preview. Its ground is the scheme's own tile, which shows only under a
+   theme whose well is a veil; the other scheme's is the token whose value on this side of the
+   mirror is that colour, as the theme samples below read theirs. */
+.code-theme-preview {
+  overflow: hidden;
+  border: 1px solid var(--code-border);
+  border-radius: 8px;
+  background: var(--color-f7f7f5);
+}
+:root:not([data-theme="night"]) .code-theme-preview[data-scheme="night"],
+:root[data-theme="night"] .code-theme-preview[data-scheme="day"] { background: var(--color-0a0a08); }
+/* The pane's diff runs edge to edge under a header; here it is a block on a page, so it has
+   room above its first line and before its numbers. A line too long for the block is cut
+   short rather than wrapped or scrolled: every sample is the same five lines tall. */
+.code-theme-preview > .diff-viewer__code { padding-block: 8px; overflow: hidden; line-height: 19px; }
+.code-theme-preview .diff-viewer__number { padding-inline: 14px 10px; }
+
 .appearance-settings-page__color-controls {
   width: 100%;
   display: flex;

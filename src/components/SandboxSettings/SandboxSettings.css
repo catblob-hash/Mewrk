@@ -62,12 +62,12 @@
   line-height: 1.6;
 }
 
-.sandbox-settings-page__textarea {
+/* Compounded with `.input`, whose own min-height would otherwise win: it loads later. */
+.sandbox-settings-page__textarea.input {
   width: 100%;
-  min-height: 96px;
-  resize: vertical;
+  min-height: 144px;
+  resize: none;
   font-family: var(--mono-font, ui-monospace, monospace);
-  font-size: 10.5px;
 }
 
 .sandbox-settings-page__actions {

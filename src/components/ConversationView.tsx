@@ -51,9 +51,13 @@ export function ConversationView({
   const stableOnSaveTool = useStableResultCallback(timelineProps.onSaveTool);
   const stableOnSaveQuestion = useStableResultCallback(timelineProps.onSaveQuestion);
   const stableOnBranchFrom = useStableCallback(timelineProps.onBranchFrom);
+  const stableOnRewindTo = useStableCallback(timelineProps.onRewindTo);
   const stableOnSelectBranch = useStableCallback(timelineProps.onSelectBranch);
   const stableOnInsert = useStableCallback(timelineProps.onInsert);
   const stableOnDeleteContexts = useStableCallback(timelineProps.onDeleteContexts);
+  const stableOnMoveContexts = useStableCallback(timelineProps.onMoveContexts);
+  const stableOnCopyContexts = useStableCallback(timelineProps.onCopyContexts);
+  const stableOnPasteContexts = useStableCallback(timelineProps.onPasteContexts);
   const stableOnUndo = useStableCallback(timelineProps.onUndo);
   const stableOnRedo = useStableCallback(timelineProps.onRedo);
   const stableOnForkAt = useStableCallback(timelineProps.onForkAt);
@@ -83,9 +87,13 @@ export function ConversationView({
         onSaveToolEdit={timelineProps.onSaveToolEdit ? stableOnSaveToolEdit : undefined}
         onSaveQuestion={timelineProps.onSaveQuestion ? stableOnSaveQuestion : undefined}
         onBranchFrom={timelineProps.onBranchFrom ? stableOnBranchFrom : undefined}
+        onRewindTo={timelineProps.onRewindTo ? stableOnRewindTo : undefined}
         onSelectBranch={timelineProps.onSelectBranch ? stableOnSelectBranch : undefined}
         onInsert={timelineProps.onInsert ? stableOnInsert : undefined}
         onDeleteContexts={timelineProps.onDeleteContexts ? stableOnDeleteContexts : undefined}
+        onMoveContexts={timelineProps.onMoveContexts ? stableOnMoveContexts : undefined}
+        onCopyContexts={timelineProps.onCopyContexts ? stableOnCopyContexts : undefined}
+        onPasteContexts={timelineProps.onPasteContexts ? stableOnPasteContexts : undefined}
         onUndo={timelineProps.onUndo ? stableOnUndo : undefined}
         onRedo={timelineProps.onRedo ? stableOnRedo : undefined}
         onForkAt={timelineProps.onForkAt ? stableOnForkAt : undefined}

@@ -11,6 +11,7 @@ import {
   Shield,
   Shrink,
   Trash2,
+  Undo2,
   UserRound,
   Wrench,
   X
@@ -48,7 +49,9 @@ import type { FollowGlide } from "../lib/followGlide";
 import { MarkdownContent } from "./MarkdownContent";
 import { QuestionTimelineCard } from "./QuestionTimelineCard";
 import { TimelineSelectionContext, useTimelineSelected } from "./timelineSelection";
-import { timelineHistoryKey, timelineSelectionModifier } from "../lib/timelineHistory";
+import { timelineClipboardKey, timelineClipboardShortcut, timelineHistoryKey, timelineSelectionModifier } from "../lib/timelineHistory";
+import { beginTimelineDrag } from "./timelineDrag";
+import type { TimelineDrag } from "./timelineDrag";
 import { StreamWaitingIndicator } from "./StreamWaitingIndicator";
 import { groupLabel, groupMeta } from "./ToolSelectionGroups";
 import type { ToolCategory } from "./ToolSelectionGroups";
@@ -141,6 +144,12 @@ export interface ContextStreamProps {
   runningTaskCount?: number;
   onOpenTasks?: () => void;
   ariaLabel?: string;
+  /**
+   * Drawn in place of the stock notice while the timeline holds nothing. The main
+   * conversation gives its new-task page here; it still sits on the timeline, so a
+   * right-click on it inserts like one anywhere else.
+   */
+  emptyState?: ReactNode;
   onEdit?: (item: ContextItem) => void;
   onDelete?: (item: ContextItem) => void;
   /** Edits the projected ask_user tool and its paired answer as one message. */
@@ -166,6 +175,9 @@ export interface ContextStreamProps {
   /** Opens a new conversation drafted with this existing user message. */
   onBranchFrom?: (item: ContextItem) => void;
   branchFromDisabledReason?: string | null;
+  /** Opens the window that rewinds the conversation and its files to before this user message. */
+  onRewindTo?: (item: ContextItem) => void;
+  rewindDisabledReason?: string | null;
   branchNavigations?: Record<string, ContextBranchNavigation>;
   onSelectBranch?: (forkContextId: string, branchId: string) => void;
   branchSwitchDisabledReason?: string | null;
@@ -176,6 +188,22 @@ export interface ContextStreamProps {
    * drawn by dragging with Ctrl held (⌘ on a Mac), and only where this is given.
    */
   onDeleteContexts?: (ids: string[]) => void;
+  /**
+   * Moves the contexts `ids` names, gathered together in timeline order, to the
+   * insertion line at `index`. What a selection picked out is dragged there:
+   * a press on any of it carries all of it, however far apart it sat.
+   */
+  onMoveContexts?: (ids: string[], index: number) => void;
+  /** Copies the contexts a selection picked out: its menu's Copy, or Ctrl+C (⌘C on a Mac). */
+  onCopyContexts?: (ids: string[]) => void;
+  /**
+   * Pastes what was copied. At the insertion line at `index` from the menu a
+   * right-click opens; in place of `replacedIds`, the contexts a selection
+   * picked out, from that selection's menu or with Ctrl+V (⌘V).
+   */
+  onPasteContexts?: (index: number, replacedIds: string[]) => void;
+  /** How many copied contexts there are to paste. None, and Paste is offered but cannot be chosen. */
+  pasteCount?: number;
   /**
    * Reverts the last edit made on this timeline. Ctrl+Z (⌘Z on a Mac) asks for
    * it, and only while focus is somewhere in the timeline: the same keys typed
@@ -447,6 +475,8 @@ const ContextCard = memo(function ContextCard({
   onDeleteItem,
   onBranchFromItem,
   branchFromDisabledReason,
+  onRewindToItem,
+  rewindDisabledReason,
   branchNavigation,
   onSelectBranchFor,
   branchSwitchDisabledReason,
@@ -467,6 +497,8 @@ const ContextCard = memo(function ContextCard({
   onDeleteItem?: (item: ContextItem) => void;
   onBranchFromItem?: (item: ContextItem) => void;
   branchFromDisabledReason?: string | null;
+  onRewindToItem?: (item: ContextItem) => void;
+  rewindDisabledReason?: string | null;
   branchNavigation?: ContextBranchNavigation;
   onSelectBranchFor?: (forkContextId: string, branchId: string) => void;
   branchSwitchDisabledReason?: string | null;
@@ -505,6 +537,10 @@ const ContextCard = memo(function ContextCard({
   const onDelete = () => onDeleteItem?.(item);
   const onBranchFrom = onBranchFromItem && item.kind === "user"
     ? () => onBranchFromItem(item)
+    : undefined;
+  // A note the host wrote in the user's place is not a message the user sent, so there is nothing to rewind to.
+  const onRewindTo = onRewindToItem && item.kind === "user" && !isHostAuthoredUserContext(item)
+    ? () => onRewindToItem(item)
     : undefined;
   const onOpenInsert = (event: React.MouseEvent | React.KeyboardEvent, after: boolean) => (
     onOpenInsertAt(event, index + (after ? 1 : 0))
@@ -717,15 +753,29 @@ const ContextCard = memo(function ContextCard({
       {item.kind === "user" && !editingInPlace && (Boolean(item.content) || !readOnly) && (
         <div className="context-card__actions">
           <ContextActions
-            leading={onBranchFrom && !readOnly ? (
-              <IconButton
-                label={t("从此消息分支", "Branch from this message")}
-                title={branchFromDisabledReason ?? t("在新对话中继续这条消息", "Continue this message in a new conversation")}
-                disabled={Boolean(branchFromDisabledReason)}
-                onClick={onBranchFrom}
-              >
-                <GitBranch size={13} />
-              </IconButton>
+            leading={!readOnly && (onBranchFrom || onRewindTo) ? (
+              <>
+                {onBranchFrom && (
+                  <IconButton
+                    label={t("从此消息分支", "Branch from this message")}
+                    title={branchFromDisabledReason ?? t("在新对话中继续这条消息", "Continue this message in a new conversation")}
+                    disabled={Boolean(branchFromDisabledReason)}
+                    onClick={onBranchFrom}
+                  >
+                    <GitBranch size={13} />
+                  </IconButton>
+                )}
+                {onRewindTo && (
+                  <IconButton
+                    label={t("回退到此消息之前", "Rewind to before this message")}
+                    title={rewindDisabledReason ?? t("把对话和文件退回到这条消息发出之前", "Put the conversation and files back to before this message was sent")}
+                    disabled={mutationReadOnly || Boolean(rewindDisabledReason)}
+                    onClick={onRewindTo}
+                  >
+                    <Undo2 size={13} />
+                  </IconButton>
+                )}
+              </>
             ) : undefined}
             copyText={item.content || undefined}
             copyLabel={t("复制用户消息", "Copy user message")}
@@ -806,10 +856,17 @@ interface MarqueeDrag {
   startContentY: number;
   x: number;
   y: number;
+  /** What was picked out when the press began, which the box adds to. */
+  base: ReadonlySet<string>;
+  /** Whether the press has travelled: a box once it has, a click on one context until then. */
+  moved: boolean;
   frame: number | null;
   /** Ends the drag and takes its listeners down. */
   release?: () => void;
 }
+
+/** How far a press with the selection modifier has to travel before it draws a box. */
+const MARQUEE_THRESHOLD = 4;
 
 function sameIds(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
   if (left.size !== right.size) return false;
@@ -980,7 +1037,7 @@ function renderNodeContextIds(node: ContextRenderNode): string[] {
   return node.entries.map((entry) => entry.item.id);
 }
 
-export const ContextStream = memo(function ContextStream({ contexts, turns = [], changeSpans: changeSpansProp, tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, runningTaskCount = 0, onOpenTasks, ariaLabel, onEdit, onDelete, onEditQuestion, onDeleteQuestion, editor = null, questionEditor = null, onCancelEdit, onSaveText, onAddAttachments, attachmentImageInput, onSaveTool, onSaveToolEdit, onSaveQuestion, onBranchFrom, branchFromDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onDeleteContexts, onUndo, onRedo, onForkAt, forkDisabledReason = null, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError, pathBaseDir = null }: ContextStreamProps) {
+export const ContextStream = memo(function ContextStream({ contexts, turns = [], changeSpans: changeSpansProp, tools, enabledTools, timelineId, readOnly = false, timelineMutationLocked = false, streaming = false, thinking = null, retryNotice = null, runningTaskCount = 0, onOpenTasks, ariaLabel, emptyState, onEdit, onDelete, onEditQuestion, onDeleteQuestion, editor = null, questionEditor = null, onCancelEdit, onSaveText, onAddAttachments, attachmentImageInput, onSaveTool, onSaveToolEdit, onSaveQuestion, onBranchFrom, branchFromDisabledReason, onRewindTo, rewindDisabledReason, branchNavigations, onSelectBranch, branchSwitchDisabledReason, onInsert, onDeleteContexts, onMoveContexts, onCopyContexts, onPasteContexts, pasteCount = 0, onUndo, onRedo, onForkAt, forkDisabledReason = null, onOpenSubagent, workflowRunByCall, onOpenWorkflowRun, onRetryTurnError, retryableTurnRequestId = null, onDismissTurnError, pathBaseDir = null }: ContextStreamProps) {
   const { t } = useI18n();
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
   /** Where the open menu is drawn, once its size is known. */
@@ -1006,6 +1063,10 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
   const [marquee, setMarquee] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
   const marqueeRef = useRef<MarqueeDrag | null>(null);
   const selecting = Boolean(onDeleteContexts) && !mutationReadOnly;
+  /** A press on what is picked out, followed until it is let go: a click, or a drag of all of it. */
+  const dragRef = useRef<TimelineDrag | null>(null);
+  /** Where what is being dragged would land: the insertion line a right-click draws, drawn there. */
+  const [dragTarget, setDragTarget] = useState<number | null>(null);
 
   // This menu is fixed to the pointer and can reach past the chat column, where the built-in
   // browser's native page paints above every HTML layer. Registering it buys the same hole in
@@ -1193,9 +1254,10 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     }
     return node.entries.map((entry) => entry.index);
   }).sort((left, right) => left - right), [renderNodes]);
-  const displayInsertionIndex = menu === null || menu.view.kind !== "insert"
+  const insertionIndex = dragTarget ?? (menu?.view.kind === "insert" ? menu.index : null);
+  const displayInsertionIndex = insertionIndex === null
     ? null
-    : renderedContextIndexes.find((index) => index >= menu.index) ?? contexts.length;
+    : renderedContextIndexes.find((index) => index >= insertionIndex) ?? contexts.length;
   const editingContextId = !mutationReadOnly && editor?.mode === "edit" ? editor.item.id : null;
   const editingQuestionId = !mutationReadOnly ? questionEditor?.item.id ?? null : null;
   // The insert editor snaps to the same drawn row the insertion line does, so an
@@ -1364,7 +1426,9 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     }
 
     const initialTimeline = previous === null;
-    const appended = previous !== null && next.length > previous.length;
+    // Appended means the timeline has a new tail. Contexts pasted or placed further up make it
+    // longer too, and following those would carry the reader off to the bottom, away from them.
+    const appended = previous !== null && next.length > previous.length && next.lastId !== previous.lastId;
     const growingTail = previous !== null
       && next.length === previous.length
       && next.lastId === previous.lastId
@@ -1452,6 +1516,12 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     drag.frame = null;
     const bounds = scroller.getBoundingClientRect();
     let scrolled = false;
+    // Until the press has travelled it is a click, which picks at its release and draws nothing.
+    drag.moved ||= Math.hypot(
+      drag.x - drag.startX,
+      drag.y - (drag.startContentY - scroller.scrollTop + bounds.top)
+    ) >= MARQUEE_THRESHOLD;
+    if (!drag.moved) return;
     if (!final) {
       const step = drag.y < bounds.top + MARQUEE_SCROLL_EDGE
         ? -Math.min(MARQUEE_SCROLL_STEP, bounds.top + MARQUEE_SCROLL_EDGE - drag.y)
@@ -1479,9 +1549,60 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
       width: Math.max(0, Math.min(box.right, bounds.right) - left),
       height: Math.max(0, Math.min(box.bottom, bounds.bottom) - top)
     });
-    const picked = idsInBox(box);
+    // The modifier is held for every box, so a box adds to what was picked out before it.
+    const picked = new Set([...drag.base, ...idsInBox(box)]);
     setSelection((current) => (sameIds(current, picked) ? current : picked));
     if (scrolled) drag.frame = window.requestAnimationFrame(() => stepMarqueeRef.current());
+  };
+
+  /**
+   * A click with the selection modifier held picks the context under it out, or
+   * lets it go if it was picked already, and leaves the rest of the selection
+   * as it was: how contexts that do not sit together are picked.
+   */
+  const toggleAt = (drag: MarqueeDrag) => {
+    const hit = idsInBox({ left: drag.x, right: drag.x, top: drag.y, bottom: drag.y });
+    if (!hit.size) return;
+    const picked = new Set(drag.base);
+    const letGo = [...hit].every((id) => drag.base.has(id));
+    for (const id of hit) {
+      if (letGo) picked.delete(id);
+      else picked.add(id);
+    }
+    setSelection(picked.size ? picked : NO_SELECTION);
+  };
+  const toggleAtRef = useRef(toggleAt);
+  toggleAtRef.current = toggleAt;
+
+  /** What is picked out, in timeline order. */
+  const orderedSelection = () => [...selectedIds].sort((left, right) => (
+    (contextIndexes.get(left) ?? 0) - (contextIndexes.get(right) ?? 0)
+  ));
+  /** What a press that outlives this render reads when it ends. */
+  const latestRef = useRef({ contexts, onMoveContexts, orderedSelection });
+  latestRef.current = { contexts, onMoveContexts, orderedSelection };
+
+  const copySelection = () => {
+    if (!selectedIds.size || !onCopyContexts) return;
+    setMenu(null);
+    onCopyContexts(orderedSelection());
+  };
+  /**
+   * Pastes what was copied over what is picked out. The selection is not let go
+   * here: what the paste takes out leaves it by leaving the timeline, and a
+   * paste that could not be made leaves it picked to try again.
+   */
+  const pasteOverSelection = () => {
+    if (!selectedIds.size || !onPasteContexts || !pasteCount) return;
+    const ids = orderedSelection();
+    setMenu(null);
+    onPasteContexts(contextIndexes.get(ids[0]) ?? contexts.length, ids);
+  };
+  /** Pastes what was copied at the insertion line. */
+  const pasteAt = (index: number) => {
+    if (!onPasteContexts || !pasteCount) return;
+    setMenu(null);
+    onPasteContexts(index, []);
   };
   const stepMarqueeRef = useRef(stepMarquee);
   stepMarqueeRef.current = stepMarquee;
@@ -1500,12 +1621,16 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     marqueeRef.current?.release?.();
     window.getSelection()?.removeAllRanges();
     setMenu(null);
+    // The press was kept from moving focus, and the selection's keys answer only in the timeline.
+    scroller.focus({ preventScroll: true });
     const drag: MarqueeDrag = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startContentY: event.clientY - bounds.top + scroller.scrollTop,
       x: event.clientX,
       y: event.clientY,
+      base: selectedIds,
+      moved: false,
       frame: null
     };
     const schedule = () => {
@@ -1522,6 +1647,7 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
       drag.x = ended.clientX;
       drag.y = ended.clientY;
       stepMarqueeRef.current(true);
+      if (!drag.moved && ended.type === "pointerup") toggleAtRef.current(drag);
       drag.release?.();
     };
     const swallow = (swallowed: Event) => {
@@ -1549,23 +1675,63 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
       setMarquee(null);
     };
     marqueeRef.current = drag;
-    stepMarqueeRef.current(true);
   };
 
-  useEffect(() => () => marqueeRef.current?.release?.(), []);
+  /**
+   * Follows a plain press on something picked out. Let go where it was made, it
+   * was a click, and lets the selection go like any other; moved, it drags
+   * everything picked out to wherever the insertion line is when it is let go.
+   */
+  const beginSelectionDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    const scroller = event.currentTarget;
+    const content = streamContentRef.current;
+    if (!content || !(event.target instanceof Element)) return;
+    // The press starts no text selection and no native drag; the click it may end in still lands.
+    event.preventDefault();
+    window.getSelection()?.removeAllRanges();
+    scroller.focus({ preventScroll: true });
+    dragRef.current?.cancel();
+    const drag = beginTimelineDrag({
+      scroller,
+      content,
+      endIndex: () => latestRef.current.contexts.length,
+      layer: overlayLayer(scroller),
+      onStart: () => setMenu(null),
+      onTarget: setDragTarget,
+      onFinish: (outcome) => {
+        if (dragRef.current === drag) dragRef.current = null;
+        setDragTarget(null);
+        if (outcome.kind === "click") setSelection(NO_SELECTION);
+        if (outcome.kind === "drop") latestRef.current.onMoveContexts?.(latestRef.current.orderedSelection(), outcome.index);
+      }
+    }, { pointerId: event.pointerId, x: event.clientX, y: event.clientY, target: event.target });
+    dragRef.current = drag;
+  };
+
+  useEffect(() => () => {
+    marqueeRef.current?.release?.();
+    dragRef.current?.cancel();
+  }, []);
 
   // A selection belongs to the timeline it was drawn on, and only lasts while it
   // can still be acted on.
   // biome-ignore lint/correctness/useExhaustiveDependencies: `timelineId` is the switch that ends the selection, though nothing here reads it.
   useEffect(() => {
     marqueeRef.current?.release?.();
+    dragRef.current?.cancel();
     setSelection(NO_SELECTION);
   }, [timelineId]);
   useEffect(() => {
     if (selecting) return;
     marqueeRef.current?.release?.();
+    dragRef.current?.cancel();
     setSelection(NO_SELECTION);
   }, [selecting]);
+  // A drag measures the cards it found when it began, so a timeline whose order changes under it
+  // ends it. The same contexts handed down again as a new list change nothing it measured.
+  const contextOrder = useMemo(() => contexts.map((context) => context.id).join(" "), [contexts]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `contextOrder` is the change that ends the drag, though nothing here reads it.
+  useEffect(() => () => dragRef.current?.cancel(), [contextOrder]);
   useEffect(() => {
     if (!selectedIds.size) setMenu((current) => (current?.view.kind === "selection" ? null : current));
   }, [selectedIds]);
@@ -1593,7 +1759,8 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
           <TimelineBlock
             entries={node.entries}
             tools={tools}
-            insertionIndex={displayInsertionIndex}
+            // Only the block the line falls in hears where it is, so moving it redraws that block alone.
+            insertionIndex={displayInsertionIndex !== null && displayInsertionIndex >= first && displayInsertionIndex < after ? displayInsertionIndex : null}
             readOnly={mutationReadOnly}
             editingContextId={editingContextId}
             onEdit={onEdit}
@@ -1654,6 +1821,8 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
           onDeleteItem={onDelete}
           onBranchFromItem={onBranchFrom}
           branchFromDisabledReason={branchFromDisabledReason}
+          onRewindToItem={onRewindTo}
+          rewindDisabledReason={rewindDisabledReason}
           branchNavigation={branchNavigations?.[node.item.id]}
           onSelectBranchFor={onSelectBranch}
           branchSwitchDisabledReason={branchSwitchDisabledReason}
@@ -1703,21 +1872,32 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
       className="context-scroll"
       data-main-context-stream={!readOnly || undefined}
       data-selecting={marquee ? "true" : undefined}
+      data-timeline-draggable={selecting && onMoveContexts && selectedIds.size ? "true" : undefined}
       role={ariaLabel ? "region" : undefined}
       aria-label={ariaLabel}
       // Focus that lands on the timeline's own background — a click between
       // cards — still has to be in the timeline for its undo keys to answer.
-      tabIndex={!readOnly && (onUndo || onRedo) ? -1 : undefined}
+      tabIndex={!readOnly && (onUndo || onRedo || selecting) ? -1 : undefined}
       onPointerDownCapture={(event) => {
         if (event.button !== 0) return;
         if (selecting && timelineSelectionModifier(event) && !isEditableTarget(event.target)) {
           beginMarquee(event);
           return;
         }
-        // A plain press anywhere but on the selection's own menu lets the selection go.
-        if (selection.size && !(event.target instanceof Node && menuRef.current?.contains(event.target))) {
-          setSelection(NO_SELECTION);
+        if (!selection.size || (event.target instanceof Node && menuRef.current?.contains(event.target))) return;
+        // A press on what is picked out may be the start of dragging it somewhere.
+        if (
+          selecting
+          && onMoveContexts
+          && event.target instanceof Element
+          && !isEditableTarget(event.target)
+          && streamContentRef.current?.contains(event.target.closest("[data-timeline-selected]"))
+        ) {
+          beginSelectionDrag(event);
+          return;
         }
+        // Any other plain press, anywhere but on the selection's own menu, lets the selection go.
+        setSelection(NO_SELECTION);
       }}
       onContextMenuCapture={selecting && selectedIds.size ? (event) => {
         // With contexts picked out, a right-click anywhere is about them, not
@@ -1732,7 +1912,27 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
         }
       }}
       onKeyDown={(event) => {
-        if (event.defaultPrevented || isEditableTarget(event.target)) return;
+        if (event.defaultPrevented || isEditableTarget(event.target) || dragRef.current?.active) return;
+        const clipboardAction = selecting ? timelineClipboardKey(event) : null;
+        // Words selected in a message are what Ctrl+C copies; the contexts picked out are next.
+        if (clipboardAction === "copy" && selectedIds.size && onCopyContexts && window.getSelection()?.isCollapsed !== false) {
+          event.preventDefault();
+          copySelection();
+          return;
+        }
+        if (clipboardAction === "paste" && onPasteContexts && pasteCount > 0) {
+          // Over what is picked out; failing that, at the line an open insert menu has drawn.
+          if (selectedIds.size) {
+            event.preventDefault();
+            pasteOverSelection();
+            return;
+          }
+          if (menu?.view.kind === "insert") {
+            event.preventDefault();
+            pasteAt(menu.index);
+            return;
+          }
+        }
         const historyAction = readOnly ? null : timelineHistoryKey(event);
         if (historyAction) {
           const run = historyAction === "undo" ? onUndo : onRedo;
@@ -1781,7 +1981,7 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
     >
       <div ref={streamContentRef} className="context-stream">
         {!insertEditor && renderNodes.length === 0 && turnProjection.leadingTurns.length === 0 ? (
-          <EmptyState
+          emptyState ?? <EmptyState
             icon={<MewrkIcon plate={false} size={44} />}
             title={t("这段对话还没有消息", "This conversation has no messages yet")}
             description={mutationReadOnly ? undefined : t("在上下文之间右键，可精确插入新内容", "Right-click between contexts to insert content precisely")}
@@ -1836,20 +2036,47 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
           style={menuStyle(menu)}
           onPointerDown={(event) => event.stopPropagation()}
           onKeyDown={(event) => {
-            if (event.key !== "Escape") return;
+            if (event.key === "Escape") {
+              event.preventDefault();
+              const trigger = menu.trigger;
+              setMenu(null);
+              window.requestAnimationFrame(() => trigger?.focus());
+              return;
+            }
+            if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
             event.preventDefault();
-            const trigger = menu.trigger;
-            setMenu(null);
-            window.requestAnimationFrame(() => trigger?.focus());
+            const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+            const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
+            const direction = event.key === "ArrowDown" ? 1 : -1;
+            buttons[(current + direction + buttons.length) % buttons.length]?.focus();
           }}
         >
+          {onCopyContexts && (
+            <button type="button" role="menuitem" onClick={copySelection}>
+              {t("复制", "Copy")}
+              <kbd className="context-menu__keys">{timelineClipboardShortcut("copy")}</kbd>
+            </button>
+          )}
+          {onPasteContexts && (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={!pasteCount}
+              title={pasteCount
+                ? t("用复制的消息替换所选消息", "Replace the selected messages with the copied ones")
+                : t("还没有复制任何消息", "No messages have been copied yet")}
+              onClick={pasteOverSelection}
+            >
+              {t("粘贴", "Paste")}
+              <kbd className="context-menu__keys">{timelineClipboardShortcut("paste")}</kbd>
+            </button>
+          )}
+          {(onCopyContexts || onPasteContexts) && <div className="context-menu__divider" role="separator" />}
           <button
             type="button"
             role="menuitem"
             onClick={() => {
-              const ids = [...selectedIds].sort((left, right) => (
-                (contextIndexes.get(left) ?? 0) - (contextIndexes.get(right) ?? 0)
-              ));
+              const ids = orderedSelection();
               setMenu(null);
               setSelection(NO_SELECTION);
               onDeleteContexts?.(ids);
@@ -1993,23 +2220,35 @@ export const ContextStream = memo(function ContextStream({ contexts, turns = [],
                 </div>
               );
             })}
+            {(onPasteContexts || onForkAt) && <div className="context-menu__divider" role="separator" />}
+            {onPasteContexts && (
+              <button
+                type="button"
+                role="menuitem"
+                disabled={!pasteCount}
+                title={pasteCount
+                  ? t("把复制的消息插入到分割线处", "Insert the copied messages at the line")
+                  : t("还没有复制任何消息", "No messages have been copied yet")}
+                onClick={() => pasteAt(menu.index)}
+              >
+                {t("粘贴", "Paste")}
+                <kbd className="context-menu__keys">{timelineClipboardShortcut("paste")}</kbd>
+              </button>
+            )}
             {onForkAt && (
-              <>
-                <div className="context-menu__divider" role="separator" />
-                <button
-                  type="button"
-                  role="menuitem"
-                  disabled={menu.index === 0 || Boolean(forkDisabledReason)}
-                  title={forkDisabledReason
-                    ?? (menu.index === 0 ? t("分割线上方没有可分叉的上下文", "There is nothing above the line to fork") : undefined)}
-                  onClick={() => {
-                    onForkAt(menu.index);
-                    setMenu(null);
-                  }}
-                >
-                  {t("分叉会话", "Fork conversation")}
-                </button>
-              </>
+              <button
+                type="button"
+                role="menuitem"
+                disabled={menu.index === 0 || Boolean(forkDisabledReason)}
+                title={forkDisabledReason
+                  ?? (menu.index === 0 ? t("分割线上方没有可分叉的上下文", "There is nothing above the line to fork") : undefined)}
+                onClick={() => {
+                  onForkAt(menu.index);
+                  setMenu(null);
+                }}
+              >
+                {t("分叉会话", "Fork conversation")}
+              </button>
             )}
           </div>
         </MenuSurfacesContext.Provider>,

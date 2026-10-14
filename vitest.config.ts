@@ -1,8 +1,10 @@
 import { configDefaults, defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
+// @ts-expect-error This config-only module intentionally has no browser-facing declaration file.
+import { fileIconsPlugin } from "./scripts/vite-file-icons.mjs";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), fileIconsPlugin()],
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],

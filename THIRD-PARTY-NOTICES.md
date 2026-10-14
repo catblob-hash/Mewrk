@@ -183,6 +183,47 @@ SOFTWARE.
 
 ---
 
+## `material-icon-theme` — MIT
+
+**Distributed files:** the file-type icons, `file-icons/*.svg` in the frontend bundle
+
+The icons Mewrk draws beside file names are those of
+[Material Icon Theme](https://github.com/material-extensions/vscode-material-icon-theme),
+taken unmodified from the `material-icon-theme` npm package at the version
+`package-lock.json` pins (`5.39.0` when this notice was written). They are not
+vendored in this repository: [`scripts/vite-file-icons.mjs`](scripts/vite-file-icons.mjs)
+reads the installed package, copies the icons its manifest assigns to files into the
+build, and distills the manifest's file-name and extension tables for the renderer.
+The theme's folder icons and the extension's own code are not distributed.
+
+Many of these icons depict the logo of the language, tool or product whose files
+they mark. Those marks remain their owners'; Mewrk uses them only to identify a
+file's type, and the license below covers the drawings, not the marks.
+
+```
+The MIT License (MIT)
+Copyright (c) 2025 Material Extensions
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+---
+
 ## `@anthropic-ai/claude-agent-sdk` — Anthropic Commercial Terms of Service
 
 **Not distributed by Mewrk; downloaded from npm at the user's request.** Neither

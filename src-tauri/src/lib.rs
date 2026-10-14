@@ -59,6 +59,7 @@ mod external_open;
 mod favicon;
 mod file_attachments;
 mod file_browser;
+mod file_checkpoints;
 mod file_read_state;
 mod file_sandbox;
 mod fork_requests;
@@ -683,6 +684,104 @@ fn attest_inserted_tool_context(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = document_path(&app)?;
     conversations::attest_inserted_tool_context(&state, &path, request)
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+fn attest_copied_tool_contexts(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: conversations::AttestCopiedToolContextsRequest,
+) -> Result<Vec<String>, String> {
+    let _guard = state
+        .storage_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = document_path(&app)?;
+    conversations::attest_copied_tool_contexts(&state, &path, request)
+}
+
+/// Puts the files the conversation's model changed back as they were before one
+/// of its user messages, or reports what that would do (`dry_run`).
+///
+/// The storage lock is held throughout, like every command that reads the
+/// conversation: a run registers before it asks for that lock
+/// (`trusted_run_request`), so one that was not yet registered when
+/// `file_checkpoints::rewind` looked cannot make a tool call until this returns.
+/// It runs off the main thread because it reads and writes files.
+///
+/// The operation gate's workspace lease is deliberately not taken. It refuses
+/// while any model run or any command in a terminal of the workspace is going on
+/// — a dev server started there would block every rewind — and what it would add
+/// is only the same exclusion from other conversations, which `peers` gives for
+/// the runs that can write these checkouts.
+#[cfg(not(test))]
+#[tauri::command]
+async fn rewind_files(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: file_checkpoints::RewindFilesRequest,
+) -> Result<file_checkpoints::RewindFilesResponse, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = state
+            .storage_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = document_path(&app)?;
+        let (roots, peers) = rewind_places(&app, &state, &path, &request.conversation_id)?;
+        file_checkpoints::rewind(
+            &state,
+            &path,
+            request,
+            &file_checkpoints::RewindContext {
+                roots: &roots,
+                peers: &peers,
+            },
+        )
+    })
+    .await
+    .map_err(|error| {
+        ui_text!(
+            "文件回退的后台任务失败: {error}",
+            "The file rewind task failed: {error}"
+        )
+    })?
+}
+
+/// Where a conversation's files are on this machine, and who else may be writing
+/// them: its workspace roots here, and the other conversations working in the
+/// same checkout rather than a worktree of their own.
+#[cfg(not(test))]
+fn rewind_places(
+    app: &AppHandle,
+    state: &AppState,
+    anchor: &Path,
+    conversation_id: &str,
+) -> Result<(Vec<PathBuf>, Vec<String>), String> {
+    let document = state.document_store.read(anchor)?;
+    let (workspace, conversation) =
+        trusted_workspace_and_conversation(&document, conversation_id, "文件回退")?;
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法解析应用数据目录: {error}"))?;
+    let workspace_path = effective_workspace_path(&app_data, workspace, conversation)?;
+    let roots = conversation_workspace_set(&document, workspace, conversation, &workspace_path)?
+        .local_roots()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let target = workspace_lookup::GitTarget::Conversation {
+        conversation_id: conversation_id.to_owned(),
+        member: None,
+    };
+    let peers = resolve_checkout(&document, &app_data, &target, "文件回退")?
+        .writers
+        .into_iter()
+        .filter(|peer| peer != conversation_id)
+        .collect();
+    Ok((roots, peers))
 }
 
 /// Loads an authoritative conversation body after turn settlement.
@@ -2239,6 +2338,13 @@ fn open_external_url_in_background(url: String) {
 /// caption buttons over the top row's right end (`--window-caption-width`); the system still
 /// resizes the frameless window from its edges and keeps its shadow. Anywhere else the frame
 /// stays.
+///
+/// The WebView2 keeps Wry's own switches, DirectComposition among them. Turned off, Chromium
+/// presents through the window's redirection surface instead of a flip-model swap chain, and
+/// the page tears as it scrolls on a high-refresh display. The price of leaving it on is paid
+/// on AMD, whose cursor rides whatever plane is under it: over a page DWM has promoted to an
+/// overlay plane the inverting cursors (`col-resize`, `row-resize`) draw blank and
+/// `grab`/`grabbing` lose their outline.
 fn main_window_chrome(
     #[allow(unused_mut)] mut config: tauri::utils::config::WindowConfig,
 ) -> tauri::utils::config::WindowConfig {
@@ -2251,18 +2357,9 @@ fn main_window_chrome(
     #[cfg(windows)]
     {
         config.decorations = false;
-        config.additional_browser_args = Some(MAIN_WEBVIEW_BROWSER_ARGS.to_owned());
     }
     config
 }
-
-/// The main window's WebView2 switches. Setting any replaces Wry's defaults, so the first two
-/// restate them. Without DirectComposition Chromium presents through the window's redirection
-/// surface, so DWM composites the page instead of promoting it to an overlay plane; on AMD,
-/// whose cursor rides whatever plane is under it, a promoted page left the inverting cursors
-/// (`col-resize`, `row-resize`) blank and stripped the outline from `grab`/`grabbing`.
-#[cfg(windows)]
-const MAIN_WEBVIEW_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required --disable-direct-composition";
 
 #[derive(Debug, PartialEq, Eq)]
 enum MainWindowNavigation {
@@ -3764,25 +3861,16 @@ fn stop_conversation_task(
     conversation_id: String,
     task: String,
 ) -> Result<bool, String> {
-    if let Some(shell_task_id) = task.strip_prefix("shell:") {
-        return Ok(state
-            .shell_tasks
-            .request_stop(&conversation_id, shell_task_id));
-    }
-    let Some(tasks) = state.existing_conversation_tasks(&conversation_id) else {
-        return Ok(false);
-    };
-    let entry = tasks
-        .pool
-        .find(&task)
-        .or_else(|| tasks.pool.find_by_label(&task));
-    match entry {
-        Some(shared) => {
-            shared.stop_task(crate::agents::StopOrigin::User);
-            Ok(true)
-        }
-        None => Ok(false),
-    }
+    // The same act the model's `task_stop` performs, so the two stops settle
+    // alike; only the origin differs, and with it the sentence the result carries.
+    let tasks = state.existing_conversation_tasks(&conversation_id);
+    Ok(crate::agents::stop_task_by_address(
+        tasks.as_ref().map(|tasks| &*tasks.pool),
+        &state.shell_tasks,
+        &conversation_id,
+        &task,
+        crate::agents::StopOrigin::User,
+    ))
 }
 
 /// Restores level-triggered task wake-ups. `TaskSettled` is an edge event and
@@ -6810,9 +6898,11 @@ fn stop_shell_task(
     conversation_id: String,
     shell_task_id: String,
 ) -> bool {
-    state
-        .shell_tasks
-        .request_stop(&conversation_id, &shell_task_id)
+    state.shell_tasks.request_stop(
+        &conversation_id,
+        &shell_task_id,
+        crate::agents::StopOrigin::User,
+    )
 }
 
 /// Every shell command this conversation is running right now. Push events carry

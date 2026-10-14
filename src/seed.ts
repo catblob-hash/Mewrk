@@ -41,9 +41,14 @@ export const toolCatalog: ToolDescriptor[] = [
     parameters: [
       { name: "pattern", label: "搜索内容", type: "string", required: true, placeholder: "TODO|FIXME" },
       { name: "path", label: "范围", type: "string", required: false, defaultValue: "." },
-      { name: "case_sensitive", label: "区分大小写", type: "boolean", required: false, defaultValue: false },
-      { name: "limit", label: "条数上限", type: "number", required: false, defaultValue: 250, help: "最多返回的匹配行，默认 250，至多 1000" },
-      { name: "offset", label: "跳过", type: "number", required: false, defaultValue: 0, help: "先跳过这么多匹配行，用于翻到下一页" }
+      { name: "glob", label: "文件通配", type: "string", required: false, placeholder: "*.rs", help: "只搜索路径匹配该 glob 的文件，例如 *.rs 或 src/**/*.tsx" },
+      { name: "case_sensitive", label: "区分大小写", type: "boolean", required: false, defaultValue: true },
+      { name: "output_mode", label: "输出模式", type: "string", required: false, defaultValue: "files_with_matches", help: "files_with_matches（默认）只列出含匹配的文件；content 列出匹配行；count 统计每个文件的匹配行数" },
+      { name: "context", label: "上下文行数", type: "number", required: false, help: "仅 content 模式：每处匹配前后各带几行上下文，0 至 20" },
+      { name: "before", label: "前置行数", type: "number", required: false, help: "仅 content 模式：每处匹配之前的上下文行数，0 至 20" },
+      { name: "after", label: "后置行数", type: "number", required: false, help: "仅 content 模式：每处匹配之后的上下文行数，0 至 20" },
+      { name: "limit", label: "条数上限", type: "number", required: false, defaultValue: 250, help: "最多返回所选模式的结果条数，默认 250，至多 1000" },
+      { name: "offset", label: "跳过", type: "number", required: false, defaultValue: 0, help: "先跳过所选模式的这么多条结果，用于翻到下一页" }
     ]
   },
   {
@@ -399,6 +404,16 @@ export const toolCatalog: ToolDescriptor[] = [
     category: "orchestration",
     dangerous: false,
     parameters: []
+  },
+  {
+    name: "task_stop",
+    label: "停止任务",
+    description: "",
+    category: "orchestration",
+    dangerous: false,
+    parameters: [
+      { name: "task", label: "任务地址", type: "string", required: true, placeholder: "shell:1", help: "要停止的任务地址：后台命令写 shell:<id>，子代理与工作流直接写名称（工作流也可写 workflow:<runId>）；终端会话不能用它停止，开发服务器用 preview_stop。被停任务的结果仍会照常交付" }
+    ]
   },
   {
     name: "box",

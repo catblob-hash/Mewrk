@@ -1871,4 +1871,33 @@ describe("GitReviewPanel", () => {
     expect(git.executeGitAction).not.toHaveBeenCalled();
   });
 
+  it("offers to mention a right-clicked diff line in the conversation", async () => {
+    const onMentionLine = vi.fn();
+    render(
+      <GitReviewPanel
+        paneId={"review" as SidePaneId}
+        paneExpanded={false}
+        onPaneToggleExpand={() => undefined}
+        onPaneFocus={() => undefined}
+        onPaneClose={() => undefined}
+        target={gitConversationTarget("conversation-1")}
+        snapshot={snapshot}
+        active
+        onMentionLine={onMentionLine}
+      />
+    );
+    await waitFor(() => expect(git.getGitDiff).toHaveBeenCalledTimes(1));
+    await expandFileCard("src/App.tsx");
+
+    const added = await waitFor(() => {
+      const found = fileCard("src/App.tsx")?.querySelector(".diff-viewer__line--addition .diff-viewer__text");
+      if (!found) throw new Error("no added line in src/App.tsx");
+      return found;
+    });
+    fireEvent.contextMenu(added, { clientX: 12, clientY: 34 });
+    await userEvent.click(await screen.findByRole("menuitem", { name: "在会话中提及" }));
+
+    expect(onMentionLine).toHaveBeenCalledWith("src/App.tsx", 1);
+  });
+
 });

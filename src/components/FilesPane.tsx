@@ -1,14 +1,11 @@
 import {
+  AtSign,
   ChevronLeft,
   ChevronRight,
   Code2,
   Copy,
-  Database,
   Eye,
   File,
-  FileArchive,
-  FileCode2,
-  FileImage,
   FilePlus2,
   FolderInput,
   FolderOpen,
@@ -26,12 +23,9 @@ import {
   PenLine,
   Pin,
   Plus,
-  Presentation,
   RotateCw,
-  Scroll,
   Search,
   Server,
-  Sheet,
   SquareArrowOutUpRight,
   SquareX,
   Trash2,
@@ -50,6 +44,7 @@ import { useI18n } from "../i18n";
 import { hasBackendRuntime } from "../lib/backend";
 import { localLinkTarget, scrollIntoContainer, scrollToFragment } from "../lib/documentLinks";
 import { externalHttpUrl } from "../lib/externalLinks";
+import type { FileMention } from "../lib/fileMention";
 import {
   browseAncestors,
   browseCreateDirectory,
@@ -83,7 +78,6 @@ import type {
   BrowseMachine,
   BrowseSearchMatch
 } from "../lib/fileBrowser";
-import { fileIconKind } from "../lib/fileIcons";
 import {
   binaryMediaType,
   codeLanguage,
@@ -105,6 +99,7 @@ import { MarkdownCodeBlock, NumberedCode } from "./CodeBlock";
 import { IconButton } from "./Common";
 import { ContextMenu } from "./ContextMenu";
 import type { ContextMenuAnchor, ContextMenuItem, ContextMenuSection } from "./ContextMenu";
+import { FileIcon } from "./FileIcon";
 import { AudioPlayer } from "./FilePreview/AudioPlayer";
 import { CsvTable } from "./FilePreview/CsvTable";
 import { FontPreview } from "./FilePreview/FontPreview";
@@ -175,6 +170,8 @@ export interface FilesPaneProps {
   openRequest?: FilesPaneOpenRequest | null;
   /** Told once `openRequest` has been acted on, so a later mount does not act on it again. */
   onOpenRequestHandled?: (nonce: number) => void;
+  /** Given, a line of a file shown as text can be mentioned in the conversation from its menu. */
+  onMention?: (mention: FileMention) => void;
   expanded: boolean;
   onToggleExpand: () => void;
   onPaneFocus: () => void;
@@ -315,28 +312,6 @@ function filesystemRoot(path: string): string {
 
 function copyText(text: string): void {
   void navigator.clipboard?.writeText(text).catch(() => undefined);
-}
-
-function FileKindIcon({ path, className }: { path: string; className?: string }) {
-  const props = { size: 14, "aria-hidden": true as const, className };
-  switch (fileIconKind(path)) {
-    case "code":
-      return <FileCode2 {...props} />;
-    case "data":
-      return <Database {...props} />;
-    case "sheet":
-      return <Sheet {...props} />;
-    case "preso":
-      return <Presentation {...props} />;
-    case "image":
-      return <FileImage {...props} />;
-    case "archive":
-      return <FileArchive {...props} />;
-    case "skill":
-      return <Scroll {...props} />;
-    default:
-      return <File {...props} />;
-  }
 }
 
 function MachineIcon({ machine, className }: { machine: BrowseMachine; className?: string }) {
@@ -508,6 +483,7 @@ export function FilesPane({
   active,
   openRequest = null,
   onOpenRequestHandled,
+  onMention,
   expanded: paneExpanded,
   onToggleExpand,
   onPaneFocus,
@@ -758,7 +734,8 @@ export function FilesPane({
   useEffect(() => {
     if (!active || !workspaces.length || !hasBackendRuntime()) return;
     let cancelled = false;
-    browseProbePaths(workspaces.map((workspace) => ({ machine: workspace.machine, path: workspace.path })))
+    // Asked in the host's spelling: a root recorded as `\\?\C:\…` is not a path the file service finds.
+    browseProbePaths(workspaces.map((workspace) => ({ machine: workspace.machine, path: browsePath(workspace.path) })))
       .then((results) => {
         if (cancelled) return;
         setResolvedRoots(new Map(results.flatMap((result, index) => (
@@ -1687,6 +1664,29 @@ export function FilesPane({
     setMenu({ anchor, sections });
   }, []);
 
+  /**
+   * A line of the open file's menu. The file is named the way the model addresses it: inside
+   * its workspace, or by its whole path when it is in none.
+   */
+  const lineMenu = useMemo(() => {
+    if (!onMention || !activeFile) return undefined;
+    return (line: number, point: { x: number; y: number }) => {
+      const workspace = containingWorkspace(activeFile);
+      const relative = workspace ? relativeBrowsePath(workspace.root, activeFile.path) : null;
+      openMenu(point, [{
+        id: "mention",
+        items: [{
+          id: "mention",
+          label: t("在会话中提及", "Mention in Conversation"),
+          icon: <AtSign size={13} aria-hidden="true" />,
+          onSelect: () => onMention(workspace && relative
+            ? { path: relative, workspace: workspace.number, line }
+            : { path: nativeSpelling(activeFile.path), workspace: null, line })
+        }]
+      }]);
+    };
+  }, [activeFile, containingWorkspace, onMention, openMenu, t]);
+
   // ---- address bar --------------------------------------------------------
 
   const addressText = directory ? formatAddress(directory.machine, directory.path, addressContext) : "";
@@ -1992,7 +1992,7 @@ export function FilesPane({
             content: page.preview ? <>{label}<span className="sr-only">{t("预览", "preview")}</span></> : undefined,
             title: pageTitle(page),
             icon: page.file
-              ? <FileKindIcon path={page.file.path} />
+              ? <FileIcon path={page.file.path} />
               : page.directory
                 ? <FolderOpen size={14} aria-hidden="true" />
                 : <Monitor size={14} aria-hidden="true" />,
@@ -2218,7 +2218,7 @@ export function FilesPane({
               className={`files-pane__chevron${row.expanded ? " files-pane__chevron--open" : ""}`}
             />
           )
-          : <FileKindIcon path={row.path} className="files-pane__icon" />}
+          : <FileIcon path={row.path} className="files-pane__icon" />}
         {editor ?? <span className="files-pane__name">{row.name}</span>}
         {row.link && !editor && <Link2 size={11} aria-label={t("链接", "link")} className="files-pane__link" />}
         {!editor && rowMenuButton(() => entryMenu(location, row.kind), t("文件操作", "File actions"))}
@@ -2341,7 +2341,7 @@ export function FilesPane({
             >
               {match.kind === "directory"
                 ? <FolderOpen size={14} aria-hidden="true" className="files-pane__icon" />
-                : <FileKindIcon path={match.path} className="files-pane__icon" />}
+                : <FileIcon path={match.path} className="files-pane__icon" />}
               <span className="files-pane__name">{highlight(match.name, match.positions, separator + 1)}</span>
               {parentPath && <span className="files-pane__detail">{highlight(parentPath, match.positions, 0)}</span>}
               {rowMenuButton(() => entryMenu(location, match.kind), t("文件操作", "File actions"))}
@@ -2670,6 +2670,7 @@ export function FilesPane({
               htmlResources={htmlResources}
               onOpenFile={onOpenFileFromPage}
               onReveal={revealActiveFile}
+              onLineMenu={lineMenu}
             />
             {!treeVisible && notices}
           </div>
@@ -2729,6 +2730,8 @@ interface FileViewerBodyProps {
   onOpenFile: (path: string, line: number | null) => void;
   /** Shows the file in the system file manager; absent where there is none to reach. */
   onReveal?: () => void;
+  /** A right click on a line of the file's text, when the pane has a menu for one. */
+  onLineMenu?: (line: number, point: { x: number; y: number }) => void;
 }
 
 /**
@@ -2752,7 +2755,8 @@ function FileViewerBody({
   resolveImageSrc,
   htmlResources,
   onOpenFile,
-  onReveal
+  onReveal,
+  onLineMenu
 }: FileViewerBodyProps) {
   const { t } = useI18n();
   const name = browseName(path);
@@ -2862,6 +2866,7 @@ function FileViewerBody({
       language={codeLanguage(path)}
       label={path}
       litLine={litLine}
+      onLineMenu={onLineMenu}
     />
   );
 }

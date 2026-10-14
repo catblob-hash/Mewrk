@@ -4,6 +4,7 @@ import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { configureI18n } from "../../i18n";
 import { defaultAppearancePreferences } from "../../lib/appearance";
+import { codeThemesFor } from "../../lib/codeThemes";
 import type { GlobalSettings } from "../../types";
 import { AppearanceSettings } from ".";
 
@@ -314,6 +315,75 @@ describe("AppearanceSettings", () => {
     fireEvent.change(input, { target: { files: [new File(["x"], "broken.png")] } });
     expect(await within(dialog).findByRole("alert")).toHaveTextContent("This picture can't be read");
     expect(getSettings().appearance.background).toBe("solid");
+  });
+
+  describe("code appearance", () => {
+    function optionNames(select: HTMLElement): (string | null)[] {
+      return within(select).getAllByRole("option").map((option) => option.textContent);
+    }
+
+    it("lists only the themes of its own scheme in each select", () => {
+      renderSettings();
+      const light = screen.getByLabelText("Code appearance in the light theme");
+      const dark = screen.getByLabelText("Code appearance in the dark theme");
+
+      expect(optionNames(light)).toEqual(codeThemesFor("day").map((theme) => theme.name));
+      expect(optionNames(light)).toEqual(expect.arrayContaining(["Mewrk Light", "GitHub Light"]));
+      expect(optionNames(light)).not.toContain("Dracula");
+
+      expect(optionNames(dark)).toEqual(codeThemesFor("night").map((theme) => theme.name));
+      expect(optionNames(dark)).toEqual(expect.arrayContaining(["Mewrk Dark", "Dracula"]));
+      expect(optionNames(dark)).not.toContain("GitHub Light");
+    });
+
+    it("saves a night theme chosen in the dark select, and leaves the day theme as it was", async () => {
+      const user = userEvent.setup();
+      const { getSettings } = renderSettings();
+
+      await user.selectOptions(screen.getByLabelText("Code appearance in the dark theme"), "Dracula");
+
+      expect(getSettings().appearance.codeThemeNight).toBe("dracula");
+      expect(getSettings().appearance.codeThemeDay).toBe("mewrk-light");
+    });
+
+    it("saves a day theme chosen in the light select", async () => {
+      const user = userEvent.setup();
+      const { getSettings } = renderSettings();
+
+      await user.selectOptions(screen.getByLabelText("Code appearance in the light theme"), "GitHub Light");
+
+      expect(getSettings().appearance.codeThemeDay).toBe("github-light");
+      expect(getSettings().appearance.codeThemeNight).toBe("mewrk-dark");
+    });
+
+    it("shows the scheme's default as selected for a saved id it does not know", () => {
+      const initial = globalSettings();
+      // Dracula is a night theme saved as the day one; "nope" is no theme at all.
+      initial.appearance = { ...initial.appearance, codeThemeDay: "dracula", codeThemeNight: "nope" };
+      renderSettings(initial);
+
+      expect(screen.getByLabelText("Code appearance in the light theme")).toHaveValue("mewrk-light");
+      expect(screen.getByLabelText("Code appearance in the dark theme")).toHaveValue("mewrk-dark");
+    });
+
+    it("draws a preview beside each select in that scheme, in the selected theme's keyword colour", async () => {
+      const user = userEvent.setup();
+      renderSettings();
+      const light = screen.getByLabelText("Code appearance in the light theme");
+      const dark = screen.getByLabelText("Code appearance in the dark theme");
+
+      expect(light.nextElementSibling).toHaveClass("code-theme-preview");
+      expect(light.nextElementSibling).toHaveAttribute("data-scheme", "day");
+      expect((light.nextElementSibling as HTMLElement).style.getPropertyValue("--code-keyword")).toBe("#6254aa");
+      expect(dark.nextElementSibling).toHaveClass("code-theme-preview");
+      expect(dark.nextElementSibling).toHaveAttribute("data-scheme", "night");
+      expect((dark.nextElementSibling as HTMLElement).style.getPropertyValue("--code-keyword")).toBe("#a99cf0");
+
+      await user.selectOptions(dark, "Dracula");
+
+      expect(dark.nextElementSibling).toHaveAttribute("data-scheme", "night");
+      expect((dark.nextElementSibling as HTMLElement).style.getPropertyValue("--code-keyword")).toBe("#ff79c6");
+    });
   });
 
   describe("local model", () => {

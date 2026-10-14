@@ -5,6 +5,7 @@ import { useI18n } from "../i18n";
 import { paneKind, sidePaneDomId } from "../lib/sidePanes";
 import type { SidePaneId } from "../lib/sidePanes";
 import { IconButton } from "./Common";
+import { GlassPlate } from "./GlassPlate";
 import { PaneTileGeometryContext } from "./paneTileGeometry";
 import { PopoverMenu } from "./PopoverMenu";
 import type { PopoverMenuSection } from "./PopoverMenu";
@@ -156,6 +157,7 @@ export function SidePane({
       onPointerDownCapture={onFocus}
       onFocusCapture={onFocus}
     >
+      <GlassPlate />
       <header className="side-pane__header">
         {header
           ? <div className="side-pane__header-slot">{header}</div>

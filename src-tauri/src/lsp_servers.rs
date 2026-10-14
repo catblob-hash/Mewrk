@@ -9,8 +9,11 @@
 //! written fresh rather than borrowed from [`crate::mcp`].
 //!
 //! Servers start lazily, on the first request for a file whose extension they
-//! claim, and are keyed by `(machine, root, name)` so every conversation in a
-//! workspace shares one `rust-analyzer` rather than paying its index cost again.
+//! claim — or on the first edit of such a file, in the background, so the edit
+//! never waits for it — and are keyed by `(machine, root, name)` so every
+//! conversation in a workspace shares one `rust-analyzer` rather than paying its
+//! index cost again. At most one start per key is in flight at any moment: a
+//! second caller, whether an edit or a navigation call, joins it.
 //!
 //! A workspace on another machine gets its server *there*: the process is
 //! started through that machine's shell transport — the same `wsl.exe` or
@@ -25,14 +28,14 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError, SyncSender},
-        Arc, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::{json, Map, Value};
@@ -263,7 +266,16 @@ struct ConversationLedger {
     /// in one project would be handed another project's compile errors.
     roots: BTreeSet<ServerRoot>,
     pending: BTreeSet<String>,
-    delivered: VecDeque<u64>,
+    delivered: VecDeque<Delivered>,
+}
+
+/// One problem this conversation has been shown. The file is kept beside the
+/// fingerprint (which already folds the file in, but one-way) so an edit can
+/// make a single file's problems reportable again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Delivered {
+    file: u64,
+    fingerprint: u64,
 }
 
 /// Published diagnostics, and who has already been told about them.
@@ -350,6 +362,7 @@ impl DiagnosticsLedger {
             let Some(file) = self.current.get(&uri) else {
                 continue;
             };
+            let file_key = hash_file(&uri);
             let mut fresh = Vec::new();
             for diagnostic in &file.diagnostics {
                 if fresh.len() >= MAX_DIAGNOSTICS_PER_FILE || total + fresh.len() >= MAX_DIAGNOSTICS_TOTAL
@@ -357,10 +370,17 @@ impl DiagnosticsLedger {
                     break;
                 }
                 let fingerprint = fingerprint_diagnostic(&uri, diagnostic);
-                if ledger.delivered.contains(&fingerprint) {
+                if ledger
+                    .delivered
+                    .iter()
+                    .any(|shown| shown.fingerprint == fingerprint)
+                {
                     continue;
                 }
-                ledger.delivered.push_back(fingerprint);
+                ledger.delivered.push_back(Delivered {
+                    file: file_key,
+                    fingerprint,
+                });
                 while ledger.delivered.len() > MAX_DELIVERED_FINGERPRINTS {
                     ledger.delivered.pop_front();
                 }
@@ -373,6 +393,33 @@ impl DiagnosticsLedger {
         }
         out
     }
+
+    /// Makes `conversation_id`'s problems in one file reportable again after
+    /// the file was edited: what it was already shown is forgotten, and what
+    /// was queued for it (published for the text as it was) is dropped.
+    ///
+    /// Without this, a problem that is still there after an edit is the same
+    /// fingerprint as the one reported before it and is never mentioned again —
+    /// the model fixes one error, the other it was told about stays out of
+    /// sight. Only this conversation's records are touched: another
+    /// conversation in the same workspace did not make the edit, and what it
+    /// has or has not been told is its own, and so is the file's stored set,
+    /// which the server replaces by publishing again.
+    fn forget_file(&mut self, conversation_id: &str, uri: &str) {
+        let Some(ledger) = self.conversations.get_mut(conversation_id) else {
+            return;
+        };
+        ledger.pending.remove(uri);
+        let file_key = hash_file(uri);
+        ledger.delivered.retain(|shown| shown.file != file_key);
+    }
+}
+
+fn hash_file(uri: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    uri.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn fingerprint_diagnostic(uri: &str, diagnostic: &Diagnostic) -> u64 {
@@ -652,14 +699,37 @@ struct ServerKey {
     name: String,
 }
 
+/// What the registry knows about one server: how it was configured, the process
+/// if there is one, the start under way if there is one, and how the last
+/// attempts went.
+///
+/// The accounting follows Claude Code's. `crashes` counts *consecutive*
+/// crashes — a process that ended abnormally — and a start that completes the
+/// handshake clears it. A start that merely fails (the command is not there,
+/// `initialize` timed out or was refused) is not a crash: it leaves the entry
+/// in the error state, counts for nothing, and the next use tries again.
 struct ServerEntry {
     config: LspServerConfig,
     connection: Option<Arc<Connection>>,
-    /// Set once the server has failed in a way that should not be retried while
-    /// its entry stays as it is, so a broken command is reported rather than
-    /// respawned per call. Editing the entry clears it.
-    fatal: Option<String>,
-    restarts: u32,
+    /// The start in progress. At most one per entry: the second caller joins it
+    /// instead of spawning another process.
+    starting: Option<Arc<StartInFlight>>,
+    crashes: u32,
+    /// Why the entry is in the error state — the last crash or failed start.
+    /// `None` when the server never ran, was stopped, or exited cleanly.
+    last_error: Option<String>,
+}
+
+impl ServerEntry {
+    fn new(config: &LspServerConfig) -> Self {
+        Self {
+            config: config.clone(),
+            connection: None,
+            starting: None,
+            crashes: 0,
+            last_error: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -668,11 +738,163 @@ struct Registry {
     diagnostics: DiagnosticsLedger,
 }
 
+/// Text of a document, read at the moment it is about to be sent rather than
+/// when the edit happened, so a start that took seconds opens the file as it is
+/// now and not as it was when the start was requested.
+pub type TextSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// A file an edit touched while its server was still starting, to be opened as
+/// soon as the server is up.
+#[derive(Clone)]
+struct QueuedDocument {
+    path: PathBuf,
+    language_id: String,
+    read_text: TextSource,
+}
+
+/// One start in progress, shared by everyone who needs the server meanwhile.
+struct StartInFlight {
+    /// The configuration the process is being started from; a caller whose
+    /// entry has since changed must not mistake this start for its own.
+    config: LspServerConfig,
+    state: Mutex<StartState>,
+    done: Condvar,
+}
+
+#[derive(Default)]
+struct StartState {
+    /// Documents to open once the server is up, one per path, newest request
+    /// last. Pushed while the registry lock is held and drained under it, so
+    /// none is added after the drain.
+    queued: Vec<QueuedDocument>,
+    outcome: Option<Result<Arc<Connection>, String>>,
+}
+
+/// How long a caller that joined a start keeps waiting past the start's own
+/// `initialize` deadline before giving up on the starter itself.
+const START_JOIN_SLACK: Duration = Duration::from_secs(30);
+
+impl StartInFlight {
+    fn new(config: &LspServerConfig) -> Arc<Self> {
+        Arc::new(Self {
+            config: config.clone(),
+            state: Mutex::new(StartState::default()),
+            done: Condvar::new(),
+        })
+    }
+
+    fn state(&self) -> MutexGuard<'_, StartState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn queue(&self, document: QueuedDocument) {
+        let mut state = self.state();
+        // The newest edit's text source wins: the older one would read the same
+        // file, but the queue should say what was last asked for.
+        state.queued.retain(|queued| queued.path != document.path);
+        state.queued.push(document);
+    }
+
+    fn take_queue(&self) -> Vec<QueuedDocument> {
+        std::mem::take(&mut self.state().queued)
+    }
+
+    fn complete(&self, outcome: Result<Arc<Connection>, String>) {
+        let mut state = self.state();
+        // The first report stands; a starter that unwinds after having
+        // reported must not rewrite it.
+        if state.outcome.is_none() {
+            state.outcome = Some(outcome);
+        }
+        drop(state);
+        self.done.notify_all();
+    }
+
+    /// Blocks until the starter reports, which it does after at most the
+    /// `initialize` deadline plus the time to reap a failed process.
+    fn wait(&self) -> Result<Arc<Connection>, String> {
+        let deadline = Instant::now()
+            + Duration::from_millis(self.config.startup_timeout_millis)
+            + START_JOIN_SLACK;
+        let mut state = self.state();
+        loop {
+            if let Some(outcome) = &state.outcome {
+                return outcome.clone();
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "Timed out waiting for the language server '{}' to start",
+                    self.config.name
+                ));
+            }
+            state = self
+                .done
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+}
+
+/// Why a start did not produce a server, and whether the *process* is to blame.
+#[derive(Debug)]
+struct StartFailure {
+    message: String,
+    /// The process came up and then ended abnormally before the handshake
+    /// finished. That is a crash and is counted as one; a command that is not
+    /// there, an `initialize` that timed out or was refused is not.
+    crashed: bool,
+}
+
+impl From<String> for StartFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            crashed: false,
+        }
+    }
+}
+
+/// What a caller asking for a server finds, decided under the registry lock.
+enum Begin {
+    /// A live connection.
+    Live(Arc<Connection>),
+    /// A start is under way for this configuration; the caller's document, if
+    /// it had one, is queued behind it.
+    Joined(Arc<StartInFlight>),
+    /// A start is under way, but for a configuration this caller has since
+    /// replaced. Wait for it to be over, then ask again.
+    Superseded(Arc<StartInFlight>),
+    /// This caller owns a new start (and its document, if any, is queued on it).
+    Own(Arc<StartInFlight>),
+    /// Nothing may be started, and why.
+    Refused(String),
+}
+
+/// Background edit tasks allowed at once. An edit's start is best effort: a
+/// burst past this is dropped rather than turned into a thread per call.
+const MAX_BACKGROUND_TASKS: usize = 16;
+
 /// Host-owned language servers. Cloneable handle over one registry, like
 /// [`crate::preview_servers::PreviewServerRegistry`].
 #[derive(Clone, Default)]
 pub struct LspRegistry {
     inner: Arc<Mutex<Registry>>,
+    /// Background tasks running now, against [`MAX_BACKGROUND_TASKS`].
+    background: Arc<AtomicUsize>,
+}
+
+/// Counts one background task for as long as it lives, including when it
+/// unwinds.
+struct BackgroundSlot(Arc<AtomicUsize>);
+
+impl Drop for BackgroundSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl LspRegistry {
@@ -753,150 +975,320 @@ impl LspRegistry {
 
     /// Returns a live connection for `config` rooted at `root`, starting or
     /// restarting as needed.
+    ///
+    /// A start already under way for the same configuration is joined, not
+    /// repeated: two callers never each spawn a process and race to keep the
+    /// better one, which is what spawning outside the lock used to allow.
     fn ensure_started(
         &self,
         host: &ServerHost,
         config: &LspServerConfig,
         root: &ServerRoot,
     ) -> Result<Arc<Connection>, String> {
+        loop {
+            match self.begin(config, root, None) {
+                Begin::Live(connection) => return Ok(connection),
+                Begin::Refused(reason) => return Err(reason),
+                Begin::Joined(start) => return start.wait(),
+                Begin::Superseded(start) => {
+                    let _ = start.wait();
+                }
+                Begin::Own(start) => return self.run_start(host, config, root, start, false),
+            }
+        }
+    }
+
+    /// Decides what a caller that needs the server for `config` at `root`
+    /// does, under the registry lock; see [`decide`].
+    ///
+    /// Connections that decision retires — a process found dead, or one started
+    /// from a configuration since replaced — are stopped here, after the lock
+    /// is released and before the caller starts anything, so a replacement
+    /// never runs beside the server it replaces.
+    fn begin(
+        &self,
+        config: &LspServerConfig,
+        root: &ServerRoot,
+        document: Option<QueuedDocument>,
+    ) -> Begin {
         let key = ServerKey {
             root: root.clone(),
             name: config.name.clone(),
         };
-
-        // Fast path under the registry lock: an already-live connection.
-        //
-        // A live connection is consulted BEFORE `fatal`. The two can coexist:
-        // one call's start can fail while another's succeeded, and a latched
-        // reason must never hide a server that is up and answering.
-        {
-            let mut registry = self.lock();
-            let entry = registry
-                .servers
-                .entry(key.clone())
-                .or_insert_with(|| ServerEntry {
-                    config: config.clone(),
-                    connection: None,
-                    fatal: None,
-                    restarts: 0,
-                });
-            // `lsp.json` is read on every call, so an entry that changed since
-            // this server started is the configuration the user wants now: the
-            // running server (started from the old one) is stopped and a fresh
-            // one started from the new one, and a failure latched against the
-            // old one no longer says anything about the new.
-            if !entry.config.launches_like(config) {
-                let stale = entry.connection.take();
-                entry.config = config.clone();
-                entry.fatal = None;
-                entry.restarts = 0;
-                if let Some(stale) = stale {
-                    drop(registry);
-                    stop_connection(&stale);
-                    return self.ensure_started(host, config, root);
-                }
-            }
-            if let Some(connection) = &entry.connection {
-                if connection.is_alive() {
-                    return Ok(Arc::clone(connection));
-                }
-                // The process died since the last call. Whether that earns a
-                // restart is the config's call, and the budget is finite.
-                entry.connection = None;
-                if !entry.config.restart_on_crash {
-                    let reason = format!(
-                        "The language server '{}' stopped and restartOnCrash is false",
-                        config.name
-                    );
-                    entry.fatal = Some(reason.clone());
-                    return Err(reason);
-                }
-                if entry.restarts >= entry.config.max_restarts {
-                    let reason = format!(
-                        "The language server '{}' crashed more than {} times and was given up on",
-                        config.name, entry.config.max_restarts
-                    );
-                    entry.fatal = Some(reason.clone());
-                    return Err(reason);
-                }
-                entry.restarts += 1;
-            } else if let Some(reason) = &entry.fatal {
-                return Err(reason.clone());
-            }
-        }
-
-        // Spawning and the initialize handshake happen outside the registry
-        // lock: a cold server takes seconds, and holding the lock would stall
-        // every other conversation's language server too.
-        let started = start_server(host, config, root, Arc::downgrade(&self.inner));
+        let mut retired = Vec::new();
         let mut registry = self.lock();
-        let entry = registry
-            .servers
-            .entry(key)
-            .or_insert_with(|| ServerEntry {
-                config: config.clone(),
-                connection: None,
-                fatal: None,
-                restarts: 0,
-            });
-        match started {
-            Ok(connection) => {
-                // Two calls can reach the spawn at once, because it deliberately
-                // happens outside the registry lock. The loser stops the process
-                // it just started rather than dropping it on the floor: only
-                // Windows has a kill-on-close backstop, so on every other
-                // platform a dropped `Connection` is a leaked language server.
-                // A server some other call started from a different
-                // configuration is not a winner to defer to; it is replaced,
-                // and stopped rather than leaked.
-                let same_config = entry.config.launches_like(config);
-                if let Some(existing) = entry
-                    .connection
+        let outcome = decide(&mut registry, &key, config, document, &mut retired);
+        drop(registry);
+        for connection in retired {
+            stop_connection(&connection);
+        }
+        outcome
+    }
+
+    /// Runs the start `start` stands for, as the one caller entitled to, and
+    /// reports it to everyone who joined.
+    ///
+    /// Spawning and the `initialize` handshake happen outside the registry
+    /// lock: a cold server takes seconds, and holding the lock would stall every
+    /// other conversation's language server too. What keeps that from being a
+    /// race is `start`: it is already recorded on the entry, so nobody else
+    /// spawns meanwhile.
+    ///
+    /// `drain_inline` is whether documents queued behind the start are opened on
+    /// this thread — a background edit, which has nothing else to do — or on a
+    /// new one, because a navigation call that happened to be the starter must
+    /// not wait for other callers' files.
+    fn run_start(
+        &self,
+        host: &ServerHost,
+        config: &LspServerConfig,
+        root: &ServerRoot,
+        start: Arc<StartInFlight>,
+        drain_inline: bool,
+    ) -> Result<Arc<Connection>, String> {
+        let key = ServerKey {
+            root: root.clone(),
+            name: config.name.clone(),
+        };
+        let mut guard = StartGuard {
+            registry: self,
+            key: key.clone(),
+            start: Arc::clone(&start),
+            reported: false,
+        };
+        let started = start_server(host, config, root, Arc::downgrade(&self.inner));
+        let result = self.finish_start(&key, &start, started, drain_inline);
+        guard.reported = true;
+        result
+    }
+
+    /// Records how a start went and wakes whoever joined it.
+    fn finish_start(
+        &self,
+        key: &ServerKey,
+        start: &Arc<StartInFlight>,
+        started: Result<Arc<Connection>, StartFailure>,
+        drain_inline: bool,
+    ) -> Result<Arc<Connection>, String> {
+        // A process nobody will use, to be stopped once the lock is released.
+        let mut orphan: Option<Arc<Connection>> = None;
+        let (result, queued) = {
+            let mut registry = self.lock();
+            let entry = registry.servers.get_mut(key).filter(|entry| {
+                entry
+                    .starting
                     .as_ref()
-                    .filter(|existing| same_config && existing.is_alive())
-                    .cloned()
-                {
-                    drop(registry);
-                    stop_connection(&connection);
-                    return Ok(existing);
+                    .is_some_and(|current| Arc::ptr_eq(current, start))
+            });
+            match entry {
+                Some(entry) => {
+                    entry.starting = None;
+                    // Taken under the lock that every push is made under, so
+                    // nothing joins after this.
+                    let queued = start.take_queue();
+                    // The entry may have been moved to another configuration
+                    // while this one was starting; the outcome then says
+                    // nothing about it.
+                    let current = entry.config.launches_like(&start.config);
+                    let result = match started {
+                        Ok(connection) if current => {
+                            entry.connection = Some(Arc::clone(&connection));
+                            // A start that completed the handshake ends a run
+                            // of crashes: the count is of *consecutive* ones.
+                            entry.crashes = 0;
+                            entry.last_error = None;
+                            Ok(connection)
+                        }
+                        Ok(connection) => {
+                            orphan = Some(connection);
+                            Err(format!(
+                                "The language server '{}' was reconfigured while it was starting",
+                                start.config.name
+                            ))
+                        }
+                        Err(failure) => {
+                            // Not latched: a start that failed is retried the
+                            // next time the server is needed. Only a process
+                            // that ended abnormally counts toward giving up.
+                            if current {
+                                if failure.crashed {
+                                    entry.crashes += 1;
+                                }
+                                entry.last_error = Some(failure.message.clone());
+                            }
+                            Err(failure.message)
+                        }
+                    };
+                    (result, queued)
                 }
-                let replaced = entry.connection.replace(Arc::clone(&connection));
-                entry.config = config.clone();
-                // A start that worked clears whatever a previous one latched:
-                // the reason is no longer true of this entry.
-                entry.fatal = None;
-                drop(registry);
-                if let Some(replaced) = replaced {
-                    stop_connection(&replaced);
+                None => {
+                    // `stop_all` ran while this was starting, or the entry has
+                    // been replaced by one with a start of its own. Either way
+                    // there is no place to put a process that came up.
+                    start.take_queue();
+                    let result = match started {
+                        Ok(connection) => {
+                            orphan = Some(connection);
+                            Err(format!(
+                                "The language server '{}' was stopped while it was starting",
+                                start.config.name
+                            ))
+                        }
+                        Err(failure) => Err(failure.message),
+                    };
+                    (result, Vec::new())
                 }
-                Ok(connection)
             }
-            Err(reason) => {
-                // A command that is not there will not be there next call
-                // either, so this is latched rather than retried per request.
-                //
-                // Not latched over a live connection: a concurrent call may
-                // have started one while this attempt was failing, and that
-                // server is working. Latching there would disable code
-                // navigation for the rest of the session over a race.
-                // Nor against an entry another call has since moved to a
-                // different configuration: the failure is this one's.
-                if entry.config.launches_like(config)
-                    && !entry
-                        .connection
-                        .as_ref()
-                        .is_some_and(|existing| existing.is_alive())
-                {
-                    entry.fatal = Some(reason.clone());
-                }
-                Err(reason)
+        };
+        if let Some(orphan) = orphan {
+            stop_connection(&orphan);
+        }
+        start.complete(result.clone());
+        if let (Ok(connection), false) = (&result, queued.is_empty()) {
+            if drain_inline {
+                open_queued(connection, &queued);
+            } else {
+                let connection = Arc::clone(connection);
+                thread::spawn(move || open_queued(&connection, &queued));
             }
         }
+        result
+    }
+
+    /// Runs `task` on its own thread, for work that must not delay the call
+    /// that caused it. Dropped, with a line on stderr, when too many such tasks
+    /// are already running: what an edit asks of a language server is best
+    /// effort, and the next edit asks again.
+    pub fn in_background(&self, task: impl FnOnce(&LspRegistry) + Send + 'static) {
+        if self.background.fetch_add(1, Ordering::SeqCst) >= MAX_BACKGROUND_TASKS {
+            self.background.fetch_sub(1, Ordering::SeqCst);
+            eprintln!("Skipped a language server update after an edit: too many are already running");
+            return;
+        }
+        let slot = BackgroundSlot(Arc::clone(&self.background));
+        let registry = self.clone();
+        let spawned = thread::Builder::new()
+            .name("lsp-after-edit".into())
+            .spawn(move || {
+                let _slot = slot;
+                task(&registry);
+            });
+        if let Err(error) = spawned {
+            // The closure, and the slot inside it, went with the failed spawn.
+            eprintln!("Could not start a language server update after an edit: {error}");
+        }
+    }
+
+    /// Blocks until every background task has finished, for tests that assert
+    /// on what an edit did (or did not) set in motion.
+    #[cfg(test)]
+    pub(crate) fn wait_for_background_tasks(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.background.load(Ordering::SeqCst) > 0 {
+            assert!(Instant::now() < deadline, "background tasks did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Claude Code's `changeFile`, for a file the model just wrote, minus the
+    /// part [`Self::notify_file_changed`] already did: make sure the server
+    /// that claims the file is up — starting it if it is not — and have it hold
+    /// the file as it is on disk now.
+    ///
+    /// Meant for a background thread ([`Self::in_background`]): the start can
+    /// take as long as a cold `rust-analyzer` takes. The caller has already
+    /// decided that starting a server on an edit is allowed here; this does not
+    /// ask again. Nothing is reported: a failure is a line on stderr, and the
+    /// next edit or the next navigation call tries again.
+    ///
+    /// The conversation is registered for diagnostics *before* anything is
+    /// started, because the first `publishDiagnostics` of a freshly opened
+    /// document can arrive before this function returns, and a publish is
+    /// fanned out only to conversations that are registered when it lands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_after_edit(
+        &self,
+        host: &ServerHost,
+        config: &LspServerConfig,
+        language_id: &str,
+        root: &ServerRoot,
+        path: &Path,
+        conversation_id: &str,
+        read_text: TextSource,
+    ) {
+        // `diagnostics: false` suppresses only the reporting half: the document
+        // is opened all the same, or the server answers navigation from nothing.
+        if config.diagnostics {
+            self.register_conversation(conversation_id, root);
+        }
+        let document = QueuedDocument {
+            path: path.to_path_buf(),
+            language_id: language_id.to_owned(),
+            read_text,
+        };
+        // A reconfiguration under way is waited out, a few times at most.
+        for _ in 0..3 {
+            match self.begin(config, root, Some(document.clone())) {
+                Begin::Live(connection) => {
+                    // A document the server already held was re-synced by the
+                    // edit hook before this ran; this is for one it did not.
+                    if !connection.has_document(path) {
+                        open_queued(&connection, std::slice::from_ref(&document));
+                    }
+                    return;
+                }
+                // Queued behind a start somebody else is running; its starter
+                // opens the file when the server is up.
+                Begin::Joined(_) => return,
+                // Crashed out or stopped for good. A navigation call reports
+                // why; saying it again on every edit would only be noise.
+                Begin::Refused(_) => return,
+                Begin::Superseded(start) => {
+                    let _ = start.wait();
+                }
+                Begin::Own(start) => {
+                    if let Err(error) = self.run_start(host, config, root, start, true) {
+                        eprintln!(
+                            "The language server '{}' did not start after an edit of {}: {error}",
+                            config.name,
+                            path.display()
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Makes `conversation_id`'s diagnostics for the file at `path` reportable
+    /// again: what it was shown for the file is forgotten, and what was queued
+    /// for it is dropped. Called after every edit, whether or not a server
+    /// holds the file, as Claude Code does.
+    pub fn forget_file_diagnostics(&self, conversation_id: &str, path: &Path) {
+        self.lock()
+            .diagnostics
+            .forget_file(conversation_id, &path_to_uri(path));
+    }
+
+    /// Whether the diagnostics ledger has a record of `conversation_id`. An
+    /// edit hook asks before it resolves a path to forget a file's records:
+    /// for a conversation that never reached a language server there are none.
+    pub fn tracks_conversation(&self, conversation_id: &str) -> bool {
+        self.lock()
+            .diagnostics
+            .conversations
+            .contains_key(conversation_id)
     }
 
     /// Tells the server that claims `path` that it changed on disk, so both the
     /// diagnostics injected next round and the next navigation call describe the
     /// file as it is now.
+    ///
+    /// This is the part of an edit's effect that is cheap enough to do inline:
+    /// it only ever re-syncs a server that is already up and already holds the
+    /// document. Starting a server, or opening a document it does not hold yet,
+    /// is [`Self::open_after_edit`]'s job, on a background thread and only where
+    /// the caller has established that it may.
     ///
     /// Silent on every failure: an edit must not fail because a language server
     /// is unhappy.
@@ -917,8 +1309,8 @@ impl LspRegistry {
         if config.diagnostics {
             self.register_conversation(conversation_id, &root);
         }
-        // Only a server that is already up: an edit is not a reason to pay a
-        // cold `rust-analyzer` start, and the next navigation call will.
+        // Only a server that is already up; a cold start, where one is allowed,
+        // is the background path's.
         let connection = {
             let registry = self.lock();
             registry
@@ -1009,13 +1401,164 @@ impl LspRegistry {
     }
 }
 
+/// What a caller that needs a server finds in its entry, and what that makes
+/// it do. Runs under the registry lock and therefore does nothing slow: a
+/// process to retire is handed back for the caller to stop afterwards.
+///
+/// `document` is the file an edit wants opened. It is queued on whichever start
+/// the caller ends up joining or owning, and left alone otherwise.
+fn decide(
+    registry: &mut Registry,
+    key: &ServerKey,
+    config: &LspServerConfig,
+    document: Option<QueuedDocument>,
+    retired: &mut Vec<Arc<Connection>>,
+) -> Begin {
+    let entry = registry
+        .servers
+        .entry(key.clone())
+        .or_insert_with(|| ServerEntry::new(config));
+
+    // `lsp.json` is read on every call, so an entry that changed since this
+    // server started is the configuration the user wants now: the running
+    // server (started from the old one) is stopped and a fresh one started from
+    // the new one, and a failure recorded against the old one no longer says
+    // anything about the new.
+    if !entry.config.launches_like(config) {
+        retired.extend(entry.connection.take());
+        entry.config = config.clone();
+        entry.crashes = 0;
+        entry.last_error = None;
+    }
+
+    // A live connection is consulted before anything recorded about failures:
+    // one call's start can fail while another's succeeded, and a recorded
+    // reason must never hide a server that is up and answering.
+    if let Some(connection) = entry
+        .connection
+        .as_ref()
+        .filter(|connection| connection.is_alive())
+    {
+        return Begin::Live(Arc::clone(connection));
+    }
+
+    // The process went away since the last call. How it went decides what it
+    // costs: ending abnormally is a crash and counts toward the budget; a clean
+    // exit is the server stopping of its own accord and costs nothing.
+    if let Some(dead) = entry.connection.take() {
+        if exited_abnormally(&dead) {
+            entry.crashes += 1;
+            entry.last_error = Some(dead.failure_reason());
+        } else {
+            entry.last_error = None;
+        }
+        retired.push(dead);
+    }
+
+    if let Some(start) = &entry.starting {
+        if start.config.launches_like(config) {
+            if let Some(document) = document {
+                start.queue(document);
+            }
+            return Begin::Joined(Arc::clone(start));
+        }
+        return Begin::Superseded(Arc::clone(start));
+    }
+
+    // Whether another start is worth trying. Both refusals are Claude Code's,
+    // in its order, and both are recomputed from the counters on every call
+    // rather than recorded: the entry changing (or the app restarting) is what
+    // lifts them, and the counters are what a changed entry resets.
+    if entry.last_error.is_some() && entry.crashes > 0 && !entry.config.restart_on_crash {
+        return Begin::Refused(format!(
+            "The language server '{}' stopped and restartOnCrash is false",
+            config.name
+        ));
+    }
+    if entry.crashes > entry.config.max_restarts {
+        return Begin::Refused(format!(
+            "The language server '{}' exceeded max crash recovery attempts ({})",
+            config.name, entry.config.max_restarts
+        ));
+    }
+
+    let start = StartInFlight::new(config);
+    if let Some(document) = document {
+        start.queue(document);
+    }
+    entry.starting = Some(Arc::clone(&start));
+    Begin::Own(start)
+}
+
+/// Whether a connection found dead ended the way a crash does.
+///
+/// Status 0 is the server choosing to stop and is not one. Everything else is:
+/// a non-zero code, a signal, and also a process that is still there with its
+/// output closed or whose status cannot be had, because a server that has
+/// stopped speaking is not behaving as asked.
+fn exited_abnormally(connection: &Connection) -> bool {
+    let Ok(mut child) = connection.child.try_lock() else {
+        return true;
+    };
+    // The reader marked the connection dead on end of file, which can be a
+    // moment before the operating system reports the exit; a process that is
+    // still there after that moment is not behaving.
+    let status = match child.try_wait() {
+        Ok(Some(status)) => Some(status),
+        Ok(None) => child.wait_timeout(EXIT_SETTLE).ok().flatten(),
+        Err(_) => None,
+    };
+    !status.is_some_and(|status| status.success())
+}
+
+/// Releases a start's slot if its starter unwinds before reporting, so that
+/// nobody waits on it forever and the next caller can start again.
+struct StartGuard<'a> {
+    registry: &'a LspRegistry,
+    key: ServerKey,
+    start: Arc<StartInFlight>,
+    reported: bool,
+}
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        if self.reported {
+            return;
+        }
+        let interrupted = "The language server's start was interrupted".to_owned();
+        if let Some(entry) = self.registry.lock().servers.get_mut(&self.key) {
+            if entry
+                .starting
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &self.start))
+            {
+                entry.starting = None;
+                entry.last_error = Some(interrupted.clone());
+            }
+        }
+        self.start.complete(Err(interrupted));
+    }
+}
+
+/// Opens each queued document on `connection` at the text its source returns
+/// now, then tells the server it was saved. A document whose text cannot be
+/// read any more (deleted since, too large) is skipped.
+fn open_queued(connection: &Connection, documents: &[QueuedDocument]) {
+    for document in documents {
+        let Some(text) = (document.read_text)() else {
+            continue;
+        };
+        resync(connection, &document.path, &document.language_id, &text);
+    }
+}
+
 /// The directory one server indexes: its own `workspaceFolder` when the entry
 /// names one, the conversation's workspace otherwise.
 ///
 /// Every caller has to agree on this, not just the one that starts the process:
 /// the registry key, the `rootUri` in `initialize`, and the root the diagnostics
 /// ledger fans out by are all this same value.
-fn server_root(config: &LspServerConfig, workspace: &Path) -> PathBuf {
+pub(crate) fn server_root(config: &LspServerConfig, workspace: &Path) -> PathBuf {
     if config.workspace_folder.trim().is_empty() {
         workspace.to_path_buf()
     } else {
@@ -1145,7 +1688,9 @@ fn start_server(
     config: &LspServerConfig,
     root: &ServerRoot,
     sink: std::sync::Weak<Mutex<Registry>>,
-) -> Result<Arc<Connection>, String> {
+) -> Result<Arc<Connection>, StartFailure> {
+    // A command that is not there fails to spawn at all: not a crash, since no
+    // process ever ran.
     let child = match host {
         ServerHost::Local => ShellChild::Local(spawn_local(config, &root.path)?),
         ServerHost::Remote { runner, .. } => spawn_remote(runner, config, &root.path)?,
@@ -1162,7 +1707,7 @@ fn attach_server(
     config: &LspServerConfig,
     root: &ServerRoot,
     sink: std::sync::Weak<Mutex<Registry>>,
-) -> Result<Arc<Connection>, String> {
+) -> Result<Arc<Connection>, StartFailure> {
     // Before it can spawn grandchildren of its own. A server the agent runs
     // is already its own process group on the machine; nothing here owns it.
     let job = ShellJob::create();
@@ -1233,6 +1778,11 @@ fn attach_server(
     match handshake(&connection, host, config, &root.path) {
         Ok(()) => Ok(connection),
         Err(error) => {
+            // Asked before the process is stopped, because stopping it makes
+            // every process look like one that ended: what matters is whether
+            // it ended by itself first. A server that never answered
+            // `initialize`, or answered it with an error, is still running here.
+            let ended_by_itself = exit_before_stop(&connection);
             stop_connection(&connection);
             // Whatever the server (or the wrapper that could not reach it)
             // said on stderr is the reason more often than the timeout is: a
@@ -1248,14 +1798,80 @@ fn attach_server(
                 let _ = done.recv_timeout(STDERR_SETTLE);
             }
             let tail = last_stderr_line(&connection.diagnostics_log());
-            Err(if tail.is_empty() {
-                error
-            } else {
-                format!("{error} ({tail})")
+            Err(StartFailure {
+                message: if tail.is_empty() {
+                    error
+                } else {
+                    format!("{error} ({tail})")
+                },
+                // Not "the process died" but "the process is what failed": a
+                // wrapper that could not reach its machine, or a launch script
+                // that refused, died too, and neither says anything about the
+                // server.
+                crashed: ended_by_itself.is_some_and(|exit| {
+                    counts_as_crash(exit, !host.is_local())
+                }),
             })
         }
     }
 }
+
+/// How a process that ended on its own ended, as far as a crash count cares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExitKind {
+    /// Status 0.
+    Clean,
+    /// A non-zero code.
+    Code(i32),
+    /// Killed by a signal, or a status that could not be had.
+    Abnormal,
+}
+
+/// Exit codes of a remote launch that mean "never reached the server": the
+/// launch script's own refusals (`cd` failed, command not found — see
+/// [`remote_launch_script`]) and `ssh`'s 255 for a connection it could not
+/// make. Counting those as the server crashing would use up the restart budget
+/// on a machine that was merely unreachable.
+const REMOTE_LAUNCH_REFUSALS: [i32; 3] = [64, 127, 255];
+
+/// Whether a process that ended on its own during start-up is to be counted as
+/// having crashed. `wrapped` is whether what ran is a wrapper relaying the
+/// server from another machine.
+fn counts_as_crash(exit: ExitKind, wrapped: bool) -> bool {
+    match exit {
+        ExitKind::Clean => false,
+        ExitKind::Code(code) => !(wrapped && REMOTE_LAUNCH_REFUSALS.contains(&code)),
+        ExitKind::Abnormal => true,
+    }
+}
+
+/// `None` while the process is still running — a timeout, or a server that
+/// refused `initialize` — and otherwise how it ended on its own.
+///
+/// A reader that has seen end of file marks the connection dead before the
+/// operating system has necessarily finished reporting the exit, so a dead
+/// connection is given a moment to settle; a status that never arrives is
+/// abnormal.
+fn exit_before_stop(connection: &Connection) -> Option<ExitKind> {
+    let mut child = connection
+        .child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let status: Option<ExitStatus> = match child.try_wait() {
+        Ok(Some(status)) => Some(status),
+        _ if connection.is_alive() => return None,
+        _ => child.wait_timeout(EXIT_SETTLE).ok().flatten(),
+    };
+    Some(match status {
+        Some(status) if status.success() => ExitKind::Clean,
+        Some(status) => status.code().map_or(ExitKind::Abnormal, ExitKind::Code),
+        None => ExitKind::Abnormal,
+    })
+}
+
+/// How long a connection whose output closed is given to report how its
+/// process ended.
+const EXIT_SETTLE: Duration = Duration::from_millis(200);
 
 /// How long a failed start waits for the stderr drain to finish after the
 /// process is gone.
@@ -2538,12 +3154,13 @@ process.stderr.write("fake server up\n");
         );
     }
 
-    /// An `lsp.json` edit takes effect on the next call: a failure is latched
-    /// only until the entry changes, a running server whose entry changed is
-    /// stopped and started again from the new entry, and an unchanged entry —
-    /// or one whose description alone changed — keeps the server it has.
+    /// An `lsp.json` edit takes effect on the next call: a running server whose
+    /// entry changed is stopped and started again from the new entry, and an
+    /// unchanged entry — or one whose description alone changed — keeps the
+    /// server it has. A start that failed is not held against the entry in the
+    /// meantime: it is simply tried again.
     #[test]
-    fn a_changed_entry_restarts_its_server_and_lifts_a_latched_failure() {
+    fn a_changed_entry_restarts_its_server() {
         let Some(node) = crate::environment_tools::resolve_on_path("node") else {
             eprintln!("skipped: node is not on PATH");
             return;
@@ -2563,7 +3180,7 @@ process.stderr.write("fake server up\n");
         let again = registry
             .ensure_started(&ServerHost::Local, &broken, &root)
             .err()
-            .expect("the same entry is not retried");
+            .expect("and does not start the second time either");
         assert_eq!(first, again);
 
         let mut fixed = test_config();
@@ -2571,7 +3188,7 @@ process.stderr.write("fake server up\n");
         fixed.args = vec![server.to_string_lossy().into_owned()];
         let started = registry
             .ensure_started(&ServerHost::Local, &fixed, &root)
-            .expect("the fixed entry is tried again, and starts");
+            .expect("the fixed entry starts");
         let reused = registry
             .ensure_started(&ServerHost::Local, &fixed, &root)
             .expect("still running");
@@ -2621,8 +3238,900 @@ process.stderr.write("fake server up\n");
             panic!("a missing command cannot complete the handshake");
         };
         assert!(
-            error.contains("command not found on the remote machine's PATH"),
-            "{error}"
+            error
+                .message
+                .contains("command not found on the remote machine's PATH"),
+            "{}",
+            error.message
         );
+        assert!(
+            !error.crashed,
+            "a launch script that refused (exit 127) is not the server crashing"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The diagnostics ledger after an edit
+    // -----------------------------------------------------------------------
+
+    /// A problem that is still there after an edit has the same fingerprint as
+    /// the one reported before it. Forgetting the file is what lets it be
+    /// reported again.
+    #[test]
+    fn an_edit_makes_a_files_problems_reportable_again() {
+        let mut ledger = DiagnosticsLedger::default();
+        ledger.register("c1", &local(project_root()));
+        let root = local(project_root());
+        ledger.publish(&root, "file:///a.rs".into(), vec![diagnostic("still broken", 1)]);
+        assert_eq!(ledger.take_new("c1").len(), 1);
+        ledger.publish(&root, "file:///a.rs".into(), vec![diagnostic("still broken", 1)]);
+        assert!(ledger.take_new("c1").is_empty(), "unchanged, so not news");
+
+        ledger.forget_file("c1", "file:///a.rs");
+        ledger.publish(&root, "file:///a.rs".into(), vec![diagnostic("still broken", 1)]);
+        assert_eq!(
+            ledger.take_new("c1").len(),
+            1,
+            "after the edit the same problem is reported once more"
+        );
+    }
+
+    /// What was queued for the file describes text that no longer exists.
+    #[test]
+    fn an_edit_drops_what_was_queued_for_the_file() {
+        let mut ledger = DiagnosticsLedger::default();
+        let root = local(project_root());
+        ledger.register("c1", &root);
+        ledger.publish(&root, "file:///a.rs".into(), vec![diagnostic("from the old text", 1)]);
+        ledger.forget_file("c1", "file:///a.rs");
+        assert!(ledger.take_new("c1").is_empty());
+    }
+
+    /// The records are per conversation and per file: another conversation did
+    /// not make the edit, and another file did not change.
+    #[test]
+    fn forgetting_a_file_touches_neither_other_files_nor_other_conversations() {
+        let mut ledger = DiagnosticsLedger::default();
+        let root = local(project_root());
+        ledger.register("editor", &root);
+        ledger.register("bystander", &root);
+        for uri in ["file:///a.rs", "file:///b.rs"] {
+            ledger.publish(&root, uri.into(), vec![diagnostic("broken", 1)]);
+        }
+        assert_eq!(ledger.take_new("editor").len(), 2);
+        assert_eq!(ledger.take_new("bystander").len(), 2);
+
+        ledger.forget_file("editor", "file:///a.rs");
+        for uri in ["file:///a.rs", "file:///b.rs"] {
+            ledger.publish(&root, uri.into(), vec![diagnostic("broken", 1)]);
+        }
+        let editor = ledger.take_new("editor");
+        assert_eq!(
+            editor.iter().map(|(uri, _)| uri.as_str()).collect::<Vec<_>>(),
+            ["file:///a.rs"],
+            "only the edited file is reportable again"
+        );
+        assert!(
+            ledger.take_new("bystander").is_empty(),
+            "the bystander was told already, and did not edit anything"
+        );
+        // A conversation the ledger does not know is not an error.
+        ledger.forget_file("nobody", "file:///a.rs");
+    }
+
+    #[test]
+    fn the_registry_forgets_a_file_by_its_path() {
+        let registry = LspRegistry::default();
+        let root = local(project_root());
+        assert!(!registry.tracks_conversation("c1"));
+        registry.register_conversation("c1", &root);
+        assert!(registry.tracks_conversation("c1"));
+        let path = project_root().join("src").join("main.rs");
+        let uri = path_to_uri(&path);
+        registry.lock().diagnostics.publish(&root, uri, vec![diagnostic("broken", 1)]);
+        registry.forget_file_diagnostics("c1", &path);
+        assert!(registry.take_new_diagnostics("c1").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // What counts as a crash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn only_an_abnormal_exit_counts_as_a_crash() {
+        // Wrapped or not, a server that exits cleanly did not crash, and one
+        // that dies with an ordinary failure code or a signal did.
+        for wrapped in [false, true] {
+            assert!(!counts_as_crash(ExitKind::Clean, wrapped));
+            assert!(counts_as_crash(ExitKind::Code(1), wrapped));
+            assert!(counts_as_crash(ExitKind::Code(139), wrapped));
+            assert!(counts_as_crash(ExitKind::Abnormal, wrapped));
+        }
+        // Through a wrapper, the launch script's refusals and ssh's own
+        // failure are the machine being out of reach, not the server dying.
+        for code in [64, 127, 255] {
+            assert!(!counts_as_crash(ExitKind::Code(code), true), "{code}");
+            assert!(counts_as_crash(ExitKind::Code(code), false), "{code}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Starting servers: one at a time, in the background, and failing cleanly
+    // -----------------------------------------------------------------------
+
+    /// A language server that also records what it is told, so the tests can
+    /// see how many processes were started and which documents they opened.
+    /// Behaviour is chosen by environment variables:
+    ///
+    /// * `FAKE_LSP_LOG` — file every start and document event is appended to.
+    /// * `FAKE_LSP_DELAY_MS` — how long `initialize` takes to answer.
+    /// * `FAKE_LSP_PUBLISH` — publish one error for every document opened.
+    /// * `FAKE_LSP_MARKER` — a file whose absence marks the first start.
+    /// * `FAKE_LSP_MODE` — `crash-on-start` (exit 1 before answering),
+    ///   `crash-first-start`, `reject-first-initialize` (answer the first
+    ///   `initialize` with an error), `die-on-hover` (exit 1),
+    ///   `exit-clean-on-hover` (exit 0).
+    const RECORDING_SERVER: &str = r#"
+const fs = require("fs");
+const log = process.env.FAKE_LSP_LOG;
+const mode = process.env.FAKE_LSP_MODE || "";
+const delay = Number(process.env.FAKE_LSP_DELAY_MS || 0);
+const marker = process.env.FAKE_LSP_MARKER || "";
+function record(line) { if (log) fs.appendFileSync(log, line + "\n"); }
+function firstStart() {
+  if (!marker || fs.existsSync(marker)) return false;
+  fs.writeFileSync(marker, "1");
+  return true;
+}
+record("start");
+if (mode === "crash-on-start") process.exit(1);
+if (mode === "crash-first-start" && firstStart()) process.exit(1);
+let buffer = Buffer.alloc(0);
+function send(payload) {
+  const body = Buffer.from(JSON.stringify(payload), "utf8");
+  process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`);
+  process.stdout.write(body);
+}
+function handle(message) {
+  const params = message.params || {};
+  switch (message.method) {
+    case "initialize":
+      if (mode === "reject-first-initialize" && firstStart()) {
+        send({ jsonrpc: "2.0", id: message.id, error: { code: -32603, message: "refused" } });
+        return;
+      }
+      setTimeout(() => send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } }), delay);
+      break;
+    case "textDocument/didOpen": {
+      const document = params.textDocument;
+      record("open " + document.uri + " " + JSON.stringify(document.text));
+      if (process.env.FAKE_LSP_PUBLISH) {
+        send({
+          jsonrpc: "2.0",
+          method: "textDocument/publishDiagnostics",
+          params: {
+            uri: document.uri,
+            diagnostics: [{
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+              severity: 1, message: "broken", source: "fake",
+            }],
+          },
+        });
+      }
+      break;
+    }
+    case "textDocument/didChange":
+      record("change " + params.textDocument.uri + " " + JSON.stringify(params.contentChanges[0].text));
+      break;
+    case "textDocument/didSave":
+      record("save " + params.textDocument.uri);
+      break;
+    case "textDocument/hover":
+      if (mode === "die-on-hover") process.exit(1);
+      if (mode === "exit-clean-on-hover") process.exit(0);
+      send({ jsonrpc: "2.0", id: message.id, result: null });
+      break;
+    case "shutdown":
+      send({ jsonrpc: "2.0", id: message.id, result: null });
+      break;
+    case "exit":
+      process.exit(0);
+  }
+}
+process.stdin.on("data", (chunk) => {
+  buffer = Buffer.concat([buffer, chunk]);
+  for (;;) {
+    const headerEnd = buffer.indexOf("\r\n\r\n");
+    if (headerEnd < 0) return;
+    const match = /Content-Length:\s*(\d+)/i.exec(buffer.slice(0, headerEnd).toString("utf8"));
+    if (!match) process.exit(3);
+    const start = headerEnd + 4;
+    const length = Number(match[1]);
+    if (buffer.length < start + length) return;
+    const body = JSON.parse(buffer.slice(start, start + length).toString("utf8"));
+    buffer = buffer.slice(start + length);
+    handle(body);
+  }
+});
+process.stdin.on("end", () => process.exit(0));
+"#;
+
+    /// A temporary workspace with the recording server in it.
+    struct Rig {
+        _temp: tempfile::TempDir,
+        node: PathBuf,
+        script: PathBuf,
+        log: PathBuf,
+        workspace: PathBuf,
+    }
+
+    fn rig() -> Option<Rig> {
+        let Some(node) = crate::environment_tools::resolve_on_path("node") else {
+            eprintln!("skipped: node is not on PATH");
+            return None;
+        };
+        let temp = tempfile::tempdir().expect("temp dir");
+        // Resolved where a temporary directory can sit behind a link (macOS),
+        // but not on Windows, where canonical paths are `\\?\` verbatim
+        // spellings that Node cannot open the server's log through.
+        let workspace = if cfg!(windows) {
+            temp.path().to_path_buf()
+        } else {
+            std::fs::canonicalize(temp.path()).expect("workspace resolves")
+        };
+        let script = workspace.join("recording-lsp.js");
+        std::fs::write(&script, RECORDING_SERVER).expect("fake server written");
+        let log = workspace.join("server.log");
+        Some(Rig {
+            _temp: temp,
+            node,
+            script,
+            log,
+            workspace,
+        })
+    }
+
+    impl Rig {
+        fn config(&self, env: &[(&str, &str)]) -> LspServerConfig {
+            let mut config = test_config();
+            config.command = self.node.to_string_lossy().into_owned();
+            config.args = vec![self.script.to_string_lossy().into_owned()];
+            config.startup_timeout_millis = 10_000;
+            config.shutdown_timeout_millis = 1_000;
+            config.env = env
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .chain([(
+                    "FAKE_LSP_LOG".to_owned(),
+                    self.log.to_string_lossy().into_owned(),
+                )])
+                .collect();
+            config
+        }
+
+        fn root(&self) -> ServerRoot {
+            ServerRoot::local(self.workspace.clone())
+        }
+
+        /// A file in the workspace, written with `text`.
+        fn file(&self, name: &str, text: &str) -> PathBuf {
+            let path = self.workspace.join(name);
+            std::fs::write(&path, text).expect("file written");
+            path
+        }
+
+        fn lines(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn starts(&self) -> usize {
+            self.lines().iter().filter(|line| *line == "start").count()
+        }
+
+        /// The documents the servers were told to open, as `(uri, text)`.
+        fn opened(&self) -> Vec<(String, String)> {
+            self.lines()
+                .iter()
+                .filter_map(|line| line.strip_prefix("open "))
+                .filter_map(|rest| rest.split_once(' '))
+                .map(|(uri, text)| {
+                    (
+                        uri.to_owned(),
+                        serde_json::from_str::<String>(text).expect("the recorded text is JSON"),
+                    )
+                })
+                .collect()
+        }
+
+        fn state(&self, registry: &LspRegistry, config: &LspServerConfig) -> (u32, Option<String>, bool) {
+            let key = ServerKey {
+                root: self.root(),
+                name: config.name.clone(),
+            };
+            let guard = registry.lock();
+            let entry = guard.servers.get(&key).expect("an entry exists");
+            (entry.crashes, entry.last_error.clone(), entry.starting.is_some())
+        }
+    }
+
+    fn text_of(path: &Path) -> TextSource {
+        let path = path.to_path_buf();
+        Arc::new(move || std::fs::read_to_string(&path).ok())
+    }
+
+    fn wait_until(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    const PATIENCE: Duration = Duration::from_secs(20);
+
+    /// The core of the feature: an edit brings the server up without waiting
+    /// for it, and the file it opens is the file as it is when the server is
+    /// ready, not as it was when the edit asked.
+    #[test]
+    fn an_edit_starts_the_server_in_the_background_and_opens_the_file_as_it_is_by_then() {
+        let Some(rig) = rig() else { return };
+        let config = rig.config(&[("FAKE_LSP_DELAY_MS", "400"), ("FAKE_LSP_PUBLISH", "1")]);
+        let file = rig.file("a.rs", "fn a() {}\n");
+        let registry = LspRegistry::default();
+
+        let asked = Instant::now();
+        let (task_config, root, task_file) = (config.clone(), rig.root(), file.clone());
+        registry.in_background(move |registry| {
+            registry.open_after_edit(
+                &ServerHost::Local,
+                &task_config,
+                "rust",
+                &root,
+                &task_file,
+                "c1",
+                text_of(&task_file),
+            );
+        });
+        assert!(
+            asked.elapsed() < Duration::from_millis(300),
+            "the caller does not wait for the server: {:?}",
+            asked.elapsed()
+        );
+        assert!(!registry.has_running_servers(), "the server is not up yet");
+
+        // The file changes again while the server is still coming up.
+        std::fs::write(&file, "fn a() { 2 }\n").unwrap();
+        wait_until("the file is opened", PATIENCE, || !rig.opened().is_empty());
+        assert_eq!(
+            rig.opened(),
+            vec![(path_to_uri(&file), "fn a() { 2 }\n".to_owned())],
+            "opened at the text on disk once the server was ready"
+        );
+        assert!(rig.lines().contains(&format!("save {}", path_to_uri(&file))));
+        assert_eq!(rig.starts(), 1);
+
+        // The conversation was registered before the start, so the first
+        // publish of the freshly opened document is its own.
+        let mut delivered = Vec::new();
+        wait_until("the first diagnostics arrive", PATIENCE, || {
+            delivered = registry.take_new_diagnostics("c1");
+            !delivered.is_empty()
+        });
+        assert_eq!(delivered[0].1[0].message, "broken");
+        registry.stop_all();
+    }
+
+    /// A second edit, a third, and a navigation call that all arrive while the
+    /// server is starting join that start instead of each spawning a process.
+    #[test]
+    fn edits_and_a_navigation_call_during_a_start_share_one_process() {
+        let Some(rig) = rig() else { return };
+        let config = rig.config(&[("FAKE_LSP_DELAY_MS", "600")]);
+        let registry = LspRegistry::default();
+        let files: Vec<PathBuf> = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .map(|name| rig.file(name, &format!("// {name}\n")))
+            .collect();
+
+        for file in &files[..2] {
+            let (config, root, file) = (config.clone(), rig.root(), file.clone());
+            registry.in_background(move |registry| {
+                registry.open_after_edit(
+                    &ServerHost::Local,
+                    &config,
+                    "rust",
+                    &root,
+                    &file,
+                    "c1",
+                    text_of(&file),
+                );
+            });
+        }
+        wait_until("a start is under way", PATIENCE, || {
+            registry
+                .lock()
+                .servers
+                .values()
+                .any(|entry| entry.starting.is_some())
+        });
+
+        // A navigation call for the third file, and an edit of it, mid-start.
+        let (config_for_edit, root, file) = (config.clone(), rig.root(), files[2].clone());
+        registry.in_background(move |registry| {
+            registry.open_after_edit(
+                &ServerHost::Local,
+                &config_for_edit,
+                "rust",
+                &root,
+                &file,
+                "c1",
+                text_of(&file),
+            );
+        });
+        let (connection, language_id, _) = registry
+            .connection_for(&ServerHost::Local, &[config.clone()], &rig.workspace, &files[2])
+            .expect("the call joins the start in flight");
+        assert_eq!(language_id, "rust");
+        assert!(connection.is_alive());
+
+        wait_until("all three files are opened", PATIENCE, || rig.opened().len() >= 3);
+        assert_eq!(rig.starts(), 1, "one process for all of them: {:?}", rig.lines());
+        let mut opened: Vec<String> = rig.opened().into_iter().map(|(uri, _)| uri).collect();
+        opened.sort();
+        let mut expected: Vec<String> = files.iter().map(|file| path_to_uri(file)).collect();
+        expected.sort();
+        assert_eq!(opened, expected);
+        registry.stop_all();
+    }
+
+    /// The old race: several calls reach the spawn at once and each starts a
+    /// process, keeping one and stopping the rest. Now exactly one is started
+    /// and everyone is handed it.
+    #[test]
+    fn simultaneous_callers_are_handed_one_connection() {
+        let Some(rig) = rig() else { return };
+        let config = rig.config(&[("FAKE_LSP_DELAY_MS", "300")]);
+        let registry = LspRegistry::default();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let (registry, config, root, barrier) =
+                    (registry.clone(), config.clone(), rig.root(), Arc::clone(&barrier));
+                thread::spawn(move || {
+                    barrier.wait();
+                    registry
+                        .ensure_started(&ServerHost::Local, &config, &root)
+                        .expect("the server starts")
+                })
+            })
+            .collect();
+        let connections: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        assert!(connections.windows(2).all(|pair| Arc::ptr_eq(&pair[0], &pair[1])));
+        assert_eq!(rig.starts(), 1);
+        registry.stop_all();
+    }
+
+    /// Edits are not only for servers that are down: a server that is up but
+    /// does not hold the file yet is given it, while one that does hold it is
+    /// left to the quick re-sync the edit hook already did.
+    #[test]
+    fn an_edit_gives_a_running_server_the_file_it_does_not_hold() {
+        let Some(rig) = rig() else { return };
+        let config = rig.config(&[]);
+        let registry = LspRegistry::default();
+        let held = rig.file("held.rs", "// held\n");
+        let new = rig.file("new.rs", "// new\n");
+        let (connection, _, _) = registry
+            .connection_for(&ServerHost::Local, &[config.clone()], &rig.workspace, &held)
+            .unwrap();
+        connection.sync_document(&held, "rust", "// held\n").unwrap();
+
+        for file in [&held, &new] {
+            registry.open_after_edit(
+                &ServerHost::Local,
+                &config,
+                "rust",
+                &rig.root(),
+                file,
+                "c1",
+                text_of(file),
+            );
+        }
+        wait_until("the new file is opened", PATIENCE, || {
+            rig.opened().iter().any(|(uri, _)| *uri == path_to_uri(&new))
+        });
+        let opens_of_held = rig
+            .opened()
+            .iter()
+            .filter(|(uri, _)| *uri == path_to_uri(&held))
+            .count();
+        assert_eq!(opens_of_held, 1, "a document the server holds is not opened twice");
+        assert!(
+            !rig.lines().iter().any(|line| line.starts_with("change ")),
+            "and not re-sent here either: {:?}",
+            rig.lines()
+        );
+        assert_eq!(rig.starts(), 1);
+        registry.stop_all();
+    }
+
+    /// `diagnostics: false` turns off only the reporting half: the document is
+    /// opened all the same, and the conversation is not registered for what the
+    /// server publishes.
+    #[test]
+    fn an_entry_without_diagnostics_still_opens_the_file_but_registers_nobody() {
+        let Some(rig) = rig() else { return };
+        let mut config = rig.config(&[("FAKE_LSP_PUBLISH", "1")]);
+        config.diagnostics = false;
+        let file = rig.file("a.rs", "fn a() {}\n");
+        let registry = LspRegistry::default();
+        registry.open_after_edit(
+            &ServerHost::Local,
+            &config,
+            "rust",
+            &rig.root(),
+            &file,
+            "c1",
+            text_of(&file),
+        );
+        wait_until("the file is opened", PATIENCE, || rig.opened().len() == 1);
+        assert!(!registry.tracks_conversation("c1"), "nothing to be owed");
+        assert!(registry.take_new_diagnostics("c1").is_empty());
+        registry.stop_all();
+    }
+
+    /// A start that fails is not held against the entry: the next use tries
+    /// again, however many times it has failed, and it is never mistaken for a
+    /// crash.
+    #[test]
+    fn a_start_that_fails_is_retried_and_never_counted_as_a_crash() {
+        let Some(rig) = rig() else { return };
+        let mut config = rig.config(&[]);
+        config.command = "definitely-not-a-language-server-xyz".into();
+        config.max_restarts = 1;
+        let registry = LspRegistry::default();
+        for attempt in 0..6 {
+            let error = registry
+                .ensure_started(&ServerHost::Local, &config, &rig.root())
+                .err()
+                .expect("a missing command does not start");
+            assert!(error.contains("Could not start the language server"), "attempt {attempt}: {error}");
+            assert!(!error.contains("exceeded"), "attempt {attempt}: {error}");
+        }
+        let (crashes, last_error, starting) = rig.state(&registry, &config);
+        assert_eq!(crashes, 0, "a command that is not there never ran, so it never crashed");
+        assert!(last_error.is_some(), "the entry is in the error state");
+        assert!(!starting);
+
+        // Once the command is there the very next use starts it.
+        let mut fixed = rig.config(&[]);
+        fixed.max_restarts = 1;
+        assert!(registry.ensure_started(&ServerHost::Local, &fixed, &rig.root()).is_ok());
+        registry.stop_all();
+    }
+
+    /// An `initialize` the server refuses is a failed start, not a crash, and
+    /// the next use gets a fresh try — which succeeds and clears the error.
+    #[test]
+    fn a_refused_initialize_is_retried_on_the_next_use() {
+        let Some(rig) = rig() else { return };
+        let marker = rig.workspace.join("marker");
+        let config = rig.config(&[
+            ("FAKE_LSP_MODE", "reject-first-initialize"),
+            ("FAKE_LSP_MARKER", &marker.to_string_lossy()),
+        ]);
+        let registry = LspRegistry::default();
+        let error = registry
+            .ensure_started(&ServerHost::Local, &config, &rig.root())
+            .err()
+            .expect("the first initialize is refused");
+        assert!(error.contains("failed to initialize"), "{error}");
+        let (crashes, last_error, _) = rig.state(&registry, &config);
+        assert_eq!(crashes, 0);
+        assert!(last_error.is_some_and(|reason| reason.contains("refused")));
+
+        registry
+            .ensure_started(&ServerHost::Local, &config, &rig.root())
+            .expect("the second try is made, and works");
+        let (crashes, last_error, _) = rig.state(&registry, &config);
+        assert_eq!((crashes, last_error), (0, None));
+        assert_eq!(rig.starts(), 2);
+        registry.stop_all();
+    }
+
+    /// A process that dies while starting is a crash, counted; the count is of
+    /// consecutive crashes; once it exceeds `maxRestarts` nothing more is
+    /// tried — until the entry is changed, which starts the count over.
+    #[test]
+    fn consecutive_crashes_at_start_up_use_up_the_budget_and_an_entry_change_restores_it() {
+        let Some(rig) = rig() else { return };
+        let mut config = rig.config(&[("FAKE_LSP_MODE", "crash-on-start")]);
+        config.max_restarts = 2;
+        let registry = LspRegistry::default();
+
+        for attempt in 1..=3 {
+            let error = registry
+                .ensure_started(&ServerHost::Local, &config, &rig.root())
+                .err()
+                .expect("the server crashes before it answers");
+            assert!(!error.contains("exceeded"), "attempt {attempt}: {error}");
+            assert_eq!(rig.state(&registry, &config).0, attempt, "crashes after attempt {attempt}");
+        }
+        assert_eq!(rig.starts(), 3);
+
+        for _ in 0..2 {
+            let error = registry
+                .ensure_started(&ServerHost::Local, &config, &rig.root())
+                .err()
+                .expect("the budget is spent");
+            assert!(
+                error.contains("exceeded max crash recovery attempts (2)"),
+                "{error}"
+            );
+        }
+        assert_eq!(rig.starts(), 3, "nothing is spawned once the budget is spent");
+
+        // `lsp.json` changed: the count starts over and the server is tried.
+        let mut changed = config.clone();
+        changed.env.insert("EXTRA".into(), "1".into());
+        let error = registry
+            .ensure_started(&ServerHost::Local, &changed, &rig.root())
+            .err()
+            .expect("it still crashes");
+        assert!(!error.contains("exceeded"), "{error}");
+        assert_eq!(rig.starts(), 4);
+        assert_eq!(rig.state(&registry, &changed).0, 1);
+    }
+
+    /// A start that completes the handshake ends the run of crashes.
+    #[test]
+    fn a_successful_start_clears_the_crash_count() {
+        let Some(rig) = rig() else { return };
+        let marker = rig.workspace.join("marker");
+        let config = rig.config(&[
+            ("FAKE_LSP_MODE", "crash-first-start"),
+            ("FAKE_LSP_MARKER", &marker.to_string_lossy()),
+        ]);
+        let registry = LspRegistry::default();
+        registry
+            .ensure_started(&ServerHost::Local, &config, &rig.root())
+            .err()
+            .expect("the first start crashes");
+        assert_eq!(rig.state(&registry, &config).0, 1);
+        registry
+            .ensure_started(&ServerHost::Local, &config, &rig.root())
+            .expect("the second start works");
+        assert_eq!(rig.state(&registry, &config).0, 0, "consecutive, so a good start resets it");
+        registry.stop_all();
+    }
+
+    /// Dying after a good start is a crash too, found the next time the server
+    /// is needed. With `restartOnCrash: false` that is the end of it; with it
+    /// on, the server is brought back.
+    #[test]
+    fn a_server_that_died_is_restarted_only_if_the_entry_allows_it() {
+        let Some(rig) = rig() else { return };
+        let mut config = rig.config(&[("FAKE_LSP_MODE", "die-on-hover")]);
+        config.restart_on_crash = false;
+        let registry = LspRegistry::default();
+        let hover = || {
+            json!({
+                "textDocument": { "uri": "file:///x.rs" },
+                "position": { "line": 0, "character": 0 },
+            })
+        };
+
+        let connection = registry
+            .ensure_started(&ServerHost::Local, &config, &rig.root())
+            .expect("a first start does not depend on restartOnCrash");
+        let _ = connection.request_with_retry("textDocument/hover", hover());
+        wait_until("the server is seen to have died", PATIENCE, || !connection.is_alive());
+        let error = registry
+            .ensure_started(&ServerHost::Local, &config, &rig.root())
+            .err()
+            .expect("restartOnCrash is false");
+        assert!(error.contains("restartOnCrash is false"), "{error}");
+        assert_eq!(rig.starts(), 1, "no second process");
+        assert_eq!(rig.state(&registry, &config).0, 1);
+
+        // The same death under an entry that allows a restart.
+        let mut allowed = rig.config(&[("FAKE_LSP_MODE", "die-on-hover")]);
+        allowed.restart_on_crash = true;
+        let registry = LspRegistry::default();
+        let first = registry
+            .ensure_started(&ServerHost::Local, &allowed, &rig.root())
+            .unwrap();
+        let _ = first.request_with_retry("textDocument/hover", hover());
+        wait_until("the server is seen to have died", PATIENCE, || !first.is_alive());
+        let second = registry
+            .ensure_started(&ServerHost::Local, &allowed, &rig.root())
+            .expect("the server is brought back");
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(rig.state(&registry, &allowed).0, 0, "and the good start cleared the count");
+        registry.stop_all();
+    }
+
+    /// A server that exits with status 0 chose to stop. That is not a crash,
+    /// so it neither counts nor trips `restartOnCrash: false`.
+    #[test]
+    fn a_clean_exit_is_not_a_crash() {
+        let Some(rig) = rig() else { return };
+        let mut config = rig.config(&[("FAKE_LSP_MODE", "exit-clean-on-hover")]);
+        config.restart_on_crash = false;
+        let registry = LspRegistry::default();
+        let first = registry
+            .ensure_started(&ServerHost::Local, &config, &rig.root())
+            .unwrap();
+        let _ = first.request_with_retry(
+            "textDocument/hover",
+            json!({ "textDocument": { "uri": "file:///x.rs" }, "position": { "line": 0, "character": 0 } }),
+        );
+        wait_until("the server is seen to have exited", PATIENCE, || !first.is_alive());
+        let second = registry
+            .ensure_started(&ServerHost::Local, &config, &rig.root())
+            .expect("a clean exit is simply started again");
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(rig.state(&registry, &config).0, 0);
+        registry.stop_all();
+    }
+
+    /// A start that failed after one edit is simply tried again by the next
+    /// one: nothing about the failure is remembered against the entry.
+    #[test]
+    fn a_failed_start_after_an_edit_is_retried_by_the_next_edit() {
+        let Some(rig) = rig() else { return };
+        let marker = rig.workspace.join("marker");
+        let config = rig.config(&[
+            ("FAKE_LSP_MODE", "reject-first-initialize"),
+            ("FAKE_LSP_MARKER", &marker.to_string_lossy()),
+            ("FAKE_LSP_DELAY_MS", "0"),
+        ]);
+        let file = rig.file("a.rs", "fn a() {}\n");
+        let registry = LspRegistry::default();
+
+        // Edit 1 fails its start (the first initialize is refused).
+        registry.open_after_edit(
+            &ServerHost::Local,
+            &config,
+            "rust",
+            &rig.root(),
+            &file,
+            "c1",
+            text_of(&file),
+        );
+        assert!(!registry.has_running_servers());
+        let (crashes, last_error, starting) = rig.state(&registry, &config);
+        assert_eq!((crashes, last_error.is_some(), starting), (0, true, false));
+
+        // Edit 2 tries again, and this time it works and opens the file.
+        registry.open_after_edit(
+            &ServerHost::Local,
+            &config,
+            "rust",
+            &rig.root(),
+            &file,
+            "c1",
+            text_of(&file),
+        );
+        assert!(registry.has_running_servers());
+        wait_until("the file is opened", PATIENCE, || rig.opened().len() == 1);
+        assert_eq!(rig.starts(), 2);
+        registry.stop_all();
+    }
+
+    /// The pool of background tasks is bounded, and a slot is given back
+    /// whether the task returns or panics.
+    #[test]
+    fn background_tasks_are_bounded_and_always_release_their_slot() {
+        let registry = LspRegistry::default();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let ran = Arc::new(AtomicUsize::new(0));
+        for _ in 0..MAX_BACKGROUND_TASKS {
+            let (release, ran) = (Arc::clone(&release), Arc::clone(&ran));
+            registry.in_background(move |_| {
+                ran.fetch_add(1, Ordering::SeqCst);
+                let (lock, signal) = &*release;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = signal.wait(open).unwrap();
+                }
+            });
+        }
+        wait_until("every task is running", PATIENCE, || {
+            ran.load(Ordering::SeqCst) == MAX_BACKGROUND_TASKS
+        });
+        let overflow = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&overflow);
+        registry.in_background(move |_| flag.store(true, Ordering::SeqCst));
+        assert_eq!(
+            registry.background.load(Ordering::SeqCst),
+            MAX_BACKGROUND_TASKS,
+            "the refused task did not take a slot"
+        );
+        {
+            let (lock, signal) = &*release;
+            *lock.lock().unwrap() = true;
+            signal.notify_all();
+        }
+        wait_until("the slots are given back", PATIENCE, || {
+            registry.background.load(Ordering::SeqCst) == 0
+        });
+        assert!(!overflow.load(Ordering::SeqCst), "the task past the bound never ran");
+
+        registry.in_background(|_| panic!("a task that fails"));
+        wait_until("a panicking task gives its slot back", PATIENCE, || {
+            registry.background.load(Ordering::SeqCst) == 0
+        });
+    }
+
+    /// `stop_all` while a server is still starting: the process that comes up
+    /// afterwards has nowhere to live and is stopped, not leaked.
+    #[test]
+    fn a_server_that_finishes_starting_after_stop_all_is_stopped() {
+        let Some(rig) = rig() else { return };
+        let config = rig.config(&[("FAKE_LSP_DELAY_MS", "500")]);
+        let file = rig.file("a.rs", "fn a() {}\n");
+        let registry = LspRegistry::default();
+        let (task_config, root, task_file) = (config.clone(), rig.root(), file.clone());
+        registry.in_background(move |registry| {
+            registry.open_after_edit(
+                &ServerHost::Local,
+                &task_config,
+                "rust",
+                &root,
+                &task_file,
+                "c1",
+                text_of(&task_file),
+            );
+        });
+        wait_until("the start is under way", PATIENCE, || {
+            registry
+                .lock()
+                .servers
+                .values()
+                .any(|entry| entry.starting.is_some())
+        });
+        registry.stop_all();
+        wait_until("the task is over", PATIENCE, || {
+            registry.background.load(Ordering::SeqCst) == 0
+        });
+        assert!(!registry.has_running_servers());
+        assert!(rig.opened().is_empty(), "nothing was opened on a server nobody owns");
+    }
+
+    /// The local edit path, end to end through [`crate::lsp::open_after_local_edit`]:
+    /// a file nothing claims starts nothing; a refused gate starts nothing; an
+    /// allowed one starts the server and opens the file.
+    #[test]
+    fn the_local_edit_path_starts_a_server_only_for_a_claimed_file_and_an_open_gate() {
+        let Some(rig) = rig() else { return };
+        let config = rig.config(&[]);
+        let registry = LspRegistry::default();
+        let file = rig.file("a.rs", "fn a() {}\n");
+        let notes = rig.file("notes.md", "# notes\n");
+        let asked = std::cell::Cell::new(0);
+        let allow = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        let deny = || false;
+        let configs = [config];
+
+        crate::lsp::open_after_local_edit(&registry, &configs, &rig.workspace, &notes, "c1", &allow);
+        assert_eq!(asked.get(), 0, "no server claims .md, so nobody is asked");
+        crate::lsp::open_after_local_edit(&registry, &configs, &rig.workspace, &file, "c1", &deny);
+        assert_eq!(rig.starts(), 0, "a refusing gate starts nothing");
+        assert!(!registry.tracks_conversation("c1"));
+
+        crate::lsp::open_after_local_edit(&registry, &configs, &rig.workspace, &file, "c1", &allow);
+        assert_eq!(asked.get(), 1);
+        wait_until("the file is opened", PATIENCE, || !rig.opened().is_empty());
+        assert_eq!(rig.opened(), vec![(path_to_uri(&file), "fn a() {}\n".to_owned())]);
+        assert!(registry.tracks_conversation("c1"));
+        registry.stop_all();
     }
 }

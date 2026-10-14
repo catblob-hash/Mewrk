@@ -1529,6 +1529,10 @@ export interface AppearancePreferences {
    * was on screen, until the theme changes; `builtin:<name>`; or an imported picture's host id.
    */
   background: string;
+  /** Id of the code theme (`lib/codeThemes.ts`) code and diffs are drawn in under the day theme. */
+  codeThemeDay: string;
+  /** The one they are drawn in under the night theme. */
+  codeThemeNight: string;
   /** The local helper model's uses and prompts (Appearance → Local model). */
   localModel: LocalModelPreferences;
 }
@@ -2089,7 +2093,50 @@ export interface AttestInsertedToolContextRequest {
   output: string;
 }
 
+/**
+ * Tool cards copied on a timeline and about to be pasted on one. A card's proof
+ * names the conversation and the id it was issued for, and a copy has a new id
+ * and perhaps a new conversation, so the host proves each source and issues its
+ * copy a proof of its own.
+ */
+export interface AttestCopiedToolContextsRequest {
+  /** The conversation the copies go into. */
+  conversationId: string;
+  copies: Array<{
+    /** The conversation the card was copied out of. */
+    sourceConversationId: string;
+    /** The card as it was copied: under its own id, with its own proof. */
+    source: ToolContext;
+    /** The id its copy takes. */
+    contextId: string;
+  }>;
+}
+
 export interface ToolExecutionResponse extends ToolResult {}
+
+/** Puts a conversation's files back as they were before one of its user messages. */
+export interface RewindFilesRequest {
+  conversationId: string;
+  /** The user message (a `UserContext` id) whose sending the files are rewound to before. */
+  contextId: string;
+  /** True only reports what would happen; nothing on disk changes. */
+  dryRun: boolean;
+}
+
+export interface RewindFileEntry {
+  /** Absolute path. */
+  path: string;
+  /** What to show: relative to the workspace (forward slashes) inside it, absolute outside. */
+  displayPath: string;
+  /** `restore` writes the earlier content back; `delete` removes a file that did not exist then. */
+  action: "restore" | "delete";
+  /** Why this file is (or will be) left alone, in words for the user; null when it is not. */
+  skipped: string | null;
+}
+
+export interface RewindFilesResponse {
+  files: RewindFileEntry[];
+}
 
 /** What the renderer needs to draw one approval card. Mirrors
  * `PendingToolPrompt` in `src-tauri/src/tool_prompt.rs`, and matches the

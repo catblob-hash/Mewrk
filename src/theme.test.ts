@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { configureI18n } from "./i18n";
 import { defaultAppearancePreferences, getAppearanceSnapshot } from "./lib/appearance";
+import { CODE_THEME_VARIABLES } from "./lib/codeThemes";
 import {
   applyResolvedApplicationAppearance,
   configureApplicationAppearance,
@@ -18,6 +19,11 @@ afterEach(() => {
   document.documentElement.style.removeProperty("color-scheme");
   for (const property of ["--accent", "--accent-soft", "--focus", "--app-font-family", "--mono", "--message-font-family", "--message-font-size", "zoom"]) {
     document.documentElement.style.removeProperty(property);
+  }
+  for (const scheme of ["day", "night"]) {
+    for (const name of CODE_THEME_VARIABLES) {
+      document.documentElement.style.removeProperty(`--code-${scheme}-${name}`);
+    }
   }
   for (const attribute of ["wideMessages", "codeWrap", "codeCollapse"]) {
     delete document.documentElement.dataset[attribute];
@@ -87,6 +93,42 @@ describe("application theme", () => {
     expect(root.dataset.codeCollapse).toBe("false");
     // Deep rendering components read the shared snapshot instead of receiving threaded props.
     expect(getAppearanceSnapshot().messageFontSize).toBe(18);
+  });
+
+  it("writes each scheme's default code theme as its keyword colour, and no ground for the app's own", () => {
+    configureApplicationAppearance({
+      appLanguage: "zh-CN",
+      theme: "day",
+      appearance: defaultAppearancePreferences()
+    });
+
+    const root = document.documentElement;
+    expect(root.style.getPropertyValue("--code-day-keyword")).toBe("#6254aa");
+    expect(root.style.getPropertyValue("--code-night-keyword")).toBe("#a99cf0");
+    expect(root.style.getPropertyValue("--code-day-bg")).toBe("");
+    expect(root.style.getPropertyValue("--code-night-bg")).toBe("");
+  });
+
+  it("gives a published code theme its own ground in each scheme, and drops it when the default returns", () => {
+    const root = document.documentElement;
+    configureApplicationAppearance({
+      appLanguage: "zh-CN",
+      theme: "system",
+      appearance: { ...defaultAppearancePreferences(), codeThemeDay: "github-light", codeThemeNight: "dracula" }
+    });
+
+    expect(root.style.getPropertyValue("--code-day-bg")).toBe("#ffffff");
+    expect(root.style.getPropertyValue("--code-day-keyword")).toBe("#cf222e");
+    expect(root.style.getPropertyValue("--code-night-bg")).toBe("#282a36");
+
+    configureApplicationAppearance({
+      appLanguage: "zh-CN",
+      theme: "system",
+      appearance: defaultAppearancePreferences()
+    });
+
+    expect(root.style.getPropertyValue("--code-day-bg")).toBe("");
+    expect(root.style.getPropertyValue("--code-night-bg")).toBe("");
   });
 
   it("falls back to the factory appearance when the caller has no document yet", () => {

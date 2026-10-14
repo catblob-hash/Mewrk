@@ -64,7 +64,25 @@ interface MarkdownContentProps {
 type VisibilityCallback = (visible: boolean) => void;
 
 const visibilityCallbacks = new WeakMap<Element, VisibilityCallback>();
+/** The replies reported visible, each with the timer that will report it gone, if one is running. */
+const shownElements = new WeakMap<Element, number | null>();
 let nearViewportObserver: IntersectionObserver | null = null;
+
+/**
+ * How long a reply stays rendered after it leaves the viewport's surroundings. Released at
+ * once, a reply at their edge was torn down and parsed afresh on every small scroll back and
+ * forth. The wait is in time rather than distance because the timeline's slots skip their
+ * contents off screen (`content-visibility`), and an observer reports skipped contents as not
+ * intersecting whatever its margin. It also takes the teardown out of the scroll that caused it.
+ */
+const RELEASE_DELAY_MS = 10_000;
+
+function cancelRelease(element: Element): void {
+  const timer = shownElements.get(element);
+  if (timer === null || timer === undefined) return;
+  window.clearTimeout(timer);
+  shownElements.set(element, null);
+}
 
 function observeNearViewport(element: Element, callback: VisibilityCallback): () => void {
   if (typeof IntersectionObserver === "undefined") {
@@ -73,12 +91,28 @@ function observeNearViewport(element: Element, callback: VisibilityCallback): ()
   }
   if (!nearViewportObserver) {
     nearViewportObserver = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => visibilityCallbacks.get(entry.target)?.(entry.isIntersecting));
+      entries.forEach((entry) => {
+        const target = entry.target;
+        if (entry.isIntersecting) {
+          cancelRelease(target);
+          shownElements.set(target, null);
+          visibilityCallbacks.get(target)?.(true);
+          return;
+        }
+        // Never shown, or already waiting to go.
+        if (shownElements.get(target) !== null) return;
+        shownElements.set(target, window.setTimeout(() => {
+          shownElements.delete(target);
+          visibilityCallbacks.get(target)?.(false);
+        }, RELEASE_DELAY_MS));
+      });
     }, { rootMargin: "1200px 0px" });
   }
   visibilityCallbacks.set(element, callback);
   nearViewportObserver.observe(element);
   return () => {
+    cancelRelease(element);
+    shownElements.delete(element);
     visibilityCallbacks.delete(element);
     nearViewportObserver?.unobserve(element);
   };
@@ -321,7 +355,11 @@ export const MarkdownContent = memo(function MarkdownContent({
   const [nearViewport, setNearViewport] = useState(() => (
     !deferOffscreen || typeof IntersectionObserver === "undefined"
   ));
-  const [measuredHeight, setMeasuredHeight] = useState(0);
+  // The height the rendered reply last had, for the placeholder that stands in for it once it
+  // is released. A ref, not state: nothing drawn reads it while the reply is on screen, and
+  // recording it as state rendered the reply a second time (a second parse of its markdown)
+  // after its first mount, after each flush of a stream and on every frame of a resize.
+  const measuredHeight = useRef(0);
   const estimatedHeight = useMemo(() => estimateMarkdownHeight(content), [content]);
   const shouldRender = streaming || !deferOffscreen || nearViewport;
   const { singleDollarMath } = useAppearance();
@@ -448,7 +486,7 @@ export const MarkdownContent = memo(function MarkdownContent({
       frame = window.requestAnimationFrame(() => {
         frame = null;
         const height = Math.ceil(host.getBoundingClientRect().height);
-        if (height > 0) setMeasuredHeight((current) => current === height ? current : height);
+        if (height > 0) measuredHeight.current = height;
       });
     };
     measure();
@@ -470,7 +508,7 @@ export const MarkdownContent = memo(function MarkdownContent({
       className={`markdown-content${className ? ` ${className}` : ""}`}
       data-markdown-deferred={!shouldRender || undefined}
       data-mewrk-path-base={(linkifyPaths && pathBaseDir) || undefined}
-      style={!shouldRender ? { minHeight: `${measuredHeight || estimatedHeight}px` } : undefined}
+      style={!shouldRender ? { minHeight: `${measuredHeight.current || estimatedHeight}px` } : undefined}
     >
       {shouldRender && (
         <ReactMarkdown

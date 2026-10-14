@@ -245,7 +245,21 @@ describe("tool titles that name their subject", () => {
     });
     expect(getToolPresentation(tool("find", { query: "*.rs" }, "No matching files")).note).toBe("0 个结果");
 
-    const searched = tool("grep", { pattern: "TODO|FIXME" }, [
+    // The default mode answers with files, so it counts files; matching lines are counted only when asked for.
+    const files = tool("grep", { pattern: "TODO|FIXME" }, [
+      "src/a.ts",
+      "src/b.ts",
+      "[skipped] src/c.bin: unreadable"
+    ].join("\n"));
+    expect(getToolPresentation(files, undefined, en)).toMatchObject({
+      title: "Searched for TODO|FIXME",
+      subject: { text: "TODO|FIXME", code: true },
+      note: "2 files",
+      stat: "2 files"
+    });
+    expect(getToolPresentation(files).note).toBe("2 个文件");
+
+    const searched = tool("grep", { pattern: "TODO|FIXME", output_mode: "content" }, [
       "src/a.ts:3:// TODO one",
       "src/b.ts:10:// FIXME two",
       "[skipped] src/c.bin: unreadable"
@@ -253,10 +267,29 @@ describe("tool titles that name their subject", () => {
     expect(getToolPresentation(searched, undefined, en)).toMatchObject({
       title: "Searched for TODO|FIXME",
       subject: { text: "TODO|FIXME", code: true },
-      note: "2 matches"
+      note: "2 matches",
+      stat: "2 matches"
     });
-    expect(getToolPresentation(tool("grep", { pattern: "x" }, "src/a.ts:1:x\n… more matches follow.")).note)
+    expect(getToolPresentation(tool("grep", { pattern: "x", output_mode: "content" }, "src/a.ts:1:x\n… more matches follow.")).note)
       .toBe("1+ 处匹配");
+    expect(getToolPresentation(tool("grep", { pattern: "x" }, "src/a.ts\n… more matches follow.")).note)
+      .toBe("1+ 个文件");
+  });
+
+  it("names a search by its pattern, then by what narrowed it", () => {
+    const en = (zh: string, english: string, params?: Record<string, string | number>) => translate("en-US", zh, english, params);
+    expect(getToolPresentation(tool("grep", { pattern: "needle" }, "")).target).toBe("needle");
+    const narrowed = tool("grep", { pattern: "needle", glob: "*.rs", output_mode: "content" }, "");
+    expect(getToolPresentation(narrowed).target).toBe("needle · *.rs · 内容");
+    expect(getToolPresentation(narrowed, undefined, en).target).toBe("needle · *.rs · content");
+    expect(getToolPresentation(tool("grep", { pattern: "needle", output_mode: "count" }, ""), undefined, en).target)
+      .toBe("needle · count");
+    // The default mode needs no word, and a mode this card does not know is the default.
+    expect(getToolPresentation(tool("grep", { pattern: "needle", output_mode: "files_with_matches" }, "")).target)
+      .toBe("needle");
+    expect(getToolPresentation(tool("grep", { pattern: "needle", output_mode: "bogus" }, "a.rs")).note).toBe("1 个文件");
+    // No pattern, no target: a glob alone names nothing.
+    expect(getToolPresentation(tool("grep", { glob: "*.rs" }, "")).target).toBeUndefined();
   });
 });
 
@@ -269,8 +302,6 @@ describe("failed tool titles", () => {
     expect(getToolPresentation(edit, undefined, en).title).toBe("Failed to edit file: The exact text to replace was not found");
     expect(getToolPresentation(edit, undefined, undefined, undefined, "找不到要替换的文本").title)
       .toBe("编辑文件失败：找不到要替换的文本");
-    // What failed, without why: the body prints the whole error under it.
-    expect(getToolPresentation(edit).failure).toBe("编辑文件失败");
     // A failed edit names no file and counts no lines.
     expect(getToolPresentation(edit).subject).toBeUndefined();
   });
@@ -345,7 +376,8 @@ describe("tool view registry", () => {
       "send_message",
       "followup_task",
       "task_wait",
-      "task_list"
+      "task_list",
+      "task_stop"
     ]) {
       expect(toolSurfaceForName(name)).toBe("group");
     }
@@ -428,6 +460,7 @@ describe("tool view registry", () => {
       ["agent_spawn", { name: "reviewer", prompt: "审查" }, "agents"],
       // A retired child → main message, as saved conversations hold it.
       ["send_message", { message: "已定位" }, "agents"],
+      ["task_stop", { task: "shell:1" }, "agents"],
       // `fork` and `skill` each own a bucket rather than falling into `other`.
       ["fork", { prompt: "继续" }, "fork"],
       ["skill", { name: "pdf" }, "skill"],
@@ -565,17 +598,214 @@ describe("tool view registry", () => {
 });
 
 describe("ordinary tool detail renderers", () => {
-  it("renders ls/find lists and grep matches as navigable structured rows", () => {
+  it("renders ls/find lists and grep matches as plain monospace lines", () => {
     const { rerender } = render(<ToolDetailRenderer item={tool("ls", { path: "." }, "src/\nsrc/App.tsx\n")} />);
     const files = screen.getByRole("list", { name: "文件结果" });
+    expect(files).toHaveClass("tool-renderer__lines");
     expect(within(files).getByText("src/")).toBeInTheDocument();
     expect(within(files).getByText("src/App.tsx")).toBeInTheDocument();
 
-    rerender(<ToolDetailRenderer item={tool("grep", { pattern: "TODO" }, "src/a.ts:12:// TODO: fix\nsrc/b.ts:7:TODO\n")} />);
+    // What the tool says about its answer, rather than an entry of it, steps back as a note.
+    rerender(<ToolDetailRenderer item={tool("find", { query: "*.tsx" }, "src/App.tsx\n(Showing 6 of 14 files)")} />);
+    const found = screen.getByRole("list", { name: "文件结果" });
+    expect(within(found).getByText("src/App.tsx")).not.toHaveClass("tool-renderer__note");
+    expect(within(found).getByText("(Showing 6 of 14 files)")).toHaveClass("tool-renderer__note");
+
+    rerender(<ToolDetailRenderer item={tool("grep", { pattern: "TODO", output_mode: "content" }, "src/a.ts:12:// TODO: fix\nsrc/b.ts:7:TODO\n… 3 more matches")} />);
     const matches = screen.getByRole("list", { name: "搜索结果" });
-    expect(within(matches).getByText("src/a.ts")).toBeInTheDocument();
-    expect(within(matches).getByLabelText("第 12 行")).toBeInTheDocument();
-    expect(within(matches).getByText("// TODO: fix")).toBeInTheDocument();
+    const [first, second, more] = within(matches).getAllByRole("listitem");
+    // A line reads as the tool printed it, with where it was found set back from what was found.
+    expect(first.textContent).toBe("src/a.ts:12:// TODO: fix");
+    expect(first.querySelector(".tool-renderer__dim")?.textContent).toBe("src/a.ts:12:");
+    expect(second.textContent).toBe("src/b.ts:7:TODO");
+    expect(second.querySelector(".tool-renderer__dim")?.textContent).toBe("src/b.ts:7:");
+    // A line that is not a match has no location to set back; it is a note.
+    expect(more.textContent).toBe("… 3 more matches");
+    expect(more).toHaveClass("tool-renderer__note");
+    expect(more.querySelector(".tool-renderer__dim")).toBeNull();
+  });
+
+  it("sets a type icon ahead of a listed file, a folder ahead of a directory, nothing ahead of a remark", () => {
+    const glyph = (row: HTMLElement) => row.querySelector("svg")
+      ? "folder"
+      : row.querySelector("img.file-icon")?.getAttribute("src") ?? null;
+    const listed = [
+      "src/",
+      "target/ (ignored)",
+      "src/App.tsx",
+      "dist/bundle.js (ignored)",
+      "(Showing 4 of 9 files)",
+      "… listing cut at the 40000-character limit",
+      "[skipped] locked.db: unreadable"
+    ].join("\n");
+    const { unmount } = render(<ToolDetailRenderer item={tool("ls", { path: "." }, listed)} />);
+    const entries = within(screen.getByRole("list", { name: "文件结果" })).getAllByRole("listitem");
+    expect(entries.map(glyph)).toEqual([
+      "folder",
+      "folder",
+      "/file-icons/react_ts.svg",
+      "/file-icons/javascript.svg",
+      null,
+      null,
+      null
+    ]);
+    // An icon is no part of what the line says: it still reads, and copies, as the tool printed it.
+    expect(entries.map((entry) => entry.textContent)).toEqual(listed.split("\n"));
+    unmount();
+
+    render(<ToolDetailRenderer item={tool("grep", { pattern: "needle" }, "src/a.rs\nREADME.md\n… more matches follow.")} />);
+    const matched = within(screen.getByRole("list", { name: "搜索结果" })).getAllByRole("listitem");
+    expect(matched.map(glyph)).toEqual(["/file-icons/rust.svg", "/file-icons/readme.svg", null]);
+  });
+
+  it("reads a tool's own sentence for finding nothing as that, not as one entry found", () => {
+    for (const [name, input, answer, list] of [
+      ["find", { query: "*.rs" }, "No matching files", "文件结果"],
+      ["ls", { path: "empty" }, "(empty directory)", "文件结果"],
+      ["grep", { pattern: "nowhere" }, "No matches found", "搜索结果"]
+    ] as const) {
+      const item = tool(name, input, answer);
+      const { unmount } = render(<ToolDetailRenderer item={item} />);
+      expect(screen.queryByRole("list", { name: list })).not.toBeInTheDocument();
+      expect(screen.getByText(answer)).toHaveClass("tool-renderer__note");
+      expect(getToolPresentation(item).stat).toMatch(/^0 /);
+      unmount();
+    }
+  });
+
+  const GREP_HINT = "… more matches follow. Showing 1–3; pass offset=3 for the next page, or narrow the pattern or path.";
+
+  it("lists the files a search matched as paths, whatever a path happens to look like", () => {
+    // A path may hold `:12:` or `-3-`; in this mode a line is a path and nothing else.
+    const output = [
+      "src/lib/glassPlate.ts",
+      "src/odd:12:name.ts",
+      "docs/2024-10-13-notes.md",
+      "src/a-3-b.ts",
+      GREP_HINT,
+      "[skipped] src/c.bin: unreadable"
+    ].join("\n");
+    // Named or not, the mode is the default one.
+    const inputs: ToolContext["input"][] = [
+      { pattern: "needle" },
+      { pattern: "needle", output_mode: "files_with_matches" },
+      { pattern: "needle", output_mode: "" }
+    ];
+    for (const input of inputs) {
+      const item = tool("grep", input, output);
+      const { unmount } = render(<ToolDetailRenderer item={item} />);
+      const list = screen.getByRole("list", { name: "搜索结果" });
+      const rows = within(list).getAllByRole("listitem");
+      expect(rows.map((row) => row.textContent)).toEqual(output.split("\n"));
+      // No location is set back from a path: every one is a plain entry.
+      expect(list.querySelector(".tool-renderer__dim")).toBeNull();
+      expect(rows.slice(0, 4).every((row) => !row.classList.contains("tool-renderer__note"))).toBe(true);
+      // The tool's own lines about its answer stay notes.
+      expect(rows[4]).toHaveClass("tool-renderer__note");
+      expect(rows[5]).toHaveClass("tool-renderer__note");
+      expect(getToolPresentation(item)).toMatchObject({ note: "4+ 个文件", stat: "4 个文件" });
+      unmount();
+    }
+  });
+
+  it("sets context lines back from matching lines and keeps each group apart", () => {
+    const output = [
+      "src/a.rs:12:fn needle() {}",
+      "src/a.rs-13-    body();",
+      "--",
+      // The date in the path and the clock in the text both look like a location.
+      "docs/2024-10-13-notes.md-4-before it, 10:30:15",
+      "docs/2024-10-13-notes.md:5:needle at 10:30:15",
+      "--",
+      "src/b.rs:3:needle",
+      GREP_HINT,
+      "[skipped] src/c.bin: unreadable"
+    ].join("\n");
+    const item = tool("grep", { pattern: "needle", output_mode: "content", context: 1 }, output);
+    render(<ToolDetailRenderer item={item} />);
+    const rows = within(screen.getByRole("list", { name: "搜索结果" })).getAllByRole("listitem");
+    expect(rows.map((row) => row.textContent)).toEqual(output.split("\n"));
+
+    expect(rows[0].querySelector(".tool-renderer__dim")?.textContent).toBe("src/a.rs:12:");
+    // A context line is stepped back as a whole, and its location further still.
+    expect(rows[1]).toHaveClass("tool-renderer__dim");
+    expect(rows[1].querySelector(".tool-renderer__note")?.textContent).toBe("src/a.rs-13-");
+    expect(rows[2].textContent).toBe("--");
+    expect(rows[2]).toHaveClass("tool-renderer__note");
+    expect(rows[3]).toHaveClass("tool-renderer__dim");
+    expect(rows[3].querySelector(".tool-renderer__note")?.textContent).toBe("docs/2024-10-13-notes.md-4-");
+    expect(rows[4].querySelector(".tool-renderer__dim")?.textContent).toBe("docs/2024-10-13-notes.md:5:");
+    expect(rows[4]).not.toHaveClass("tool-renderer__dim");
+    expect(rows[6].querySelector(".tool-renderer__dim")?.textContent).toBe("src/b.rs:3:");
+    expect(rows[7]).toHaveClass("tool-renderer__note");
+    expect(rows[8]).toHaveClass("tool-renderer__note");
+    // Only the matching lines are counted, never the lines around them.
+    expect(getToolPresentation(item)).toMatchObject({ note: "3+ 处匹配", stat: "3 处匹配" });
+  });
+
+  it("reads a context line by the group's file when only one side of a match was asked for", () => {
+    // `after` alone, and no `--` because there is a single group.
+    const output = "src/a-1-b.ts:7:needle\nsrc/a-1-b.ts-8-next: 12:30";
+    const item = tool("grep", { pattern: "needle", output_mode: "content", after: 1 }, output);
+    render(<ToolDetailRenderer item={item} />);
+    const [match, context] = within(screen.getByRole("list", { name: "搜索结果" })).getAllByRole("listitem");
+    expect(match.querySelector(".tool-renderer__dim")?.textContent).toBe("src/a-1-b.ts:7:");
+    expect(context.querySelector(".tool-renderer__note")?.textContent).toBe("src/a-1-b.ts-8-");
+    expect(getToolPresentation(item).stat).toBe("1 处匹配");
+  });
+
+  it("reads content lines with no context as matches only, even where a path holds -3-", () => {
+    const item = tool("grep", { pattern: "needle", output_mode: "content" }, "src/a-3-b.ts:7:needle\nsrc/b.ts:2:x-4-y");
+    render(<ToolDetailRenderer item={item} />);
+    const [first, second] = within(screen.getByRole("list", { name: "搜索结果" })).getAllByRole("listitem");
+    expect(first.querySelector(".tool-renderer__dim")?.textContent).toBe("src/a-3-b.ts:7:");
+    expect(second.querySelector(".tool-renderer__dim")?.textContent).toBe("src/b.ts:2:");
+    expect(getToolPresentation(item).stat).toBe("2 处匹配");
+  });
+
+  it("still reads a search recorded before output_mode existed as the matching lines it printed", () => {
+    // No mode was named and every entry is `path:line:text`: the old transcripts.
+    const old = tool("grep", { pattern: "needle" }, "src/a.ts:7:needle\nsrc/b.ts:2:more needle\n… more matches follow.");
+    render(<ToolDetailRenderer item={old} />);
+    const [first] = within(screen.getByRole("list", { name: "搜索结果" })).getAllByRole("listitem");
+    expect(first.querySelector(".tool-renderer__dim")?.textContent).toBe("src/a.ts:7:");
+    expect(getToolPresentation(old).note).toBe("2+ 处匹配");
+    // A mode that was named is never second-guessed, and a mixed answer is a list of files.
+    const named = tool("grep", { pattern: "needle", output_mode: "files_with_matches" }, "src/a.ts:7:needle");
+    expect(getToolPresentation(named).stat).toBe("1 个文件");
+    const files = tool("grep", { pattern: "needle" }, "src/a.ts\nsrc/b:1:.ts");
+    expect(getToolPresentation(files).stat).toBe("2 个文件");
+  });
+
+  it("shows a count per file and the total as a note after the paging hint", () => {
+    const output = [
+      "src/a.rs:3",
+      "src/odd:12:name.rs:1",
+      GREP_HINT,
+      "Total: 4 matching line(s) in 2 file(s).",
+      "[skipped] src/c.bin: unreadable"
+    ].join("\n");
+    const item = tool("grep", { pattern: "needle", output_mode: "count" }, output);
+    render(<ToolDetailRenderer item={item} />);
+    const rows = within(screen.getByRole("list", { name: "搜索结果" })).getAllByRole("listitem");
+    expect(rows.map((row) => row.textContent)).toEqual(output.split("\n"));
+    expect(rows[0].querySelector(".tool-renderer__dim")?.textContent).toBe("src/a.rs:");
+    // The path is everything before the last colon.
+    expect(rows[1].querySelector(".tool-renderer__dim")?.textContent).toBe("src/odd:12:name.rs:");
+    for (const note of rows.slice(2)) expect(note).toHaveClass("tool-renderer__note");
+    expect(getToolPresentation(item)).toMatchObject({ note: "2+ 个文件", stat: "2 个文件" });
+  });
+
+  it("reads the tool's answer for a page past the last entry as that, in every mode", () => {
+    for (const mode of [undefined, "content", "count"]) {
+      const answer = "No matches at offset 500; there are 12.";
+      const item = tool("grep", { pattern: "needle", ...(mode ? { output_mode: mode } : {}) }, answer);
+      const { unmount } = render(<ToolDetailRenderer item={item} />);
+      expect(screen.queryByRole("list", { name: "搜索结果" })).not.toBeInTheDocument();
+      expect(screen.getByText(answer)).toHaveClass("tool-renderer__note");
+      expect(getToolPresentation(item).stat).toMatch(/^0 /);
+      unmount();
+    }
   });
 
   it("renders read output on the diff base with source line numbers", () => {
@@ -585,6 +815,47 @@ describe("ordinary tool detail renderers", () => {
     expect(preview.querySelectorAll(".diff-output__line")).toHaveLength(2);
     expect(preview.querySelector(".diff-output__line-number")).toHaveTextContent("8");
     expect(within(preview).getByText("second")).toBeInTheDocument();
+  });
+
+  it("sets the notes a read ends with apart from the file's own lines", () => {
+    const continued = "alpha\nbeta\n… showing lines 1–2 of 900. Continue with start_line=3.";
+    const unsized = "alpha\nbeta\n… showing lines 1–2; the total line count was not computed because the file is large. Continue with start_line=3.";
+    const lossy = "alpha\n(This file is not valid UTF-8, so it was decoded lossily: invalid bytes show as U+FFFD. `edit` cannot modify it.)";
+    const utf16 = "alpha\n(This file is UTF-16LE text, decoded for this read. `edit` cannot modify it.)";
+    for (const output of [continued, unsized, lossy, utf16]) {
+      const item = tool("read", { path: "src/a.txt" }, output);
+      const { unmount } = render(<ToolDetailRenderer item={item} />);
+      const lines = screen.getByRole("region", { name: "src/a.txt 内容" }).querySelectorAll(".diff-output__line");
+      expect(lines[0]).toHaveClass("diff-output__line--context");
+      expect(lines[lines.length - 1]).toHaveClass("diff-output__line--meta");
+      // The note is not a line of the file: the range counts what the file held.
+      expect(getToolPresentation(item).stat).toBe(output === lossy || output === utf16 ? "1–1 行" : "1–2 行");
+      unmount();
+    }
+    // Both notes can follow the text, in either order.
+    const both = tool("read", { path: "src/a.txt" }, `${continued}\n${utf16.split("\n")[1]}`);
+    render(<ToolDetailRenderer item={both} />);
+    const kinds = [...screen.getByRole("region", { name: "src/a.txt 内容" }).querySelectorAll(".diff-output__line")]
+      .map((line) => line.classList.contains("diff-output__line--meta") ? "meta" : "text");
+    expect(kinds).toEqual(["text", "text", "meta", "meta"]);
+  });
+
+  it("answers an empty file or a start past the end with the sentence, not a numbered line", () => {
+    const empty = tool("read", { path: "src/empty.ts" }, "(The file exists but is empty)");
+    const { container, rerender } = render(<ToolDetailRenderer item={empty} />);
+    expect(screen.getByText("文件内容为空")).toHaveClass("tool-renderer__note");
+    expect(container.querySelector(".diff-output__line")).toBeNull();
+    expect(getToolPresentation(empty).stat).toBeUndefined();
+
+    const sentence = "(The file has only 3 lines, so the requested start_line is out of range)";
+    const past = tool("read", { path: "src/a.ts", start_line: 40 }, sentence);
+    rerender(<ToolDetailRenderer item={past} />);
+    expect(screen.getByText(sentence)).toHaveClass("tool-renderer__note");
+    expect(container.querySelector(".diff-output__line")).toBeNull();
+    expect(getToolPresentation(past).stat).toBeUndefined();
+    // One line is "1 line", not "1 lines".
+    rerender(<ToolDetailRenderer item={tool("read", { path: "src/a.ts", start_line: 40 }, "(The file has only 1 line, so the requested start_line is out of range)")} />);
+    expect(container.querySelector(".diff-output__line")).toBeNull();
   });
 
   it("prefers DiffOutput for successful write/edit calls", () => {
@@ -601,6 +872,39 @@ describe("ordinary tool detail renderers", () => {
     expect(screen.getByText("printf '<tag>'")).toBeInTheDocument();
     expect(container.querySelector(".tool-renderer__terminal-output")).toHaveTextContent("[stderr]");
     expect(document.querySelector("tag")).toBeNull();
+  });
+
+  it("draws a failed command as the same terminal card, with nothing on it marked as an error", () => {
+    const failed = tool("bash", { command: "pnpm i" }, "Exit code 127\nbash: pnpm: command not found", { success: false });
+    const { container } = render(<ToolDetailRenderer item={failed} />);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(container.querySelector(".tool-renderer__command")).toHaveTextContent("pnpm i");
+    expect(container.querySelector(".tool-renderer__terminal-output")).toHaveTextContent("bash: pnpm: command not found");
+  });
+
+  it("opens a failed call that has no result to picture as its arguments and the error", () => {
+    // A read that failed has no lines to number, an edit no diff, a listing no files.
+    const read = render(
+      <ToolDetailRenderer item={tool("read", { path: "missing.ts", start_line: 40 }, "文件不存在", { success: false })} />
+    );
+    expect(read.container.querySelector(".diff-output__line")).toBeNull();
+    expect([...kvRows(read.container)]).toEqual([["path", "missing.ts"], ["start_line", "40"], ["", "文件不存在"]]);
+    read.unmount();
+
+    const edit = render(
+      <ToolDetailRenderer
+        item={tool("edit", { path: "src/App.tsx", find: "old" }, "The exact text to replace was not found", { success: false })}
+      />
+    );
+    // Not the success line an edit with no diff prints.
+    expect(edit.container.querySelector(".tool-renderer__lines")).toBeNull();
+    expect(kvRows(edit.container).get("")).toBe("The exact text to replace was not found");
+    edit.unmount();
+
+    const { container } = render(<ToolDetailRenderer item={tool("ls", { path: "nope" }, "目录不存在", { success: false })} />);
+    expect(container.querySelector("ul.tool-renderer__lines")).toBeNull();
+    expect(kvRows(container).get("")).toBe("目录不存在");
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("lays a curated call out as the arguments worth reading and then its result", () => {
@@ -738,8 +1042,8 @@ describe("preview tool detail families", () => {
 
   it("renders screenshot dimensions, and thumbnails alone when pixels came back", async () => {
     const metadata = JSON.stringify({ width: 1280, height: 720 });
-    const { rerender } = render(<ToolDetailRenderer item={tool("preview_screenshot", {}, metadata)} />);
-    expect(screen.getByText("1280×720")).toBeInTheDocument();
+    const { container, rerender } = render(<ToolDetailRenderer item={tool("preview_screenshot", {}, metadata)} />);
+    expect(kvRows(container).get("尺寸")).toBe("1280×720");
     expect(getToolPresentation(tool("preview_screenshot", {}, metadata)).stat).toBe("1280×720");
 
     const image = await previewPixel("preview-20260714T000000.000Z");
@@ -752,17 +1056,24 @@ describe("preview tool detail families", () => {
     expect(screen.queryByText("1280×720")).not.toBeInTheDocument();
   });
 
-  it("splits console entries out of the tool's own line format and lifts its footer", () => {
+  it("keeps console entries as the tool's own lines, tinted by level, with its footer as a note in the list", () => {
     const { rerender } = render(<ToolDetailRenderer item={tool(
       "preview_console_logs",
       { level: "all" },
       "[error] boom\n[log] ready\n\n(Showing last 2 of 9 entries. Use 'lines' parameter (max 200) to see more.)"
     )} />);
     const entries = screen.getByRole("list", { name: "Console 日志" });
-    expect(within(entries).getByText("boom")).toBeInTheDocument();
-    expect(within(entries).getByText("ready")).toBeInTheDocument();
-    expect(within(entries).queryByText(/Showing last/)).not.toBeInTheDocument();
-    expect(screen.getByText(/Showing last 2 of 9 entries/)).toBeInTheDocument();
+    const items = within(entries).getAllByRole("listitem");
+    // Each line verbatim, level tag included; the blank line between them is not an entry.
+    expect(items.map((entry) => entry.textContent)).toEqual([
+      "[error] boom",
+      "[log] ready",
+      "(Showing last 2 of 9 entries. Use 'lines' parameter (max 200) to see more.)"
+    ]);
+    expect(items[0]).toHaveClass("tool-renderer__log--error");
+    expect(items[1]).toHaveClass("tool-renderer__log--log");
+    // The footer is not lifted out of the list: it is its last line, stepped back as a note.
+    expect(items[2]).toHaveClass("tool-renderer__note");
 
     // The tool's own empty answer is not one entry.
     rerender(<ToolDetailRenderer item={tool("preview_console_logs", {}, "No console logs.")} />);
@@ -770,16 +1081,19 @@ describe("preview tool detail families", () => {
     expect(getToolPresentation(tool("preview_console_logs", {}, "No console logs.")).stat).toBe("0 条");
   });
 
-  it("splits the network ledger but leaves a fetched response body as text", () => {
+  it("keeps the network ledger verbatim, tints a failed request, and leaves a fetched response body as text", () => {
     const { rerender } = render(<ToolDetailRenderer item={tool(
       "preview_network",
       { filter: "all" },
       "[req-1] GET https://example.com/api → 200 OK\n[req-2] POST https://example.com/save [FAILED: net::ERR_ABORTED]"
     )} />);
     const requests = screen.getByRole("list", { name: "网络请求" });
-    expect(within(requests).getByText("https://example.com/api")).toBeInTheDocument();
-    expect(within(requests).getByText("200 OK")).toBeInTheDocument();
-    expect(within(requests).getByText("[FAILED: net::ERR_ABORTED]")).toBeInTheDocument();
+    const [ok, failed] = within(requests).getAllByRole("listitem");
+    // The id a line leads with is what a later call asks for its body by, so it stays.
+    expect(ok.textContent).toBe("[req-1] GET https://example.com/api → 200 OK");
+    expect(ok).not.toHaveClass("tool-renderer__log--error");
+    expect(failed.textContent).toBe("[req-2] POST https://example.com/save [FAILED: net::ERR_ABORTED]");
+    expect(failed).toHaveClass("tool-renderer__log--error");
 
     rerender(<ToolDetailRenderer item={tool(
       "preview_network",
@@ -787,7 +1101,9 @@ describe("preview tool detail families", () => {
       "{\"ok\":true}"
     )} />);
     expect(screen.queryByRole("list", { name: "网络请求" })).not.toBeInTheDocument();
-    expect(screen.getByText('{"ok":true}')).toBeInTheDocument();
+    const body = screen.getByText('{"ok":true}');
+    expect(body.tagName).toBe("PRE");
+    expect(body).toHaveClass("tool-renderer__lines");
   });
 
   it("re-indents the compact JSON that inspect and list answer with", () => {
@@ -830,14 +1146,14 @@ describe("preview tool detail families", () => {
     const item = tool("read", { path: "diagram.png" }, "图片超过 5 MiB 限制", { success: false });
     item.result.images = [image];
 
-    render(<ToolDetailRenderer item={item} />);
+    const { container } = render(<ToolDetailRenderer item={item} />);
 
-    expect(screen.getByRole("alert")).toHaveTextContent("图片超过 5 MiB 限制");
+    expect(kvRows(container).get("")).toBe("图片超过 5 MiB 限制");
   });
 
   it("uses a safe text fallback for malformed preview JSON", () => {
     render(<ToolDetailRenderer item={tool("preview_dialog", {}, "{not-json")} />);
-    expect(screen.getByText("结果不是有效 JSON")).toBeInTheDocument();
+    expect(screen.getByText("结果不是有效 JSON")).toHaveClass("tool-renderer__note");
     expect(screen.getByText("{not-json")).toBeInTheDocument();
   });
 
@@ -953,7 +1269,7 @@ describe("memory tool presentation", () => {
     expect(container).toHaveTextContent("端口 4000");
   });
 
-  it("surfaces a failed memory call with its reason", () => {
+  it("draws a failed memory call as the same card, ending in its reason", () => {
     const item = tool(
       "edit_project_memory",
       { name: "build", old_text: "3000", new_text: "4000", description: "端口" },
@@ -961,11 +1277,12 @@ describe("memory tool presentation", () => {
       { success: false }
     );
 
-    render(<ToolDetailRenderer item={item} />);
-    const alert = screen.getByRole("alert");
-    expect(alert).toHaveTextContent("编辑项目记忆失败");
-    expect(alert).toHaveTextContent("build");
-    expect(alert).toHaveTextContent("出现了 2 次");
+    const { container } = render(<ToolDetailRenderer item={item} />);
+    expect(screen.queryByRole("alert")).toBeNull();
+    const rows = kvRows(container);
+    expect(rows.get("文档")).toBe("build");
+    expect(rows.get("原文")).toBe("3000");
+    expect(rows.get("")).toContain("出现了 2 次");
   });
 
   it("carries no model identity, scope selector, or version anywhere in the card", () => {
@@ -1049,10 +1366,13 @@ describe("agent detail views", () => {
 
     expect(getToolPresentation(item)).toMatchObject({ family: "agent-wait", stat: "收到 2 条" });
     const { container } = render(<ToolDetailRenderer item={item} />);
-    const rows = kvRows(container);
-    expect([...rows.keys()]).toEqual(["reviewer · 已完成", "tester · 进度更新", ""]);
-    expect(rows.get("reviewer · 已完成")).toBe("12 项检查全部通过");
-    expect(rows.get("")).toBe("当前状态：reviewer 已完成、tester 运行中");
+    // Who answered heads its own line, whole: a name is not cut to fit a column.
+    const envelopes = Array.from(container.querySelectorAll(".tool-renderer__lines > section"));
+    expect(envelopes.map((envelope) => envelope.querySelector(".tool-renderer__dim")?.textContent))
+      .toEqual(["reviewer · 已完成", "tester · 进度更新"]);
+    expect(envelopes[0]).toHaveTextContent("12 项检查全部通过");
+    expect(screen.getByText("当前状态：reviewer 已完成、tester 运行中")).toHaveClass("tool-renderer__note");
+    expect(container.querySelector(".tool-kv")).toBeNull();
   });
 
   it("keeps an unparsable or empty wait result readable instead of dropping it", () => {
@@ -1076,15 +1396,30 @@ describe("agent detail views", () => {
     expect(screen.getByText("正在跑 e2e")).toBeInTheDocument();
     expect(screen.getByText("状态已返回给主智能体")).toBeInTheDocument();
   });
+
+  it("titles a task_stop row by phase and shows the address it acted on beside the receipt", () => {
+    const done = tool("task_stop", { task: "shell:1" }, "已请求停止 shell:1");
+    expect(getToolPresentation(done)).toMatchObject({
+      family: "raw",
+      title: "停止了任务",
+      target: "shell:1"
+    });
+    const running = { ...done, streaming: true, streamStatus: "running" as const };
+    expect(getToolPresentation(running).title).toBe("正在停止任务");
+    const failed = tool("task_stop", { task: "shell:9" }, "没有这个任务", { success: false });
+    // A failed row appends the host's reason to its phrase.
+    expect(getToolPresentation(failed).title).toBe("停止任务失败：没有这个任务");
+
+    const { container } = render(<ToolDetailRenderer item={done} />);
+    expect(kvRows(container).get("task")).toBe("shell:1");
+    expect(screen.getByText("已请求停止 shell:1")).toBeInTheDocument();
+  });
 });
 
 describe("shared safeguards", () => {
-  it("renders failures prominently and only materializes raw data after its disclosure opens", async () => {
+  it("only materializes raw data after its disclosure opens", async () => {
     const user = userEvent.setup();
     render(<ToolDetailRenderer item={tool("read", { path: "missing.ts" }, "文件不存在", { success: false })} />);
-    const alert = screen.getByRole("alert");
-    expect(alert).toHaveTextContent("读取文件失败");
-    expect(alert).toHaveTextContent("文件不存在");
     const disclosure = screen.getByText("原始数据").closest("details");
     expect(disclosure).not.toHaveAttribute("open");
     expect(disclosure).not.toHaveTextContent("missing.ts");

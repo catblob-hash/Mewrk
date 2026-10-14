@@ -1,5 +1,6 @@
 import {
   ArrowRight,
+  AtSign,
   Check,
   CircleAlert,
   LoaderCircle,
@@ -32,6 +33,7 @@ import {
   type GitWorkspaceSnapshot
 } from "../lib/git";
 import { IconButton } from "./Common";
+import { ContextMenu } from "./ContextMenu";
 import { DiffViewer, DIFF_LARGE_LINE_COUNT } from "./DiffViewer";
 import type { DiffEntry, DiffEntryStatus } from "./DiffViewer";
 import { PopoverMenu } from "./PopoverMenu";
@@ -97,6 +99,11 @@ export interface GitReviewPanelProps {
   /** Told once `revealRequest` has been acted on, so a later mount does not act on it again. */
   onRevealRequestHandled?: (nonce: number) => void;
   mutationDisabledReason?: string | null;
+  /**
+   * Given, a line of a diff can be mentioned in the conversation from its menu: told the file's
+   * repository-relative path and the number the line shows.
+   */
+  onMentionLine?: (path: string, line: number) => void;
   onSnapshotChange?: (snapshot: GitWorkspaceSnapshot | null) => void;
   onMutationStart?: () => boolean;
   onMutationEnd?: () => void;
@@ -310,6 +317,7 @@ export function GitReviewPanel({
   revealRequest = null,
   onRevealRequestHandled,
   mutationDisabledReason = null,
+  onMentionLine,
   onSnapshotChange = () => undefined,
   onMutationStart = () => true,
   onMutationEnd = () => undefined,
@@ -323,6 +331,8 @@ export function GitReviewPanel({
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
   const [operationMessage, setOperationMessage] = useState<string | null>(null);
+  /** The diff line a right click landed on, while its menu is open. */
+  const [lineMenu, setLineMenu] = useState<{ path: string; line: number; x: number; y: number } | null>(null);
   // A pane mounted to show one file asks for that file with its first page.
   const [selectedPath, setSelectedPath] = useState<string | null>(
     revealRequest?.path ?? snapshot.files.find(isReviewableChange)?.path ?? null
@@ -1574,6 +1584,7 @@ export function GitReviewPanel({
           onExpandContext={expandFileContext}
           expandingPaths={expandingPaths}
           fullyExpandedPaths={fullyExpandedPaths}
+          onLineMenu={onMentionLine && ((path, line, point) => setLineMenu({ path, line, ...point }))}
           emptyLabel={diffState === "loading"
             ? t("正在读取差异", "Loading the diff")
             : t("这个范围没有行级差异", "No line-level diff in this scope")}
@@ -1646,6 +1657,22 @@ export function GitReviewPanel({
               )
               : t("工作区没有变更", "Working tree is clean")}
         </div>
+      )}
+      {lineMenu && (
+        <ContextMenu
+          anchor={{ x: lineMenu.x, y: lineMenu.y }}
+          label={t("这一行的操作", "Actions for this line")}
+          sections={[{
+            id: "mention",
+            items: [{
+              id: "mention",
+              label: t("在会话中提及", "Mention in Conversation"),
+              icon: <AtSign size={13} aria-hidden="true" />,
+              onSelect: () => onMentionLine?.(lineMenu.path, lineMenu.line)
+            }]
+          }]}
+          onClose={() => setLineMenu(null)}
+        />
       )}
     </section>
   );

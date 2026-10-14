@@ -17,6 +17,8 @@ import {
   ZOOM_STEP
 } from "../../lib/appearance";
 import { parseBackground } from "../../lib/background";
+import { codeThemeFor, codeThemesFor } from "../../lib/codeThemes";
+import type { CodeThemeScheme } from "../../lib/codeThemes";
 import { bindingsConflict, shortcutKeyCaps } from "../../lib/shortcuts";
 import { useResolvedTheme } from "../../theme";
 import type {
@@ -29,6 +31,7 @@ import type {
 import { IconButton, Switch } from "../Common";
 import { SettingsPageHeading } from "../SettingsPageHeading";
 import { BackgroundLibraryDialog, BackgroundPreview, useBackgroundPicture } from "./BackgroundLibrary";
+import { CodeThemePreview } from "./CodeThemePreview";
 import { LocalModelSettings } from "./LocalModelSettings";
 import { SettingRow, SettingsCard } from "./rows";
 import { ThemeSample } from "./ThemeSample";
@@ -254,6 +257,19 @@ export function AppearanceSettings({
   ];
   // The theme cards draw the window as it would look: a solid ground is each theme's own.
   const samplePicture = backgroundPicture || null;
+  // One code theme per app theme, each chosen from the themes of its own scheme.
+  const codeThemeChoices: Array<{ scheme: CodeThemeScheme; label: string; value: string }> = [
+    {
+      scheme: "day",
+      label: t("浅色主题下的代码外观", "Code appearance in the light theme"),
+      value: appearance.codeThemeDay
+    },
+    {
+      scheme: "night",
+      label: t("深色主题下的代码外观", "Code appearance in the dark theme"),
+      value: appearance.codeThemeNight
+    }
+  ];
   const newlineChoices = COMPOSER_SHORTCUT_CHOICES.filter(
     (choice) => !bindingsConflict(choice, appearance.sendShortcut)
   );
@@ -401,6 +417,45 @@ export function AppearanceSettings({
                 }
               }}
             />
+          </div>
+        </SettingRow>
+      </SettingsCard>
+
+      <SettingsCard label={t("代码外观", "Code appearance")}>
+        <SettingRow
+          title={t("代码外观", "Code appearance")}
+          description={t(
+            "代码与差异的配色：左侧用于浅色主题，右侧用于深色主题。",
+            "The colours of code and diffs: the left one for the light theme, the right one for the dark theme."
+          )}
+          vertical
+        >
+          <div className="appearance-settings-page__code-themes">
+            {codeThemeChoices.map((choice) => {
+              const selected = codeThemeFor(choice.value, choice.scheme);
+              return (
+                <div className="appearance-settings-page__code-theme" key={choice.scheme}>
+                  <select
+                    className="input"
+                    aria-label={choice.label}
+                    value={selected.id}
+                    onChange={(event) =>
+                      setAppearanceValue(
+                        choice.scheme === "day" ? "codeThemeDay" : "codeThemeNight",
+                        event.target.value
+                      )
+                    }
+                  >
+                    {codeThemesFor(choice.scheme).map((theme) => (
+                      <option key={theme.id} value={theme.id}>
+                        {theme.name}
+                      </option>
+                    ))}
+                  </select>
+                  <CodeThemePreview theme={selected} glass={appearance.liquidGlass} />
+                </div>
+              );
+            })}
           </div>
         </SettingRow>
       </SettingsCard>

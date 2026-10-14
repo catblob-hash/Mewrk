@@ -460,6 +460,40 @@ impl FileReadRegistry {
         }
     }
 
+    /// Forgets what every scope of `conversation_id` — its own and each child
+    /// agent's — remembers of `paths`, the saved records of its own included.
+    ///
+    /// For files the host changed behind the model's back on purpose (a rewind
+    /// puts an earlier version back): the model's copy of each is no longer the
+    /// file, whatever times the record carries, so the next `edit` or `write` has
+    /// to be preceded by a fresh `read`.
+    pub fn forget_paths(&self, conversation_id: &str, paths: &[PathBuf]) {
+        {
+            let mut scopes = self
+                .scopes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (id, scope) in scopes.iter_mut() {
+                if conversation_of_scope(id) != conversation_id {
+                    continue;
+                }
+                for path in paths {
+                    if let Some(entry) = scope.entries.remove(path) {
+                        scope.content_bytes =
+                            scope.content_bytes.saturating_sub(text_bytes(&entry.record));
+                    }
+                }
+            }
+        }
+        if let Some(store) = self.store_for(conversation_id) {
+            for path in paths {
+                if let Err(error) = store.delete_file_read_record(conversation_id, path) {
+                    eprintln!("Could not forget a saved file read of {conversation_id}: {error}");
+                }
+            }
+        }
+    }
+
     /// Every full record in the scope, for the external-change scan. A
     /// snapshot: the scan stats and reads outside the lock.
     pub fn full_records(&self, scope: ScopeRef<'_>) -> Vec<(PathBuf, FileReadRecord)> {
@@ -655,6 +689,45 @@ mod tests {
         );
         registry.retire_conversation("conv");
         assert_eq!(registry.scope_count(), 0, "retiring drops the children too");
+    }
+
+    /// A rewind puts a file back behind the model: every scope of the
+    /// conversation, each subagent's copy and the saved record included, stops
+    /// vouching for it, and the other files and conversations are left alone.
+    #[test]
+    fn forgetting_paths_reaches_child_scopes_and_the_saved_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::conversation_store::store_for(&directory.path().join("document.v1.json")).unwrap();
+        let document = crate::catalog::default_document();
+        let conversation = document.workspaces[0].conversations[0].clone();
+        store.put_conversation(&document.workspaces[0].id, &conversation).unwrap();
+        let id = conversation.id.as_str();
+
+        let registry = FileReadRegistry::default();
+        registry.attach_store(store.clone());
+        let (target, other) = (PathBuf::from("/w/target.rs"), PathBuf::from("/w/other.rs"));
+        for path in [&target, &other] {
+            registry.record(scope(id), path.clone(), FileReadRecord::full_read(1, "text\n".into()));
+        }
+        let child_id = child_scope_id(id);
+        let child = ScopeRef { id: &child_id, parent: Some(id) };
+        // The child starts as a copy of its parent's record, and writes one of its own.
+        assert!(registry.get(child, &target).is_some());
+        registry.record(child, PathBuf::from("/w/child.rs"), FileReadRecord::full_read(2, "c\n".into()));
+        registry.record(scope("elsewhere"), target.clone(), FileReadRecord::partial_read(3));
+
+        registry.forget_paths(id, &[target.clone(), PathBuf::from("/w/child.rs")]);
+
+        assert!(registry.get(scope(id), &target).is_none());
+        assert!(registry.get(child, &target).is_none());
+        assert!(registry.get(child, Path::new("/w/child.rs")).is_none());
+        assert!(registry.get(scope(id), &other).is_some(), "other files keep their record");
+        assert!(registry.get(child, &other).is_some());
+        assert!(registry.get(scope("elsewhere"), &target).is_some(), "another conversation's record is its own");
+        let restarted = FileReadRegistry::default();
+        restarted.attach_store(store);
+        assert!(restarted.get(scope(id), &target).is_none(), "the saved record is gone too");
+        assert!(restarted.get(scope(id), &other).is_some());
     }
 
     #[test]
