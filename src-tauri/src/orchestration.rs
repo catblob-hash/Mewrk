@@ -1375,7 +1375,7 @@ mod tests {
     }
 
     fn english_profile() -> PromptProfile {
-        PromptProfile::builtin_english()
+        PromptProfile::builtin()
     }
 
     /// Parses `agent_spawn` in fallback mode, where a role is optional.
@@ -1401,7 +1401,7 @@ mod tests {
     #[test]
     fn a_stopped_tasks_result_names_who_stopped_it() {
         use agents::StopOrigin;
-        for profile in [PromptProfile::builtin_english(), PromptProfile::builtin_concise()] {
+        for profile in [PromptProfile::builtin(), PromptProfile::builtin()] {
             let by_user = append_stop_note("partial", Some(StopOrigin::User), &profile);
             assert!(by_user.starts_with("partial\n"), "{by_user}");
             assert!(by_user.contains("user"), "{by_user}");
@@ -2103,8 +2103,8 @@ mod tests {
         // contradicting results in the same output.
         let timeout = format_wait_output(&envelopes, &[], &statuses, &[], &[], true, 45, &profile);
         assert!(timeout.contains("The 45-second wait expired"), "{timeout}");
-        assert!(timeout.contains("the results of a2 are below"), "{timeout}");
-        assert!(timeout.contains("a1 are still running"), "{timeout}");
+        assert!(timeout.contains("results of a2 are below"), "{timeout}");
+        assert!(timeout.contains("a1 still running in the background"), "{timeout}");
         assert!(
             !timeout.contains("No task is running"),
             "a timeout that carries updates must not claim there were none: {timeout}"
@@ -2117,7 +2117,7 @@ mod tests {
         // The no-result branch remains a state statement.
         let empty_timeout = format_wait_output(&[], &[], &statuses, &[], &[], true, 45, &profile);
         assert!(
-            empty_timeout.contains("a1, a2 have not produced a result yet"),
+            empty_timeout.contains("with a1, a2 still running"),
             "{empty_timeout}"
         );
         assert!(

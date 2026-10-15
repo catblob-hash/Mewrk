@@ -276,11 +276,11 @@ update the counts here in the same commit; see the module doc and \
 
         let english = addendum(
             PromptVersion::V3,
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
             &all_note_tools(),
         );
-        assert_eq!(english.len(), 2324, "{WHY}");
-        assert_eq!(english.chars().count(), 2316, "{WHY}");
+        assert_eq!(english.len(), 1650, "{WHY}");
+        assert_eq!(english.chars().count(), 1650, "{WHY}");
     }
 
     /// Without a shell tool there is nothing to run in the background and no
@@ -288,7 +288,7 @@ update the counts here in the same commit; see the module doc and \
     #[test]
     fn v3_leaves_the_shell_note_to_a_child_with_a_shell() {
         let browser_only = ["read", "preview_screenshot"].map(String::from).to_vec();
-        for profile in PromptProfile::builtins() {
+        for profile in [PromptProfile::builtin()] {
             for tools in [browser_only.clone(), no_note_tools()] {
                 let rendered = render(PromptVersion::V3, "Be useful.", &profile, &tools);
                 let note = profile.text(PromptKey::SubagentAddendumShellNote);
@@ -304,7 +304,7 @@ update the counts here in the same commit; see the module doc and \
     #[test]
     fn v3_leaves_the_browser_note_to_a_child_with_a_browser_tool() {
         let shell_only = ["read", "powershell", "task_wait"].map(String::from).to_vec();
-        for profile in PromptProfile::builtins() {
+        for profile in [PromptProfile::builtin()] {
             for tools in [shell_only.clone(), no_note_tools()] {
                 let rendered = render(PromptVersion::V3, "Be useful.", &profile, &tools);
                 let note = profile.text(PromptKey::SubagentAddendumBrowserNote);
@@ -330,7 +330,7 @@ update the counts here in the same commit; see the module doc and \
             ["preview_start", "zsh"].map(String::from).to_vec(),
             ["sh", "preview_list", "read"].map(String::from).to_vec(),
         ];
-        for profile in PromptProfile::builtins() {
+        for profile in [PromptProfile::builtin()] {
             let browser = profile.text(PromptKey::SubagentAddendumBrowserNote);
             let shell = profile.text(PromptKey::SubagentAddendumShellNote);
             for tools in &tool_sets {
@@ -359,10 +359,10 @@ update the counts here in the same commit; see the module doc and \
     /// is not appended a second time, and one it lacks still is.
     #[test]
     fn v3_does_not_repeat_a_note_the_addendum_already_carries() {
-        let guided = PromptProfile::builtin_english();
-        let shell = guided.text(PromptKey::SubagentAddendumShellNote).to_owned();
-        let browser = guided.text(PromptKey::SubagentAddendumBrowserNote).to_owned();
-        let older = format!("{}\n- {shell}", guided.text(PromptKey::SubagentAddendum));
+        let builtin = PromptProfile::builtin();
+        let shell = builtin.text(PromptKey::SubagentAddendumShellNote).to_owned();
+        let browser = builtin.text(PromptKey::SubagentAddendumBrowserNote).to_owned();
+        let older = format!("{}\n- {shell}", builtin.text(PromptKey::SubagentAddendum));
         let file = PromptProfile::from_file(
             "test".into(),
             "Test".into(),
@@ -408,7 +408,7 @@ update the counts here in the same commit; see the module doc and \
     /// the tool set. V2 now lacks both notes, which moved out of its key.
     #[test]
     fn only_v3_reads_the_tool_set() {
-        for profile in PromptProfile::builtins() {
+        for profile in [PromptProfile::builtin()] {
             for version in [PromptVersion::V1, PromptVersion::V2] {
                 assert_eq!(
                     render(version, "Be useful.", &profile, &all_note_tools()),
@@ -419,7 +419,7 @@ update the counts here in the same commit; see the module doc and \
             assert!(!v2.contains(profile.text(PromptKey::SubagentAddendumBrowserNote)));
             assert!(!v2.contains(profile.text(PromptKey::SubagentAddendumShellNote)));
         }
-        assert!(render(PromptVersion::V1, "", &PromptProfile::builtin_english(), &all_note_tools())
+        assert!(render(PromptVersion::V1, "", &PromptProfile::builtin(), &all_note_tools())
             .ends_with(V1_GOLDEN));
     }
 
@@ -472,7 +472,7 @@ update the counts here in the same commit; see the module doc and \
             let rendered = render(
                 PromptVersion::V1,
                 &base,
-                &PromptProfile::builtin_english(),
+                &PromptProfile::builtin(),
                 &all_note_tools(),
             );
             assert_eq!(
@@ -492,7 +492,7 @@ update the counts here in the same commit; see the module doc and \
         let v1 = render(
             PromptVersion::V1,
             "Be useful.",
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
             &all_note_tools(),
         );
         for marker in [
@@ -513,16 +513,16 @@ update the counts here in the same commit; see the module doc and \
 
     #[test]
     fn v2_english_is_a_separate_variant_not_a_second_copy() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         for version in [PromptVersion::V2, PromptVersion::V3] {
             let en = render(version, "", &profile, &all_note_tools());
             assert!(en.starts_with("You are a child agent spawned by the main agent."));
             assert!(en.contains("Instruction-source boundary:"));
             assert!(en.contains("\n\nNotes:\n- "));
-            assert!(en.contains("you have no tool for asking"));
+            assert!(en.contains("You have no tool for asking the user"));
             assert!(en.contains("cannot spawn or direct further child agents"));
-            assert!(en.contains("unless the host assigned you a partition of your own"));
-            assert!(en.contains("You have no round or time limit"));
+            assert!(en.contains("write the conversation's shared memory"));
+            assert!(en.contains("You have no round limit"));
             // V2 replaces V1's Chinese paragraph rather than following it, and
             // V3 replaces V2's: emitting both would double every child turn's
             // prompt tokens.
@@ -531,7 +531,7 @@ update the counts here in the same commit; see the module doc and \
             assert_eq!(en.matches("Instruction-source boundary:").count(), 1);
         }
         let v3 = render(PromptVersion::V3, "", &profile, &all_note_tools());
-        assert!(v3.contains("browser session and web authorization are shared"));
+        assert!(v3.contains("The browser session is shared with the whole conversation"));
         assert!(v3.ends_with("Any command still running when you give your final reply is stopped."));
     }
 
@@ -555,14 +555,12 @@ update the counts here in the same commit; see the module doc and \
             Vec::new(),
         );
         for (version, profile, tools) in [
-            (PromptVersion::V1, PromptProfile::builtin_english(), all_note_tools()),
+            (PromptVersion::V1, PromptProfile::builtin(), all_note_tools()),
             (PromptVersion::V2, file.clone(), all_note_tools()),
-            (PromptVersion::V2, PromptProfile::builtin_english(), all_note_tools()),
+            (PromptVersion::V2, PromptProfile::builtin(), all_note_tools()),
             (PromptVersion::V3, file, all_note_tools()),
-            (PromptVersion::V3, PromptProfile::builtin_english(), all_note_tools()),
-            (PromptVersion::V3, PromptProfile::builtin_english(), no_note_tools()),
-            (PromptVersion::V3, PromptProfile::builtin_concise(), all_note_tools()),
-            (PromptVersion::V3, PromptProfile::builtin_concise(), no_note_tools()),
+            (PromptVersion::V3, PromptProfile::builtin(), all_note_tools()),
+            (PromptVersion::V3, PromptProfile::builtin(), no_note_tools()),
         ] {
             let tail = render(version, "", &profile, &tools);
             for base in bases {

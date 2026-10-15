@@ -429,10 +429,10 @@ mod tests {
 
     #[test]
     fn section_lists_every_fact_as_one_item() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         assert_eq!(
             environment_section(&profile, &facts()),
-            "# Environment\nYou have been invoked in the following environment:\n\
+            "# Environment\n\
              \x20- Primary working directory: C:/work/app\n\
              \x20- Is a git repository: true\n\
              \x20- Platform: windows\n\
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn workspaces_are_numbered_under_their_own_heading() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let section = environment_section(
             &profile,
             &EnvironmentFacts {
@@ -470,7 +470,7 @@ mod tests {
     fn a_single_workspace_states_no_numbers() {
         // With one workspace the number is not a choice, and the working-directory
         // line has already said where the conversation is.
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let section = environment_section(
             &profile,
             &EnvironmentFacts {
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn a_worktree_says_so_and_warns_about_the_shared_stash() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let section = environment_section(
             &profile,
             &EnvironmentFacts {
@@ -492,7 +492,7 @@ mod tests {
                 ..facts()
             },
         );
-        assert!(section.contains(" - This is a git worktree"), "{section}");
+        assert!(section.contains(" - This is an isolated git worktree"), "{section}");
         assert!(section.contains("git stash push -u -m"), "{section}");
         assert!(
             !environment_section(&profile, &facts()).contains("worktree"),
@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_os_version_drops_its_line_rather_than_stating_nothing() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let section = environment_section(
             &profile,
             &EnvironmentFacts {
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn bidirectional_and_control_characters_never_reach_the_prompt() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let section = environment_section(
             &profile,
             &EnvironmentFacts {
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn a_remote_working_directory_names_its_machine_and_claims_nothing_about_git() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let facts = EnvironmentFacts::collect_remote(
             "/home/dev/app",
             EnvironmentMachine::Ssh("devbox".into()),

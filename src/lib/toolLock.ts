@@ -73,18 +73,28 @@ export const EMPTY_TOOL_LOCK: ConversationToolLock = {
   fileWriteGuards: null
 };
 
-/** The built-in prompt profile's id; a conversation that selects none uses it. */
-export const BUILTIN_PROMPT_PROFILE_ID = "tooldesc_builtin_en_us";
+/**
+ * The built-in prompt profile's id ("Mewrk concise"); a conversation that
+ * selects none uses it. Mirrors `prompt_profile::BUILTIN_ID` in `src-tauri`.
+ */
+export const BUILTIN_PROMPT_PROFILE_ID = "tooldesc_builtin_concise_en_us";
 
 /**
- * The built-in concise prompt profile's id, the one the built-in preset selects.
- * Mirrors `prompt_profile::BUILTIN_CONCISE_EN_US_ID` in `src-tauri`.
+ * The id of "Mewrk guided", the built-in profile that was removed in favor of
+ * the concise one. Older settings and role files may still name it; it reads
+ * as the built-in. Mirrors `prompt_profile::RETIRED_GUIDED_ID`.
  */
-export const BUILTIN_CONCISE_PROMPT_PROFILE_ID = "tooldesc_builtin_concise_en_us";
+export const RETIRED_GUIDED_PROMPT_PROFILE_ID = "tooldesc_builtin_en_us";
+
+/** Whether `id` selects the built-in profile: nothing, its id, or the retired one's. */
+export function isBuiltinPromptProfileId(id: string | null | undefined): boolean {
+  return !id || id === BUILTIN_PROMPT_PROFILE_ID || id === RETIRED_GUIDED_PROMPT_PROFILE_ID;
+}
 
 /** The prompt profile these settings word their requests with. */
 function promptProfileOf(settings: ConversationSettings): string {
-  return settings.toolDescriptionFileId || BUILTIN_PROMPT_PROFILE_ID;
+  const id = settings.toolDescriptionFileId;
+  return id && !isBuiltinPromptProfileId(id) ? id : BUILTIN_PROMPT_PROFILE_ID;
 }
 
 /** How long a model's prompt cache is taken to stay warm when its profile says nothing. */
@@ -730,7 +740,7 @@ export function restoreLockedSettings(
     ...(lock.hookIds !== null ? { hookIds: [...lock.hookIds] } : {}),
     ...(lock.promptProfile !== null && lock.promptProfile !== promptProfileOf(settings)
       ? {
-        toolDescriptionFileId: lock.promptProfile === BUILTIN_PROMPT_PROFILE_ID ? null : lock.promptProfile
+        toolDescriptionFileId: isBuiltinPromptProfileId(lock.promptProfile) ? null : lock.promptProfile
       }
       : {})
   };

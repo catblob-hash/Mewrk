@@ -1415,7 +1415,7 @@ mod tests {
 
     #[test]
     fn a_listing_cut_by_its_budget_names_the_depth_that_is_complete() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let mut listing = Listing::new();
         listing.budget = 30;
         assert!(listing.push(1, "a", true, false, &profile));
@@ -1430,7 +1430,7 @@ mod tests {
 
     #[test]
     fn a_collapsed_directory_is_marked_and_explained_once() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let mut listing = Listing::new();
         listing.push(1, "node_modules", true, true, &profile);
         listing.push(1, "target", true, true, &profile);
@@ -1445,7 +1445,7 @@ mod tests {
 
     #[test]
     fn find_lists_ignored_matches_after_the_rest_and_reports_the_total() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let mut matches = FindMatches::default();
         for index in 0..(FIND_LIMIT + 20) {
             matches.push(format!("node_modules/pkg{index:03}/index.js"), true);
@@ -1467,7 +1467,7 @@ mod tests {
 
     #[test]
     fn a_grep_page_says_where_the_next_one_starts() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let page = GrepPage::from_input(
             &json!({"limit": 2, "offset": 1})
                 .as_object()
@@ -1625,7 +1625,7 @@ mod tests {
 
     #[test]
     fn content_lines_merge_windows_and_separate_groups_the_way_ripgrep_prints_them() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let with_context = query(json!({"output_mode": "content", "context": 1}));
         let rendered = with_context.render_content(
             vec![
@@ -1656,7 +1656,7 @@ mod tests {
 
     #[test]
     fn a_files_page_is_newest_first_and_a_count_page_carries_whole_search_totals() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let files = query(json!({}));
         let hit = |path: &str, modified_ms: i64| FileHit {
             path: path.to_owned(),

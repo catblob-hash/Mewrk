@@ -43,7 +43,7 @@ import { fileWriteGuardsEnabledOf } from "../lib/fileWriteGuards";
 import { hostMessageContainerOf } from "../lib/hostMessages";
 import { familySelectsNativeToolType, familySupportsNativeFetch } from "../lib/webSearch";
 import {
-  BUILTIN_PROMPT_PROFILE_ID,
+  isBuiltinPromptProfileId,
   backendPinned,
   backendTone,
   lockTone,
@@ -388,17 +388,16 @@ export function ConversationSettings({
     ),
     [capabilities.agents, settings.agentIds, workspaces]
   );
-  /* The tool-description page lists every profile but the guided built-in. That
-   * one is what selecting none means rather than an entry beside the others, so
-   * its row is left out and its id reads as no selection. "Mewrk concise" is a
-   * real choice and keeps its row, marked built-in because it lives in no folder
-   * the section could name. */
+  /* The tool-description page lists every profile but the built-in "Mewrk
+   * concise". That one is what selecting none means rather than an entry beside
+   * the others, so its row is left out and its id — or the retired guided
+   * one's — reads as no selection. */
   const toolDescriptionFiles = useMemo(
-    () => capabilities.toolDescriptionFiles.filter((resource) => resource.id !== BUILTIN_PROMPT_PROFILE_ID),
+    () => capabilities.toolDescriptionFiles.filter((resource) => !isBuiltinPromptProfileId(resource.id)),
     [capabilities.toolDescriptionFiles]
   );
   const toolDescriptionIds = settings.toolDescriptionFileId
-    && settings.toolDescriptionFileId !== BUILTIN_PROMPT_PROFILE_ID
+    && !isBuiltinPromptProfileId(settings.toolDescriptionFileId)
     ? [settings.toolDescriptionFileId]
     : [];
   /* The conversation's lock, read against the model selected now
@@ -814,7 +813,7 @@ export function ConversationSettings({
       )}
 
       {/* One file words the whole run, so the page picks one: another row
-          replaces it, and unticking it goes back to Mewrk guided. There is no
+          replaces it, and unticking it goes back to Mewrk concise. There is no
           workspace level — the files are read from ~/.mewrk alone. */}
       {view === "toolDescriptions" && (
         <CapabilitySelectionPage
@@ -832,15 +831,15 @@ export function ConversationSettings({
           onReveal={onRevealCapabilityLocation}
           onChange={(ids) => update({ toolDescriptionFileId: ids[0] ?? null })}
           /* A dangling file was never read: the host already worded the run with
-             Mewrk guided, so going back to it rewrites nothing. */
+             Mewrk concise, so going back to it rewrites nothing. */
           onUntickDangling={() => onChange({ ...settings, toolDescriptionFileId: null })}
           danglingDetail={t(
-            "目录中已不存在；运行时用的是 Mewrk guided（内置引导版）",
-            "No longer in the catalog. Runs use Mewrk guided (built-in) instead."
+            "目录中已不存在；运行时用的是内置的 Mewrk concise",
+            "No longer in the catalog. Runs use the built-in Mewrk concise instead."
           )}
           selectedUnavailableDetail={t(
-            "已选择，但文件里没有可用条目；运行时用的是 Mewrk guided（内置引导版）",
-            "Selected, but the file has no usable entries. Runs use Mewrk guided (built-in) instead."
+            "已选择，但文件里没有可用条目；运行时用的是内置的 Mewrk concise",
+            "Selected, but the file has no usable entries. Runs use the built-in Mewrk concise instead."
           )}
           rowBadge={(resource) => (resource.source === "builtin"
             ? <em className="catalog-row__badge">{t("内置", "Built-in")}</em>
@@ -848,13 +847,13 @@ export function ConversationSettings({
           searchLabel={t("搜索工具描述", "Search tool descriptions")}
           emptyTitle={t("尚未发现工具描述文件", "No tool-description files discovered")}
           emptyDescription={t(
-            "把 JSON 文件放在 ~/.mewrk/tool-descriptions/ 下，列表很快会自动刷新。",
-            "Put JSON files under ~/.mewrk/tool-descriptions/; the list refreshes by itself shortly after."
+            "把 JSON 文件（可带注释）放在 ~/.mewrk/tool-descriptions/ 下，列表很快会自动刷新。",
+            "Put JSON files (comments allowed) under ~/.mewrk/tool-descriptions/; the list refreshes by itself shortly after."
           )}
           footer={(
             <p className="capability-page__hint">{t(
-              "一次只用一份：选另一份会替换当前这份。都不选时，用 Mewrk guided（内置引导版）。",
-              "One at a time: picking another replaces the current one. With none picked, Mewrk guided (built-in) is used."
+              "一次只用一份：选另一份会替换当前这份。都不选时，用内置的 Mewrk concise。",
+              "One at a time: picking another replaces the current one. With none picked, the built-in Mewrk concise is used."
             )}</p>
           )}
         />

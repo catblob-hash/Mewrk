@@ -336,7 +336,7 @@ fn codex_async_live_a_wait_reports_status_and_the_result_lands_on_the_launch() {
     assert!(
         waits
             .iter()
-            .any(|output| output.contains(PromptKey::TaskWaitDeliveredOnCall.builtin_en())),
+            .any(|output| output.contains(PromptKey::TaskWaitDeliveredOnCall.builtin_text())),
         "{waits:?}"
     );
     let (answers, output) = delivery_card(&response.contexts);

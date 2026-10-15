@@ -1475,7 +1475,7 @@ mod tests {
         let tree = TempTree::new("context");
         let global = tree.global();
         let project = tree.project();
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         fs::create_dir_all(global.memory_dir()).unwrap();
         fs::create_dir_all(project.memory_dir()).unwrap();
         // The instruction loader sends these; the memory block must not send
@@ -1513,7 +1513,7 @@ mod tests {
     #[test]
     fn context_is_absent_when_nothing_is_stored() {
         let tree = TempTree::new("empty-context");
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         assert_eq!(read_index_context(&tree.global()), None);
         assert!(render_memory_context(None, None, &profile).is_none());
 
@@ -1681,7 +1681,7 @@ mod tests {
         let tree = TempTree::new("tier-switches");
         let home = tree.root.join("home");
         let workspace = tree.root.join("workspace");
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         for root in [tree.global(), tree.project()] {
             fs::create_dir_all(root.memory_dir()).unwrap();
         }
@@ -1785,7 +1785,7 @@ mod tests {
             Some(&tree.root.join("workspace")),
             MemoryTierAccess::ALL,
         );
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
 
         for (create, read, edit, tier) in [
             (
@@ -1856,7 +1856,7 @@ mod tests {
     #[test]
     fn an_unavailable_tier_fails_closed_instead_of_using_the_other_one() {
         let tree = TempTree::new("unavailable");
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         // No workspace: project memory is unavailable for the whole run.
         let roots = MemoryRoots::resolve_enabled(
             Some(&tree.root.join("home")),
@@ -1914,7 +1914,7 @@ mod tests {
             None,
             MemoryTierAccess::ALL,
         );
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
 
         assert!(execute_tool(&roots, "read_global_memory", &input(&[]), &profile).is_err());
         // create requires a description so the index can never go stale.
@@ -1942,7 +1942,7 @@ mod tests {
             None,
             MemoryTierAccess::ALL,
         );
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         execute_tool(
             &roots,
             "create_global_memory",
@@ -2011,7 +2011,7 @@ mod tests {
             ],
             access: MemoryTierAccess::ALL,
         };
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let create = |input: serde_json::Value| {
             execute_tool(&roots, "create_project_memory", input.as_object().unwrap(), &profile)
         };

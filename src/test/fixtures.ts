@@ -235,21 +235,13 @@ export function createTestDocument(): AppDocument {
     source: "user",
     available: true
   });
-  // The host always lists the two compiled-in profiles first, then files.
+  // The host always lists the compiled-in profile first, then files.
   document.capabilities.toolDescriptionFiles.push(
-    {
-      id: "tooldesc_builtin_en_us",
-      name: "Mewrk guided",
-      description: "Built-in prompts and tool descriptions with usage guidance, the default; ships with this version of Mewrk",
-      location: "builtin:en-US",
-      source: "builtin",
-      available: true
-    },
     {
       id: "tooldesc_builtin_concise_en_us",
       name: "Mewrk concise",
-      description: "Built-in prompts and tool descriptions cut to what a frontier model cannot infer; ships with this version of Mewrk",
-      location: "builtin:en-US/concise",
+      description: "Built-in prompts and tool descriptions cut to what a frontier model cannot infer, the default; ships with this version of Mewrk",
+      location: "builtin:en-US",
       source: "builtin",
       available: true
     },

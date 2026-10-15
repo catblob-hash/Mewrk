@@ -7869,7 +7869,7 @@ mod tests {
     #[test]
     fn saved_tool_output_is_judged_as_the_host_file_it_is() {
         let fixture = Fixture::new();
-        let profile = crate::prompt_profile::PromptProfile::builtin_english();
+        let profile = crate::prompt_profile::PromptProfile::builtin();
         let spill = |conversation: &'static str| {
             let notice = crate::tool_output::fit(
                 "output\n".repeat(100),

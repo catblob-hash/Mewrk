@@ -18,7 +18,6 @@ import { CODEX_PROVIDER_FAMILY, CODEX_PROVIDER_NAME } from "./lib/codexProvider"
 import { backendOfTool, knownShells, preferredBackend } from "./lib/machineShells";
 import { isHostDerivedToolName } from "./lib/taskTools";
 import { createId } from "./lib/id";
-import { BUILTIN_CONCISE_PROMPT_PROFILE_ID } from "./lib/toolLock";
 
 export const toolCatalog: ToolDescriptor[] = [
   {
@@ -742,9 +741,9 @@ function seedPresetEnabledTools(tools: readonly ToolDescriptor[], shell: ShellBa
     });
 }
 
-/** Keep in sync with `src-tauri/src/catalog.rs::builtin_preset`. It renders
- * with the concise built-in tool descriptions and selects no role: none ships,
- * so its children are anonymous ones on the conversation's model. */
+/** Keep in sync with `src-tauri/src/catalog.rs::builtin_preset`. It selects no
+ * tool-description file, so it renders with the built-in one, and no role: none
+ * ships, so its children are anonymous ones on the conversation's model. */
 function builtinPreset(
   tools: readonly ToolDescriptor[],
   platform: string
@@ -758,7 +757,7 @@ function builtinPreset(
     templateId: BUILTIN_PRESET_TEMPLATE_ID,
     settings: {
       enabledTools: seedPresetEnabledTools(tools, seedShellBackend(platform)),
-      toolDescriptionFileId: BUILTIN_CONCISE_PROMPT_PROFILE_ID,
+      toolDescriptionFileId: null,
       agentIds: [],
       // With no role selected, an anonymous child is the only kind `agent_spawn`
       // and `workflow` can start.

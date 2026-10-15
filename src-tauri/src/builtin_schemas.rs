@@ -1686,9 +1686,9 @@ mod tests {
     }
 
     fn schema_with_workspaces(name: &str, workspaces: &WorkspaceSet) -> Value {
-        let schema = builtin_tool_schema(name, ToolVariant::Standard, &PromptProfile::builtin_english())
+        let schema = builtin_tool_schema(name, ToolVariant::Standard, &PromptProfile::builtin())
             .unwrap_or_else(|| panic!("no schema for {name}"));
-        with_workspace_parameter(schema, name, workspaces, &PromptProfile::builtin_english())
+        with_workspace_parameter(schema, name, workspaces, &PromptProfile::builtin())
     }
 
     /// One workspace is not a choice, so the parameter is not a question worth
@@ -1783,9 +1783,16 @@ mod tests {
             let description = schema["properties"]["workspace"]["description"]
                 .as_str()
                 .unwrap_or_default();
+            let why = PromptProfile::builtin().render(
+                PromptKey::ToolParamWorkspaceShellSuffix,
+                &[(
+                    "shell",
+                    crate::shell_backend::ShellBackend::WindowsPowerShell.display_name(),
+                )],
+            );
             assert!(
-                description.contains("PowerShell") && description.contains("another shell tool"),
-                "a narrowed list has to say why and where to go instead: {description}"
+                description.contains("PowerShell") && description.ends_with(&why),
+                "a narrowed list has to say why: {description}"
             );
         } else {
             // No machine here has PowerShell, so the tool is withdrawn from the
@@ -1856,9 +1863,25 @@ mod tests {
         let powershell = &schema_with_workspaces("powershell", &workspaces)["properties"]["workspace"];
         assert_eq!(powershell["enum"], json!([2]));
         assert_eq!(powershell["default"], json!(2));
-        let description = powershell["description"].as_str().unwrap();
-        assert!(description.contains("Defaults to 2."), "{description}");
         assert_eq!(workspaces.default_address("powershell"), 2);
+        // The built-in wording leaves the default to the schema's `default`; a
+        // profile that names it in prose gets the same number filled in.
+        let stating = PromptProfile::from_file(
+            "stating".into(),
+            "Stating".into(),
+            crate::model::ResolvedLanguage::EnUs,
+            [(PromptKey::ToolParamWorkspace, "Workspace number. Defaults to {default}.".to_owned())]
+                .into(),
+            Vec::new(),
+        );
+        let stated = with_workspace_parameter(
+            builtin_tool_schema("powershell", ToolVariant::Standard, &stating).unwrap(),
+            "powershell",
+            &workspaces,
+            &stating,
+        );
+        let description = stated["properties"]["workspace"]["description"].as_str().unwrap();
+        assert!(description.contains("Defaults to 2."), "{description}");
 
         let bash = &schema_with_workspaces("bash", &workspaces)["properties"]["workspace"];
         assert_eq!(bash["enum"], json!([1, 2]));
@@ -1887,7 +1910,7 @@ mod tests {
     fn configured_role_names_become_enum_values_in_both_role_naming_tools() {
         let names = vec!["alpha".to_owned(), "zeta".to_owned()];
 
-        let spawn = agent_spawn_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin_english());
+        let spawn = agent_spawn_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin());
         assert_eq!(
             spawn["properties"]["agent_type"]["enum"],
             json!(["alpha", "zeta"])
@@ -1895,7 +1918,7 @@ mod tests {
         // The `not` guard references `agent_type` and must remain with roles.
         assert!(spawn.get("not").is_some());
 
-        let workflow = workflow_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin_english());
+        let workflow = workflow_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin());
         assert_eq!(
             workflow["$defs"]["agentType"]["enum"],
             json!(["alpha", "zeta"])
@@ -1915,14 +1938,14 @@ mod tests {
     /// value.
     #[test]
     fn a_conversation_without_roles_loses_the_agent_type_field_entirely() {
-        let spawn = agent_spawn_schema_for_roles(&[], false, ToolVariant::Standard, &PromptProfile::builtin_english());
+        let spawn = agent_spawn_schema_for_roles(&[], false, ToolVariant::Standard, &PromptProfile::builtin());
         assert!(spawn["properties"].get("agent_type").is_none(), "{spawn}");
         assert!(spawn.get("not").is_none(), "{spawn}");
         // Only the role selector is removed; other tool properties remain.
         assert!(spawn["properties"].get("prompt").is_some());
         assert!(spawn["properties"].get("schema").is_some());
 
-        let workflow = workflow_schema_for_roles(&[], false, ToolVariant::Standard, &PromptProfile::builtin_english());
+        let workflow = workflow_schema_for_roles(&[], false, ToolVariant::Standard, &PromptProfile::builtin());
         assert!(workflow.get("$defs").is_none(), "{workflow}");
         let description = workflow["properties"]["script"]["description"]
             .as_str()
@@ -1937,7 +1960,7 @@ mod tests {
     /// selecting another skill mid-conversation leaves the tool set untouched.
     #[test]
     fn the_skill_schema_names_no_skill_and_lists_no_trigger() {
-        let schema = builtin_tool_schema("skill", ToolVariant::Standard, &PromptProfile::builtin_english())
+        let schema = builtin_tool_schema("skill", ToolVariant::Standard, &PromptProfile::builtin())
             .expect("skill has a static schema");
 
         assert!(
@@ -1946,7 +1969,7 @@ mod tests {
         );
         let description = schema["description"].as_str().expect("skill description");
         assert!(
-            !description.contains(PromptKey::SkillListingHeading.builtin_en()),
+            !description.contains(PromptKey::SkillListingHeading.builtin_text()),
             "{description}"
         );
         // Nor may the parameter's own prose promise a listing the schema does
@@ -1968,7 +1991,7 @@ mod tests {
         let names = vec!["alpha".to_owned()];
 
         let required =
-            agent_spawn_schema_for_roles(&names, true, ToolVariant::Standard, &PromptProfile::builtin_english());
+            agent_spawn_schema_for_roles(&names, true, ToolVariant::Standard, &PromptProfile::builtin());
         assert_eq!(
             required["required"],
             json!(["prompt", "name", "agent_type"])
@@ -1992,7 +2015,7 @@ mod tests {
         }
 
         let fallback =
-            agent_spawn_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin_english());
+            agent_spawn_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin());
         // Fallback relaxes only role selection; `prompt` and generated task address
         // `name` are required in both modes.
         assert_eq!(fallback["required"], json!(["prompt", "name"]));
@@ -2006,7 +2029,7 @@ mod tests {
     fn requiring_a_role_states_both_the_rule_and_its_enforcement_in_the_script_prose() {
         let names = vec!["alpha".to_owned()];
         let script_prose = |required: bool| {
-            workflow_schema_for_roles(&names, required, ToolVariant::Standard, &PromptProfile::builtin_english())
+            workflow_schema_for_roles(&names, required, ToolVariant::Standard, &PromptProfile::builtin())
                 ["properties"]["script"]["description"]
                 .as_str()
                 .expect("script description")
@@ -2014,21 +2037,21 @@ mod tests {
         };
 
         let required = script_prose(true);
-        assert!(required.contains("REQUIRED"), "{required}");
+        assert!(required.contains("required on every agent() call"), "{required}");
         assert!(required.contains("$defs.agentType"), "{required}");
         assert!(
-            required.contains("throws synchronously"),
+            required.contains("throws at the call"),
             "要说清楚强制发生在哪里：{required}"
         );
         assert!(
-            required.contains("NOT a step that resolves to null"),
+            required.contains("instead of yielding a null step"),
             "要否掉「大不了这一步是 null」这个读法：{required}"
         );
         // Required mode makes `opts` non-optional in the signature.
         assert!(required.contains("agent(prompt, opts) ->"), "{required}");
 
         let fallback = script_prose(false);
-        assert!(!fallback.contains("REQUIRED"), "{fallback}");
+        assert!(!fallback.contains("required on every agent() call"), "{fallback}");
         assert!(fallback.contains("agent(prompt, opts?) ->"), "{fallback}");
     }
 
@@ -2043,7 +2066,7 @@ mod tests {
                 role("reviewer", "对抗式审查：负责证伪既有结论。"),
                 role("researcher", "深入检索与资料汇总。"),
             ],
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         );
         assert_eq!(
             schema["description"],
@@ -2068,7 +2091,7 @@ mod tests {
                 role("spacey", "   \n  "),
                 role("loud", "说点什么。"),
             ],
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         );
         assert_eq!(
             schema["description"],
@@ -2081,7 +2104,7 @@ mod tests {
     fn an_all_silent_role_set_leaves_the_description_untouched() {
         for roles in [vec![], vec![role("quiet", ""), role("also-quiet", "  ")]] {
             let mut schema = json!({"description": "Tool prose."});
-            append_role_descriptions(&mut schema, &roles, &PromptProfile::builtin_english());
+            append_role_descriptions(&mut schema, &roles, &PromptProfile::builtin());
             assert_eq!(schema["description"], json!("Tool prose."), "{roles:?}");
         }
     }
@@ -2094,7 +2117,7 @@ mod tests {
         append_role_descriptions(
             &mut schema,
             &[role("multi", "第一行。\n第二行 - 带个横线。\n\n第四行。")],
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         );
         assert_eq!(
             schema["description"],
@@ -2113,12 +2136,12 @@ mod tests {
         let roles = vec![role("reviewer", "证伪既有结论。")];
 
         let mut spawn =
-            agent_spawn_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin_english());
+            agent_spawn_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin());
         let spawn_base = spawn["description"]
             .as_str()
             .expect("spawn description")
             .to_owned();
-        append_role_descriptions(&mut spawn, &roles, &PromptProfile::builtin_english());
+        append_role_descriptions(&mut spawn, &roles, &PromptProfile::builtin());
         let spawn_block = spawn["description"]
             .as_str()
             .expect("spawn description")
@@ -2127,12 +2150,12 @@ mod tests {
             .to_owned();
 
         let mut workflow =
-            workflow_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin_english());
+            workflow_schema_for_roles(&names, false, ToolVariant::Standard, &PromptProfile::builtin());
         let workflow_base = workflow["description"]
             .as_str()
             .expect("workflow description")
             .to_owned();
-        append_role_descriptions(&mut workflow, &roles, &PromptProfile::builtin_english());
+        append_role_descriptions(&mut workflow, &roles, &PromptProfile::builtin());
         let workflow_block = workflow["description"]
             .as_str()
             .expect("workflow description")
@@ -2164,7 +2187,7 @@ mod tests {
     /// committed-tree boundary, retention rule, and cost.
     #[test]
     fn the_script_description_states_what_isolation_actually_does() {
-        let description = workflow_schema(None, false, ToolVariant::Standard, &PromptProfile::builtin_english())
+        let description = workflow_schema(None, false, ToolVariant::Standard, &PromptProfile::builtin())
             ["properties"]["script"]["description"]
             .as_str()
             .expect("script description")
@@ -2174,7 +2197,8 @@ mod tests {
             "worktree",
             "HEAD",
             "uncommitted",
-            "EXPENSIVE",
+            "kept if the step changed or committed anything",
+            "Costs a full checkout per step",
             "git repository root",
         ] {
             assert!(description.contains(needle), "缺少 {needle}：{description}");
@@ -2185,26 +2209,53 @@ mod tests {
     fn every_public_tool_has_a_builtin_schema() {
         for tool in tool_catalog() {
             assert!(
-                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin_english()).is_some(),
+                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin()).is_some(),
                 "{} lacks a hand-authored schema",
                 tool.name
             );
         }
     }
 
+    /// Every schema is a closed object whose root description is its tool's
+    /// description key. The built-in profile leaves some of those empty on
+    /// purpose; a profile that states what each operation is reaches every
+    /// tool through that same slot.
     #[test]
     fn every_builtin_schema_is_a_closed_object_with_a_factual_description() {
+        let key_of = |name: &str| {
+            PromptKey::for_tool_description(name, ToolVariant::Standard)
+                .unwrap_or_else(|| panic!("{name} has no description key"))
+        };
+        let stating = PromptProfile::from_file(
+            "stating".into(),
+            "Stating".into(),
+            crate::model::ResolvedLanguage::EnUs,
+            tool_catalog()
+                .iter()
+                .map(|tool| (key_of(&tool.name), format!("What {} does.", tool.name)))
+                .collect(),
+            Vec::new(),
+        );
+        let builtin = PromptProfile::builtin();
         for tool in tool_catalog() {
-            let schema =
-                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
-            assert_eq!(schema["type"], "object", "{}", tool.name);
-            let description = schema["description"].as_str().unwrap_or_default();
-            assert!(
-                !description.trim().is_empty(),
+            for profile in [&builtin, &stating] {
+                let schema = builtin_tool_schema(&tool.name, ToolVariant::Standard, profile).unwrap();
+                assert_eq!(schema["type"], "object", "{}", tool.name);
+                assert_eq!(
+                    schema["description"].as_str(),
+                    Some(profile.text(key_of(&tool.name))),
+                    "{} schema must carry its description key",
+                    tool.name
+                );
+                assert_eq!(schema["additionalProperties"], false, "{}", tool.name);
+            }
+            let stated = builtin_tool_schema(&tool.name, ToolVariant::Standard, &stating).unwrap();
+            assert_eq!(
+                stated["description"],
+                json!(format!("What {} does.", tool.name)),
                 "{} schema must state what the operation is",
                 tool.name
             );
-            assert_eq!(schema["additionalProperties"], false, "{}", tool.name);
         }
     }
 
@@ -2212,7 +2263,7 @@ mod tests {
     fn schema_properties_match_catalog_parameters() {
         for tool in tool_catalog() {
             let schema =
-                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
+                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin()).unwrap();
             let schema_properties = properties(&schema);
             let parameters: BTreeSet<String> = tool
                 .parameters
@@ -2268,7 +2319,7 @@ mod tests {
         );
         assert!(!tool_catalog().iter().any(|tool| tool.name == "playwright"));
         for name in &names {
-            let schema = builtin_tool_schema(name, ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
+            let schema = builtin_tool_schema(name, ToolVariant::Standard, &PromptProfile::builtin()).unwrap();
             assert!(
                 schema.get("oneOf").is_none(),
                 "{name} must be a flat tool, not a discriminated union"
@@ -2286,7 +2337,7 @@ mod tests {
                 continue;
             }
             let schema =
-                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
+                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin()).unwrap();
             if schema["properties"].get("serverId").is_none() {
                 assert!(
                     tool.name == "preview_start" || tool.name == "preview_list",
@@ -2317,12 +2368,12 @@ mod tests {
     #[test]
     fn preview_start_descriptions_quote_the_launch_json_format_verbatim() {
         let english = format!(
-            "Start a dev server by name from .mewrk/launch.json. If .mewrk/launch.json doesn't exist, create it first with this format:\n{}\n{} Reuses the server if already running.{{?@shell}} ALWAYS use this instead of a shell command for running servers.{{/}} If the deliverable is already published as an Artifact, update the Artifact instead of starting a server to show it.",
+            "Start a dev server by name from .mewrk/launch.json. If .mewrk/launch.json doesn't exist, create it first with this format:\n{}\n{} Reuses the server if already running.",
             crate::preview_launch_config::LAUNCH_JSON_FORMAT,
             crate::preview_launch_config::LAUNCH_JSON_FORMAT_NOTES
         );
         assert_eq!(
-            PromptProfile::builtin_english().text(PromptKey::ToolPreviewStartDescription),
+            PromptProfile::builtin().text(PromptKey::ToolPreviewStartDescription),
             english
         );
     }
@@ -2331,7 +2382,7 @@ mod tests {
     fn required_entries_reference_declared_properties() {
         for tool in tool_catalog() {
             let schema =
-                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
+                builtin_tool_schema(&tool.name, ToolVariant::Standard, &PromptProfile::builtin()).unwrap();
             let schema_properties = properties(&schema);
             if let Some(required) = schema["required"].as_array() {
                 for entry in required {
@@ -2393,13 +2444,10 @@ mod tests {
         rendered
     }
 
-    /// One baseline per built-in profile: the guided one, which every user
-    /// file falls back to, and the concise one.
-    fn baselines() -> [(&'static str, String); 2] {
-        [
-            ("builtin-tool-schemas.json", baseline_document(&PromptProfile::builtin_english())),
-            ("builtin-tool-schemas.concise.json", baseline_document(&PromptProfile::builtin_concise())),
-        ]
+    /// The baseline of the built-in profile, which every user file falls
+    /// back to.
+    fn baselines() -> [(&'static str, String); 1] {
+        [("builtin-tool-schemas.json", baseline_document(&PromptProfile::builtin()))]
     }
 
     fn baseline_path(name: &str) -> std::path::PathBuf {
@@ -2453,7 +2501,7 @@ mod tests {
 
     #[test]
     fn task_wait_bounds_track_agents_constants() {
-        let schema = builtin_tool_schema("task_wait", ToolVariant::Standard, &PromptProfile::builtin_english()).unwrap();
+        let schema = builtin_tool_schema("task_wait", ToolVariant::Standard, &PromptProfile::builtin()).unwrap();
         let timeout = &schema["properties"]["timeout_seconds"];
         assert_eq!(timeout["minimum"], json!(WAIT_MIN_TIMEOUT_SECONDS));
         assert_eq!(timeout["maximum"], json!(WAIT_MAX_TIMEOUT_SECONDS));

@@ -286,7 +286,7 @@ mod tests {
             assert!(crate::builtin_schemas::builtin_tool_schema(
                 name,
                 crate::tool_surface::ToolVariant::Standard,
-                &PromptProfile::builtin_english()
+                &PromptProfile::builtin()
             )
             .is_some());
         }

@@ -2334,9 +2334,9 @@ pub(crate) fn builtin_preset_enabled_tools(
 /// the document it goes into.
 ///
 /// The one shell is this machine's and is chosen by storage, which takes a
-/// probe. It renders with the concise built-in tool descriptions and selects
-/// no role: none ships, so its children are anonymous ones on the
-/// conversation's model.
+/// probe. It selects no tool-description file, so it renders with the
+/// built-in one, and no role: none ships, so its children are anonymous ones
+/// on the conversation's model.
 pub(crate) fn builtin_preset(
     tools: &[ToolDescriptor],
     shell: Option<crate::shell_backend::ShellBackend>,
@@ -2348,7 +2348,7 @@ pub(crate) fn builtin_preset(
         template_id: BUILTIN_PRESET_TEMPLATE_ID.into(),
         settings: ConversationPresetSettings {
             enabled_tools: builtin_preset_enabled_tools(tools, shell),
-            tool_description_file_id: Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID.into()),
+            tool_description_file_id: None,
             agent_ids: Vec::new(),
             agent_definitions: Vec::new(),
             // With no role selected, an anonymous child is the only kind

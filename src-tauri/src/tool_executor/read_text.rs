@@ -599,7 +599,7 @@ mod tests {
     use super::*;
 
     fn english() -> PromptProfile {
-        PromptProfile::builtin_english()
+        PromptProfile::builtin()
     }
 
     fn read(bytes: &[u8], start: u64, end: u64) -> Result<TextRead, String> {

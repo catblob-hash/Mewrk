@@ -74,9 +74,10 @@ flate2 = "1"
 fs2 = "0.4"
 futures-util = { version = "0.3", optional = true }
 globset = "0.4"
-# `.mewrk/launch.json` is JSONC: comments and trailing commas, which serde_json
-# cannot read. Default features only, so this pulls in no transitive crates.
-jsonc-parser = "0.33.1"
+# `.mewrk/launch.json` and tool-description files are JSONC: comments and
+# trailing commas, which serde_json cannot read. `serde` (already in the tree)
+# lets them parse straight to a `serde_json::Value`; it pulls in no other crates.
+jsonc-parser = { version = "0.33.1", features = ["serde"] }
 # Engine-agnostic workflow decision layer. The host uses `workflow_core::`, and
 # `subagent_schema` is re-exported from its `schema` module.
 mewrk-workflow-core = { path = "workflow-core" }

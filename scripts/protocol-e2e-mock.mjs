@@ -128,7 +128,7 @@ const IMAGE_USER_PLACEHOLDERS = {
 // `workflow`, a shell or `preview_start`: `TASK_PRODUCING_TOOL_NAMES` in
 // src-tauri/src/agents.rs), which the default conversation preset does. The
 // E2E conversation starts no task, so the result is the built-in profile's
-// `task.list_empty` text (src-tauri/src/prompt_profile/english.rs). The call
+// `task.list_empty` text (src-tauri/src/prompt_profile/concise.rs). The call
 // carries no input to tell the protocols apart, so each earlier protocol's
 // exchange is found in later history by the call id this mock minted for it.
 const PROBE_TOOL = "task_list";

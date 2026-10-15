@@ -227,9 +227,10 @@ async function openPage(user: ReturnType<typeof userEvent.setup>, name: RegExp):
    page that follows the hooks, so the tool list is named by what it is not. */
 const TOOLS_PAGE = /^工具(?!描述)/;
 const TOOL_DESCRIPTIONS_PAGE = /^工具描述/;
-/** The prompt profile every fixture conversation's lock is worded with unless it says otherwise. */
-const BUILTIN_PROFILE = "tooldesc_builtin_en_us";
-const CONCISE_PROFILE = "tooldesc_builtin_concise_en_us";
+/** The built-in prompt profile, "Mewrk concise"; selecting none is it, and it is no row of the list. */
+const BUILTIN_PROFILE = "tooldesc_builtin_concise_en_us";
+/** "Mewrk guided", removed in favor of the built-in; older settings may still name it, and it reads as the built-in. */
+const RETIRED_GUIDED_PROFILE = "tooldesc_builtin_en_us";
 const MAIN_PROFILE = "tooldesc_user_main_0f0f0f0f";
 const ALT_PROFILE = "tooldesc_user_alt_1a1a1a1a";
 /** An id a conversation still names though the catalog has lost the file. */
@@ -1462,15 +1463,14 @@ describe("ConversationSettings", () => {
     const global = screen.getByRole("region", { name: "全局" });
     expect(within(global).queryByRole("textbox")).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
-    // The conversation selects nothing, which the host renders with Mewrk
-    // guided. That one is no row of the list — selecting none IS it — so the
-    // rows there are the concise built-in and the user's file, neither on.
-    expect(screen.queryByRole("button", { name: "Mewrk guided" })).toBeNull();
+    // The conversation selects nothing, which the host renders with the
+    // built-in Mewrk concise. That one is no row of the list — selecting none
+    // IS it — so the only row there is the user's file, not on.
+    expect(screen.queryByRole("button", { name: "Mewrk concise" })).toBeNull();
     const main = within(global).getByRole("button", { name: "main" });
     expect(main).toHaveAttribute("aria-pressed", "false");
-    expect(within(global).getByRole("button", { name: "Mewrk concise" })).toHaveAttribute("aria-pressed", "false");
-    expect(global.querySelectorAll(".catalog-row")).toHaveLength(2);
-    expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
+    expect(global.querySelectorAll(".catalog-row")).toHaveLength(1);
+    expect(screen.getByText("0 / 1 个已选")).toBeInTheDocument();
 
     await user.click(main);
     expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({
@@ -1479,7 +1479,7 @@ describe("ConversationSettings", () => {
     expect(screen.getByRole("button", { name: "main" })).toHaveAttribute("aria-pressed", "true");
   });
 
-  it("offers Mewrk concise as a selectable built-in row, and leaves Mewrk guided to selecting none", async () => {
+  it("lists only the user's files, with no row for the built-in Mewrk concise, and unticking goes back to selecting none", async () => {
     const user = userEvent.setup();
     const seed = createSeedDocument();
     const onSettingsChange = vi.fn();
@@ -1495,56 +1495,65 @@ describe("ConversationSettings", () => {
     await openPage(user, TOOL_DESCRIPTIONS_PAGE);
 
     const global = screen.getByRole("region", { name: "全局" });
-    // In the host's order, the built-in before the user's files; the guided one is not drawn.
+    // The catalog lists the built-in first (the fixture does, as the host does),
+    // yet only the user's files are drawn: neither Mewrk concise nor the retired
+    // Mewrk guided is a row.
+    expect(seed.capabilities.toolDescriptionFiles.map((file) => file.id)).toEqual([BUILTIN_PROFILE, MAIN_PROFILE]);
     expect([...global.querySelectorAll(".catalog-row__toggle")].map((row) => row.getAttribute("aria-label")))
-      .toEqual(["Mewrk concise", "main"]);
+      .toEqual(["main"]);
+    expect(screen.queryByRole("button", { name: "Mewrk concise" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Mewrk guided" })).toBeNull();
-    // It says it is built in, and the user's file does not.
-    const concise = screen.getByRole("button", { name: "Mewrk concise" }).closest(".catalog-row") as HTMLElement;
-    expect(within(concise).getByText("内置")).toBeInTheDocument();
-    expect(concise).toHaveAttribute("title", expect.stringContaining("builtin:en-US/concise"));
+    expect(screen.queryByText("Mewrk concise")).toBeNull();
+    // No row says it is built in, and the user's file does not either.
+    expect(within(global).queryByText("内置")).toBeNull();
     const main = screen.getByRole("button", { name: "main" }).closest(".catalog-row") as HTMLElement;
-    expect(within(main).queryByText("内置")).toBeNull();
+    expect(main).not.toHaveAttribute("title", expect.stringContaining("builtin:"));
+    expect(screen.getByText("0 / 1 个已选")).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Mewrk concise" }));
-    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({
-      toolDescriptionFileId: CONCISE_PROFILE
-    }));
-    expect(screen.getByRole("button", { name: "Mewrk concise" })).toHaveAttribute("aria-pressed", "true");
-    expect(concise).toHaveClass("catalog-row--on");
-    expect(screen.getByText("1 / 2 个已选")).toBeInTheDocument();
-    expect(within(navigation()).getByRole("button", { name: TOOL_DESCRIPTIONS_PAGE })).toHaveTextContent(/^工具描述1$/);
-
-    // Another row replaces it, and unticking it goes back to selecting none: null, not the guided id.
+    // Picking the file ticks it; unticking it goes back to selecting none: null,
+    // not the built-in's id.
     await user.click(screen.getByRole("button", { name: "main" }));
     expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ toolDescriptionFileId: MAIN_PROFILE }));
-    expect(screen.getByRole("button", { name: "Mewrk concise" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: "main" })).toHaveAttribute("aria-pressed", "true");
+    expect(main).toHaveClass("catalog-row--on");
+    expect(screen.getByText("1 / 1 个已选")).toBeInTheDocument();
+    expect(within(navigation()).getByRole("button", { name: TOOL_DESCRIPTIONS_PAGE })).toHaveTextContent(/^工具描述1$/);
     await user.click(screen.getByRole("button", { name: "main" }));
     expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ toolDescriptionFileId: null }));
-    expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "main" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByText("0 / 1 个已选")).toBeInTheDocument();
+    expect(within(navigation()).getByRole("button", { name: TOOL_DESCRIPTIONS_PAGE })).toHaveTextContent(/^工具描述0$/);
   });
 
-  it("reads a conversation naming Mewrk concise as having picked its row", async () => {
+  it("reads a conversation naming the built-in Mewrk concise or the retired Mewrk guided as having picked nothing", async () => {
     const user = userEvent.setup();
     const seed = createSeedDocument();
     const conversation = seed.workspaces[0].conversations[0];
-    render(
-      <SettingsHarness
-        initialConversation={{ ...conversation, settings: { ...conversation.settings, toolDescriptionFileId: CONCISE_PROFILE } }}
-        globalSettings={seed.globalSettings}
-        tools={seed.tools}
-        capabilities={seed.capabilities}
-        onSettingsChange={vi.fn()}
-      />
-    );
-    expect(within(navigation()).getByRole("button", { name: TOOL_DESCRIPTIONS_PAGE })).toHaveTextContent(/^工具描述1$/);
-    await openPage(user, TOOL_DESCRIPTIONS_PAGE);
-    const concise = screen.getByRole("button", { name: "Mewrk concise" });
-    expect(concise).toHaveAttribute("aria-pressed", "true");
-    expect(concise.closest(".catalog-row")).toHaveClass("catalog-row--on");
-    // A listed built-in is no dangling id.
-    expect(screen.queryByText("悬空")).toBeNull();
-    expect(screen.getByText("1 / 2 个已选")).toBeInTheDocument();
+    for (const named of [BUILTIN_PROFILE, RETIRED_GUIDED_PROFILE]) {
+      resetCacheBreakWarnings();
+      const onSettingsChange = vi.fn();
+      const view = render(
+        <SettingsHarness
+          initialConversation={{ ...conversation, settings: { ...conversation.settings, toolDescriptionFileId: named } }}
+          globalSettings={seed.globalSettings}
+          tools={seed.tools}
+          capabilities={seed.capabilities}
+          onSettingsChange={onSettingsChange}
+        />
+      );
+      // No pick is counted, no row is on, and the id is no dangling row either.
+      expect(within(navigation()).getByRole("button", { name: TOOL_DESCRIPTIONS_PAGE })).toHaveTextContent(/^工具描述0$/);
+      await openPage(user, TOOL_DESCRIPTIONS_PAGE);
+      expect(screen.queryByRole("button", { name: "Mewrk concise" })).toBeNull();
+      expect(screen.queryByRole("button", { name: named })).toBeNull();
+      expect(document.querySelectorAll(".catalog-row--on")).toHaveLength(0);
+      expect(screen.queryByText("悬空")).toBeNull();
+      expect(screen.getByText("0 / 1 个已选")).toBeInTheDocument();
+      // The first file clicked is a plain pick.
+      await user.click(screen.getByRole("button", { name: "main" }));
+      expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ toolDescriptionFileId: MAIN_PROFILE }));
+      view.unmount();
+    }
   });
 
   it("puts the tool-descriptions page right after the hooks and counts the one file a conversation uses", async () => {
@@ -1578,11 +1587,15 @@ describe("ConversationSettings", () => {
     expect(within(nav).getByRole("button", { name: TOOLS_PAGE })).not.toHaveAttribute("aria-current");
     first.unmount();
 
-    // A file picked counts one; Mewrk guided's own id is no pick at all.
+    // A file picked counts one; the built-in's own id, and the retired Mewrk
+    // guided's, are no pick at all.
     const picked = mount(MAIN_PROFILE);
     expect(within(navigation()).getByRole("button", { name: TOOL_DESCRIPTIONS_PAGE })).toHaveTextContent(/^工具描述1$/);
     picked.unmount();
-    mount(BUILTIN_PROFILE);
+    const builtin = mount(BUILTIN_PROFILE);
+    expect(within(navigation()).getByRole("button", { name: TOOL_DESCRIPTIONS_PAGE })).toHaveTextContent(/^工具描述0$/);
+    builtin.unmount();
+    mount(RETIRED_GUIDED_PROFILE);
     expect(within(navigation()).getByRole("button", { name: TOOL_DESCRIPTIONS_PAGE })).toHaveTextContent(/^工具描述0$/);
   });
 
@@ -1628,19 +1641,18 @@ describe("ConversationSettings", () => {
     expect(screen.getByRole("button", { name: "打开全局配置目录" })).toBeInTheDocument();
     const global = screen.getByRole("region", { name: "全局" });
     expect(within(global).getByText("~/.mewrk")).toBeInTheDocument();
-    // The user's file and the concise built-in are drawn; Mewrk guided and the
+    // Only the user's file is drawn; the built-in Mewrk concise and the
     // workspace's stray are not.
     expect(within(global).getByRole("button", { name: "main" })).toBeInTheDocument();
-    expect(within(global).getByRole("button", { name: "Mewrk concise" })).toBeInTheDocument();
-    expect(screen.queryByText("Mewrk guided")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Mewrk guided" })).toBeNull();
+    expect(screen.queryByText("Mewrk concise")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Mewrk concise" })).toBeNull();
     expect(screen.queryByRole("button", { name: "stray" })).toBeNull();
-    expect(global.querySelectorAll(".catalog-row")).toHaveLength(2);
+    expect(global.querySelectorAll(".catalog-row")).toHaveLength(1);
     // The counter divides what is drawn, so it too leaves both out.
-    expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
+    expect(screen.getByText("0 / 1 个已选")).toBeInTheDocument();
   });
 
-  it("picks one tool-description file at a time: another row replaces it, and unticking goes back to Mewrk guided", async () => {
+  it("picks one tool-description file at a time: another row replaces it, and unticking goes back to the built-in", async () => {
     const seed = createSeedDocument();
     withAltToolDescription(seed.capabilities);
     const conversation = seed.workspaces[0].conversations[0];
@@ -1664,7 +1676,7 @@ describe("ConversationSettings", () => {
     expect(row("main")).toHaveClass("catalog-row--pick", "catalog-row--on");
     expect(screen.getByRole("button", { name: "alt" })).toHaveAttribute("aria-pressed", "false");
     expect(row("alt")).not.toHaveClass("catalog-row--on");
-    expect(screen.getByText("1 / 3 个已选")).toBeInTheDocument();
+    expect(screen.getByText("1 / 2 个已选")).toBeInTheDocument();
     // Plain rows: the conversation has no lock, so nothing here is orange.
     expect(document.querySelectorAll(".catalog-row--cache")).toHaveLength(0);
 
@@ -1675,41 +1687,44 @@ describe("ConversationSettings", () => {
     expect(screen.getByRole("button", { name: "main" })).toHaveAttribute("aria-pressed", "false");
     expect(row("alt")).toHaveClass("catalog-row--on");
     expect(row("main")).not.toHaveClass("catalog-row--on");
-    expect(screen.getByText("1 / 3 个已选")).toBeInTheDocument();
+    expect(screen.getByText("1 / 2 个已选")).toBeInTheDocument();
     expect(count()).toHaveTextContent(/^工具描述1$/);
 
-    // Unticking the one picked selects nothing, which is Mewrk guided: null, not "".
+    // Unticking the one picked selects nothing, which is the built-in Mewrk concise: null, not "".
     await user.click(screen.getByRole("button", { name: "alt" }));
     expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ toolDescriptionFileId: null }));
     expect(screen.getByRole("button", { name: "alt" })).toHaveAttribute("aria-pressed", "false");
     expect(screen.getByRole("button", { name: "main" })).toHaveAttribute("aria-pressed", "false");
-    expect(screen.getByText("0 / 3 个已选")).toBeInTheDocument();
+    expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
     expect(count()).toHaveTextContent(/^工具描述0$/);
     expect(onSettingsChange).toHaveBeenCalledTimes(2);
     unmount();
 
-    // A conversation that names Mewrk guided reads as selecting nothing: no row
-    // is on, no dangling row appears for an id the list deliberately leaves out,
-    // and the first file clicked is a plain pick.
-    resetCacheBreakWarnings();
-    const onBuiltinChange = vi.fn();
-    render(
-      <SettingsHarness
-        initialConversation={{ ...conversation, settings: { ...conversation.settings, toolDescriptionFileId: BUILTIN_PROFILE } }}
-        globalSettings={seed.globalSettings}
-        tools={seed.tools}
-        capabilities={seed.capabilities}
-        onSettingsChange={onBuiltinChange}
-      />
-    );
-    expect(count()).toHaveTextContent(/^工具描述0$/);
-    await openPage(user, TOOL_DESCRIPTIONS_PAGE);
-    expect(document.querySelectorAll(".catalog-row--on")).toHaveLength(0);
-    expect(screen.queryByText("悬空")).toBeNull();
-    expect(screen.queryByRole("button", { name: BUILTIN_PROFILE })).toBeNull();
-    expect(screen.getByText("0 / 3 个已选")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "main" }));
-    expect(onBuiltinChange).toHaveBeenLastCalledWith(expect.objectContaining({ toolDescriptionFileId: MAIN_PROFILE }));
+    // A conversation that names the built-in, or the retired Mewrk guided, reads
+    // as selecting nothing: no row is on, no dangling row appears for an id the
+    // list deliberately leaves out, and the first file clicked is a plain pick.
+    for (const named of [BUILTIN_PROFILE, RETIRED_GUIDED_PROFILE]) {
+      resetCacheBreakWarnings();
+      const onBuiltinChange = vi.fn();
+      const view = render(
+        <SettingsHarness
+          initialConversation={{ ...conversation, settings: { ...conversation.settings, toolDescriptionFileId: named } }}
+          globalSettings={seed.globalSettings}
+          tools={seed.tools}
+          capabilities={seed.capabilities}
+          onSettingsChange={onBuiltinChange}
+        />
+      );
+      expect(count()).toHaveTextContent(/^工具描述0$/);
+      await openPage(user, TOOL_DESCRIPTIONS_PAGE);
+      expect(document.querySelectorAll(".catalog-row--on")).toHaveLength(0);
+      expect(screen.queryByText("悬空")).toBeNull();
+      expect(screen.queryByRole("button", { name: named })).toBeNull();
+      expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "main" }));
+      expect(onBuiltinChange).toHaveBeenLastCalledWith(expect.objectContaining({ toolDescriptionFileId: MAIN_PROFILE }));
+      view.unmount();
+    }
   });
 
   it("draws every tool-description row orange while the warm cache was worded with the current file, and asks before changing it", async () => {
@@ -1739,9 +1754,10 @@ describe("ConversationSettings", () => {
     await openPage(user, TOOL_DESCRIPTIONS_PAGE);
 
     // Whichever row is clicked, the words the cached prefix was written in
-    // change, so the picked row and the ones beside it, the concise built-in
-    // included, are orange alike.
-    for (const name of ["main", "alt", "Mewrk concise"]) {
+    // change, so the picked row and the ones beside it are orange alike. The
+    // built-in is no row to be orange.
+    expect(screen.queryByRole("button", { name: "Mewrk concise" })).toBeNull();
+    for (const name of ["main", "alt"]) {
       const box = screen.getByRole("button", { name }).closest(".catalog-row") as HTMLElement;
       expect(box).toHaveClass("catalog-row--cache");
       expect(box.querySelector(".catalog-row__sign.lock-mark--cache")).not.toBeNull();
@@ -1769,7 +1785,7 @@ describe("ConversationSettings", () => {
     expect(document.querySelectorAll(".catalog-row--cache")).toHaveLength(0);
     unmount();
 
-    // Going back to Mewrk guided by unticking asks as well: it moves the same profile.
+    // Going back to the built-in by unticking asks as well: it moves the same profile.
     resetCacheBreakWarnings();
     const onUntick = vi.fn();
     const untick = render(
@@ -1788,6 +1804,31 @@ describe("ConversationSettings", () => {
       .getByRole("button", { name: "仍然更改" }));
     expect(onUntick).toHaveBeenLastCalledWith(expect.objectContaining({ toolDescriptionFileId: null }));
     untick.unmount();
+
+    // A conversation still naming the retired Mewrk guided is on the built-in
+    // all the same, so a lock worded with the built-in is the profile it is on:
+    // the rows are orange, and picking a file asks first.
+    resetCacheBreakWarnings();
+    const onRetired = vi.fn();
+    const retired = render(
+      <SettingsHarness
+        initialConversation={settings(RETIRED_GUIDED_PROFILE, { promptProfile: BUILTIN_PROFILE })}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onRetired}
+      />
+    );
+    await openPage(user, TOOL_DESCRIPTIONS_PAGE);
+    for (const name of ["main", "alt"]) {
+      const box = screen.getByRole("button", { name }).closest(".catalog-row") as HTMLElement;
+      expect(box).toHaveClass("catalog-row--cache");
+      expect(box).not.toHaveClass("catalog-row--on");
+    }
+    await user.click(screen.getByRole("button", { name: "alt" }));
+    expect(screen.getByRole("dialog", { name: CACHE_BREAK_TITLE })).toBeInTheDocument();
+    expect(onRetired).not.toHaveBeenCalled();
+    retired.unmount();
 
     // Nothing is orange, and nothing asks, when the cache is long cold, when the
     // selection already moved off the profile the lock recorded, or when the
@@ -1852,12 +1893,12 @@ describe("ConversationSettings", () => {
     expect(box).toHaveClass("catalog-row--on");
     expect(within(box).getByText("悬空")).toBeInTheDocument();
     // The host words the run with the built-in instead of failing it, and says so.
-    expect(box).toHaveAttribute("title", expect.stringContaining("目录中已不存在；运行时用的是 Mewrk guided（内置引导版）"));
+    expect(box).toHaveAttribute("title", expect.stringContaining("目录中已不存在；运行时用的是内置的 Mewrk concise"));
     expect(box).not.toHaveTextContent("每次运行都会失败");
     expect(box).not.toHaveClass("catalog-row--cache");
     expect(box.querySelector(".lock-mark")).toBeNull();
     // The counter is over the catalog, which the dangling row is no part of.
-    expect(screen.getByText("0 / 2 个已选")).toBeInTheDocument();
+    expect(screen.getByText("0 / 1 个已选")).toBeInTheDocument();
 
     await user.click(dangling);
     expect(screen.queryByRole("dialog")).toBeNull();
@@ -1891,7 +1932,7 @@ describe("ConversationSettings", () => {
     await openPage(user, TOOL_DESCRIPTIONS_PAGE);
 
     const box = () => screen.getByRole("button", { name: "broken" }).closest(".catalog-row") as HTMLElement;
-    const fallback = "已选择，但文件里没有可用条目；运行时用的是 Mewrk guided（内置引导版）";
+    const fallback = "已选择，但文件里没有可用条目；运行时用的是内置的 Mewrk concise";
     // Not picked, it says only that it is unavailable.
     expect(within(box()).getByText("不可用")).toBeInTheDocument();
     expect(box()).toHaveAttribute("title", expect.stringContaining("当前不可用"));
@@ -1936,7 +1977,7 @@ describe("ConversationSettings", () => {
 
     expect(screen.getByRole("link", { name: "配置说明文档" }))
       .toHaveAttribute("href", "https://mewrk.dev/zh-CN/prompt-profiles.html");
-    expect(screen.getByText("一次只用一份：选另一份会替换当前这份。都不选时，用 Mewrk guided（内置引导版）。"))
+    expect(screen.getByText("一次只用一份：选另一份会替换当前这份。都不选时，用内置的 Mewrk concise。"))
       .toBeInTheDocument();
 
     const search = screen.getByRole("textbox", { name: "搜索工具描述" });
@@ -1948,7 +1989,7 @@ describe("ConversationSettings", () => {
     expect(screen.getByText("没有匹配的条目")).toBeInTheDocument();
   });
 
-  it("says no tool-description file was found when only Mewrk guided exists, and still states the rule", async () => {
+  it("says no tool-description file was found when only the built-in exists, and still states the rule", async () => {
     const seed = createSeedDocument();
     seed.capabilities.toolDescriptionFiles = seed.capabilities.toolDescriptionFiles
       .filter((resource) => resource.id === BUILTIN_PROFILE);
@@ -1964,16 +2005,17 @@ describe("ConversationSettings", () => {
     );
     await openPage(user, TOOL_DESCRIPTIONS_PAGE);
 
-    // Mewrk guided is not a row, so a catalog of nothing but it is an empty one.
+    // The built-in Mewrk concise is not a row, so a catalog of nothing but it is an empty one.
+    expect(seed.capabilities.toolDescriptionFiles.map((file) => file.id)).toEqual([BUILTIN_PROFILE]);
     expect(screen.getByText("尚未发现工具描述文件")).toBeInTheDocument();
-    expect(screen.getByText("把 JSON 文件放在 ~/.mewrk/tool-descriptions/ 下，列表很快会自动刷新。"))
+    expect(screen.getByText("把 JSON 文件（可带注释）放在 ~/.mewrk/tool-descriptions/ 下，列表很快会自动刷新。"))
       .toBeInTheDocument();
     expect(screen.getByText("0 / 0 个已选")).toBeInTheDocument();
-    expect(screen.queryByText("Mewrk guided")).toBeNull();
+    expect(screen.queryByText("Mewrk concise")).toBeNull();
     expect(document.querySelectorAll(".catalog-row")).toHaveLength(0);
     // The rule is drawn with or without rows: how nothing selected behaves is
     // worth knowing before the first file is written.
-    expect(screen.getByText(/都不选时，用 Mewrk guided（内置引导版）/)).toBeInTheDocument();
+    expect(screen.getByText(/都不选时，用内置的 Mewrk concise。/)).toBeInTheDocument();
   });
 
   it("words the tool-descriptions page in English", async () => {
@@ -1995,8 +2037,10 @@ describe("ConversationSettings", () => {
     expect(screen.getByRole("region", { name: "Global" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "main" })).toBeInTheDocument();
     expect(screen.getByText(
-      "One at a time: picking another replaces the current one. With none picked, Mewrk guided (built-in) is used."
+      "One at a time: picking another replaces the current one. With none picked, the built-in Mewrk concise is used."
     )).toBeInTheDocument();
+    // The built-in is no row of the list.
+    expect(screen.queryByRole("button", { name: "Mewrk concise" })).toBeNull();
   });
 
   it("never shows host-derived tools or a skill tool in the tool picker", () => {
@@ -3533,7 +3577,7 @@ describe("ConversationSettings", () => {
       .toEqual(["全局"]);
     expect(within(dialog).queryByRole("button", { name: "stray" })).toBeNull();
     expect(within(dialog).queryByRole("button", { name: "Mewrk guided" })).toBeNull();
-    expect(within(dialog).getByRole("button", { name: "Mewrk concise" })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Mewrk concise" })).toBeNull();
     // A preset has run nothing, so nothing here is toned.
     expect(dialog.querySelectorAll(".catalog-row--cache")).toHaveLength(0);
 

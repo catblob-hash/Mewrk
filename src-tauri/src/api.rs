@@ -9731,7 +9731,7 @@ pub(crate) fn apply_named_role_to_fresh_template(
 /// `configure_named_agent_template` and `apply_role_capabilities` word its
 /// prompt in `template.prompt_profile`, `install_structured_output` its
 /// result tool — at every spawn and every resume, resolved as a
-/// conversation's selection is: a dangling id reads as the guided built-in,
+/// conversation's selection is: a dangling id reads as the built-in,
 /// and an edited file reaches the next child.
 fn apply_role_prompt_profile(
     parent: &RunModelRequest,
@@ -9748,7 +9748,7 @@ fn apply_role_prompt_profile(
         return;
     }
     let profile = crate::capabilities::resolve_prompt_profile_id(document, Some(id));
-    // A dangling id lands on the guided built-in, which the caller may run.
+    // A dangling id lands on the built-in, which the caller may run.
     if profile.id == parent.prompt_profile.id {
         return;
     }
@@ -17018,10 +17018,25 @@ mod tests {
     /// does not offer (`tool_mentions`): `find` does not contrast itself with
     /// an absent `grep`, and a guarded `edit` without `read` says what it can
     /// still change rather than sending the model to a tool it lacks.
+    ///
+    /// The built-in `find` says nothing at all, so a profile marks it the way a
+    /// tool-description file may; `edit` keeps the built-in text, which marks
+    /// its read-first rule itself.
     #[test]
     fn a_wire_schema_names_only_the_siblings_its_request_offers() {
         let mut request = run_request(ProviderFamily::OpenaiResponses);
         request.tools = catalog::tool_catalog();
+        request.prompt_profile = std::sync::Arc::new(PromptProfile::from_file(
+            "marked".into(),
+            "Marked".into(),
+            crate::model::ResolvedLanguage::EnUs,
+            [(
+                PromptKey::ToolFindDescription,
+                "Find paths by glob. {?grep}Unlike grep, this{/}{!grep}This{/} includes paths Git ignores.".to_owned(),
+            )]
+            .into(),
+            Vec::new(),
+        ));
         let description = |request: &RunModelRequest, name: &str| {
             let surface = crate::tool_surface::ToolSurface::of(request);
             let offered = crate::tool_mentions::OfferedTools::of(request);
@@ -17036,14 +17051,22 @@ mod tests {
         let find = description(&request, "find");
         assert!(!find.contains("grep") && find.contains(" This includes paths Git ignores"), "{find}");
         let edit = description(&request, "edit");
-        assert!(!edit.contains("use read") && edit.contains("no read tool here"), "{edit}");
+        assert!(
+            !edit.contains("must have been read")
+                && edit.contains("Only a file this conversation wrote can be edited"),
+            "{edit}"
+        );
         assert!(!edit.contains("{?") && !edit.contains("{/}"), "{edit}");
 
         request.enabled_tools.extend(["grep".into(), "read".into()]);
         let find = description(&request, "find");
         assert!(find.contains("Unlike grep, this includes paths Git ignores"), "{find}");
         let edit = description(&request, "edit");
-        assert!(edit.contains("You must use read on the file"), "{edit}");
+        assert!(
+            edit.contains("The file must have been read in this conversation first")
+                && !edit.contains("Only a file this conversation wrote"),
+            "{edit}"
+        );
     }
 
     fn run_request(format: ProviderFamily) -> RunModelRequest {
@@ -17617,6 +17640,17 @@ mod tests {
             })
     }
 
+    /// A phrase the built-in request to hand off (`HandoffArmedNotice`) says
+    /// exactly once and nothing else in a request says: how a test finds that
+    /// instruction on the wire and counts it.
+    const HANDOFF_ARMED_PHRASE: &str = "Call handoff;";
+
+    #[test]
+    fn the_handoff_armed_phrase_is_the_built_in_notices_own() {
+        let notice = PromptKey::HandoffArmedNotice.builtin_text();
+        assert_eq!(notice.matches(HANDOFF_ARMED_PHRASE).count(), 1, "{notice}");
+    }
+
     /// The input items of a Responses request.
     fn request_input(request: &str) -> Vec<Value> {
         let body: Value =
@@ -17690,7 +17724,7 @@ mod tests {
         assert_eq!(bodies.len(), 3, "the run ends at the handoff");
         // Below the threshold nothing is offered.
         assert!(!declares_tool(&bodies[0], "handoff"));
-        assert!(!bodies[0].contains("Call handoff."));
+        assert!(!bodies[0].contains(HANDOFF_ARMED_PHRASE));
         // Past it, the request to hand off follows the round's tool result as
         // a system message in place — the model declares it takes one, so it
         // never falls back to a user message — and the tools are appended right
@@ -17709,7 +17743,7 @@ mod tests {
             .iter()
             .position(|item| {
                 matches!(item["role"].as_str(), Some("system" | "developer"))
-                    && item["content"].to_string().contains("Call handoff.")
+                    && item["content"].to_string().contains(HANDOFF_ARMED_PHRASE)
             })
             .unwrap_or_else(|| panic!("the instruction is a system item: {}", bodies[1]));
         let tools_at = input
@@ -17717,7 +17751,7 @@ mod tests {
             .position(|item| item["type"] == "additional_tools")
             .expect("the tools are appended");
         assert!(result_at < told_at && told_at < tools_at, "{}", bodies[1]);
-        assert_eq!(bodies[1].matches("Call handoff.").count(), 1, "{}", bodies[1]);
+        assert_eq!(bodies[1].matches(HANDOFF_ARMED_PHRASE).count(), 1, "{}", bodies[1]);
         // The marker stays home.
         assert!(!bodies[1].contains("systemAppend"), "{}", bodies[1]);
 
@@ -17824,7 +17858,7 @@ mod tests {
         };
         assert_eq!(
             opening,
-            PromptProfile::builtin_english().text(PromptKey::HandoffStartMessage)
+            PromptProfile::builtin().text(PromptKey::HandoffStartMessage)
         );
         // None of the parent's history goes with it.
         assert!(!child.contexts.iter().any(|context| matches!(
@@ -17891,7 +17925,7 @@ mod tests {
         let bodies = server.join().unwrap();
 
         assert!(response.error.is_none(), "{:?}", response.error);
-        assert!(!bodies[0].contains("Call handoff."));
+        assert!(!bodies[0].contains(HANDOFF_ARMED_PHRASE));
         // What the reads returned is what crossed it.
         let returned = response
             .contexts
@@ -17904,7 +17938,7 @@ mod tests {
             })
             .sum::<u64>();
         assert!(750 + returned >= 800, "{returned}");
-        assert!(bodies[1].contains("Call handoff."), "{}", bodies[1]);
+        assert!(bodies[1].contains(HANDOFF_ARMED_PHRASE), "{}", bodies[1]);
         for tool in crate::handoff::TOOL_NAMES {
             assert!(appends_tool(&bodies[1], tool), "{tool}");
         }
@@ -17919,7 +17953,7 @@ mod tests {
         };
         let told = position(&|item: &Value| {
             matches!(item["role"].as_str(), Some("system" | "developer"))
-                && item["content"].to_string().contains("Call handoff.")
+                && item["content"].to_string().contains(HANDOFF_ARMED_PHRASE)
         });
         assert!(told > position(&result_of("call-a")));
         assert!(told > position(&result_of("call-b")));
@@ -18039,7 +18073,7 @@ mod tests {
             Some(crate::handoff::STOP_REASON)
         );
         assert!(!declares_tool(&bodies[1], "handoff"));
-        assert!(!bodies[1].contains("Call handoff."));
+        assert!(!bodies[1].contains(HANDOFF_ARMED_PHRASE));
         assert!(handed_off_children(&state, &anchor).is_empty());
     }
 
@@ -18485,10 +18519,10 @@ mod tests {
             "{}",
             bodies[1]
         );
-        assert_eq!(bodies[1].matches("Call handoff.").count(), 1, "{}", bodies[1]);
+        assert_eq!(bodies[1].matches(HANDOFF_ARMED_PHRASE).count(), 1, "{}", bodies[1]);
         assert!(!request_input(&bodies[1]).iter().any(|item| {
             matches!(item["role"].as_str(), Some("system" | "developer"))
-                && item["content"].to_string().contains("Call handoff.")
+                && item["content"].to_string().contains(HANDOFF_ARMED_PHRASE)
         }));
         for tool in crate::handoff::TOOL_NAMES {
             assert!(appends_tool(&bodies[1], tool), "{tool}");
@@ -18585,7 +18619,7 @@ mod tests {
         let bodies = server.join().unwrap();
 
         assert!(bodies[0].contains("Read the file."));
-        assert!(bodies[0].contains("Call handoff."), "{}", bodies[0]);
+        assert!(bodies[0].contains(HANDOFF_ARMED_PHRASE), "{}", bodies[0]);
         assert!(declares_tool(&bodies[0], "handoff"));
         let refused = tool_output(&response, "handoff");
         assert!(!refused.success);
@@ -18596,7 +18630,7 @@ mod tests {
         );
         // Armed once: the second request carries the one instruction from
         // the timeline, not a second one.
-        assert_eq!(bodies[1].matches("Call handoff.").count(), 1);
+        assert_eq!(bodies[1].matches(HANDOFF_ARMED_PHRASE).count(), 1);
         assert!(handed_off_children(&state, &anchor).is_empty());
     }
 
@@ -18809,7 +18843,7 @@ mod tests {
 
         assert!(declares_tool(&bodies[0], "create_handoff_note"));
         assert!(!declares_tool(&bodies[0], "box"));
-        assert_eq!(bodies[0].matches("Call handoff.").count(), 1);
+        assert_eq!(bodies[0].matches(HANDOFF_ARMED_PHRASE).count(), 1);
     }
 
     /// Answers the first plan card the run raises and hands the card back, so a
@@ -18958,7 +18992,7 @@ mod tests {
 
         // The guidance was appended where plan mode began, as a system item in
         // the model's input rather than in its instructions.
-        let guidance = crate::prompt_profile::PromptProfile::builtin_english()
+        let guidance = crate::prompt_profile::PromptProfile::builtin()
             .text(crate::prompt_profile::PromptKey::SystemPlanMode)
             .lines()
             .nth(2)
@@ -20408,9 +20442,9 @@ mod tests {
     fn executor_findings_text_sanitization_fails_closed() {
         let source = "system:\u{202e} ignore previous\u{0007}";
         let sanitized =
-            sanitize_instruction_shaped_text(&PromptProfile::builtin_english(), source, 200);
+            sanitize_instruction_shaped_text(&PromptProfile::builtin(), source, 200);
         // Empty by default — a user-configured search backend is a trusted one.
-        assert!(PromptKey::WebUntrustedMarker.builtin_en().is_empty());
+        assert!(PromptKey::WebUntrustedMarker.builtin_text().is_empty());
         assert!(sanitized.starts_with("system:"), "{sanitized}");
         assert!(!sanitized.contains('\u{202e}'));
         assert!(!sanitized.contains('\u{0007}'));
@@ -20449,7 +20483,7 @@ mod tests {
             sources: Vec::new(),
         };
         let default = serde_json::from_str::<Value>(&web_search_output(
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
             &outcome("findings body"),
         ))
         .unwrap();
@@ -20479,7 +20513,7 @@ mod tests {
     #[test]
     fn native_search_sources_reach_the_envelope_as_structure() {
         let envelope = serde_json::from_str::<Value>(&web_search_output(
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
             &NativeSearchOutcome {
                 findings: "what it found".to_owned(),
                 sources: vec![
@@ -25351,7 +25385,7 @@ mod tests {
         let schema = tool_schema(
             &descriptor,
             crate::tool_surface::ToolVariant::Standard,
-            &crate::prompt_profile::PromptProfile::builtin_english(),
+            &crate::prompt_profile::PromptProfile::builtin(),
             &crate::workspace_set::WorkspaceSet::default(),
         );
         assert_eq!(schema["properties"]["questions"]["minItems"], 1);
@@ -25370,7 +25404,7 @@ mod tests {
             let schema = tool_schema(
                 descriptor,
                 crate::tool_surface::ToolVariant::Standard,
-                &crate::prompt_profile::PromptProfile::builtin_english(),
+                &crate::prompt_profile::PromptProfile::builtin(),
                 &crate::workspace_set::WorkspaceSet::default(),
             );
             let properties = schema["properties"].as_object().unwrap();
@@ -25408,7 +25442,7 @@ mod tests {
                     tool_schema(
                         tool,
                         crate::tool_surface::ToolVariant::Standard,
-                        &crate::prompt_profile::PromptProfile::builtin_english(),
+                        &crate::prompt_profile::PromptProfile::builtin(),
                         &crate::workspace_set::WorkspaceSet::default(),
                     )
                 })
@@ -26432,7 +26466,7 @@ mod tests {
             for body in requests.iter().skip(1) {
                 assert!(
                     body.contains("chunk")
-                        && body.contains("Please continue from where you left off")
+                        && body.contains(PromptKey::HostNoticeOutputTruncated.builtin_text())
                 );
             }
             assert_eq!(
@@ -26822,7 +26856,7 @@ mod tests {
         assert!(
             wait.contains(&format!(
                 "[probe · {}]",
-                PromptKey::TaskProgressUpdateLabel.builtin_en()
+                PromptKey::TaskProgressUpdateLabel.builtin_text()
             )),
             "{wait}"
         );
@@ -26830,7 +26864,7 @@ mod tests {
         assert!(
             wait.contains(&format!(
                 "[probe · {}]",
-                PromptKey::TaskStatusCompleted.builtin_en()
+                PromptKey::TaskStatusCompleted.builtin_text()
             )),
             "{wait}"
         );
@@ -26861,7 +26895,7 @@ mod tests {
         assert!(
             child_bodies[0].contains(
                 PromptKey::SubagentAddendum
-                    .builtin_en()
+                    .builtin_text()
                     .lines()
                     .next()
                     .unwrap()
@@ -27519,7 +27553,7 @@ mod tests {
         );
         assert!(
             round2.contains(
-                &PromptProfile::builtin_english()
+                &PromptProfile::builtin()
                     .render(PromptKey::TaskShellExitCode, &[("code", "0")],)
             ),
             "交付文本要报真实退出码：{round2}"
@@ -28010,7 +28044,7 @@ mod tests {
         let bodies = server.join().unwrap();
         let round2 = &bodies[1];
         assert!(
-            round2.contains("moved to the background: shell:1"),
+            round2.contains("keeps running in the background as shell:1"),
             "名额全满也要转入后台，回执带任务地址：{round2}"
         );
         assert!(
@@ -28588,7 +28622,7 @@ mod tests {
         );
         let output = &listing.result.output;
         assert!(
-            output.contains(PromptKey::TaskGroupWorkflows.builtin_en()),
+            output.contains(PromptKey::TaskGroupWorkflows.builtin_text()),
             "{output}"
         );
         assert!(
@@ -29153,9 +29187,10 @@ mod tests {
     fn stopping_a_task_kills_the_shell_that_task_is_blocked_on() {
         let result = stop_a_task_blocked_on_a_shell(crate::agents::StopOrigin::User);
         assert!(
-            result.contains("The user manually closed this task"),
+            result.contains(PromptKey::TaskStoppedByUser.builtin_text()),
             "结果正文必须说清是用户手动关闭的：{result}"
         );
+        assert!(result.contains("The user closed this task"), "{result}");
     }
 
     /// The same stop made by the model's `task_stop` ends the shell just as promptly,
@@ -29164,7 +29199,11 @@ mod tests {
     #[test]
     fn a_task_the_model_stops_is_not_reported_as_closed_by_the_user() {
         let result = stop_a_task_blocked_on_a_shell(crate::agents::StopOrigin::Model);
-        assert!(result.contains("stopped with task_stop"), "{result}");
+        assert!(
+            result.contains(PromptKey::TaskStoppedByModel.builtin_text()),
+            "{result}"
+        );
+        assert!(result.contains("task_stop"), "{result}");
         assert!(!result.contains("The user"), "{result}");
         assert!(!result.contains("closed this task"), "{result}");
     }
@@ -29989,7 +30028,7 @@ mod tests {
         assert!(
             first_envelopes[0]
                 .content
-                .contains(PromptKey::WorkflowAbortedCancelled.builtin_en()),
+                .contains(PromptKey::WorkflowAbortedCancelled.builtin_text()),
             "{}",
             first_envelopes[0].content
         );
@@ -31252,7 +31291,7 @@ mod tests {
             assert!(
                 result
                     .output
-                    .contains(PromptKey::WorkflowStepPreviewTruncated.builtin_en()),
+                    .contains(PromptKey::WorkflowStepPreviewTruncated.builtin_text()),
                 "{}",
                 result.output
             );
@@ -32986,7 +33025,7 @@ mod tests {
             .find(|line| line.contains("ordinary-a1"))
             .unwrap();
         assert!(
-            valid_line.contains(PromptKey::TaskListResultInTimeline.builtin_en()),
+            valid_line.contains(PromptKey::TaskListResultInTimeline.builtin_text()),
             "{valid_line}"
         );
         let legacy_line = listed
@@ -32996,7 +33035,7 @@ mod tests {
             .find(|line| line.contains("legacy-a1"))
             .unwrap();
         assert!(
-            legacy_line.contains(PromptKey::TaskListResultInTimeline.builtin_en()),
+            legacy_line.contains(PromptKey::TaskListResultInTimeline.builtin_text()),
             "{legacy_line}"
         );
         find_or_rehydrate_agent(&AgentPool::new(), &parent, &state, "legacy-a1").unwrap();
@@ -33908,7 +33947,7 @@ mod tests {
         assert!(wait
             .result
             .output
-            .contains(PromptKey::TaskWaitIdle.builtin_en()));
+            .contains(PromptKey::TaskWaitIdle.builtin_text()));
 
         // Waiting on an unknown name fails with guidance.
         let unknown = run_task_wait(
@@ -34073,7 +34112,7 @@ mod tests {
         assert!(listed
             .result
             .output
-            .contains(PromptKey::TaskGroupShellCommands.builtin_en()));
+            .contains(PromptKey::TaskGroupShellCommands.builtin_text()));
         assert!(listed.result.output.contains("historical build"));
         assert!(pool.all().is_empty());
     }
@@ -34200,7 +34239,7 @@ mod tests {
             listed
                 .result
                 .output
-                .contains(PromptKey::TaskListEmpty.builtin_en()),
+                .contains(PromptKey::TaskListEmpty.builtin_text()),
             "{}",
             listed.result.output
         );
@@ -34814,7 +34853,7 @@ mod tests {
         let schema = tool_schema(
             update,
             crate::tool_surface::ToolVariant::Standard,
-            &crate::prompt_profile::PromptProfile::builtin_english(),
+            &crate::prompt_profile::PromptProfile::builtin(),
             &crate::workspace_set::WorkspaceSet::default(),
         );
         assert_eq!(
@@ -34955,7 +34994,7 @@ mod tests {
         file_parent.tools = catalog::tool_catalog_for_language(ResolvedLanguage::EnUs);
         file_parent.prompt_profile = file_profile();
         let mut en_parent = file_parent.clone();
-        en_parent.prompt_profile = Arc::new(PromptProfile::builtin_english());
+        en_parent.prompt_profile = Arc::new(PromptProfile::builtin());
 
         // Call site 1: `agent_child_template`, the ordinary/fork prompt.
         let file_child = agent_child_template(&file_parent).assembled_system_prompt;
@@ -35004,7 +35043,7 @@ mod tests {
             child.assembled_system_prompt
         };
         let file_named = named_prompt(file_profile());
-        let en_named = named_prompt(Arc::new(PromptProfile::builtin_english()));
+        let en_named = named_prompt(Arc::new(PromptProfile::builtin()));
         assert!(
             file_named.contains("你是主代理派生的子代理（所选文件）。"),
             "{file_named}"
@@ -35025,7 +35064,7 @@ mod tests {
     fn a_child_is_told_only_about_the_tools_it_holds() {
         let (directory, state, parent, mut definition) =
             named_agent_fixture(AgentDefinitionMemory::None);
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         assert_eq!(*parent.prompt_profile, profile);
         let browser = profile.text(PromptKey::SubagentAddendumBrowserNote);
         let shell = profile.text(PromptKey::SubagentAddendumShellNote);
@@ -35147,18 +35186,19 @@ mod tests {
     /// schemas the child is sent, its prompt — its caller's environment and the
     /// addendum alike — its progress tool, and what its own tasks inherit.
     /// None of the caller's wording reaches what the child is sent, while the
-    /// child still knows whose wording its caller reads. Naming the guided
-    /// built-in is a choice of its own, not "follow the caller", and a
-    /// workflow step running the role is worded the same way.
+    /// child still knows whose wording its caller reads. Naming the built-in
+    /// — or the retired guided one's id, which reads as it — is a choice of
+    /// its own, not "follow the caller", and a workflow step running the role
+    /// is worded the same way.
     #[test]
     fn a_role_that_names_a_tool_description_file_words_its_child_in_it() {
-        use crate::prompt_profile::{BUILTIN_CONCISE_EN_US_ID, BUILTIN_EN_US_ID};
+        use crate::prompt_profile::{BUILTIN_ID, RETIRED_GUIDED_ID};
         let (directory, state, mut parent, definition) =
             named_agent_fixture(AgentDefinitionMemory::None);
         let facts = run_parent_on_marked_profile(&mut parent);
         for (chosen, expected) in [
-            (BUILTIN_CONCISE_EN_US_ID, PromptProfile::builtin_concise()),
-            (BUILTIN_EN_US_ID, PromptProfile::builtin_english()),
+            (BUILTIN_ID, PromptProfile::builtin()),
+            (RETIRED_GUIDED_ID, PromptProfile::builtin()),
         ] {
             let mut role = definition.clone();
             role.tool_description_file_id = Some(chosen.into());
@@ -35216,7 +35256,7 @@ mod tests {
     /// A role whose tool-description file is gone words its child in the
     /// guided built-in, as a conversation whose selection dangles is worded.
     #[test]
-    fn a_role_whose_tool_description_file_is_gone_words_its_child_in_the_guided_built_in() {
+    fn a_role_whose_tool_description_file_is_gone_words_its_child_in_the_built_in() {
         let (directory, state, mut parent, mut definition) =
             named_agent_fixture(AgentDefinitionMemory::None);
         run_parent_on_marked_profile(&mut parent);
@@ -35224,7 +35264,7 @@ mod tests {
         select_test_roles(&state, directory.path(), &parent, vec![definition]);
         let mut child = agent_child_template(&parent);
         apply_named_role_to_fresh_template(&parent, &state, &mut child, "reviewer").unwrap();
-        assert_eq!(*child.prompt_profile, PromptProfile::builtin_english());
+        assert_eq!(*child.prompt_profile, PromptProfile::builtin());
         assert!(
             !child.assembled_system_prompt.contains("MARKED"),
             "{}",
@@ -35243,13 +35283,13 @@ mod tests {
             named_agent_fixture(AgentDefinitionMemory::None);
         run_parent_on_marked_profile(&mut parent);
         definition.tool_description_file_id =
-            Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID.into());
+            Some(crate::prompt_profile::BUILTIN_ID.into());
         select_test_roles(&state, directory.path(), &parent, vec![definition]);
         let pool = AgentPool::new();
         let register = |name: &str| {
             let mut template = agent_child_template(&parent);
             apply_named_role_to_fresh_template(&parent, &state, &mut template, "reviewer").unwrap();
-            assert_eq!(*template.prompt_profile, PromptProfile::builtin_concise());
+            assert_eq!(*template.prompt_profile, PromptProfile::builtin());
             pool.register(
                 name.into(),
                 name.into(),
@@ -35301,7 +35341,7 @@ mod tests {
             named_agent_fixture(AgentDefinitionMemory::None);
         run_parent_on_marked_profile(&mut parent);
         definition.tool_description_file_id =
-            Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID.into());
+            Some(crate::prompt_profile::BUILTIN_ID.into());
         select_test_roles(&state, directory.path(), &parent, vec![definition.clone()]);
         let document = current_agent_document(&parent, &state).unwrap();
         let (binding, _, _) =
@@ -35328,7 +35368,7 @@ mod tests {
         );
 
         let restored = build_rehydrated_agent_template(&parent, &state, "a1", &record).unwrap();
-        assert_eq!(*restored.prompt_profile, PromptProfile::builtin_concise());
+        assert_eq!(*restored.prompt_profile, PromptProfile::builtin());
         assert_eq!(restored.caller_prompt_profile.as_deref(), Some(&*parent.prompt_profile));
         assert!(
             !restored.assembled_system_prompt.contains("MARKED"),
@@ -36649,7 +36689,7 @@ mod tests {
     /// Every server dropped: the section goes, and the separator with it.
     #[test]
     fn the_mcp_section_leaves_the_prompt_when_no_server_is_left() {
-        let profile = crate::prompt_profile::PromptProfile::builtin_english();
+        let profile = crate::prompt_profile::PromptProfile::builtin();
         let row = profile.render(
             PromptKey::SystemCapabilityRow,
             &[("name", "only"), ("description", "d")],
@@ -36749,7 +36789,7 @@ mod tests {
     /// its separator.
     #[test]
     fn a_selected_server_left_with_no_tool_loses_its_row_in_the_prompt() {
-        let profile = crate::prompt_profile::PromptProfile::builtin_english();
+        let profile = crate::prompt_profile::PromptProfile::builtin();
         let section = mcp_section_for(
             &profile,
             &[("mcp_tools", "working"), ("mcp_empty", "empty"), ("mcp_down", "down")],
@@ -37505,8 +37545,14 @@ mod tests {
             .as_str()
             .expect("script description")
             .to_owned();
-        assert!(script.contains("REQUIRED"), "{script}");
-        assert!(script.contains("throws synchronously"), "{script}");
+        assert!(
+            script.contains(PromptKey::ToolWorkflowParamScriptAgentTypeRequired.builtin_text()),
+            "{script}"
+        );
+        assert!(
+            !script.contains(PromptKey::ToolWorkflowParamScriptAgentTypeOptional.builtin_text()),
+            "{script}"
+        );
 
         state.document_store.flush(Duration::from_secs(10)).unwrap();
     }
@@ -37694,7 +37740,7 @@ mod tests {
     fn role_specialised_schemas_send_no_empty_description() {
         let (directory, state, mut parent, _user) =
             named_agent_fixture(AgentDefinitionMemory::None);
-        parent.prompt_profile = std::sync::Arc::new(crate::prompt_profile::PromptProfile::builtin_concise());
+        parent.prompt_profile = std::sync::Arc::new(crate::prompt_profile::PromptProfile::builtin());
         parent.tools = crate::catalog::tool_catalog();
         parent.enabled_tools = vec!["agent_spawn".into(), workflow::WORKFLOW_TOOL.into()];
         let alpha = vec![crate::builtin_schemas::AgentRoleSummary {
@@ -38708,14 +38754,14 @@ mod tests {
     #[test]
     fn the_spawn_schema_becomes_the_child_tools_wire_schema() {
         let schema = structured_output_schema();
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let descriptor = structured_output_descriptor(&profile, &schema);
         assert!(descriptor.parameters.is_empty());
         assert_eq!(descriptor.description, "");
         let wire = tool_schema(
             &descriptor,
             crate::tool_surface::ToolVariant::Standard,
-            &crate::prompt_profile::PromptProfile::builtin_english(),
+            &crate::prompt_profile::PromptProfile::builtin(),
             &crate::workspace_set::WorkspaceSet::default(),
         );
         let mut expected = schema.as_value().clone();
@@ -38780,7 +38826,7 @@ mod tests {
             assert!(crate::builtin_schemas::builtin_tool_schema(
                 name,
                 crate::tool_surface::ToolVariant::Standard,
-                &PromptProfile::builtin_english()
+                &PromptProfile::builtin()
             )
             .is_some());
         }
@@ -38800,7 +38846,7 @@ mod tests {
             "additionalProperties": false
         }))
         .unwrap();
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let wire = tool_schema(
             &structured_output_descriptor(&profile, &schema),
             crate::tool_surface::ToolVariant::Standard,
@@ -39135,7 +39181,7 @@ mod tests {
         assert!(unresumable.contains("[runabc]"), "{unresumable}");
         assert!(unresumable.contains("resume_run_id"), "{unresumable}");
         assert!(unresumable.contains("3 reusable step results"), "{unresumable}");
-        assert!(unresumable.contains("could not resume it on its own"), "{unresumable}");
+        assert!(unresumable.contains("the host could not resume it"), "{unresumable}");
         assert!(unresumable.contains(reason.trim()), "{unresumable}");
         assert!(unresumable.contains("<status>failed</status>"), "{unresumable}");
         assert!(
@@ -39145,7 +39191,7 @@ mod tests {
         let resumed = output(1);
         assert!(resumed.contains("has resumed on its own"), "{resumed}");
         assert!(resumed.contains("the 3 step results"), "{resumed}");
-        assert!(!resumed.contains("will not continue on its own"), "{resumed}");
+        assert!(!resumed.contains("could not resume"), "{resumed}");
         assert!(resumed.contains("<status>running</status>"), "{resumed}");
         assert!(resumed.contains("<task-id>workflow:rundef</task-id>"), "{resumed}");
     }
@@ -39470,7 +39516,7 @@ mod tests {
             "{silent_output}"
         );
         assert!(
-            silent_output.contains(PromptKey::TaskRestartNoOutput.builtin_en()),
+            silent_output.contains(PromptKey::TaskRestartNoOutput.builtin_text()),
             "{silent_output}"
         );
         assert!(!state
@@ -40008,7 +40054,7 @@ mod tests {
         assert!(
             content.contains(
                 PromptKey::SubagentStructuredResultBlock
-                    .builtin_en()
+                    .builtin_text()
                     .split("{body}")
                     .next()
                     .unwrap()
@@ -40711,7 +40757,7 @@ mod tests {
         let wait = input[wait_at]["output"].as_str().unwrap();
         assert!(wait.contains("[a1 · "), "{wait}");
         assert!(
-            wait.contains(PromptKey::TaskWaitDeliveredOnCall.builtin_en()),
+            wait.contains(PromptKey::TaskWaitDeliveredOnCall.builtin_text()),
             "{wait}"
         );
         assert!(!wait.contains("子代理结论"), "the result is not in the wait: {wait}");
@@ -41147,7 +41193,7 @@ mod tests {
         assert!(child_execution.result.success);
         assert_eq!(
             child_execution.result.output,
-            PromptKey::SubagentUpdateAck.builtin_en()
+            PromptKey::SubagentUpdateAck.builtin_text()
         );
     }
 
@@ -41251,7 +41297,7 @@ mod tests {
 
         // The native task body contains only this query; it receives no
         // conversation context.
-        let task = web_search_native_task(&PromptProfile::builtin_english(), "claude 5 发布日期");
+        let task = web_search_native_task(&PromptProfile::builtin(), "claude 5 发布日期");
         assert!(task.contains("claude 5 发布日期"));
         assert!(!task.contains("outputFormat"));
     }
@@ -41735,7 +41781,7 @@ mod tests {
         let entry_schema = tool_schema(
             entry,
             crate::tool_surface::ToolVariant::Standard,
-            &crate::prompt_profile::PromptProfile::builtin_english(),
+            &crate::prompt_profile::PromptProfile::builtin(),
             &crate::workspace_set::WorkspaceSet::default(),
         );
         assert!(entry_schema.pointer("/properties/query").is_some());
@@ -43982,7 +44028,7 @@ mod tests {
         record_full_read(&guard, &touched, "same\n", 1_000);
         record_full_read(&guard, &gone, "bye\n", 1_000);
         std::fs::remove_file(&gone).unwrap();
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let notices = scan_changed_files(&guard, workspace.path(), &profile);
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(
@@ -44032,13 +44078,12 @@ mod tests {
                 in_model_context: true,
             },
         );
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let notices = scan_changed_files(&guard, workspace.path(), &profile);
         assert_eq!(notices.len(), 1);
-        assert!(
-            notices[0].contains("The diff is omitted here"),
-            "{}",
-            notices[0]
+        assert_eq!(
+            notices[0],
+            profile.render(PromptKey::ToolFileChangedOmitted, &[("path", "big.txt")])
         );
     }
 
@@ -44217,15 +44262,15 @@ mod tests {
         let path = canonical_file(workspace.path(), "fmt.rs", "fn main() {}\n");
         let registry = crate::file_read_state::FileReadRegistry::default();
         let guard = file_guard_for(&registry);
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         // The model's write, as the executor recorded it; then a formatter
         // rewrote the file and bumped its time.
         record_full_read(&guard, &path, "fn main(){}\n", 1_000);
         let notice = resync_written_file(&guard, &path, workspace.path(), &profile)
             .expect("a changed file produces a notice");
-        assert!(
-            notice.starts_with("PostToolUse hook modified fmt.rs after your edit"),
-            "{notice}"
+        assert_eq!(
+            notice,
+            profile.render(PromptKey::ToolHookFileResynced, &[("path", "fmt.rs")])
         );
         let record = registry.get(guard.scope, &path).unwrap();
         assert!(record.matches("fn main() {}\n"));
@@ -44279,7 +44324,10 @@ mod tests {
         let on = step_json(&request);
         assert_eq!(description(&on, "edit"), said(PromptKey::ToolEditDescription, &request));
         assert_eq!(description(&on, "write"), said(PromptKey::ToolWriteDescription, &request));
-        assert!(description(&on, "edit").contains("use read"), "the guarded edit says to read first");
+        assert!(
+            description(&on, "edit").contains("must have been read in this conversation first"),
+            "the guarded edit says to read first"
+        );
 
         // Off, they are the unguarded tools, and `read` does not change.
         request.file_guard.enabled = false;
@@ -44339,8 +44387,29 @@ mod tests {
         assert_eq!(description(&child, shell), said(child_key(shell)));
         assert_eq!(description(&child, "task_wait"), said(child_key("task_wait")));
         assert!(!description(&child, shell).contains("grep tool"));
-        assert_ne!(description(&top, shell), description(&child, shell));
-        assert!(!description(&child, shell).contains("fresh turn"), "a child is never woken");
+        assert_ne!(description(&top, "task_wait"), description(&child, "task_wait"));
+        // Where a background command's result goes is the child's own: the
+        // built-in shell descriptions are alike, the `run_in_background`
+        // parameter is not.
+        let background = |step: &Value| -> String {
+            step["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == shell)
+                .map(|tool| {
+                    tool["inputSchema"]["properties"]["run_in_background"]["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .unwrap()
+        };
+        assert_eq!(background(&top), said(PromptKey::ToolShellParamRunInBackground));
+        assert_eq!(background(&child), said(PromptKey::ToolShellChildParamRunInBackground));
+        assert_ne!(background(&top), background(&child));
+        assert!(background(&top).contains("waking the conversation"));
+        assert!(!background(&child).contains("waking"), "a child is never woken");
     }
 
     /// What a successful `edit` sets in motion for the language servers, from

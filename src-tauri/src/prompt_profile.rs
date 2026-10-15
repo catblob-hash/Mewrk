@@ -6,17 +6,15 @@
 //! a workspace's own folder is never read) declares two things: per-tool
 //! description overrides (`tools`) and the wording of
 //! every place where Mewrk itself injects fixed text into a model request
-//! (`prompts`). There are two built-in profiles. "Mewrk guided" is the default:
-//! its English texts are code in [`english`] and steer a model through each
-//! tool. "Mewrk concise" keeps only what a frontier model cannot infer; its
-//! texts are code in [`concise`], which decides every key — keep the guided
-//! wording, say nothing, or say less. Both ship with each build and change with
-//! it. Nothing writes them to disk and nothing edits them in place. A user who
-//! wants other wording writes a tool-description file; it overrides only the
-//! keys it names, and every other key falls back to the guided built-in. The
-//! registry below carries the key ids, their placeholders and their
-//! documentation; the texts sit in [`english`] and [`concise`], one match arm
-//! per key.
+//! (`prompts`). There is one built-in profile, "Mewrk concise": it keeps only
+//! what a frontier model cannot infer, and its English texts are code in
+//! [`concise`]. It ships with each build and changes with it. Nothing writes it
+//! to disk and nothing edits it in place. A user who wants other wording writes
+//! a tool-description file — `docs/context-injections/` carries a commented
+//! template of it, generated from this registry — and the file overrides only
+//! the keys it names; every other key keeps the built-in text. The registry
+//! below carries the key ids, their placeholders and their documentation; the
+//! texts sit in [`concise`], one match arm per key.
 //!
 //! What lives here, in one sentence per group: the capability sections appended
 //! to the system prompt; the safety boundaries; the child agent addendum and
@@ -53,27 +51,22 @@ use crate::model::{ResolvedLanguage, ToolDescriptionEntry};
 use crate::tool_surface::ToolVariant;
 
 mod concise;
-mod english;
+#[cfg(test)]
+mod template;
 
-/// Stable resource id of the guided built-in profile, the default. Selecting it
-/// and selecting nothing are the same thing. Saved conversations and presets
-/// reference this exact value, `_en_us` suffix included.
-pub const BUILTIN_EN_US_ID: &str = "tooldesc_builtin_en_us";
+/// Stable resource id of the built-in profile, "Mewrk concise". Selecting it
+/// and selecting nothing are the same thing. Saved conversations, presets and
+/// role files reference this exact value, `_en_us` suffix included.
+pub const BUILTIN_ID: &str = "tooldesc_builtin_concise_en_us";
 
-/// Stable resource id of the concise built-in profile.
-pub const BUILTIN_CONCISE_EN_US_ID: &str = "tooldesc_builtin_concise_en_us";
-
-/// Which built-in table a profile falls back to for the keys it does not
-/// override. A user file always falls back to the guided one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Base {
-    Guided,
-    Concise,
-}
+/// Id of "Mewrk guided", the built-in profile that used to be the default and
+/// was removed in favor of [`BUILTIN_ID`]. Saved conversations, presets and
+/// role files may still name it; it reads as the built-in.
+pub const RETIRED_GUIDED_ID: &str = "tooldesc_builtin_en_us";
 
 /// Declares the registry. Each entry is one injection point: the enum variant,
 /// its stable id, the placeholders its text may use, and a one-line description
-/// for the documentation. The texts themselves live in [`english`], whose match
+/// for the documentation. The texts themselves live in [`concise`], whose match
 /// is exhaustive over these variants, so a key added here without its text does
 /// not compile.
 macro_rules! prompt_keys {
@@ -1145,7 +1138,6 @@ pub struct PromptProfile {
     /// and the language recorded on fork bindings. It does not pick texts: every
     /// key a profile leaves out falls back to the English built-in.
     pub language: ResolvedLanguage,
-    base: Base,
     overrides: HashMap<PromptKey, String>,
     /// Per-tool description overrides.
     pub tools: Vec<ToolDescriptionEntry>,
@@ -1153,21 +1145,15 @@ pub struct PromptProfile {
 
 impl Default for PromptProfile {
     fn default() -> Self {
-        Self::builtin_english()
+        Self::builtin()
     }
 }
 
 impl PromptKey {
-    /// The guided built-in English text — the fallback of every user file. It
-    /// is code in [`english`], so it ships with the build and changes with it.
-    pub fn builtin_en(self) -> &'static str {
-        english::text(self)
-    }
-
-    /// The concise built-in text: [`concise`]'s decision for this key, which
-    /// is the guided text wherever it keeps it.
-    pub fn builtin_concise(self) -> &'static str {
-        concise::text(self).unwrap_or_else(|| english::text(self))
+    /// The built-in English text — the fallback of every user file. It is code
+    /// in [`concise`], so it ships with the build and changes with it.
+    pub fn builtin_text(self) -> &'static str {
+        concise::text(self)
     }
 }
 
@@ -1216,45 +1202,22 @@ pub fn parse_prompt_overrides(value: &Value) -> HashMap<PromptKey, String> {
 }
 
 impl PromptProfile {
-    /// The guided built-in profile, the default: the compiled English texts,
-    /// no overrides.
-    pub fn builtin_english() -> Self {
+    /// The built-in profile, the default: the compiled texts, no overrides.
+    pub fn builtin() -> Self {
         Self {
-            id: BUILTIN_EN_US_ID.to_owned(),
-            name: "Mewrk guided".to_owned(),
-            language: ResolvedLanguage::EnUs,
-            base: Base::Guided,
-            overrides: HashMap::new(),
-            tools: Vec::new(),
-        }
-    }
-
-    /// The concise built-in profile: the compiled concise texts, no overrides.
-    pub fn builtin_concise() -> Self {
-        Self {
-            id: BUILTIN_CONCISE_EN_US_ID.to_owned(),
+            id: BUILTIN_ID.to_owned(),
             name: "Mewrk concise".to_owned(),
             language: ResolvedLanguage::EnUs,
-            base: Base::Concise,
             overrides: HashMap::new(),
             tools: Vec::new(),
         }
     }
 
-    /// The built-in profile `id` names, or `None` when it names none. An
-    /// empty id is not a built-in's: callers decide what "nothing selected"
-    /// resolves to.
-    pub fn builtin(id: &str) -> Option<Self> {
-        match id {
-            BUILTIN_EN_US_ID => Some(Self::builtin_english()),
-            BUILTIN_CONCISE_EN_US_ID => Some(Self::builtin_concise()),
-            _ => None,
-        }
-    }
-
-    /// Every built-in profile, the default first.
-    pub fn builtins() -> [Self; 2] {
-        [Self::builtin_english(), Self::builtin_concise()]
+    /// Whether `id` names the built-in profile: its own id, or the retired
+    /// guided one's. An empty id is not the built-in's: callers decide what
+    /// "nothing selected" resolves to.
+    pub fn is_builtin_id(id: &str) -> bool {
+        id == BUILTIN_ID || id == RETIRED_GUIDED_ID
     }
 
     /// A user-authored profile. `language` is the application language: a file
@@ -1280,21 +1243,16 @@ impl PromptProfile {
             id,
             name,
             language,
-            base: Base::Guided,
             overrides,
             tools,
         }
     }
 
-    /// The text for `key`: the profile's override, else its built-in table's
-    /// text.
+    /// The text for `key`: the profile's override, else the built-in text.
     pub fn text(&self, key: PromptKey) -> &str {
         match self.overrides.get(&key) {
             Some(text) => text,
-            None => match self.base {
-                Base::Guided => key.builtin_en(),
-                Base::Concise => key.builtin_concise(),
-            },
+            None => key.builtin_text(),
         }
     }
 
@@ -1459,11 +1417,12 @@ mod tests {
             .any(|character| ('\u{4E00}'..='\u{9FFF}').contains(&character))
     }
 
-    /// Keys whose built-in default is deliberately empty, so the host says
+    /// Runtime keys whose built-in text is deliberately empty, so the host says
     /// nothing at that injection point until a profile fills it in. All three
     /// are the web-evidence texts: the search backend is user-configured and
     /// therefore trusted, so no untrusted-content wording ships by default.
-    /// Every other key must have a default — an accidentally empty one is a bug.
+    /// Every other runtime text — a receipt, a notice, a heading — must say
+    /// something; an accidentally empty one is a bug.
     const INTENTIONALLY_EMPTY: &[PromptKey] = &[
         PromptKey::WebFindingsNotice,
         PromptKey::WebResultsNotice,
@@ -1473,37 +1432,25 @@ mod tests {
     /// Keys whose built-in texts deliberately leave a declared placeholder
     /// unused: the receipt reads as a bare acknowledgement, while the host keeps
     /// substituting the value, so a profile that wants it only has to write
-    /// `{name}`. Every other key must exercise its full set, so a placeholder no
-    /// code supplies cannot hide behind a default that never prints it.
+    /// `{name}`. Every other runtime key must exercise its full set, so a
+    /// placeholder no code supplies cannot hide behind a default that never
+    /// prints it.
     const PLACEHOLDERS_OFFERED_BUT_UNUSED: &[PromptKey] = &[
         PromptKey::ToolWriteDone,
         PromptKey::ToolEditDone,
         PromptKey::ToolEditDoneAll,
     ];
 
-    /// A built-in text may only reference placeholders its key declares, and
-    /// must reference all of them unless the key is offered-but-unused.
-    fn assert_placeholders_are_declared(key: PromptKey, text: &str) {
-        let declared = key
-            .placeholders()
-            .iter()
-            .map(|placeholder| (*placeholder).to_owned())
-            .collect::<HashSet<_>>();
-        let used = placeholders_in(text).into_iter().collect::<HashSet<_>>();
-        if PLACEHOLDERS_OFFERED_BUT_UNUSED.contains(&key) {
-            assert!(
-                used.is_subset(&declared),
-                "{} uses {used:?} but declares {declared:?}",
-                key.id()
-            );
-        } else {
-            assert_eq!(
-                used,
-                declared,
-                "{} uses {used:?} but declares {declared:?}",
-                key.id()
-            );
-        }
+    /// A tool's or parameter's description: what a model reads about a tool
+    /// before it calls it. The built-in may leave these empty where the tool's
+    /// name and schema already say it, and may drop the placeholders of a
+    /// sentence it leaves out.
+    fn is_description_key(key: PromptKey) -> bool {
+        let id = key.id();
+        id.ends_with(".description")
+            || id.ends_with("_description")
+            || id.contains(".param.")
+            || id.contains(".defs.")
     }
 
     #[test]
@@ -1524,129 +1471,23 @@ mod tests {
         assert_eq!(PromptKey::parse("no.such.key"), None);
     }
 
-    /// `english.rs` lists its texts in registry order, so the two files read
-    /// side by side. Completeness needs no test: the match there is exhaustive,
-    /// so a key without a text does not compile.
+    /// `concise.rs` lists its texts in registry order, so the two files read
+    /// side by side. Completeness needs no test: the match there is
+    /// exhaustive, so a key without a text does not compile.
     #[test]
-    fn english_texts_are_listed_in_registry_order() {
-        // An arm is a literal, or — for the variants of one tool, which share
-        // most of their text — a `concat!` or a text macro of the file's own.
-        let listed = include_str!("prompt_profile/english.rs")
-            .lines()
-            .filter_map(|line| {
-                let (variant, value) = line.strip_prefix("    ")?.split_once(" => ")?;
-                let arm = value.starts_with('"')
-                    || value.starts_with("concat!(")
-                    || value.split_once("!(").is_some_and(|(name, _)| {
-                        name.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-                    });
-                (arm && variant.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-                    .then_some(variant.to_owned())
-            })
-            .collect::<Vec<_>>();
-        let registry = PromptKey::ALL
-            .iter()
-            .map(|key| format!("{key:?}"))
-            .collect::<Vec<_>>();
-        assert_eq!(listed, registry);
-    }
-
-    #[test]
-    fn english_defaults_use_exactly_their_declared_placeholders_and_no_cjk() {
-        for key in PromptKey::ALL {
-            let text = key.builtin_en();
-            assert_eq!(
-                text.is_empty(),
-                INTENTIONALLY_EMPTY.contains(key),
-                "{} disagrees with the intentionally-empty list",
-                key.id()
-            );
-            assert!(!has_cjk(text), "{} English default contains CJK", key.id());
-            assert_placeholders_are_declared(*key, text);
-        }
-    }
-
-    /// Texts the renderer or the host parses back out of what it wrote: the
-    /// `[name · status]` slots, the wait roll-up heading, the progress label a
-    /// recorded wait is scanned for, the memory block the send gate counts tags
-    /// in, and the meta lines the tool renderers match. Rewording one in the
-    /// concise profile would break that parse — and, for the progress label,
-    /// misread every conversation the other profile wrote — so concise keeps them.
-    const CONCISE_KEEPS_GUIDED: &[PromptKey] = &[
-        PromptKey::TaskProgressUpdateLabel,
-        PromptKey::TaskWaitStatusHeading,
-        PromptKey::TaskStatusCompleted,
-        PromptKey::TaskStatusInterrupted,
-        PromptKey::TaskStatusFailed,
-        PromptKey::TaskStatusStopped,
-        PromptKey::TaskStatusRoundLimit,
-        PromptKey::TaskStatusRunning,
-        PromptKey::TaskStatusIdle,
-        PromptKey::TaskPreviewStarting,
-        PromptKey::TaskPreviewRunning,
-        PromptKey::TaskPreviewStopped,
-        PromptKey::TaskTerminalRunning,
-        PromptKey::TaskTerminalIdle,
-        PromptKey::TaskTerminalExited,
-        PromptKey::TaskTerminalClosed,
-        PromptKey::TaskShellAborted,
-        PromptKey::TaskShellAborting,
-        PromptKey::TaskShellRunning,
-        PromptKey::TaskShellFinished,
-        PromptKey::MemoryContextIntro,
-        PromptKey::MemoryTierGlobal,
-        PromptKey::MemoryTierProject,
-        PromptKey::MemoryTierProjectOfWorkspace,
-        PromptKey::MemoryIndexHeading,
-        PromptKey::ToolLsLimit,
-        PromptKey::ToolLsLimitPartial,
-        PromptKey::ToolGrepLimit,
-        PromptKey::ToolGrepCountTotal,
-        PromptKey::ToolFindLimit,
-        PromptKey::ToolFindIgnoredNote,
-        PromptKey::ToolFindScanLimit,
-        PromptKey::ToolFindNoMatch,
-        PromptKey::ToolReadLimit,
-        PromptKey::ToolReadLimitUncounted,
-        PromptKey::ToolReadLossyNote,
-        PromptKey::ToolReadUtf16Note,
-        PromptKey::ToolShellExitUnknown,
-        PromptKey::ToolShellExitCode,
-        PromptKey::ToolOutputTruncated,
-        PromptKey::ToolDiffTruncated,
-        PromptKey::FormatListSeparator,
-    ];
-
-    /// The non-description keys the concise profile leaves empty on purpose:
-    /// guidance the host appends only when it has text, so empty means the
-    /// sentence is simply not said. Any other runtime text — a receipt, a
-    /// notice, a heading — must keep saying something.
-    const CONCISE_OMITS: &[PromptKey] = &[];
-
-    /// A tool's or parameter's description: what a model reads about a tool
-    /// before it calls it. The concise profile may leave these empty and may
-    /// drop the placeholders of a sentence it leaves out.
-    fn is_description_key(key: PromptKey) -> bool {
-        let id = key.id();
-        id.ends_with(".description")
-            || id.ends_with("_description")
-            || id.contains(".param.")
-            || id.contains(".defs.")
-    }
-
-    /// `concise.rs` lists its decisions in registry order, like `english.rs`.
-    /// Completeness needs no test: its match is exhaustive too.
-    #[test]
-    fn concise_texts_are_listed_in_registry_order() {
+    fn builtin_texts_are_listed_in_registry_order() {
         assert_eq!(super::concise::ORDER, PromptKey::ALL);
     }
 
+    /// A built-in text references only the placeholders its key declares. A
+    /// runtime text carries its facts in them — an id, a count, a name — so it
+    /// uses all of them unless its key is offered-but-unused; a description
+    /// may leave out the sentence a placeholder sat in.
     #[test]
-    fn concise_texts_keep_their_facts_and_their_parsed_forms() {
+    fn builtin_texts_use_their_declared_placeholders_and_no_cjk() {
         for key in PromptKey::ALL {
-            let text = key.builtin_concise();
-            let guided = key.builtin_en();
-            assert!(!has_cjk(text), "{} concise text contains CJK", key.id());
+            let text = key.builtin_text();
+            assert!(!has_cjk(text), "{} built-in text contains CJK", key.id());
             let declared = key
                 .placeholders()
                 .iter()
@@ -1658,48 +1499,36 @@ mod tests {
                 "{} uses {used:?} but declares {declared:?}",
                 key.id()
             );
-            if CONCISE_KEEPS_GUIDED.contains(key) {
-                assert_eq!(text, guided, "{} is parsed back and must keep its guided text", key.id());
-                continue;
-            }
             if is_description_key(*key) {
                 continue;
             }
-            if text.is_empty() {
-                assert!(
-                    guided.is_empty() || CONCISE_OMITS.contains(key),
-                    "{} is a runtime text; concise may not leave it empty unless listed in CONCISE_OMITS",
-                    key.id()
-                );
-                continue;
-            }
-            // A runtime text carries its facts in its placeholders: an id, a
-            // count, a name. A shorter sentence still says all of them.
-            let guided_used = placeholders_in(guided).into_iter().collect::<HashSet<_>>();
             assert_eq!(
-                used,
-                guided_used,
-                "{} must keep the placeholders its guided text uses",
+                text.is_empty(),
+                INTENTIONALLY_EMPTY.contains(key),
+                "{} disagrees with the intentionally-empty list",
                 key.id()
             );
+            if !text.is_empty() && !PLACEHOLDERS_OFFERED_BUT_UNUSED.contains(key) {
+                assert_eq!(used, declared, "{} must use every placeholder it declares", key.id());
+            }
         }
     }
 
+    /// The built-in answers to its own id and to the retired guided one, which
+    /// saved settings may still name; nothing else is a built-in's id.
     #[test]
-    fn the_two_builtins_resolve_by_id_and_differ_only_in_their_base() {
-        let guided = PromptProfile::builtin(BUILTIN_EN_US_ID).expect("guided");
-        let concise = PromptProfile::builtin(BUILTIN_CONCISE_EN_US_ID).expect("concise");
-        assert_eq!(guided, PromptProfile::builtin_english());
-        assert_eq!(concise, PromptProfile::builtin_concise());
-        assert_eq!(PromptProfile::builtin(""), None);
-        assert_eq!(PromptProfile::builtin("tooldesc_builtin_zh_cn"), None);
-        assert_eq!(concise.language, guided.language);
+    fn the_builtin_answers_to_its_id_and_the_retired_guided_one() {
+        assert!(PromptProfile::is_builtin_id(BUILTIN_ID));
+        assert!(PromptProfile::is_builtin_id(RETIRED_GUIDED_ID));
+        assert!(!PromptProfile::is_builtin_id(""));
+        assert!(!PromptProfile::is_builtin_id("tooldesc_builtin_zh_cn"));
+        let builtin = PromptProfile::builtin();
+        assert_eq!(builtin, PromptProfile::default());
+        assert_eq!(builtin.id, BUILTIN_ID);
+        assert_eq!(builtin.language, ResolvedLanguage::EnUs);
         for key in PromptKey::ALL {
-            assert_eq!(guided.text(*key), key.builtin_en());
-            assert_eq!(concise.text(*key), key.builtin_concise());
+            assert_eq!(builtin.text(*key), key.builtin_text());
         }
-        let ids = PromptProfile::builtins().map(|profile| profile.id);
-        assert_eq!(ids, [BUILTIN_EN_US_ID.to_owned(), BUILTIN_CONCISE_EN_US_ID.to_owned()]);
     }
 
     /// A file's `language` is the app language and never picks texts: every key
@@ -1725,7 +1554,7 @@ mod tests {
             assert_eq!(profile.text(PromptKey::ToolGrepDescription), "notes");
             assert_eq!(
                 profile.text(PromptKey::TaskListEmpty),
-                PromptKey::TaskListEmpty.builtin_en()
+                PromptKey::TaskListEmpty.builtin_text()
             );
         }
     }
@@ -1759,14 +1588,14 @@ mod tests {
             overrides,
             Vec::new(),
         );
-        assert!(!PromptKey::SubagentAddendum.builtin_en().is_empty());
+        assert!(!PromptKey::SubagentAddendum.builtin_text().is_empty());
         assert_eq!(profile.text(PromptKey::SubagentAddendum), "");
     }
 
     #[test]
     fn join_list_uses_the_profile_separator() {
         assert_eq!(
-            PromptProfile::builtin_english().join_list(["a", "b", "c"]),
+            PromptProfile::builtin().join_list(["a", "b", "c"]),
             "a, b, c"
         );
         let mut overrides = HashMap::new();
@@ -1780,7 +1609,7 @@ mod tests {
         );
         assert_eq!(file.join_list(["a", "b"]), "a、b");
         assert_eq!(
-            PromptProfile::builtin_english().join_list(Vec::<&str>::new()),
+            PromptProfile::builtin().join_list(Vec::<&str>::new()),
             ""
         );
     }
@@ -1797,7 +1626,7 @@ mod tests {
 
     #[test]
     fn the_document_form_lists_every_key() {
-        let document = PromptProfile::builtin_english().to_document();
+        let document = PromptProfile::builtin().to_document();
         let prompts = document["prompts"].as_object().unwrap();
         assert_eq!(prompts.len(), PromptKey::ALL.len());
         assert!(document.get("baseLanguage").is_none());
@@ -1809,7 +1638,7 @@ mod tests {
     /// untrusted-web-evidence wording without a code change.
     #[test]
     fn the_web_evidence_keys_are_empty_but_still_overridable() {
-        let builtin = PromptProfile::builtin_english();
+        let builtin = PromptProfile::builtin();
         for key in INTENTIONALLY_EMPTY {
             assert_eq!(builtin.text(*key), "", "{}", key.id());
         }
@@ -1833,12 +1662,13 @@ mod tests {
 
     // ---- Golden exports -----------------------------------------------------
     //
-    // Two files under docs/context-injections/ are generated from the compiled
-    // registry, exactly like the schema baseline in builtin_schemas.rs: the
-    // built-in profile as a complete user-file document, and the key manifest
-    // (id, placeholders, description). The documentation site renders both and
-    // offers them for download, so a user writing a tool-description file
-    // starts from the texts this build ships.
+    // Four files under docs/context-injections/ are generated from the
+    // compiled registry, exactly like the schema baseline in
+    // builtin_schemas.rs: the built-in profile as a complete user-file
+    // document, the key manifest (id, placeholders, description), and the
+    // built-in again as the commented template a user copies and edits
+    // (`template`), with English and with Chinese comments. A user writing a
+    // tool-description file starts from the texts this build ships.
 
     fn baseline_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/context-injections")
@@ -1851,8 +1681,7 @@ mod tests {
     }
 
     fn golden_files() -> Vec<(&'static str, String)> {
-        let builtin = PromptProfile::builtin_english().to_document();
-        let concise = PromptProfile::builtin_concise().to_document();
+        let builtin = PromptProfile::builtin().to_document();
         let manifest = serde_json::json!({
             "kind": "mewrk-prompt-profile-keys",
             "note": "Every host injection point a tool-description file may override under `prompts`. Generated by prompt_profile.rs tests; regenerate with: cargo test --lib -- prompt_profile::tests::regenerate_prompt_profile_baselines --ignored",
@@ -1860,20 +1689,22 @@ mod tests {
             "keyCount": PromptKey::ALL.len(),
             "keys": key_manifest(),
         });
-        vec![
+        let mut files = vec![
             ("prompt-profile.en-US.json", pretty(&builtin)),
-            ("prompt-profile.concise.en-US.json", pretty(&concise)),
             ("prompt-profile-keys.json", pretty(&manifest)),
-        ]
+        ];
+        for language in template::Language::ALL {
+            files.push((language.file_name(), template::render(language)));
+        }
+        files
     }
 
     /// Every variant of every built-in tool (`crate::tool_surface`) has a
-    /// description key of its own, and the guided texts of two variants of one
-    /// tool differ: a variant is a different tool, so if the two read the same
-    /// one of them is describing the wrong tool.
+    /// description key of its own: a variant is a different tool, so a file
+    /// can describe each one. The built-in may word two variants alike where
+    /// its text says nothing they differ on (`(as Key)` in `concise.rs`).
     #[test]
     fn every_tool_variant_has_a_description_of_its_own() {
-        let guided = PromptProfile::builtin_english();
         for tool in crate::catalog::tool_catalog() {
             let variants = crate::tool_surface::variants_of(&tool.name);
             let keys = variants
@@ -1885,15 +1716,8 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             for (index, key) in keys.iter().enumerate() {
-                assert!(!guided.text(*key).is_empty(), "{} {:?}", tool.name, variants[index]);
                 for other in &keys[index + 1..] {
                     assert_ne!(key, other, "{} shares a key between variants", tool.name);
-                    assert_ne!(
-                        guided.text(*key),
-                        guided.text(*other),
-                        "{}: two variants read the same",
-                        tool.name
-                    );
                 }
             }
             // A variant the tool does not have has no key.
@@ -1908,58 +1732,24 @@ mod tests {
     }
 
     /// A sentence about another tool is marked so a run without that tool
-    /// never reads it (`tool_mentions`). Every marker in both built-in
-    /// profiles is closed and names a tool the catalog has.
+    /// never reads it (`tool_mentions`). Every marker in the built-in is
+    /// closed and names a tool the catalog has.
     #[test]
     fn every_mention_marker_is_balanced_and_names_a_real_tool() {
-        for profile in [PromptProfile::builtin_english(), PromptProfile::builtin_concise()] {
-            for key in PromptKey::ALL {
-                let text = profile.text(*key);
-                assert!(
-                    crate::tool_mentions::is_balanced(text),
-                    "{}: unbalanced mention markers",
-                    key.id()
-                );
-                for name in crate::tool_mentions::mentioned_tools(text) {
-                    assert!(
-                        crate::tool_mentions::is_known_name(&name),
-                        "{} names {name}, which no catalog tool is",
-                        key.id()
-                    );
-                }
-            }
-        }
-    }
-
-    /// The shell tools' advice resolves to grammatical text whichever of the
-    /// dedicated tools a run offers, and names only the ones it offers.
-    #[test]
-    fn a_shell_description_names_only_the_dedicated_tools_on_offer() {
-        use crate::tool_mentions::{resolve, OfferedTools};
-        let guided = PromptProfile::builtin_english();
-        let siblings = ["find", "grep", "read", "edit", "write", "ls"];
-        for key in [
-            PromptKey::ToolBashDescription,
-            PromptKey::ToolShDescription,
-            PromptKey::ToolPwshDescription,
-            PromptKey::ToolPowershellChildDescription,
-        ] {
-            let all = resolve(guided.text(key), &OfferedTools::from_names(siblings)).into_owned();
-            for sibling in siblings {
-                assert!(all.contains(&format!("the {sibling} tool")) || all.contains(&format!("use {sibling}")), "{}: {sibling}", key.id());
-            }
-            let bare = resolve(guided.text(key), &OfferedTools::from_names([])).into_owned();
-            assert!(!bare.contains("IMPORTANT"), "{}: {bare}", key.id());
-            assert!(!bare.contains("use ls"), "{}", key.id());
+        for key in PromptKey::ALL {
+            let text = key.builtin_text();
             assert!(
-                bare.contains("first 2,000 characters instead."),
-                "{}: the spill bullet still ends its sentence",
+                crate::tool_mentions::is_balanced(text),
+                "{}: unbalanced mention markers",
                 key.id()
             );
-            let read_only = resolve(guided.text(key), &OfferedTools::from_names(["read"])).into_owned();
-            assert!(read_only.contains("Read files: use the read tool"), "{}", key.id());
-            assert!(!read_only.contains("grep tool"), "{}", key.id());
-            assert!(read_only.contains("use read on that path"), "{}", key.id());
+            for name in crate::tool_mentions::mentioned_tools(text) {
+                assert!(
+                    crate::tool_mentions::is_known_name(&name),
+                    "{} names {name}, which no catalog tool is",
+                    key.id()
+                );
+            }
         }
     }
 
@@ -1968,15 +1758,13 @@ mod tests {
     /// the ANSI default.
     #[test]
     fn each_powershell_edition_says_only_what_is_true_of_it() {
-        for profile in [PromptProfile::builtin_english(), PromptProfile::builtin_concise()] {
-            let pwsh = profile.text(PromptKey::ToolPwshDescription);
-            let windows = profile.text(PromptKey::ToolPowershellDescription);
-            assert!(pwsh.contains("PowerShell 7"), "{pwsh}");
-            assert!(!pwsh.contains("ANSI"), "{pwsh}");
-            assert!(windows.contains("5.1"), "{windows}");
-            assert!(windows.contains("ANSI"), "{windows}");
-            assert!(windows.contains("if ($?)"), "{windows}");
-        }
+        let pwsh = PromptKey::ToolPwshDescription.builtin_text();
+        let windows = PromptKey::ToolPowershellDescription.builtin_text();
+        assert!(pwsh.contains("PowerShell 7"), "{pwsh}");
+        assert!(!pwsh.contains("ANSI"), "{pwsh}");
+        assert!(windows.contains("5.1"), "{windows}");
+        assert!(windows.contains("ANSI"), "{windows}");
+        assert!(windows.contains("if ($?)"), "{windows}");
     }
 
     /// A `tools[]` entry overrides the description of the one variant it
@@ -2001,21 +1789,21 @@ mod tests {
                 entry("bash", "grandchild", "NO SUCH ID"),
             ],
         );
-        let guided = PromptProfile::builtin_english();
+        let builtin = PromptProfile::builtin();
         assert_eq!(profile.text(PromptKey::ToolEditDescription), "GUARDED");
         assert_eq!(
             profile.text(PromptKey::ToolEditUnguardedDescription),
-            guided.text(PromptKey::ToolEditUnguardedDescription)
+            builtin.text(PromptKey::ToolEditUnguardedDescription)
         );
         assert_eq!(profile.text(PromptKey::ToolWriteUnguardedDescription), "UNGUARDED WRITE");
         assert_eq!(
             profile.text(PromptKey::ToolWriteDescription),
-            guided.text(PromptKey::ToolWriteDescription)
+            builtin.text(PromptKey::ToolWriteDescription)
         );
-        assert_eq!(profile.text(PromptKey::ToolLsDescription), guided.text(PromptKey::ToolLsDescription));
+        assert_eq!(profile.text(PromptKey::ToolLsDescription), builtin.text(PromptKey::ToolLsDescription));
         assert_eq!(
             profile.text(PromptKey::ToolBashChildDescription),
-            guided.text(PromptKey::ToolBashChildDescription)
+            builtin.text(PromptKey::ToolBashChildDescription)
         );
     }
 

@@ -3368,7 +3368,7 @@ mod tests {
 
         let rendered = render_project_memory_prompt(
             &startup_sources(&report),
-            &crate::prompt_profile::PromptProfile::builtin_english(),
+            &crate::prompt_profile::PromptProfile::builtin(),
         );
         assert!(rendered.contains("path: managed:MEWRK.md"));
         assert!(rendered.contains("path: user:.mewrk/MEWRK.md"));
@@ -4564,7 +4564,7 @@ mod tests {
         let startup = startup_sources(&report);
         let rendered = render_project_memory_prompt(
             &startup,
-            &crate::prompt_profile::PromptProfile::builtin_english(),
+            &crate::prompt_profile::PromptProfile::builtin(),
         );
 
         assert!(rendered.starts_with(PROJECT_MEMORY_PROMPT_START));
@@ -4582,7 +4582,7 @@ mod tests {
         assert_eq!(rendered.matches(PROJECT_MEMORY_PROMPT_END).count(), 1);
         assert!(render_project_memory_prompt(
             &[],
-            &crate::prompt_profile::PromptProfile::builtin_english()
+            &crate::prompt_profile::PromptProfile::builtin()
         )
         .is_empty());
     }
@@ -4601,7 +4601,7 @@ mod tests {
         let report = discover_project_memory(&options(&workspace, &floor));
         let rendered = render_project_memory_prompt(
             &startup_sources(&report),
-            &crate::prompt_profile::PromptProfile::builtin_english(),
+            &crate::prompt_profile::PromptProfile::builtin(),
         );
 
         assert!(rendered.contains("path: ancestor:MEWRK.md"));

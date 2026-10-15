@@ -718,7 +718,7 @@ mod tests {
         // spelled twice.
         assert_eq!(
             receipt,
-            crate::prompt_profile::PromptProfile::builtin_english()
+            crate::prompt_profile::PromptProfile::builtin()
                 .text(PromptKey::ForkRequestSubmitted)
         );
 

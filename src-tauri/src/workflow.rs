@@ -2784,7 +2784,7 @@ mod tests {
 
     #[test]
     fn a_failed_step_says_why_after_its_status() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let request: WorkflowStepRequest =
             serde_json::from_value(json!({ "prompt": "task", "schema": { "type": "object" } }))
                 .unwrap();
@@ -2925,15 +2925,13 @@ mod tests {
         });
         let journal = store.load_journal();
 
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let resumed = resume_hint(&profile, "run1", &journal, true);
-        assert!(
-            resumed.contains("1 steps started repeatedly without ever producing a result"),
-            "{resumed}"
-        );
+        let repeated = profile.render(PromptKey::WorkflowResumeRepeatedWarning, &[("count", "1")]);
+        assert!(resumed.contains(&repeated), "{resumed}");
         // An initial run always has count 1, so it provides no diagnostic value.
         let first_run = resume_hint(&profile, "run1", &journal, false);
-        assert!(!first_run.contains("started repeatedly"), "{first_run}");
+        assert!(!first_run.contains("kept starting"), "{first_run}");
         // Both paths need a run ID to provide a recovery entry point.
         for hint in [&resumed, &first_run] {
             assert_eq!(parse_resume_run_id(hint), Some("run1"), "{hint}");

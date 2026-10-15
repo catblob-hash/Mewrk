@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn the_continuation_carries_the_first_system_card_the_index_and_the_opening() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let source = vec![
             system("preset", "You are the project's reviewer."),
             system("second", "a later card"),
@@ -1102,7 +1102,7 @@ mod tests {
         notes
             .create("state", "Next, buy the milk.", "where the work stands")
             .unwrap();
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let mut request = crate::agents::tests::template();
         request.app_data_path = directory.path().to_string_lossy().into_owned();
         request.conversation_id = "conv_1".into();

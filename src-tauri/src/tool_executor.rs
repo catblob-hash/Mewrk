@@ -6014,7 +6014,7 @@ mod tests {
                 ExecutionScope::workspace_only(directory.path()),
                 Some(app_data.as_path()),
                 &crate::workspace_set::WorkspaceSet::default(),
-                &PromptProfile::builtin_english(),
+                &PromptProfile::builtin(),
             )
         };
 
@@ -6145,7 +6145,7 @@ mod tests {
                     ExecutionScope::workspace_only(directory.path()),
                     Some(app_data.as_path()),
                     &crate::workspace_set::WorkspaceSet::default(),
-                    &PromptProfile::builtin_english(),
+                    &PromptProfile::builtin(),
                 )
             };
             assert!(run("cd nested").success, "{tool}");
@@ -6187,7 +6187,7 @@ mod tests {
                 ExecutionScope::workspace_only(first.path()),
                 Some(app_data.path()),
                 &workspaces,
-                &PromptProfile::builtin_english(),
+                &PromptProfile::builtin(),
             )
         };
 
@@ -6232,7 +6232,7 @@ mod tests {
             ExecutionScope::workspace_only(directory.path()),
             Some(app_data.as_path()),
             &crate::workspace_set::WorkspaceSet::default(),
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         );
         assert!(result.success, "{}", result.output);
 
@@ -6275,7 +6275,7 @@ mod tests {
             &CancelSignal::default(),
             &crate::workspace_set::WorkspaceSet::default(),
             None,
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         )
         .result;
 
@@ -6379,7 +6379,7 @@ mod tests {
         let sandbox = Some(&sandbox);
         // No boundary of its own: only the sandbox's.
         let scope = ExecutionScope::Unrestricted;
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let read = |path: &str| {
             run_read(&workspace, &object(json!({ "path": path })), &scope, None, &profile, None, sandbox)
         };
@@ -6461,7 +6461,7 @@ mod tests {
             "replace": "gamma"
         }));
         let scope = ExecutionScope::workspace_only(directory.path());
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         assert!(run_edit(directory.path(), &ambiguous, &scope, &profile, None, None).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "alpha beta beta");
 
@@ -6529,7 +6529,7 @@ mod tests {
             directory.path(),
             &object(json!({"path": "sample.txt", "find": "gamma", "replace": "delta"})),
             &scope,
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
             None,
             None,
         )
@@ -7508,7 +7508,7 @@ mod tests {
 
     #[test]
     fn a_stream_past_its_capture_keeps_its_start_and_its_end() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let mut captured = CapturedStream::default();
         // The head ends inside a three-byte character and the tail starts
         // inside another; neither half is left with a broken one.
@@ -7544,7 +7544,7 @@ mod tests {
                 ]),
                 Some(app_data.path()),
                 &crate::workspace_set::WorkspaceSet::default(),
-                &PromptProfile::builtin_english(),
+                &PromptProfile::builtin(),
             )
         };
         let result = run(
@@ -7590,7 +7590,7 @@ mod tests {
             "saved line\n".repeat(10),
             5,
             crate::tool_output::Spill::new(Some(app_data.path()), "conversation-test", "bash-1"),
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         );
         let path = crate::tool_output::saved_path(&notice).unwrap();
         let unreachable = crate::run_environment::ShellRunner::Ssh {
@@ -7610,7 +7610,7 @@ mod tests {
             ]),
             Some(app_data.path()),
             &crate::workspace_set::WorkspaceSet::single("/home/dev/app", unreachable),
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         );
         assert!(read.success, "{}", read.output);
         assert_eq!(read.output, "saved line\nsaved line");
@@ -7708,7 +7708,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         #[cfg(windows)]
         use std::os::windows::process::ExitStatusExt;
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let output = format_process_output(
             ExitStatus::from_raw(0),
             ShellCompletion::Exited,
@@ -7726,7 +7726,7 @@ mod tests {
     /// that explains the failure.
     #[test]
     fn a_failed_command_leads_with_its_exit_code_and_stderr() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let output = format_process_output(
             exit_status(2),
             ShellCompletion::Exited,
@@ -7770,7 +7770,7 @@ mod tests {
     /// check with the user before retrying.
     #[test]
     fn a_timed_out_command_says_so_and_names_its_deadline() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let output = format_process_output(
             exit_status(1),
             ShellCompletion::TimedOut,
@@ -7801,7 +7801,7 @@ mod tests {
                 ExecutionScope::workspace_only(&workspace),
                 None,
                 &crate::workspace_set::WorkspaceSet::default(),
-                &PromptProfile::builtin_english(),
+                &PromptProfile::builtin(),
             );
             assert!(!result.success);
             assert!(result.output.contains(path), "{}", result.output);
@@ -8193,7 +8193,7 @@ mod tests {
                 directory.path().to_string_lossy().into_owned(),
                 runner,
             ),
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         );
         assert!(result.success, "{}", result.output);
         assert!(
@@ -8304,7 +8304,7 @@ mod tests {
             &signal,
             &crate::workspace_set::WorkspaceSet::default(),
             None,
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         )
         .result;
         assert!(
@@ -8376,7 +8376,7 @@ mod tests {
             &signal,
             &crate::workspace_set::WorkspaceSet::default(),
             None,
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         )
         .result;
         let survived = orchestrator.join().unwrap().unwrap();
@@ -8432,7 +8432,7 @@ mod tests {
             &signal,
             &crate::workspace_set::WorkspaceSet::default(),
             None,
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         )
         .result;
         assert!(
@@ -8492,7 +8492,7 @@ mod tests {
                 &CancelSignal::default(),
                 &crate::workspace_set::WorkspaceSet::default(),
                 None,
-                &PromptProfile::builtin_english(),
+                &PromptProfile::builtin(),
             )
             .result
         };
@@ -8560,7 +8560,7 @@ mod tests {
             &signal,
             &crate::workspace_set::WorkspaceSet::default(),
             None,
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         )
         .result;
         let stopped_at = stopper
@@ -8655,7 +8655,7 @@ mod tests {
             scope,
             Some(app_data.path()),
             &crate::workspace_set::WorkspaceSet::default(),
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         );
         assert!(result.success, "{}", result.output);
         assert_eq!(result.images.len(), 1);
@@ -8694,7 +8694,7 @@ mod tests {
                 ExecutionScope::workspace_only(workspace.path()),
                 Some(app_data.path()),
                 &crate::workspace_set::WorkspaceSet::default(),
-                &PromptProfile::builtin_english(),
+                &PromptProfile::builtin(),
             );
             assert!(result.success, "{input}: {}", result.output);
             assert_eq!(result.images.len(), 1, "{input}");
@@ -8722,7 +8722,7 @@ mod tests {
             scope,
             Some(app_data.path()),
             &crate::workspace_set::WorkspaceSet::default(),
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         );
         assert!(!result.success);
         assert!(
@@ -9069,7 +9069,7 @@ mod tests {
         fs::write(root.join("app.txt"), "alpha\n").unwrap();
         git(&["add", ".gitignore", "app.txt"]);
         let outside = tempfile::tempdir().unwrap();
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let refusal = |tool_name: &str, input: Value, scope: ExecutionScope| {
             plan_mode_refusal(
                 &request(root, tool_name, input),
@@ -9132,7 +9132,7 @@ mod tests {
             &object(json!({ "path": name })),
             &scope,
             None,
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
             Some(guard),
             None,
         )
@@ -9148,7 +9148,7 @@ mod tests {
         let registry = FileReadRegistry::default();
         let guard = guard(&registry);
         let scope = ExecutionScope::workspace_only(directory.path());
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let edit = object(json!({ "path": "a.txt", "find": "alpha", "replace": "beta" }));
         assert_eq!(
             run_edit(directory.path(), &edit, &scope, &profile, Some(guard), None).err().unwrap(),
@@ -9190,13 +9190,13 @@ mod tests {
             directory.path(),
             &create,
             &scope,
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
             Some(guard),
             None,
         )
         .unwrap();
         assert!(written.output.ends_with(
-            PromptProfile::builtin_english().text(PromptKey::ToolFileStateCurrent)
+            PromptProfile::builtin().text(PromptKey::ToolFileStateCurrent)
         ));
         let record = guard.get(&fs::canonicalize(&path).unwrap()).unwrap();
         assert!(record.full);
@@ -9214,7 +9214,7 @@ mod tests {
         let registry = FileReadRegistry::default();
         let guard = guard(&registry);
         let scope = ExecutionScope::workspace_only(directory.path());
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         read_and_commit(directory.path(), "a.txt", guard);
         let canonical = fs::canonicalize(&path).unwrap();
         let fresh = guard.get(&canonical).unwrap();
@@ -9272,7 +9272,7 @@ mod tests {
         let registry = FileReadRegistry::default();
         let guard = guard(&registry);
         let scope = ExecutionScope::workspace_only(directory.path());
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let outcome = run_read(
             directory.path(),
             &object(json!({ "path": "a.txt", "start_line": 2, "end_line": 2 })),
@@ -9311,7 +9311,7 @@ mod tests {
         let path = directory.path().join("dos.txt");
         fs::write(&path, "\u{feff}alpha\r\nbeta\r\ngamma\r\n").unwrap();
         let scope = ExecutionScope::workspace_only(directory.path());
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let edit = object(json!({ "path": "dos.txt", "find": "beta\ngamma", "replace": "b\ng\nh" }));
         run_edit(directory.path(), &edit, &scope, &profile, None, None).unwrap();
         assert_eq!(
@@ -9478,7 +9478,7 @@ mod tests {
         // The tool refuses identical find and replace before it looks for the file.
         let directory = tempfile::tempdir().unwrap();
         let scope = ExecutionScope::workspace_only(directory.path());
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let same = object(json!({ "path": "absent.txt", "find": "a", "replace": "a" }));
         assert_eq!(
             run_edit(directory.path(), &same, &scope, &profile, None, None).err().unwrap(),
@@ -9624,7 +9624,7 @@ mod tests {
         let path = directory.path().join("a.txt");
         fs::write(&path, "x = 1\nx = 2\n").unwrap();
         let scope = ExecutionScope::workspace_only(directory.path());
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let wrong = object(json!({ "path": "a.txt", "find": "x", "replace": "y", "replace_all": "yes" }));
         assert_eq!(
             run_edit(directory.path(), &wrong, &scope, &profile, None, None).err().unwrap(),
@@ -9655,7 +9655,7 @@ mod tests {
         let registry = FileReadRegistry::default();
         let guard = guard(&registry);
         let scope = ExecutionScope::workspace_only(directory.path());
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         read_and_commit(directory.path(), "a.txt", guard);
         let canonical = fs::canonicalize(&path).unwrap();
         // The model last saw other text, longer ago than the file's last write.
@@ -9695,7 +9695,7 @@ mod tests {
         let registry = FileReadRegistry::default();
         let guard = guard(&registry);
         let scope = ExecutionScope::workspace_only(directory.path());
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         read_and_commit(directory.path(), "a.txt", guard);
         let canonical = fs::canonicalize(&path).unwrap();
         let fresh = guard.get(&canonical).unwrap();
@@ -9722,7 +9722,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("a.txt"), "alpha\n").unwrap();
         let scope = ExecutionScope::workspace_only(directory.path());
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let read = run_read(
             directory.path(),
             &object(json!({ "path": "a.txt" })),
@@ -9786,7 +9786,7 @@ mod tests {
             .unwrap();
         let registry = FileReadRegistry::default();
         let guard = guard(&registry);
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         for name in ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt", "g.txt", "untouched.txt"] {
             read_and_commit(workspace, name, guard);
         }
@@ -10320,7 +10320,7 @@ mod tests {
             root,
             &object(json!({"path": "latin.txt", "find": "second", "replace": "2nd"})),
             &scope,
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
             Some(guard),
             None,
         );
@@ -10414,7 +10414,7 @@ mod tests {
         let registry = FileReadRegistry::default();
         let guard = guard(&registry);
         let scope = ExecutionScope::workspace_only(root);
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let record_of = |input: Value| {
             let path = input["path"].as_str().unwrap().to_owned();
             let outcome =

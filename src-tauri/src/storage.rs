@@ -3105,7 +3105,7 @@ pub(crate) const MAX_TOOL_DESCRIPTION_ID_BYTES: usize = 256;
 /// rule for a conversation's (`validate_tool_description_selection`) and a
 /// role file's (`agent_roles::validate_role`), each saying it in its own
 /// words. Whether the id names a file is not asked: a dangling one is allowed,
-/// and reads as the guided built-in when a run resolves it.
+/// and reads as the built-in when a run resolves it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolDescriptionSelectionProblem {
     Blank,
@@ -6599,10 +6599,7 @@ b"
         let installed = builtin_preset_of(&document);
         assert_eq!(installed.name, "mewrk");
         assert!(installed.settings.agent_ids.is_empty());
-        assert_eq!(
-            installed.settings.tool_description_file_id.as_deref(),
-            Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID)
-        );
+        assert_eq!(installed.settings.tool_description_file_id, None);
         assert!(installed.settings.web_search_enabled);
         assert_eq!(
             document.presets.default_conversation_preset_id,
@@ -6754,11 +6751,8 @@ b"
 
         let preset = builtin_preset_of(&restored);
         assert_eq!(preset.name, "mewrk");
-        // It renders with the concise built-in tool descriptions.
-        assert_eq!(
-            preset.settings.tool_description_file_id.as_deref(),
-            Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID)
-        );
+        // It selects no tool-description file: it renders with the built-in.
+        assert_eq!(preset.settings.tool_description_file_id, None);
         // No role ships, so it selects none, and its children are anonymous
         // ones on the conversation's model.
         assert!(preset.settings.agent_ids.is_empty());

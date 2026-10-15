@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn a_short_output_is_left_alone() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let app_data = tempfile::tempdir().unwrap();
         let spill = Spill::new(Some(app_data.path()), "conversation", "bash-1");
         assert_eq!(fit("short".into(), 10, spill, &profile), "short");
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn a_long_output_is_saved_whole_and_previewed() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let app_data = tempfile::tempdir().unwrap();
         let text = (0..5_000)
             .map(|n| format!("line {n}\n"))
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn with_nowhere_to_spill_the_output_is_cut() {
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let cut = fit("中文".repeat(20), 10, None, &profile);
         assert!(cut.starts_with(&"中文".repeat(5)), "{cut}");
         assert!(

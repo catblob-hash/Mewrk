@@ -10,6 +10,7 @@ import {
   createSeedDocument
 } from "./seed";
 import { defaultConversationWebSearchSettings, normalizeDocument } from "./lib/runtime";
+import { BUILTIN_PROMPT_PROFILE_ID, RETIRED_GUIDED_PROMPT_PROFILE_ID } from "./lib/toolLock";
 import type { ConversationPreset } from "./types";
 
 function builtinPresetOf(platform?: string): ConversationPreset {
@@ -159,14 +160,19 @@ describe("seed document", () => {
     expect(preset.settings.agentIds).toEqual([]);
     expect(document.capabilities.agents).toEqual([]);
     expect(preset.settings).not.toHaveProperty("agentDefinitions");
-    // It words its tool descriptions with the concise built-in profile, whose id
-    // the host's constant has to spell the same way.
-    expect(preset.settings.toolDescriptionFileId).toBe("tooldesc_builtin_concise_en_us");
+    // It selects no tool-description file, which is the built-in Mewrk concise
+    // profile, so the preset names no id at all; the host's preset says the same.
+    expect(preset.settings.toolDescriptionFileId).toBeNull();
+    const builtinPresetSource = catalogSource.slice(catalogSource.indexOf("pub(crate) fn builtin_preset("));
+    expect(builtinPresetSource.slice(0, builtinPresetSource.indexOf("allow_roleless_subagents")))
+      .toContain("tool_description_file_id: None,");
+    // The ids the client reads as the built-in (the profile itself, and the retired
+    // Mewrk guided one) have to be spelled the same way as the host's constants.
     expect(promptProfileSource).toContain(
-      `pub const BUILTIN_CONCISE_EN_US_ID: &str = "${preset.settings.toolDescriptionFileId}";`
+      `pub const BUILTIN_ID: &str = "${BUILTIN_PROMPT_PROFILE_ID}";`
     );
-    expect(catalogSource).toContain(
-      "tool_description_file_id: Some(crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID.into())"
+    expect(promptProfileSource).toContain(
+      `pub const RETIRED_GUIDED_ID: &str = "${RETIRED_GUIDED_PROMPT_PROFILE_ID}";`
     );
 
     expect(catalogSource).toContain(`const BUILTIN_PRESET_ID: &str = "${BUILTIN_PRESET_ID}";`);

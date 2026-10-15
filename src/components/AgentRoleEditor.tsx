@@ -23,6 +23,7 @@ import {
 import { supportsVision } from "../lib/modelCapabilities";
 import { REASONING_EFFORTS } from "../lib/reasoningEffort";
 import type { SaveAgentRoleTarget } from "../lib/runtime";
+import { BUILTIN_PROMPT_PROFILE_ID, RETIRED_GUIDED_PROMPT_PROFILE_ID } from "../lib/toolLock";
 import {
   isHostDerivedToolName,
   isPreviewLifecycleToolName,
@@ -604,12 +605,17 @@ export function AgentRoleEditor({
     return provider ? `${provider.name} · ${selection.modelId}` : selection.modelId;
   };
 
+  /* The tool-description choice as the select shows it: the retired "Mewrk
+   * guided" id reads as the built-in it now resolves to. */
+  const toolDescriptionChoice = draft.toolDescriptionFileId === RETIRED_GUIDED_PROMPT_PROFILE_ID
+    ? BUILTIN_PROMPT_PROFILE_ID
+    : draft.toolDescriptionFileId;
   /* A tool-description choice the catalog no longer lists. The host words the
-   * child with the guided built-in then, but the file may simply not have been
+   * child with the built-in then, but the file may simply not have been
    * scanned yet, so the id is kept and offered as it stands. */
-  const danglingToolDescriptionId = draft.toolDescriptionFileId
-    && !catalog.toolDescriptionFiles.some((file) => file.id === draft.toolDescriptionFileId)
-    ? draft.toolDescriptionFileId
+  const danglingToolDescriptionId = toolDescriptionChoice
+    && !catalog.toolDescriptionFiles.some((file) => file.id === toolDescriptionChoice)
+    ? toolDescriptionChoice
     : null;
 
   /* The template page. The body is read the first time the page is opened and
@@ -1125,10 +1131,10 @@ export function AgentRoleEditor({
                           </select>
                         </Field>
 
-                        {/* Both built-ins are rows here, unlike the
+                        {/* The built-in is a row here, unlike the
                           * conversation's page where "none picked" already is
-                          * the guided one: for a role, "Mewrk guided" pins the
-                          * default even under a caller on another file, which
+                          * it: for a role, "Mewrk concise" pins the default
+                          * even under a caller on another file, which
                           * following the caller does not. A choice the catalog
                           * lost stays a visible option, or the closed select
                           * would show "follow" for a role that is not
@@ -1142,7 +1148,7 @@ export function AgentRoleEditor({
                         >
                           <select
                             className="input"
-                            value={draft.toolDescriptionFileId ?? ""}
+                            value={toolDescriptionChoice ?? ""}
                             aria-label={t("工具描述", "Tool descriptions")}
                             onChange={(event) => replaceDraft({
                               toolDescriptionFileId: event.target.value || null

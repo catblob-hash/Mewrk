@@ -1434,11 +1434,11 @@ export interface AgentRole {
   /**
    * The tool-description file this role's child renders with — its tool
    * schemas, system prompt wording and the notices inside its own run — or
-   * `null` to render with its caller's. Only ever an id: a built-in profile
-   * ("Mewrk guided", "Mewrk concise") or a `~/.mewrk/tool-descriptions` file.
-   * May dangle; the child then falls back to "Mewrk guided", as a conversation's
-   * choice does. What the caller's model reads about the child stays in the
-   * caller's profile.
+   * `null` to render with its caller's. Only ever an id: the built-in profile
+   * ("Mewrk concise") or a `~/.mewrk/tool-descriptions` file. May dangle; the
+   * child then falls back to the built-in, as a conversation's choice does.
+   * What the caller's model reads about the child stays in the caller's
+   * profile.
    */
   toolDescriptionFileId: string | null;
 }

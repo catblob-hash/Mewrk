@@ -1016,7 +1016,7 @@ pub struct AgentDefinition {
     /// schemas, its system prompt and every text of its own run — or `None` to
     /// render with its caller's. Resolved at spawn and at every resume
     /// (`api::apply_role_prompt_profile`) the way a conversation's selection
-    /// is, so a dangling id reads as the guided built-in. What the caller's
+    /// is, so a dangling id reads as the built-in. What the caller's
     /// model reads about the child keeps the caller's wording whatever this
     /// says.
     ///

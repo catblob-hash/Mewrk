@@ -20,7 +20,6 @@ use crate::{
     skills,
 };
 
-const METADATA_READ_LIMIT: u64 = 64 * 1024;
 pub(crate) const SKILL_READ_LIMIT: u64 = 256 * 1024;
 const RUNTIME_CONTEXT_LIMIT: usize = 1024 * 1024;
 /// Maximum metadata length for catalog display. Names, descriptions, authors,
@@ -889,9 +888,9 @@ fn remote_parent(path: &str) -> String {
 /// version now dangles, which [`resolve_prompt_profile`] resolves to the
 /// built-in profile.
 ///
-/// The built-in profiles come first and are always present: the guided one is
-/// the default every conversation renders with until it selects something
-/// else, and neither has a location a user could delete.
+/// The built-in profile comes first and is always present: it is the default
+/// every conversation renders with until it selects something else, and it
+/// has no location a user could delete.
 fn discover_tool_description_files() -> Vec<ResourceDescriptor> {
     tool_description_files_under(ConfigLevel::user().as_ref().map(|level| level.base.as_path()))
 }
@@ -911,35 +910,19 @@ fn tool_description_files_under(home: Option<&Path>) -> Vec<ResourceDescriptor> 
     catalog
 }
 
-/// The built-in profiles as catalog entries, the default first. `location` is
-/// a `builtin:` pseudo-location so the renderer can tell them from the files a
-/// user added.
+/// The built-in profile as a catalog entry. `location` is a `builtin:`
+/// pseudo-location so the renderer can tell it from the files a user added.
 fn builtin_prompt_profile_descriptors() -> Vec<ResourceDescriptor> {
-    PromptProfile::builtins()
-        .into_iter()
-        .map(|profile| {
-            let (description, location) = if profile.id == prompt_profile::BUILTIN_CONCISE_EN_US_ID {
-                (
-                    "Built-in prompts and tool descriptions cut to what a frontier model cannot infer; ships with this version of Mewrk",
-                    "builtin:en-US/concise",
-                )
-            } else {
-                (
-                    "Built-in prompts and tool descriptions with usage guidance, the default; ships with this version of Mewrk",
-                    "builtin:en-US",
-                )
-            };
-            ResourceDescriptor {
-                id: profile.id,
-                name: profile.name,
-                description: description.to_owned(),
-                location: location.to_owned(),
-                source: ResourceSource::Builtin,
-                available: true,
-                workspace_key: None,
-            }
-        })
-        .collect()
+    let profile = PromptProfile::builtin();
+    vec![ResourceDescriptor {
+        id: profile.id,
+        name: profile.name,
+        description: "Built-in prompts and tool descriptions cut to what a frontier model cannot infer, the default; ships with this version of Mewrk".to_owned(),
+        location: "builtin:en-US".to_owned(),
+        source: ResourceSource::Builtin,
+        available: true,
+        workspace_key: None,
+    }]
 }
 
 /// Runtime context for this turn: the system-prompt addendum, the skills
@@ -1028,7 +1011,7 @@ impl Default for RoleBasis {
     fn default() -> Self {
         Self {
             environment: String::new(),
-            prompt_profile_id: crate::prompt_profile::BUILTIN_EN_US_ID.to_owned(),
+            prompt_profile_id: crate::prompt_profile::BUILTIN_ID.to_owned(),
             environment_facts: Default::default(),
             host_messages_in_user: false,
             skill_ids: Vec::new(),
@@ -3073,6 +3056,12 @@ pub struct ToolDescriptionDocument {
 const TOOL_DESCRIPTION_FILE_LABEL: &str = "工具描述";
 const MAX_TOOL_DESCRIPTION_NAME_CHARS: usize = 120;
 
+/// The most a tool-description file may hold. A file that spells out every
+/// key with a comment above each — the template in `docs/context-injections`
+/// — runs to a few hundred KiB, well past the metadata limit the other
+/// capability files are read under.
+const TOOL_DESCRIPTION_READ_LIMIT: usize = 1024 * 1024;
+
 /// The scope a tool-description file's id is minted under. The files are global
 /// only, so there is one scope; an id minted under a workspace scope by an older
 /// version matches nothing and dangles.
@@ -3157,8 +3146,9 @@ fn read_tool_description_document(
         maximum_bytes,
         TOOL_DESCRIPTION_FILE_LABEL,
     )?;
-    let value: Value = crate::config_file::parse_json(&bytes)
-        .map_err(|_| format!("{TOOL_DESCRIPTION_FILE_LABEL}文件不是有效的 JSON"))?;
+    // JSONC, so a file can carry comments: the template annotates every key.
+    let value: Value = crate::config_file::parse_jsonc(&bytes)
+        .ok_or_else(|| format!("{TOOL_DESCRIPTION_FILE_LABEL}文件不是有效的 JSON（可带注释）"))?;
     let fallback_name = path
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
@@ -3195,7 +3185,7 @@ fn tool_description_entry_is_addressable(entry: &ToolDescriptionEntry) -> bool {
 }
 
 fn tool_description_descriptor(path: &Path, location: String) -> ResourceDescriptor {
-    let document = read_tool_description_document(path, METADATA_READ_LIMIT as usize).ok();
+    let document = read_tool_description_document(path, TOOL_DESCRIPTION_READ_LIMIT).ok();
     let fallback_name = path
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
@@ -3234,9 +3224,9 @@ fn tool_description_descriptor(path: &Path, location: String) -> ResourceDescrip
     }
 }
 
-/// Scans all `*.json` files in the global `tool-descriptions/` directory. Each
-/// file is one complete tool-description table, parallel to a skill directory or
-/// MCP entry.
+/// Scans all `*.json` and `*.jsonc` files in the global `tool-descriptions/`
+/// directory. Each file is one complete tool-description table, parallel to a
+/// skill directory or MCP entry.
 fn scan_tool_description_root(root: &Path, output: &mut Vec<ResourceDescriptor>) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -3249,9 +3239,9 @@ fn scan_tool_description_root(root: &Path, output: &mut Vec<ResourceDescriptor>)
             continue;
         };
         if !metadata.is_file()
-            || !path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            || !path.extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("json") || extension.eq_ignore_ascii_case("jsonc")
+            })
         {
             continue;
         }
@@ -3263,12 +3253,12 @@ fn scan_tool_description_root(root: &Path, output: &mut Vec<ResourceDescriptor>)
 /// Resolves the conversation's selected tool-description file into the prompt
 /// profile the run renders with.
 ///
-/// No selection, the guided built-in's id, a dangling id, or an unreadable
-/// file all resolve to the guided built-in — the default, always present and
-/// compiled into this build; the concise built-in's id resolves to it. A
-/// selected file declares no language of its own, so it carries the
-/// application language; the keys it does not override keep the guided
-/// built-in's English wording. See [`resolve_prompt_profile_id`].
+/// No selection, the built-in's id (or the retired guided one's), a dangling
+/// id, or an unreadable file all resolve to the built-in "Mewrk concise" — the
+/// default, always present and compiled into this build. A selected file
+/// declares no language of its own, so it carries the application language;
+/// the keys it does not override keep the built-in's English wording. See
+/// [`resolve_prompt_profile_id`].
 pub fn resolve_prompt_profile(
     document: &AppDocument,
     conversation: &Conversation,
@@ -3295,10 +3285,10 @@ fn prompt_profile_at(
 }
 
 /// The profile a tool-description file id resolves to, by the conversation's
-/// rule: nothing selected → the guided built-in; a built-in's id → that
-/// built-in; a global file's id → that file; a dangling id or an unreadable
-/// file → the guided built-in. A subagent role that names a file resolves it
-/// here too, so a role and a conversation naming the same id render alike.
+/// rule: nothing selected, or the built-in's id → the built-in; a global
+/// file's id → that file; a dangling id or an unreadable file → the built-in.
+/// A subagent role that names a file resolves it here too, so a role and a
+/// conversation naming the same id render alike.
 pub fn resolve_prompt_profile_id(document: &AppDocument, id: Option<&str>) -> PromptProfile {
     prompt_profile_for_id_at(
         ConfigLevel::user().as_ref().map(|level| level.base.as_path()),
@@ -3317,19 +3307,16 @@ fn prompt_profile_for_id_at(
 ) -> PromptProfile {
     let app_language = document.global_settings.resolved_app_language;
     let Some(selected) = id.map(str::trim).filter(|id| !id.is_empty()) else {
-        return PromptProfile::builtin_english();
+        return PromptProfile::builtin();
     };
-    if let Some(builtin) = PromptProfile::builtin(selected) {
-        return builtin;
+    if PromptProfile::is_builtin_id(selected) {
+        return PromptProfile::builtin();
     }
     tool_description_files_under(home)
         .iter()
         .find(|descriptor| descriptor.id == selected)
         .and_then(|descriptor| {
-            read_tool_description_document(
-                Path::new(&descriptor.location),
-                METADATA_READ_LIMIT as usize,
-            )
+            read_tool_description_document(Path::new(&descriptor.location), TOOL_DESCRIPTION_READ_LIMIT)
             .ok()
             .map(|file| {
                 PromptProfile::from_file(
@@ -3341,7 +3328,7 @@ fn prompt_profile_for_id_at(
                 )
             })
         })
-        .unwrap_or_else(PromptProfile::builtin_english)
+        .unwrap_or_else(PromptProfile::builtin)
 }
 
 /*
@@ -3545,27 +3532,41 @@ mod tests {
             }"#,
         )
         .unwrap();
+        // A file may be JSONC — comments and a trailing comma — under either
+        // extension; the template in docs/context-injections is one.
+        fs::write(
+            root.join("annotated.jsonc"),
+            "// A user's notes.
+{
+  /* display name */ \"name\": \"annotated\",
+  \"prompts\": {
+    // the idle wait receipt
+    \"task.wait_idle\": \"Nothing to wait for.\",
+  },
+}
+",
+        )
+        .unwrap();
 
         let mut document = crate::catalog::default_document();
         let catalog = tool_description_files_under(Some(&home));
         assert_eq!(catalog.len(), 3);
-        // The built-ins come first, the default (guided) one leading, under
-        // `builtin:` pseudo-locations, and name no path: there is nothing on
-        // disk to edit.
-        let builtins = &catalog[..2];
+        // The built-in comes first, under a `builtin:` pseudo-location, and
+        // names no path: there is nothing on disk to edit.
+        let builtin = &catalog[0];
         assert_eq!(
-            builtins.iter().map(|builtin| (builtin.id.as_str(), builtin.name.as_str())).collect::<Vec<_>>(),
-            [
-                (prompt_profile::BUILTIN_EN_US_ID, "Mewrk guided"),
-                (prompt_profile::BUILTIN_CONCISE_EN_US_ID, "Mewrk concise"),
-            ]
+            (builtin.id.as_str(), builtin.name.as_str()),
+            (prompt_profile::BUILTIN_ID, "Mewrk concise")
         );
-        for builtin in builtins {
-            assert_eq!(builtin.source, ResourceSource::Builtin);
-            assert!(builtin.location.starts_with("builtin:"));
-            assert!(!builtin.description.contains(&*directory.path().to_string_lossy()));
-        }
-        assert_ne!(builtins[0].location, builtins[1].location);
+        assert_eq!(builtin.source, ResourceSource::Builtin);
+        assert!(builtin.location.starts_with("builtin:"));
+        assert!(!builtin.description.contains(&*directory.path().to_string_lossy()));
+        let annotated = &catalog[1];
+        assert_eq!(annotated.name, "annotated");
+        assert_eq!(annotated.description, "0 个工具描述 · 1 条提示词覆盖");
+        assert!(annotated.available);
+        let annotated = prompt_profile_for_id_at(Some(&home), &document, Some(&annotated.id));
+        assert_eq!(annotated.text(PromptKey::TaskWaitIdle), "Nothing to wait for.");
         assert_eq!(catalog[2].name, "strict");
         let found = &catalog[2];
         assert_eq!(found.description, "2 个工具描述 · 1 条提示词覆盖");
@@ -3611,7 +3612,7 @@ mod tests {
         );
         assert_eq!(
             profile.text(PromptKey::SystemHooksSection),
-            PromptKey::SystemHooksSection.builtin_en()
+            PromptKey::SystemHooksSection.builtin_text()
         );
 
         // Switching the application language changes the profile's language and
@@ -3629,7 +3630,7 @@ mod tests {
         );
         assert_eq!(
             profile.text(PromptKey::SystemHooksSection),
-            PromptKey::SystemHooksSection.builtin_en()
+            PromptKey::SystemHooksSection.builtin_text()
         );
     }
 
@@ -3646,29 +3647,32 @@ mod tests {
             )
         };
         let profile = resolve(&document);
-        assert_eq!(profile, PromptProfile::builtin_english());
+        assert_eq!(profile, PromptProfile::builtin());
 
-        // Selecting the guided built-in by id is the same as selecting nothing.
+        // Selecting the retired guided built-in by id is the same as selecting
+        // nothing, and so is selecting the built-in itself, by a conversation
+        // or by a role.
         document.workspaces[0].conversations[0]
             .settings
-            .tool_description_file_id = Some(prompt_profile::BUILTIN_EN_US_ID.to_owned());
-        assert_eq!(resolve(&document), PromptProfile::builtin_english());
-
-        // The concise built-in is a choice of its own, and a role naming it
-        // resolves the same way.
-        document.workspaces[0].conversations[0]
-            .settings
-            .tool_description_file_id = Some(prompt_profile::BUILTIN_CONCISE_EN_US_ID.to_owned());
-        assert_eq!(resolve(&document), PromptProfile::builtin_concise());
+            .tool_description_file_id = Some(prompt_profile::RETIRED_GUIDED_ID.to_owned());
+        assert_eq!(resolve(&document), PromptProfile::builtin());
         assert_eq!(
-            resolve_prompt_profile_id(&document, Some(prompt_profile::BUILTIN_CONCISE_EN_US_ID)),
-            PromptProfile::builtin_concise()
+            resolve_prompt_profile_id(&document, Some(prompt_profile::RETIRED_GUIDED_ID)),
+            PromptProfile::builtin()
         );
-        assert_eq!(resolve_prompt_profile_id(&document, None), PromptProfile::builtin_english());
-        assert_eq!(resolve_prompt_profile_id(&document, Some("  ")), PromptProfile::builtin_english());
+        document.workspaces[0].conversations[0]
+            .settings
+            .tool_description_file_id = Some(prompt_profile::BUILTIN_ID.to_owned());
+        assert_eq!(resolve(&document), PromptProfile::builtin());
+        assert_eq!(
+            resolve_prompt_profile_id(&document, Some(prompt_profile::BUILTIN_ID)),
+            PromptProfile::builtin()
+        );
+        assert_eq!(resolve_prompt_profile_id(&document, None), PromptProfile::builtin());
+        assert_eq!(resolve_prompt_profile_id(&document, Some("  ")), PromptProfile::builtin());
         assert_eq!(
             resolve_prompt_profile_id(&document, Some("missing-profile")),
-            PromptProfile::builtin_english()
+            PromptProfile::builtin()
         );
 
         // A dangling id — a removed file, or the retired Chinese built-in's id
@@ -3677,7 +3681,7 @@ mod tests {
             document.workspaces[0].conversations[0]
                 .settings
                 .tool_description_file_id = Some(dangling.to_owned());
-            assert_eq!(resolve(&document), PromptProfile::builtin_english());
+            assert_eq!(resolve(&document), PromptProfile::builtin());
         }
 
         // A file left under the application data directory is not read: the
@@ -3693,10 +3697,10 @@ mod tests {
             .settings
             .tool_description_file_id = None;
         let profile = resolve(&document);
-        assert_eq!(profile, PromptProfile::builtin_english());
+        assert_eq!(profile, PromptProfile::builtin());
         assert_eq!(
             profile.text(PromptKey::SystemCapabilityRow),
-            PromptKey::SystemCapabilityRow.builtin_en()
+            PromptKey::SystemCapabilityRow.builtin_text()
         );
     }
 
@@ -3733,7 +3737,7 @@ mod tests {
         let files = tool_description_files_under(Some(&home));
         assert_eq!(
             files.iter().map(|file| file.name.as_str()).collect::<Vec<_>>(),
-            ["Mewrk guided", "Mewrk concise", "global"]
+            ["Mewrk concise", "global"]
         );
 
         // The catalog — whose global level is the real home — offers nothing
@@ -3762,7 +3766,7 @@ mod tests {
                 &document,
                 &document.workspaces[0].conversations[0]
             ),
-            PromptProfile::builtin_english()
+            PromptProfile::builtin()
         );
     }
 
@@ -3781,7 +3785,7 @@ mod tests {
         let names = |home: &Path| {
             tool_description_files_under(Some(home))
                 .into_iter()
-                .skip(2)
+                .skip(1)
                 .map(|file| file.name)
                 .collect::<Vec<_>>()
         };
@@ -3796,8 +3800,12 @@ mod tests {
         write(&both, ".mewrk", "current");
         assert_eq!(names(&both), ["current"]);
 
-        // No home, or one with no folder, offers the built-in profiles alone.
-        assert_eq!(tool_description_files_under(None).len(), 2);
+        // No home, or one with no folder, offers the built-in profile alone.
+        let builtin_only = tool_description_files_under(None);
+        assert_eq!(builtin_only.len(), 1);
+        assert_eq!(builtin_only[0].id, crate::prompt_profile::BUILTIN_ID);
+        assert_eq!(builtin_only[0].name, "Mewrk concise");
+        assert_eq!(builtin_only[0].location, "builtin:en-US");
         assert!(names(&directory.path().join("empty")).is_empty());
     }
 
@@ -3973,7 +3981,7 @@ mod tests {
         assert!(builtin[0].workspace_key.is_none());
         assert_eq!(skills::directory_name_of(builtin[0]), "mewrk-sdk");
 
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let context = runtime_context_from_discovery(
             conversation,
             &discovered(catalog, HashMap::new()),
@@ -4003,7 +4011,7 @@ mod tests {
             unreadable_levels: Vec::new(),
         };
         assert!(catalog.skills[0].description.contains("内置"));
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let version = format!("Mewrk {}", env!("CARGO_PKG_VERSION"));
 
         document.workspaces[0].conversations[0]
@@ -4104,7 +4112,7 @@ mod tests {
             },
         )]);
         let conversation = &document.workspaces[0].conversations[0];
-        let english = PromptProfile::builtin_english();
+        let english = PromptProfile::builtin();
         let scan = || DiscoveredCapabilities {
             mcp_servers: HashMap::from([(
                 "mcp-probe".to_owned(),
@@ -4128,8 +4136,7 @@ mod tests {
         assert!(skill_position < mcp_position && mcp_position < hook_position);
         assert!(addendum.contains("- Probe MCP: stdio test server"));
         assert!(addendum.contains("- Probe Hook: Before a tool runs"));
-        assert!(addendum
-            .contains("Their tools can be called only when the host exposed them to this turn"));
+        assert!(addendum.contains("Their tools are callable only when exposed to this turn"));
         assert!(!addendum.contains("npm test"));
         // The same scan that wrote the section is what gets dialed.
         assert_eq!(context.mcp_servers.len(), 1);
@@ -4185,7 +4192,7 @@ mod tests {
         let conversation = &document.workspaces[0].conversations[0];
 
         let hook_definitions = HashMap::new();
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let context = runtime_context_from_discovery(
             conversation,
             &discovered(catalog.clone(), hook_definitions.clone()),
@@ -4227,7 +4234,7 @@ mod tests {
         let conversation = &document.workspaces[0].conversations[0];
 
         let hook_definitions = HashMap::new();
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let context = runtime_context_from_discovery(
             conversation,
             &discovered(catalog.clone(), hook_definitions.clone()),
@@ -4278,7 +4285,7 @@ mod tests {
                 prompt_skill_ids: Some(Vec::new()),
                 ..Default::default()
             });
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let scan = || discovered(catalog.clone(), HashMap::new());
 
         let inline = runtime_context_from_discovery(
@@ -4347,7 +4354,7 @@ mod tests {
             .skill_tool_enabled = true;
         let scan = || discovered(catalog.clone(), HashMap::new());
 
-        for profile in [PromptProfile::builtin_english(), PromptProfile::builtin_concise()] {
+        for profile in [PromptProfile::builtin(), PromptProfile::builtin()] {
             document.workspaces[0].conversations[0].settings.tool_lock = None;
             let opening = runtime_context_from_discovery(
                 &document.workspaces[0].conversations[0],
@@ -4391,11 +4398,11 @@ mod tests {
             assert!(!content.contains("bare-skill:"), "{content}");
             assert!(!content.trim_end().ends_with(':'), "{content}");
         }
-        // The guided wording, spelled out.
+        // The built-in wording, spelled out.
         assert_eq!(
-            PromptProfile::builtin_english()
+            PromptProfile::builtin()
                 .render(PromptKey::SkillListingRowUntriggered, &[("name", "bare-skill")]),
-            "- bare-skill (no description: load it to see when it applies)"
+            "- bare-skill"
         );
     }
 
@@ -4474,7 +4481,7 @@ mod tests {
 
         // Prompt mode permits duplicate names because both bodies reach the model.
         let hook_definitions = HashMap::new();
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let concatenated = runtime_context_from_discovery(
             &document.workspaces[0].conversations[0],
             &discovered(catalog.clone(), hook_definitions.clone()),
@@ -4554,7 +4561,7 @@ mod tests {
             )]),
             ..discovered(catalog, HashMap::new())
         };
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let run = |document: &AppDocument| {
             runtime_context_from_discovery(&document.workspaces[0].conversations[0], &scan, &profile, &WorkspacePlaces::default())
         };
@@ -4750,15 +4757,15 @@ mod tests {
         document.workspaces[0].conversations[0].settings = settings;
         let conversation = &document.workspaces[0].conversations[0];
 
-        let context = runtime_context(&document, conversation, &PromptProfile::builtin_english()).unwrap();
+        let context = runtime_context(&document, conversation, &PromptProfile::builtin()).unwrap();
         for (name, dir, member) in [("alpha", &first, 1), ("beta", &second, 2), ("gamma", &attached, 3)] {
             assert!(context.addendum.contains(&format!("{name}-BODY")), "{}", context.addendum);
             let folder = dir.path().join(".mewrk").join("skills").join(name);
-            assert!(
-                context.addendum.contains(&format!("{} in workspace {member}", folder.display())),
-                "{}",
-                context.addendum
+            let place = PromptProfile::builtin().render(
+                PromptKey::SystemSkillWorkspaceDirectory,
+                &[("path", &folder.display().to_string()), ("workspace", &member.to_string())],
             );
+            assert!(context.addendum.contains(&place), "{}", context.addendum);
         }
         let declared = context
             .mcp_servers
@@ -4770,7 +4777,10 @@ mod tests {
             [("alpha-server", Some(1)), ("beta-server", Some(2)), ("gamma-server", Some(3))]
         );
         assert!(
-            context.addendum.contains("Runs on this machine: use it only for workspaces on that machine (1, 2, 3)."),
+            context.addendum.contains(&PromptProfile::builtin().render(
+                PromptKey::SystemMcpServerPlace,
+                &[("machine", "this machine"), ("workspaces", "1, 2, 3")],
+            )),
             "{}",
             context.addendum
         );
@@ -4858,7 +4868,7 @@ mod tests {
         // `quiet` is on disk but not selected, so its hooks are not listed.
         settings.agent_ids = vec![role_id("reviewer"), role_id("follower"), role_id("broken")];
         let conversation = document.workspaces[0].conversations[0].clone();
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
 
         let context = runtime_context(&document, &conversation, &profile).unwrap();
         assert_eq!(context.role_hooks.keys().collect::<Vec<_>>(), ["reviewer"]);
@@ -5206,7 +5216,7 @@ mod tests {
         document.workspaces[0].conversations[0].settings.skill_ids = vec![skills[0].id.clone()];
         document.workspaces[0].conversations[0].settings.mcp_ids = vec![docs.id.clone()];
         document.workspaces[0].conversations[0].settings.hook_ids = vec![hooks[0].id.clone()];
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let context = runtime_context_with(
             &document,
             &document.workspaces[0].conversations[0],
@@ -5216,7 +5226,10 @@ mod tests {
         .unwrap();
         assert!(context.addendum.contains("REMOTE-BODY"), "{}", context.addendum);
         assert!(
-            context.addendum.contains("/srv/app/.mewrk/skills/review in workspace 1"),
+            context.addendum.contains(&profile.render(
+                PromptKey::SystemSkillWorkspaceDirectory,
+                &[("path", "/srv/app/.mewrk/skills/review"), ("workspace", "1")],
+            )),
             "{}",
             context.addendum
         );
@@ -5503,7 +5516,7 @@ mod tests {
         let hooks = runtime_context(
             &document,
             &document.workspaces[0].conversations[0],
-            &PromptProfile::builtin_english(),
+            &PromptProfile::builtin(),
         )
         .unwrap()
         .hooks;

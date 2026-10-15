@@ -7240,7 +7240,7 @@ mod prompt_tests {
         );
         // The built-in wording is gone, not merely preceded by the override.
         assert!(!wire_description(&profile, "read")
-            .contains(&wire_description(&PromptProfile::builtin_english(), "read")));
+            .contains(&wire_description(&PromptProfile::builtin(), "read")));
         // The descriptor's own description stays empty: the override lives in
         // the schema root alone.
         assert_eq!(overridden.description, "");
@@ -7251,7 +7251,7 @@ mod prompt_tests {
         // Only the named tool moves.
         assert_eq!(
             wire_description(&profile, "write"),
-            wire_description(&PromptProfile::builtin_english(), "write")
+            wire_description(&PromptProfile::builtin(), "write")
         );
     }
 
@@ -7276,7 +7276,7 @@ mod prompt_tests {
 
         assert_eq!(
             wire_description(&profile, "read"),
-            wire_description(&PromptProfile::builtin_english(), "read")
+            wire_description(&PromptProfile::builtin(), "read")
         );
         assert_eq!(wire_description(&profile, "write"), "SCHEMA ONLY");
         for tool in crate::catalog::tool_catalog_for_language(profile.language) {
@@ -7291,7 +7291,7 @@ mod prompt_tests {
     /// file would do nothing.
     #[test]
     fn a_selected_profile_changes_every_tool_description() {
-        let builtin = PromptProfile::builtin_english();
+        let builtin = PromptProfile::builtin();
         let overrides = crate::catalog::tool_catalog()
             .iter()
             .map(|tool| {
@@ -7314,9 +7314,16 @@ mod prompt_tests {
         for tool in crate::catalog::tool_catalog() {
             let shipped = wire_description(&builtin, &tool.name);
             let selected = wire_description(&file, &tool.name);
-            assert!(
-                !shipped.is_empty(),
-                "{} has no built-in description",
+            // The built-in says what its key says, which may be nothing.
+            let key = crate::prompt_profile::PromptKey::for_tool_description(
+                &tool.name,
+                crate::tool_surface::ToolVariant::Standard,
+            )
+            .unwrap();
+            assert_eq!(
+                shipped,
+                builtin.text(key),
+                "{} does not read its built-in description key",
                 tool.name
             );
             assert_ne!(selected, shipped, "{} ignores the selected file", tool.name);
@@ -7331,7 +7338,7 @@ mod prompt_tests {
     #[test]
     fn trusted_tool_catalog_uses_the_resolved_description_language_before_overrides() {
         let english = crate::catalog::tool_catalog_for_language(
-            PromptProfile::builtin_english().language,
+            PromptProfile::builtin().language,
         );
         let read = english.iter().find(|tool| tool.name == "read").unwrap();
         // A descriptor's own description is empty in every language; locale
@@ -7349,7 +7356,7 @@ mod prompt_tests {
         // A file overriding one tool leaves the rest on the built-in.
         assert_eq!(
             wire_description(&profile, "write"),
-            wire_description(&PromptProfile::builtin_english(), "write")
+            wire_description(&PromptProfile::builtin(), "write")
         );
     }
 }

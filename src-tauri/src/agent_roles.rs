@@ -157,7 +157,7 @@ pub struct AgentRoleFile {
     pub template_id: Option<String>,
     /// The tool-description file the child renders with, by catalog id — a
     /// built-in's or a `~/.mewrk/tool-descriptions` file's. `None` renders
-    /// with the caller's. May dangle, and then reads as the guided built-in,
+    /// with the caller's. May dangle, and then reads as the built-in,
     /// as a conversation's selection does.
     #[serde(default)]
     pub tool_description_file_id: Option<String>,
@@ -584,7 +584,7 @@ pub(crate) fn validate_role(role: &AgentRoleFile) -> Result<(), String> {
         }
     }
     // The rule a conversation's selection meets. Whether the id names a file
-    // is not checked: a dangling one renders with the guided built-in, as a
+    // is not checked: a dangling one renders with the built-in, as a
     // conversation's does.
     match crate::storage::tool_description_selection_problem(role.tool_description_file_id.as_deref()) {
         Some(crate::storage::ToolDescriptionSelectionProblem::Blank) => {
@@ -1998,19 +1998,19 @@ mod tests {
     /// meets and is never looked up, so a dangling one is kept.
     #[test]
     fn a_roles_tool_description_file_round_trips_and_is_checked_like_a_conversations() {
-        let concise = crate::prompt_profile::BUILTIN_CONCISE_EN_US_ID;
+        let builtin = crate::prompt_profile::BUILTIN_ID;
         let home = tempfile::tempdir().unwrap();
         let levels = [level(home.path(), None)];
         let mut chosen = role("reviewer");
-        chosen.tool_description_file_id = Some(concise.into());
+        chosen.tool_description_file_id = Some(builtin.into());
         let saved = save_role_in(&levels, &SaveAgentRoleTarget::default(), chosen.clone()).unwrap();
         let text = fs::read_to_string(home.path().join(".mewrk").join("agents").join("reviewer.json")).unwrap();
-        assert!(text.contains(&format!(r#""toolDescriptionFileId": "{concise}""#)), "{text}");
+        assert!(text.contains(&format!(r#""toolDescriptionFileId": "{builtin}""#)), "{text}");
         assert_eq!(role_from_bytes(text.as_bytes(), "reviewer").unwrap(), chosen);
-        assert_eq!(saved.registered.definition.tool_description_file_id.as_deref(), Some(concise));
+        assert_eq!(saved.registered.definition.tool_description_file_id.as_deref(), Some(builtin));
         let listed = crate::capabilities::scan_agent_roles(&levels);
         let listed = listed.roles.iter().find(|role| role.id == saved.id).expect("listed");
-        assert_eq!(listed.definition.tool_description_file_id.as_deref(), Some(concise));
+        assert_eq!(listed.definition.tool_description_file_id.as_deref(), Some(builtin));
 
         let following = role_file_text(&role("reviewer")).unwrap();
         assert!(following.contains(r#""toolDescriptionFileId": null"#), "{following}");

@@ -40,6 +40,24 @@ pub(crate) fn parse_json(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     serde_json::from_slice(without_bom(bytes))
 }
 
+/// Parses a file that may be JSONC — JSON with `//` and `/* */` comments and
+/// trailing commas, the dialect VS Code's `settings.json` takes — the way a
+/// tool-description file is read, so a user can annotate the keys they edit.
+/// Plain JSON parses the same as through [`parse_json`].
+pub(crate) fn parse_jsonc(bytes: &[u8]) -> Option<Value> {
+    let text = std::str::from_utf8(without_bom(bytes)).ok()?;
+    let options = jsonc_parser::ParseOptions {
+        allow_comments: true,
+        allow_loose_object_property_names: false,
+        allow_trailing_commas: true,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+    };
+    jsonc_parser::parse_to_serde_value::<Value>(text, &options).ok()
+}
+
 /// The members of the top-level object's `key`, in the order the file writes
 /// them, or `None` when the file has no such object.
 ///

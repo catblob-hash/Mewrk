@@ -2413,7 +2413,7 @@ pub(crate) mod tests {
         );
         let set = WorkspaceSet::local_root(root_text).sandboxed(&assets, "conv-files-e2e");
         let sandbox = set.primary().unwrap().sandbox.clone().expect("sandboxed");
-        let profile = PromptProfile::builtin_english();
+        let profile = PromptProfile::builtin();
         let cancel = CancelSignal::default();
         let target = RemoteWorkspace {
             workspace: set.primary().unwrap(),

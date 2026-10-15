@@ -446,24 +446,10 @@ function buildOutputs(catalogs) {
     );
     assert.ok(tools.every((tool) => [...tool.description].length <= 4096),
       `${language} contains a tool description above the runtime 4,096-character limit`);
-    const redesignDocument = render({
-        name: language === "zh-CN"
-          ? "Mewrk 内置工具上下文重设计基线"
-          : "Mewrk built-in tool context redesign baseline",
-        note: "Each entry's description replaces the built-in tool description. Copy this file to ~/.mewrk/tool-descriptions only when you want Mewrk to discover it (only the global folder is read, never a workspace's), then explicitly select it in the conversation preset.",
-        source,
-        toolCount: tools.length,
-        tools: tools.map((tool) => ({
-          toolName: tool.name,
-          description: tool.description
-        }))
-      });
-    assert.ok(Buffer.byteLength(redesignDocument, "utf8") < 56 * 1024,
-      `${language} redesign file exceeds the runtime 56 KiB write limit`);
-    outputs.set(
-      join(outputDirectory, `builtin-tool-descriptions.redesign.${language}.json`),
-      redesignDocument
-    );
+    // The file a user starts a tool-description file from is the commented
+    // template, tool-description-template.{en-US,zh-CN}.jsonc, which the Rust
+    // golden test prompt_profile::tests::prompt_profile_baselines_are_current
+    // writes from the built-in texts.
   }
   return outputs;
 }
