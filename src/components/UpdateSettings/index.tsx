@@ -19,6 +19,7 @@ import { hasBackendRuntime } from "../../lib/backend";
 import { appComponentsStatus, appVersionInfo } from "../../lib/runtime";
 import type { AisdkComponentStatus, AppVersionInfo } from "../../types";
 import { IconButton } from "../Common";
+import { DocsLink } from "../DocsLink";
 import { MarkdownContent } from "../MarkdownContent";
 import { MewrkIcon } from "../MewrkIcon";
 import { PathText } from "../PathText";
@@ -103,8 +104,8 @@ function StoreUpdatesCard() {
           <strong>{t("由 Microsoft Store 更新", "Updated by the Microsoft Store")}</strong>
           <span>
             {t(
-              "这份 MSIX 版是从 Microsoft Store 安装的，由 Store 自动更新；应用内不检查也不下载新版本。",
-              "This MSIX edition was installed from the Microsoft Store, which keeps it up to date; the app neither checks for nor downloads new versions itself."
+              "Store 自动更新，应用内不检查、不下载。",
+              "The Store updates it; the app doesn't check or download."
             )}
           </span>
         </div>
@@ -577,25 +578,27 @@ export function UpdateSettings({
       <SettingsPageHeading
         title={t("版本更新", "Updates")}
         description={!inApp
-          ? t("这个版本的更新由 Microsoft Store 提供。", "This edition is updated by the Microsoft Store.")
+          ? t("更新由 Microsoft Store 提供。", "Updates come from the Microsoft Store.")
           : !info || downloadsUpdates(info)
-            ? t(
-              "从 GitHub Releases 检查新版本，从下载镜像 dl.mewrk.dev 下载（不通时改从 GitHub 下载）。安装版可以在应用内下载并安装；便携版下载压缩包后由你手动替换。",
-              "Check GitHub Releases for a newer version and download it from the dl.mewrk.dev mirror (or from GitHub when the mirror is unreachable). The installer flavor downloads and installs in place; the portable flavor downloads the archive for you to unpack."
+            ? (
+              <>
+                {t("检查并下载新版本。", "Checks for and downloads new versions.")}
+                <DocsLink inline page="settings" section="updates" />
+              </>
             )
             : info.flavor === "mac_app"
               ? t(
-                "Mewrk 会从 GitHub Releases 检查新版本，但不负责下载：点「前往发布页」，在那里下载新的 .dmg。",
-                "Mewrk checks GitHub Releases for a newer version but doesn't download it: choose Open release page and download the new .dmg there."
+                "只检查新版本，请到发布页下载 .dmg。",
+                "Only checks for updates; download the .dmg from the release page."
               )
               : info.flavor === "sideloaded_msix"
                 ? t(
-                  "这是从发布页安装的 MSIX 版，没有任何渠道会自动更新它。Mewrk 会从 GitHub Releases 检查新版本；点「前往发布页」下载并安装新的 .msix。",
-                  "This MSIX edition was installed from the release page, so nothing updates it for you. Mewrk checks GitHub Releases for a newer version; choose Open release page to download and install the next .msix."
+                  "不会自动更新，请到发布页获取新的 .msix。",
+                  "Not auto-updated; get the new .msix from the release page."
                 )
                 : t(
-                  "Mewrk 会从 GitHub Releases 检查新版本，但不负责下载：点「前往发布页」下载新版本。",
-                  "Mewrk checks GitHub Releases for a newer version but doesn't download it: choose Open release page to get it."
+                  "只检查新版本，请到发布页下载。",
+                  "Only checks for updates; download from the release page."
                 )}
         action={connected && inApp ? (
           <div className="settings-page-heading__actions">

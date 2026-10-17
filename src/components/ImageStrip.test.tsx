@@ -47,6 +47,17 @@ describe("ImageStrip", () => {
     expect(onRemove).toHaveBeenCalledWith("image-one");
   });
 
+  it("draws no conversation number on a tile, whatever number the image carries", async () => {
+    const { container } = render(<ImageStrip images={[{ ...image, shortId: 3 }]} />);
+
+    await screen.findByRole("img", { name: "screen.png" });
+    expect(container.querySelector(".image-strip__short-id")).toBeNull();
+    expect(container).not.toHaveTextContent("#3");
+    expect(container).not.toHaveTextContent("对话编号");
+    // The tile's hover text is the name and size alone.
+    expect(container.querySelector(".image-strip__item")).toHaveAttribute("title", "screen.png · 1280 × 720");
+  });
+
   it("opens the full image from the keyboard and restores focus after close or Escape", async () => {
     const user = userEvent.setup();
     render(<ImageStrip images={[{ ...image, id: "keyboard-viewer-image" }]} />);

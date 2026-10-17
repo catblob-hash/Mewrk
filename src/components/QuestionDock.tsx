@@ -15,8 +15,8 @@ import "./QuestionDock.css";
 
 /**
  * The card an `ask_user` call blocks on, modeled on Claude Code's
- * AskUserQuestion dialog: a tab per question plus a Submit tab, numbered
- * options with an "Other" row, "Chat about this", a preview layout with notes
+ * AskUserQuestion dialog: a tab per question plus a Submit tab, options
+ * with an "Other" row, "Chat about this", a preview layout with notes
  * for single-select questions whose options carry previews, and a review
  * screen. Esc, the close button and the review screen's Cancel close the card.
  *
@@ -444,7 +444,6 @@ function QuestionDockContent({
                         onClick={() => pick(option.label)}
                       >
                         <span className="question-dock__pointer" aria-hidden="true">{focus === row ? "❯" : ""}</span>
-                        <span className="question-dock__index">{row + 1}.</span>
                         <span className="question-dock__label">{option.label}</span>
                         {selected && <span className="question-dock__tick" aria-hidden="true">✔</span>}
                       </button>
@@ -509,7 +508,6 @@ function QuestionDockContent({
                     onClick={() => activateRow(row)}
                   >
                     <span className="question-dock__pointer" aria-hidden="true">{focus === row ? "❯" : ""}</span>
-                    <span className="question-dock__index">{row + 1}.</span>
                     {question.multiSelect ? (
                       <span className="question-dock__checkbox" aria-hidden="true">{selected ? "[✔]" : "[ ]"}</span>
                     ) : (
@@ -526,7 +524,6 @@ function QuestionDockContent({
                 className={`question-dock__row question-dock__row--other${focus === otherRow ? " question-dock__row--focused" : ""}${(question.multiSelect ? draft.other.trim() : draft.selected === OTHER) ? " question-dock__row--selected" : ""}`}
               >
                 <span className="question-dock__pointer" aria-hidden="true">{focus === otherRow ? "❯" : ""}</span>
-                <span className="question-dock__index">{otherRow + 1}.</span>
                 {question.multiSelect ? (
                   <span className="question-dock__checkbox" aria-hidden="true">{draft.other.trim() ? "[✔]" : "[ ]"}</span>
                 ) : (
@@ -593,7 +590,6 @@ function QuestionDockContent({
             onClick={chat}
           >
             <span className="question-dock__pointer" aria-hidden="true">{focus === chatRow ? "❯" : ""}</span>
-            {!previewLayout && <span className="question-dock__index">{chatRow + 1}.</span>}
             <span className="question-dock__label">{t("先聊聊这个", "Chat about this")}</span>
           </button>
         </div>

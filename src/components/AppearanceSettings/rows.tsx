@@ -35,7 +35,7 @@ export function SettingRow({
   vertical = false
 }: {
   title: string;
-  description?: string;
+  description?: ReactNode;
   children: ReactNode;
   vertical?: boolean;
 }): JSX.Element {

@@ -11,13 +11,16 @@
 .composer { position: relative; width: min(820px, 100%); margin: 0 auto; padding: 8px 12px; border: 1px solid var(--border-strong); border-radius: 14px; background: var(--color-ffffff); box-shadow: 0 4px 18px var(--color-000000-ap6), 0 1px 2px var(--color-000000-ap5); translate: 0 0; transition: translate .32s cubic-bezier(.2, .75, .25, 1), border-color .12s ease, box-shadow .12s ease; }
 
 /* The viewBox is the artwork's drawing space, so the numbers below are the ones in
-   catArt.ts. The ledge line — where the cat's chin and the tail's root meet — is
-   y=730.9, which is 63.43% down a 610-unit box, so at 45px tall it lands 28.54px
-   below the element's top. `top` is measured from the composer's padding box,
-   which is already 1px inside its border, so -29.54px is what puts that line on
-   the border itself rather than 1px inside the box. The box's aspect has to stay
-   724:610 or `xMidYMid meet` letterboxes the drawing and slides the line off
-   the border anyway.
+   catArt.ts. The ledge line — where the cat's underside lies — is y=730.9, 386.9
+   units down a 400-unit box, so at the scene's scale of 45px per 610 units the box
+   is 57.84 × 29.51px and the line lands 28.54px below its top. `top` is measured
+   from the composer's padding box, which is 1px inside the border's outer edge, so
+   -29.04px puts that line half-way down the border: the cat lies on it, covering
+   its upper half. Half-way rather than on the outer edge because the border is not
+   always 1px: at 150% it is drawn 0.67px thick, and a line a full pixel up sat
+   above it, with daylight between the cat and the border.
+   The box's aspect has to stay 784:400 or `xMidYMid meet` letterboxes the drawing
+   and slides the line off the border anyway.
 
    The 28.5px of overhang has to stay under the 32px the chips row and its margin
    give it, or the cat starts covering chips on a narrow window.
@@ -27,17 +30,17 @@
    over the cat, and at `right: 14px` it swallowed the head and the laptop and
    left a tail sticking out from behind a chip. 92px is the card's own width plus
    room for a longer label. */
-.composer-cat { position: absolute; top: -29.54px; right: 92px; width: 53.41px; height: 45px; pointer-events: none; color: var(--faint); fill: currentColor; }
+.composer-cat { position: absolute; top: -29.04px; right: 92px; width: 57.84px; height: 29.51px; pointer-events: none; color: var(--faint); fill: currentColor; }
 .composer-cat__figure { transform-box: view-box; transform-origin: 653.7px 730.9px; animation: composer-cat-breathe 4.2s ease-in-out infinite; }
-/* Rotates about its own root on the ledge. `transform-box: view-box` measures the
-   origin from the viewBox, and the tail is the one piece drawn there unshifted, so
-   731 is both the ledge and the point this pivots on. */
-.composer-cat__tail { transform-box: view-box; transform-origin: 431.6px 730.9px; animation: composer-cat-tail 5.2s ease-in-out infinite; }
+/* Sways about where it comes out of the rump, CAT_TAIL_RAISED_ROOT in catArt.ts.
+   The tail sits inside the group that lowers the cat onto the ledge, so the origin
+   is in the drawing's own coordinates rather than the scene's. */
+.composer-cat__tail { transform-box: view-box; transform-origin: 298px 552px; animation: composer-cat-tail 5.2s ease-in-out infinite; }
 /* The cat has no separately animated head any more. Head, haunch and forelegs are
    one contour in the artwork with the face punched out of it, so a head drawn over
    the top to nod it would plug the eyes; the figure breathes instead. */
 @keyframes composer-cat-breathe { 0%, 100% { transform: scaleY(1); } 50% { transform: scaleY(1.035); } }
-@keyframes composer-cat-tail { 0%, 100% { transform: rotate(0deg); } 30% { transform: rotate(7deg); } 70% { transform: rotate(-5deg); } }
+@keyframes composer-cat-tail { 0%, 100% { transform: rotate(0deg); } 30% { transform: rotate(6deg); } 70% { transform: rotate(-5deg); } }
 .composer__images { margin-bottom: 8px; }
 /* What an edit on the timeline just did, and the key that takes it back: one line floating above
    the row of chips over the composer, gone again on its own after a few seconds. It only says
@@ -85,7 +88,6 @@
 /* The address the model uses for this workspace. It reads as a badge rather than
    as part of the name, because the number is what a tool call carries and the
    name is only how a person recognizes the directory. */
-.composer-chip__index { flex: 0 0 auto; min-width: 13px; padding: 0 3px; border-radius: 4px; background: var(--subtle); color: var(--muted); font-size: 9px; font-weight: 650; font-variant-numeric: tabular-nums; text-align: center; }
 .composer-chip__caret { flex: 0 0 auto; color: var(--faint); }
 /* Branch and worktree form one chip because they describe the same run location. */
 .composer-chip-group { height: 25px; display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 7px; }

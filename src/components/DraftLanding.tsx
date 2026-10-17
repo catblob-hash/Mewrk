@@ -149,8 +149,8 @@ export function DraftLanding({
         <p className="draft-landing__lede">
           {canInsert
             ? t(
-              "在下方说说要做的事，或在这里右键，手写一段上下文。",
-              "Say what to do below, or right-click here to write a piece of context by hand."
+              "在下方说说要做什么，或右键手写上下文。",
+              "Say what to do below, or right-click to hand-write context."
             )
             : t("在下方说说要做的事。", "Say what to do below.")}
         </p>

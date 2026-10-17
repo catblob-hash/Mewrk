@@ -35,7 +35,7 @@ describe("SshPromptDialog", () => {
     expect(screen.getByRole("dialog", { name: "Confirm the host key of dev@devbox" })).toBeInTheDocument();
     expect(screen.getByText("SHA256:8Fz0bQh2Yc0p1X7nq")).toBeInTheDocument();
     expect(screen.getByText("ED25519")).toBeInTheDocument();
-    expect(screen.getByText(/added to ~\/\.ssh\/known_hosts/)).toBeInTheDocument();
+    expect(screen.getByText(/Saved to ~\/\.ssh\/known_hosts/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Accept" }));
     expect(onAnswer).toHaveBeenLastCalledWith("yes");
     unmount();
@@ -55,7 +55,7 @@ describe("SshPromptDialog", () => {
     expect(field).toHaveAttribute("type", "password");
     expect(field).toHaveFocus();
     expect(screen.getByText("上次输入的没有被接受，请重新输入。")).toBeInTheDocument();
-    expect(screen.getByText(/只把它保存在内存里/)).toBeInTheDocument();
+    expect(screen.getByText(/只留在内存里/)).toBeInTheDocument();
     await user.type(field, "hunter2{Enter}");
     expect(onAnswer).toHaveBeenCalledWith("hunter2");
   });

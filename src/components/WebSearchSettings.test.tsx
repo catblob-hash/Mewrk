@@ -130,11 +130,10 @@ describe("WebSearchSettings", () => {
     expect(screen.queryByLabelText("Search endpoint")).toBeNull();
     expect(screen.queryByLabelText("Fetch endpoint")).toBeNull();
     expect(screen.queryByLabelText("API Key")).toBeNull();
-    // Full access lets the model fetch a local address it names; nothing else does.
-    expect(screen.getByText(/except that at Full access the model may fetch a local address it names directly/))
-      .toBeInTheDocument();
-    expect(screen.getByText(/Redirects into your local network and links found in search results are always refused/))
-      .toBeInTheDocument();
+    // The limits on what it may reach are on the site, one link away.
+    expect(screen.getByText(/The app reads pages itself; nothing to configure/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Learn more/ }))
+      .toHaveAttribute("href", "https://mewrk.dev/en/web.html#local-fetch");
   });
 
   /* Jina searches only with a key but reads pages without one, so the field is
@@ -144,20 +143,25 @@ describe("WebSearchSettings", () => {
     renderSettings();
     await selectProvider(user, "Jina");
     expect(screen.queryByText("API Key (required)")).toBeNull();
-    expect(screen.getByText(/Searching needs an API key; fetching pages works without one/)).toBeInTheDocument();
+    expect(screen.getByText(/Only search needs an API key/)).toBeInTheDocument();
 
     await selectProvider(user, "Tavily");
     expect(screen.getByText("API Key (required)")).toBeInTheDocument();
-    expect(screen.getByText(/A provider without an API key cannot work/)).toBeInTheDocument();
+    // The required mark already says it, so the help has nothing to add about the key itself.
+    expect(screen.queryByText(/needs an API key|is optional/)).toBeNull();
+    expect(screen.getByText(/^Browser preview sends no requests/)).toBeInTheDocument();
   });
 
-  // The validator lets any local or private-network address use http, not only loopback.
-  it("states the endpoint rule the host enforces", async () => {
+  // The validator lets any local or private-network address use http, not only loopback;
+  // the line names https and the site spells the exception out.
+  it("states the endpoint rule in one line and links the rest", async () => {
     const user = userEvent.setup();
     renderSettings();
     await selectProvider(user, "Jina");
-    const rule = /may use http/;
-    expect(screen.getAllByText(rule)).toHaveLength(2);
+    expect(screen.getAllByText(/Leave empty for the default; must be https/)).toHaveLength(2);
+    for (const link of screen.getAllByRole("link", { name: /Learn more/ })) {
+      expect(link).toHaveAttribute("href", "https://mewrk.dev/en/web.html#provider-settings");
+    }
     expect(screen.queryByText(/Only loopback/)).toBeNull();
   });
 

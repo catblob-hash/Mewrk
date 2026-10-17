@@ -770,6 +770,32 @@ pub(crate) fn builtin_tool_schema(
             "required": ["task"],
             "additionalProperties": false
         }),
+        // Claude Code's `SendMessage` shape: who, what, and an optional preview.
+        // `to` is the name `agent_spawn` took, so it carries that pattern.
+        "send_message" => json!({
+            "type": "object",
+            "description": profile.text(PromptKey::ToolSendMessageDescription),
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+                    "description": profile.text(PromptKey::ToolSendMessageParamTo)
+                },
+                "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32768,
+                    "description": profile.text(PromptKey::ToolSendMessageParamMessage)
+                },
+                "summary": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": profile.text(PromptKey::ToolSendMessageParamSummary)
+                }
+            },
+            "required": ["to", "message"],
+            "additionalProperties": false
+        }),
         // One argument, always empty: the host's fabricated calls carry it, so
         // the call the model reads matches this schema, and an endpoint that
         // mishandles a tool without parameters has one to see.
@@ -2375,6 +2401,52 @@ mod tests {
         assert_eq!(
             PromptProfile::builtin().text(PromptKey::ToolPreviewStartDescription),
             english
+        );
+    }
+
+    /// Claude Code's `SendMessage` shape: who, what, and an optional preview.
+    /// `to` carries the pattern `agent_spawn.name` does, because it is that name.
+    #[test]
+    fn send_message_takes_a_child_name_a_message_and_an_optional_summary() {
+        let profile = PromptProfile::builtin();
+        let schema = builtin_tool_schema("send_message", ToolVariant::Standard, &profile).unwrap();
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "description": profile.text(PromptKey::ToolSendMessageDescription),
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+                        "description": profile.text(PromptKey::ToolSendMessageParamTo)
+                    },
+                    "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 32768,
+                        "description": profile.text(PromptKey::ToolSendMessageParamMessage)
+                    },
+                    "summary": {
+                        "type": "string",
+                        "maxLength": 200,
+                        "description": profile.text(PromptKey::ToolSendMessageParamSummary)
+                    }
+                },
+                "required": ["to", "message"],
+                "additionalProperties": false
+            })
+        );
+        // The name pattern is the one `agent_spawn` enforces on `name`.
+        let spawn = builtin_tool_schema("agent_spawn", ToolVariant::Standard, &profile).unwrap();
+        assert_eq!(
+            schema["properties"]["to"]["pattern"],
+            spawn["properties"]["name"]["pattern"]
+        );
+        // And the host's own bound on the message is what `agent_spawn.prompt` has.
+        assert_eq!(
+            schema["properties"]["message"]["maxLength"],
+            spawn["properties"]["prompt"]["maxLength"]
         );
     }
 

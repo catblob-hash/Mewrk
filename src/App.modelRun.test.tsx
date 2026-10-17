@@ -1563,7 +1563,7 @@ describe("App model run flow — modelRun", () => {
     await user.click(screen.getByRole("button", { name: "新建项目" }));
     const dialog = screen.getByRole("dialog", { name: "新建项目" });
     // Without a host picker the first workspace takes a typed path.
-    const path = within(dialog).getByRole("textbox", { name: "工作区 1 的绝对路径" });
+    const path = within(dialog).getByRole("textbox", { name: "工作区的绝对路径" });
     await user.type(path, "relative/path");
     await user.click(within(dialog).getByRole("button", { name: "创建项目" }));
     // Relative paths are rejected without closing the dialog or creating a

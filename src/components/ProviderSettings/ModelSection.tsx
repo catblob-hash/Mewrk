@@ -223,7 +223,7 @@ export function ModelSection({
           <div className="provider-empty provider-empty--dashed">
             <Bot size={20} />
             <strong>{t("还没有模型", "No models yet")}</strong>
-            <span>{t("用上面的「拉取模型」看看这家上游有哪些模型，或者手动加一个。", "Use “Fetch models” above to see what this upstream offers, or add one manually.")}</span>
+            <span>{t("拉取模型，或手动添加一个。", "Fetch models, or add one manually.")}</span>
           </div>
         )}
         {hasModels && !groups.length && (

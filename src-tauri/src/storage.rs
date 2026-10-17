@@ -151,10 +151,10 @@ fn recovery_title() -> String {
     ui_text::pick("数据恢复", "Data recovery").to_owned()
 }
 
-/// Brings the built-in preset in `document` to this build's definition, writes
-/// the system prompt it opens with, and removes the presets earlier builds
-/// seeded in its place. Returns whether the document changed, so a start that
-/// finds everything current writes nothing.
+/// Brings the built-in preset in `document` to this build's definition and
+/// removes the presets earlier builds seeded in its place, together with the
+/// templates they and the built-in used to open with. Returns whether the
+/// document changed, so a start that finds everything current writes nothing.
 ///
 /// Runs on every start, not only the first: the preset is part of the build
 /// (see [`crate::catalog::BUILTIN_PRESET_ID`]), so whatever an earlier build
@@ -176,16 +176,19 @@ pub fn install_builtin_preset(path: &Path, document: &mut AppDocument) -> Result
         *document = installed;
     }
     let store = crate::conversation_store::store_for(path)?;
-    write_builtin_preset_template(&store)?;
     let templates = store
         .templates()?
         .into_iter()
         .map(|template| template.id)
         .collect::<HashSet<_>>();
     // Nothing else cites these bodies: a template belongs to exactly one
-    // preset, and the preset is gone.
-    for (_, template_id) in crate::catalog::RETIRED_SEEDED_PRESETS {
-        if templates.contains(*template_id) {
+    // preset, and the preset is gone or no longer opens with it.
+    let retired = crate::catalog::RETIRED_SEEDED_PRESETS
+        .iter()
+        .map(|(_, template_id)| *template_id)
+        .chain([crate::catalog::RETIRED_BUILTIN_PRESET_TEMPLATE_ID]);
+    for template_id in retired {
+        if templates.contains(template_id) {
             store.delete_template(template_id)?;
         }
     }
@@ -306,45 +309,6 @@ fn seed_conversations(
             .collect::<Vec<_>>();
         store.set_workspace_order(&workspace.id, &ids)?;
     }
-    Ok(())
-}
-
-/// Writes the built-in preset's system prompt behind its template id, unless
-/// the row already holds exactly that prompt.
-///
-/// Rewritten whenever it differs rather than written once, because the prompt
-/// ships with the build. Nothing of the user's is lost by it: the preset
-/// cannot be edited, and `update_conversation_template` refuses this id.
-fn write_builtin_preset_template(
-    store: &crate::conversation_store::ConversationStore,
-) -> Result<(), String> {
-    let current = store.template_contexts(crate::catalog::BUILTIN_PRESET_TEMPLATE_ID)?;
-    let up_to_date = matches!(
-        current.as_slice(),
-        [ContextItem::System { content, local_only: false, hook_execution: None, .. }]
-            if content == crate::catalog::BUILTIN_PRESET_PROMPT
-    );
-    if up_to_date {
-        return Ok(());
-    }
-    // The name stays empty like every other template: nothing displays it,
-    // and the preset page addresses this row through `template_id` alone.
-    store.put_template(
-        crate::catalog::BUILTIN_PRESET_TEMPLATE_ID,
-        "",
-        &[ContextItem::System {
-            id: format!("ctx_{}", uuid::Uuid::new_v4().simple()),
-            content: crate::catalog::BUILTIN_PRESET_PROMPT.into(),
-            // Never `true`: a local-only system row is a lifecycle diagnostic
-            // and `system_prompt_parts` drops it, so the prompt would be
-            // written and then never sent.
-            local_only: false,
-            hook_execution: None,
-            tools_added: Vec::new(),
-            native_compaction: None,
-            created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        }],
-    )?;
     Ok(())
 }
 
@@ -6462,61 +6426,24 @@ b"
         );
     }
 
-    /// The built-in preset opens with a system prompt kept in the conversation
-    /// store rather than the document — `ConversationPresetSettings` has no
-    /// prompt field, and a template `System` row is what reaches the request's
-    /// system half. It ships with the build, so a start that finds another
-    /// body there (an older build's) writes this one back, and a start that
-    /// finds it current writes nothing.
+    /// The built-in preset opens with no messages: it binds no template, and a
+    /// start removes the system prompt an older build wrote behind the
+    /// template it used to bind.
     ///
     /// Driven with the product document rather than through `load_or_recover`,
     /// because `hydrate_test_settings` replaces the preset library in test
     /// builds; the product document is what a real first launch starts from.
     #[test]
-    fn the_builtin_preset_opens_with_this_builds_prompt() {
+    fn the_builtin_preset_opens_with_no_messages() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("document.v1.json");
         let mut document = crate::catalog::product_default_document();
-        install_builtin_preset(&path, &mut document).unwrap();
         let store = crate::conversation_store::store_for(&path).unwrap();
-        let body = || {
-            let contexts = store
-                .template_contexts(crate::catalog::BUILTIN_PRESET_TEMPLATE_ID)
-                .unwrap();
-            assert_eq!(contexts.len(), 1, "模板应当只有一条系统提示");
-            match &contexts[0] {
-                ContextItem::System {
-                    id,
-                    content,
-                    local_only,
-                    ..
-                } => {
-                    assert!(
-                        !local_only,
-                        "local_only 的系统行是生命周期诊断，永远不会上线"
-                    );
-                    (id.clone(), content.clone())
-                }
-                other => panic!("模板正文不是系统行：{other:?}"),
-            }
-        };
-        let (first_id, content) = body();
-        assert_eq!(content, crate::catalog::BUILTIN_PRESET_PROMPT);
-        assert_eq!(
-            builtin_preset_of(&document).template_id,
-            crate::catalog::BUILTIN_PRESET_TEMPLATE_ID
-        );
-        // An engineering prompt: where it runs is the host's to say.
-        assert!(!content.to_lowercase().contains("mewrk"));
-
-        // Current: nothing is rewritten.
-        install_builtin_preset(&path, &mut document).unwrap();
-        assert_eq!(body().0, first_id);
-
-        // An older build's body is replaced by this build's.
+        // What an older build left: its built-in bound this template, which
+        // held its system prompt.
         store
             .put_template(
-                crate::catalog::BUILTIN_PRESET_TEMPLATE_ID,
+                crate::catalog::RETIRED_BUILTIN_PRESET_TEMPLATE_ID,
                 "",
                 &[ContextItem::System {
                     id: "ctx_older_build".into(),
@@ -6529,8 +6456,28 @@ b"
                 }],
             )
             .unwrap();
-        install_builtin_preset(&path, &mut document).unwrap();
-        assert_eq!(body().1, crate::catalog::BUILTIN_PRESET_PROMPT);
+        document
+            .presets
+            .conversation_presets
+            .iter_mut()
+            .find(|preset| preset.id == crate::catalog::BUILTIN_PRESET_ID)
+            .unwrap()
+            .template_id = crate::catalog::RETIRED_BUILTIN_PRESET_TEMPLATE_ID.into();
+
+        assert!(install_builtin_preset(&path, &mut document).unwrap());
+        assert!(builtin_preset_of(&document).template_id.is_empty());
+        assert!(store
+            .template_contexts(crate::catalog::RETIRED_BUILTIN_PRESET_TEMPLATE_ID)
+            .unwrap()
+            .is_empty());
+        assert!(!store
+            .templates()
+            .unwrap()
+            .iter()
+            .any(|template| template.id == crate::catalog::RETIRED_BUILTIN_PRESET_TEMPLATE_ID));
+
+        // Nothing left to change.
+        assert!(!install_builtin_preset(&path, &mut document).unwrap());
     }
 
     /// A start replaces whatever an earlier build left under the built-in id,
@@ -6664,7 +6611,7 @@ b"
                 .find(|preset| preset.id == crate::catalog::BUILTIN_PRESET_ID)
                 .unwrap();
             preset.name = "改名".into();
-            preset.template_id = String::new();
+            preset.template_id = "template_user".into();
             preset.settings.agent_ids.clear();
             preset.settings.web_search_enabled = false;
         }
@@ -6763,6 +6710,7 @@ b"
         let withheld = |name: &str| {
             crate::mewrk_memory::is_memory_tool(name)
                 || crate::agents::is_task_runtime_tool_name(name)
+                || crate::agents::is_subagent_messaging_tool_name(name)
                 || crate::plan_mode::is_plan_mode_tool_name(name)
                 || crate::handoff::is_handoff_tool_name(name)
                 || name == crate::capabilities::SKILL_TOOL
@@ -6809,10 +6757,8 @@ b"
         );
         assert!(preset.settings.web_search.include_domains.is_empty());
         assert!(preset.settings.web_search.exclude_domains.is_empty());
-        // The body lives in the conversation store, not the document; the id
-        // survives the save boundary either way.
-        assert_eq!(preset.template_id, crate::catalog::BUILTIN_PRESET_TEMPLATE_ID);
-
+        // It opens with no messages.
+        assert!(preset.template_id.is_empty());
     }
 
     #[test]

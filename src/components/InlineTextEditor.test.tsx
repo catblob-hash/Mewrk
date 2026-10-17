@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import { pastedTextIdMark } from "../lib/pastedText";
 import { InlineTextEditor } from "./InlineTextEditor";
 
 const image = (id: string, name: string) => ({ id, name, mime: "image/png", width: 100, height: 80, bytes: 500 });
@@ -203,9 +204,11 @@ describe("InlineTextEditor", () => {
 
     expect(pasteEvent).toBe(false);
     expect(onAddAttachments).not.toHaveBeenCalled();
-    const label = "\u00a0粘贴文本\u00a0#1\u00a0+119\u00a0行\u00a0";
+    const label = `\u00a0粘贴文本\u00a0+119\u00a0行${pastedTextIdMark(1)}\u00a0`;
     expect(box).toHaveValue(`看看这段${label}`);
-    expect(container.querySelector(".pasted-text-tag")).toHaveTextContent("粘贴文本 #1 +119 行", { normalizeWhitespace: true });
+    // The tag reads as its name alone; the paste's number is carried by invisible marks.
+    expect(container.querySelector(".pasted-text-tag")).toHaveTextContent("粘贴文本 +119 行", { normalizeWhitespace: true });
+    expect(container.querySelector(".pasted-text-tag")?.textContent).not.toContain("#");
 
     await user.click(screen.getByRole("button", { name: "保存" }));
     expect(onSave).toHaveBeenCalledWith(`看看这段${long}`, [], []);

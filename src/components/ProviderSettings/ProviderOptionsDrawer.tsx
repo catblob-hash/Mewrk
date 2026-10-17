@@ -3,6 +3,7 @@ import { knownFamilySettings, requiredFamilySettings } from "../../lib/modelCapa
 import { CODEX_DEFAULT_BASE_URL, isBuiltinProvider, isCodexProvider } from "../../lib/codexProvider";
 import type { ProviderFamily, ApiProvider } from "../../types";
 import { Field } from "../Common";
+import { DocsLink } from "../DocsLink";
 import { Drawer } from "./Drawer";
 import { API_FORMAT_OPTIONS, builtinFamilyOption, familyLabel, familySettingMeta } from "./endpointMeta";
 
@@ -51,7 +52,10 @@ export function ProviderOptionsDrawer({
 
       <Field
         label={t("API 格式", "API format")}
-        hint={t("宿主按它决定对话请求走哪个端点。", "The host uses this to decide which endpoint chat requests go to.")}
+        hint={<>
+          {t("决定对话请求走哪个端点。", "Picks the endpoint chat requests use.")}
+          <DocsLink inline page="providers" section="protocols" />
+        </>}
       >
         <select
           className="input"
@@ -88,8 +92,8 @@ export function ProviderOptionsDrawer({
           <div className="drawer-section__title">
             <strong>{t("身份字段", "Identity fields")}</strong>
             <small>{t(
-              "这一家的地址不是一个固定常量——它由下面这几项推导出来，或者是账号相关的。缺项时宿主会在发请求前指名道姓地拒绝，而不是让上游回一条与凭据无关的错误。",
-              "This family's address is not a fixed constant: it is derived from these, or is account-specific. A missing one is refused by name before the request goes out, instead of surfacing as an unrelated upstream error."
+              "地址由这些字段推导，缺项会拒绝请求。",
+              "The address comes from these; a missing one blocks requests."
             )}</small>
           </div>
           {settings.map((setting) => {
@@ -130,8 +134,8 @@ export function ProviderOptionsDrawer({
         <Field
           label={t("本机测试桩地址", "Local test stub address")}
           hint={t(
-            "对话地址属于 ChatGPT 后端，只有测试桩才需要改。留空使用 ChatGPT 后端；只接受本机地址。",
-            "The chat address belongs to the ChatGPT backend; only a test stub needs to change it. Blank uses the ChatGPT backend. Only a local address is accepted."
+            "留空使用 ChatGPT 后端，仅限本机地址。",
+            "Blank uses the ChatGPT backend; local addresses only."
           )}
         >
           <input

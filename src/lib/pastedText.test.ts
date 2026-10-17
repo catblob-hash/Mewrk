@@ -8,6 +8,7 @@ import {
   normalizePastedText,
   parseDraftClipboard,
   pastedTextExtraLines,
+  pastedTextIdMark,
   pastedTextRangeAround,
   pastedTextRanges,
   type PastedText,
@@ -40,6 +41,36 @@ describe("pasted text", () => {
   it("numbers pastes past the highest the draft ever held", () => {
     expect(nextPastedTextId([])).toBe(1);
     expect(nextPastedTextId([{ id: 1 }, { id: 4 }])).toBe(5);
+  });
+
+  it("spells a paste's number in invisible marks, so tags that read alike stay apart", () => {
+    const ids = [1, 2, 3, 4, 5, 8, 16, 255];
+    const marks = ids.map(pastedTextIdMark);
+    for (const mark of marks) expect(mark).toMatch(/^[\u2060\u200d]+$/u);
+    expect(new Set(marks).size).toBe(ids.length);
+    // The id in binary: a 1 is the zero-width joiner and a 0 the word joiner.
+    expect(pastedTextIdMark(1)).toBe("\u200d");
+    expect(pastedTextIdMark(2)).toBe("\u200d\u2060");
+    expect(pastedTextIdMark(3)).toBe("\u200d\u200d");
+
+    // Two pastes whose labels read the same on screen: one name, different marks.
+    const unmarked = (text: string) => text.replace(/[\u2060\u200d]/gu, "");
+    const label = (id: number) => `\u00a0粘贴文本\u00a0+1\u00a0行${pastedTextIdMark(id)}\u00a0`;
+    const first: PastedText = { id: 1, label: label(1), content: "one\ntwo" };
+    const second: PastedText = { id: 2, label: label(2), content: "three\nfour" };
+    expect(first.label).not.toBe(second.label);
+    expect(unmarked(first.label)).toBe(unmarked(second.label));
+    expect(unmarked(first.label)).not.toContain("#");
+
+    const value = `a ${first.label} b ${second.label} c ${first.label}`;
+    const ranges = pastedTextRanges(value, [first, second]);
+    expect(ranges.map((range) => range.paste.id)).toEqual([1, 2, 1]);
+    expect(ranges.map((range) => value.slice(range.start, range.end))).toEqual([first.label, second.label, first.label]);
+    expect(expandPastedTexts(value, [first, second])).toBe("a one\ntwo b three\nfour c one\ntwo");
+    // Take the marks away and the label is only the words around it.
+    const edited = `x ${unmarked(first.label)} y`;
+    expect(pastedTextRanges(edited, [first, second])).toEqual([]);
+    expect(expandPastedTexts(edited, [first, second])).toBe(edited);
   });
 
   it("finds each label where it stands, and none a hand edit broke", () => {

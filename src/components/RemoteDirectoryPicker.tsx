@@ -91,10 +91,7 @@ export function RemoteDirectoryPicker({
   return (
     <Dialog
       title={t("选择 {name} 上的工作区", "Choose a workspace on {name}", { name: machineName })}
-      description={t(
-        "目录经这台机器自己的 shell 读取；选中的目录会成为一个工作区。",
-        "Each level is read through this machine's own shell. The directory you choose becomes a workspace."
-      )}
+      description={t("选中的目录会成为一个工作区。", "The directory you choose becomes a workspace.")}
       width="460px"
       onClose={onClose}
       footer={<>

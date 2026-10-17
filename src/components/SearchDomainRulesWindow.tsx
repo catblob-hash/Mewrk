@@ -3,6 +3,7 @@ import { Ban, ShieldCheck } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { SearchDomainFilterMode } from "../types";
 import { Dialog, DialogSidebarTitle } from "./Common";
+import { DocsLink } from "./DocsLink";
 
 /** Which of the two lists a page of this window edits. */
 type DomainList = Exclude<SearchDomainFilterMode, "off">;
@@ -99,15 +100,12 @@ export function SearchDomainRulesWindow({
           <h3 className="domain-rules__title">
             {page === "exclude" ? t("黑名单", "Blocklist") : t("白名单", "Allowlist")}
           </h3>
-          <p className="domain-rules__help">{page === "exclude"
-            ? t(
-              "命中其中任意一条的结果会被丢掉。一行一条：<all_urls>、scheme://host/path 匹配模式（* 通配，*. 匹配子域名），或前后加斜杠的正则。要覆盖一个域名及其所有子域名，写 *://*.example.com/*；裸写的 example.com 或 *.example.com 不是规则，会被忽略。写错的规则会被忽略，而不是让整次检索失败。",
-              "A result matching any of these is dropped. One rule per line: <all_urls>, a scheme://host/path match pattern (* wildcards, *. matches subdomains), or a /regex/. To cover a domain and all its subdomains, write *://*.example.com/*; a bare example.com or *.example.com is not a rule and is ignored. A malformed rule is ignored rather than failing the whole search."
-            )
-            : t(
-              "只有命中其中某一条的结果会被留下，其余一律丢掉——所以白名单为空时什么都留不下。语法与黑名单相同。",
-              "Only results matching one of these are kept; everything else is dropped — so an empty allowlist keeps nothing. Same syntax as the blocklist."
-            )}</p>
+          <p className="domain-rules__help">
+            {page === "exclude"
+              ? t("命中的结果会被丢掉，一行一条规则。", "Matching results are dropped; one rule per line.")
+              : t("只保留命中的结果，空名单什么都不留。", "Only matching results are kept; an empty list keeps nothing.")}
+            <DocsLink inline page="web" section="domains" />
+          </p>
           <textarea
             className="input domain-rules__input"
             aria-label={page === "exclude" ? t("黑名单", "Blocklist") : t("白名单", "Allowlist")}

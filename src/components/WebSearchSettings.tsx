@@ -16,6 +16,7 @@ import type {
   WebSearchAssets
 } from "../types";
 import { Switch } from "./Common";
+import { DocsLink } from "./DocsLink";
 import { SecretField } from "./SecretField";
 import { SettingsRail, SettingsRailRow } from "./SettingsRail";
 
@@ -146,21 +147,22 @@ function ProviderPane({
   const capabilities = [entry.search, entry.fetch].filter((spec) => spec !== null);
   const keyRequired = capabilities.every((spec) => spec.requiresApiKey);
   const searchNeedsKeyOnly = !keyRequired && entry.search?.requiresApiKey === true;
+  /* A required key is already said by the field's label. */
+  const keyNote = keyRequired
+    ? null
+    : searchNeedsKeyOnly
+      ? t("仅搜索需要 API Key。", "Only search needs an API key.")
+      : t("API Key 可选，用于提高配额。", "The API key is optional; it raises the quota.");
   const secretHelp = desktopRuntime
-    ? t(
-      "输入后失去焦点会自动保存；清空后失焦即删除。明文存在系统凭据库里，不会写进对话文档，也不随端点变化而失效。",
-      "Changes save on blur; clearing the field and blurring deletes it. The secret lives in the system credential store, is never written to conversation documents, and survives an endpoint edit."
-    )
-    : t(
-      "浏览器预览不会发起真实请求，也不会保存凭据明文。",
-      "Browser preview does not send real requests or store credentials in plain text."
-    );
+    ? t("失去焦点时自动保存到系统凭据库。", "Saved to the system credential store when you leave the field.")
+    : t("浏览器预览不发送请求，也不保存凭据。", "Browser preview sends no requests and stores no credentials.");
   /* The rule `providers.rs::parse_api_host` enforces: http is fine for any
-     address on this machine or the local network, not only loopback. */
-  const endpointRule = t(
-    "留空使用目录默认端点。端点必须用 https，但本机或局域网里的地址（localhost、*.local、192.168.x.x 等）可以用 http。",
-    "Leave empty to use the catalog default. The endpoint must use https, except that an address on this machine or your local network (localhost, *.local, 192.168.x.x and similar) may use http."
-  );
+     address on this machine or the local network, not only loopback. The short
+     line names https; the exception for local addresses is on the site. */
+  const endpointRule = <>
+    {t("留空使用默认端点，须为 https。", "Leave empty for the default; must be https.")}
+    <DocsLink inline page="web" section="provider-settings" />
+  </>;
   const apiCredentials = useSearchCredentialPort(entry.kind, "apiKey");
   const basicAuthCredentials = useSearchCredentialPort(entry.kind, "basicAuthPassword");
 
@@ -183,10 +185,13 @@ function ProviderPane({
           {isLocalFetch && (
             <section className="provider-field">
               <div className="provider-field__title"><span>{t("本机抓取", "Local fetch")}</span></div>
-              <p className="provider-field__help">{t(
-                "这一家没有任何配置：它由应用自己去取目标网页并抽出可读正文，不经过第三方服务，因此既没有端点也没有凭据。解析到内网或回环地址的目标会被拒绝；只有在完全访问下，模型直接给出的本机地址（比如你的开发服务器）可以抓取。重定向到局域网的请求和搜索结果里的链接一律拒绝。",
-                "This one has nothing to configure: the app retrieves the page itself and extracts its readable text, with no third-party service, so it has neither an endpoint nor a credential. Targets on a private or loopback address are refused, except that at Full access the model may fetch a local address it names directly, such as your dev server. Redirects into your local network and links found in search results are always refused."
-              )}</p>
+              <p className="provider-field__help">
+                {t(
+                  "由应用自己读取网页，无需配置。",
+                  "The app reads pages itself; nothing to configure."
+                )}
+                <DocsLink inline page="web" section="local-fetch" />
+              </p>
             </section>
           )}
 
@@ -196,14 +201,7 @@ function ProviderPane({
               credentials={apiCredentials}
               label="API Key"
               required={keyRequired}
-              help={`${keyRequired
-                ? t("没有 API Key 的提供商无法工作。", "A provider without an API key cannot work.")
-                : searchNeedsKeyOnly
-                  ? t(
-                    "搜索需要 API Key；抓取网页不需要 Key，有 Key 只是配额更高。",
-                    "Searching needs an API key; fetching pages works without one, and a key only raises the quota."
-                  )
-                  : t("这一家匿名可用，API Key 只用来抬高配额。", "This one works anonymously; an API key only raises the quota.")}${secretHelp}`}
+              help={keyNote ? t("{note}{storage}", "{note} {storage}", { note: keyNote, storage: secretHelp }) : secretHelp}
               onFlush={onFlush}
             />
           )}
@@ -234,8 +232,8 @@ function ProviderPane({
                   </div>
                 </div>
                 <p className="provider-field__help">{t(
-                  "逗号分隔。留空则读这台实例的 /config，自动挑出 general + web 两个类目下已启用的引擎。",
-                  "Comma separated. Leave empty to read the instance's /config and pick the enabled engines in the general + web categories."
+                  "逗号分隔；留空则用实例已启用的引擎。",
+                  "Comma separated; empty uses the instance's enabled engines."
                 )}</p>
               </section>
 
@@ -253,8 +251,8 @@ function ProviderPane({
                   </div>
                 </div>
                 <p className="provider-field__help">{t(
-                  "自托管实例挂在一层 Basic Auth 后面时填。留空则不带鉴权头。",
-                  "Fill this in when the self-hosted instance sits behind basic auth. Leave empty to send no auth header."
+                  "实例有 Basic Auth 时填写。",
+                  "For instances behind basic auth."
                 )}</p>
               </section>
 
@@ -309,10 +307,7 @@ function ProviderPane({
                   />
                 </div>
               </div>
-              <p className="provider-field__help">{`${endpointRule} ${t(
-                "抓取与检索是两条独立的能力，可以指向不同主机——Jina 出厂就是 s.jina.ai 与 r.jina.ai 两台。",
-                "Fetching and searching are separate capabilities and may point at different hosts — Jina ships with s.jina.ai and r.jina.ai."
-              )}`}</p>
+              <p className="provider-field__help">{endpointRule}</p>
             </section>
           )}
         </div>

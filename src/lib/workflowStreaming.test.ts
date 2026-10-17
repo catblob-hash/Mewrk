@@ -8,7 +8,7 @@ import { deriveWorkflowProgress } from "./workflowProgress";
 import type { ContextItem, JsonObject, ModelRunRequest, ModelStreamEvent } from "../types";
 
 const messages = {
-  fallbackLabel: (index: number) => `子代理 ${index}`,
+  fallbackLabel: "子代理",
   workflowStepLabel: "工作流步骤",
   missingTask: "未提供任务说明",
   updateReturned: "状态已返回给主智能体",

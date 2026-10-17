@@ -1070,16 +1070,29 @@ fn native_search(request: &RunModelRequest, family: Family) -> Option<NativeSear
 /// to retrieve.
 ///
 /// The fetch leg's per-page token cap rides along as the tool's own
-/// `max_content_tokens`, where the family has a fetch tool to carry it on; zero
-/// is "no cap" and sends nothing. Native SEARCH takes no such parameter on any
-/// family, so [`native_search`] reads nothing from the execution options.
+/// `max_content_tokens`, where the family writes a fetch tool definition to
+/// carry it on — the Messages families, the same ones a tool version is spelled
+/// on. Claude Code's `WebFetch` has no such parameter, so the agent family never
+/// gets one. Zero is "no cap" and sends nothing. Native SEARCH takes no such
+/// parameter on any family, so [`native_search`] reads nothing from the
+/// execution options.
+///
+/// The URLs themselves go only to the Claude Agent family. There the sidecar
+/// admits each of Claude Code's `WebFetch` calls itself and holds them to this
+/// list; a Messages upstream already refuses an address the conversation never
+/// mentioned, and the request's own context carries every one of them.
 fn native_fetch(request: &RunModelRequest, family: Family) -> Option<NativeFetch> {
-    request.native_fetch_call.map(|max_uses| NativeFetch {
-        max_uses,
-        tool_type: crate::web_search::family_selects_native_tool_type(family)
-            .then(|| request.web_search.native_fetch_tool.wire_type()),
+    let selects_type = crate::web_search::family_selects_native_tool_type(family);
+    request.native_fetch_call.as_ref().map(|urls| NativeFetch {
+        max_uses: urls.len().min(u32::MAX as usize) as u32,
+        tool_type: selects_type.then(|| request.web_search.native_fetch_tool.wire_type()),
         max_content_tokens: Some(request.web_search.execution.fetch_compression_cutoff)
-            .filter(|&cap| cap > 0 && crate::web_search::family_supports_native_fetch(family))
+            .filter(|&cap| cap > 0 && selects_type)
             .map(|cap| cap.min(crate::model::MAX_SEARCH_CUTOFF_LIMIT)),
+        urls: if family == Family::ClaudeAgent {
+            urls.clone()
+        } else {
+            Vec::new()
+        },
     })
 }

@@ -151,13 +151,6 @@
   color: var(--accent);
 }
 
-.question-dock__index {
-  min-width: 16px;
-  flex: 0 0 auto;
-  color: var(--faint);
-  font-variant-numeric: tabular-nums;
-}
-
 .question-dock__checkbox {
   flex: 0 0 auto;
   color: var(--muted);

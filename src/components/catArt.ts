@@ -6,8 +6,11 @@
  * It is drawn in two places — loafing on a draft composer's rim, and at its laptop (or
  * pointedly not) beside a streaming round — and nowhere official. The brand mark is a
  * different drawing (`brandMark.ts`), and the two never share a surface. Both mascot surfaces
- * draw this one drawing in the same scene, because redrawing it twice is how two different
- * cats happen.
+ * draw this one drawing — head, face, forepaws and laptop are the same paths on both — because
+ * redrawing it twice is how two different cats happen. The one place they part is the rear
+ * half: beside a streaming round the tail hangs over the front of the ledge drawn for it, while
+ * on the composer the cat lies with its hind leg showing and its tail raised behind it
+ * ({@link CAT_COMPOSER_BODY}, {@link CAT_TAIL_RAISED}).
  *
  * All coordinates are in the artwork's own drawing space.
  *
@@ -33,7 +36,7 @@
  */
 
 /**
- * The scene both surfaces draw the cat in: the drawing's own coordinates, framed round the
+ * The scene the streaming cat is drawn in: the drawing's own coordinates, framed round the
  * cat lying on a ledge at {@link CAT_LEDGE_Y} with its tail hanging below it.
  *
  * The box is padded rather than tight because a breath scales the figure about the ledge: at
@@ -232,3 +235,78 @@ export const CAT_LID_LIFT = 54;
  */
 export const CAT_LIDS =
   "M500 468.6C499.2 475.9 499.4 482.2 502.3 489.4C514.8 521.2 569.1 530.5 597.8 510.4C609.2 502.4 614.6 493.3 617 481.2L617 451L500 451ZM669.2 481.4C670.1 490.7 672.3 499.7 679.9 506.9C699.8 525.6 735.2 523.7 753.3 504.1C762.1 494.7 763.9 482.9 763.2 471.4L750 451L669.2 451Z";
+
+/**
+ * The scene the composer draws its cat in. It keeps {@link CAT_SCENE_VIEWBOX}'s scale and top,
+ * so the cat is its old size and the ledge is still 386.9 units down, but nothing hangs below
+ * the ledge any more: the bottom is cut to the toes, which dip a few units past it, plus room
+ * for a breath. The left edge is pushed out instead, to where {@link CAT_TAIL_RAISED} reaches
+ * when it is swung furthest back.
+ */
+export const CAT_COMPOSER_VIEWBOX = "232 344 784 400";
+
+/** The top of the desk in the drawing's own coordinates: the ledge, before {@link CAT_ON_LEDGE} lowers it. */
+const DESK_TOP = 668.78;
+
+/** The drawing's haunch: from the notch behind the cheek round to the desk, with the hanging tail's root under it. */
+const HAUNCH = "C392.4 473.9 378.2 483.8 365.9 494.5C321.1 533.6 291.7 598.7 309.5 657.8";
+
+/** The desk line under the chin, between the paws. */
+const DESK_UNDER_CHIN = "C592.4 659 614.7 658.2 636.7 657.9";
+
+/**
+ * The composer cat's back and rump, in place of {@link HAUNCH}: lower and longer, so that there
+ * is a rear end for the tail to rise from, and rounded right down onto the desk.
+ */
+const RUMP = `C388 476 366 488 348 500C318 520 292 540 282 580C274 612 282 650 300 664C306 668 312 ${DESK_TOP} 318 ${DESK_TOP}`;
+
+/**
+ * The hind leg, drawn as the one slit that outlines it: up the front of the toes, back along
+ * the top of the foot, then up the front of the thigh and over it, closing to a point at the
+ * back of the rump, and down the slit's other side to the desk again. It opens onto the desk
+ * in front of the toes, as the near forepaw's slit does, which is what makes the toes read as
+ * a paw rather than a bump.
+ */
+const HIND_LEG =
+  "C427.8 647.8 421.3 641.9 406.8 640.4C392.6 636.8 390.7 625.6 385.8 614C376 571.8 325.1 577.9 310 606" +
+  `C322.9 574.1 380 564.2 398 609.5C401.6 619 402.5 627.2 408.8 627.6C426.7 630.1 440.2 644.2 440.5 ${DESK_TOP}`;
+
+/** The hind leg's slit on its own, closed along the desk: the hole {@link CAT_TAIL_RAISED} must keep out of. */
+export const CAT_HIND_LEG_SLIT = `M427.5 ${DESK_TOP}${HIND_LEG}Z`;
+
+const [BODY_UP_TO_HAUNCH, BODY_PAST_HAUNCH] = cutAround(CAT_BODY, `${HAUNCH}${DESK_UNDER_NEAR_PAW}`);
+const [BODY_UP_TO_CHIN_LINE, BODY_PAST_CHIN_LINE] = cutAround(BODY_PAST_HAUNCH, DESK_UNDER_CHIN);
+
+/**
+ * {@link CAT_BODY} as the composer draws it: the haunch redrawn as {@link RUMP} with
+ * {@link HIND_LEG} in it, and the underside put down on the desk.
+ *
+ * ## Why the underside is redrawn
+ *
+ * The drawing's underside runs at y≈658 from the haunch to the near paw and again under the
+ * chin, 11 units above the desk the paws and the laptop stand on. On a slab that gap is the
+ * slab's back edge in perspective; on the composer, where the border is the desk, it was a
+ * pixel of daylight between the cat and the border it was supposed to be lying on. Here both
+ * stretches run along the desk itself.
+ */
+export const CAT_COMPOSER_BODY =
+  `${BODY_UP_TO_HAUNCH}${RUMP}L427.5 ${DESK_TOP}${HIND_LEG}L491.5 ${DESK_TOP}` +
+  `${BODY_UP_TO_CHIN_LINE}L570.4 ${DESK_TOP}L630 ${DESK_TOP}C634.5 ${DESK_TOP} 636.7 664 636.7 657.9${BODY_PAST_CHIN_LINE}`;
+
+/**
+ * The composer cat's tail, raised behind it with the tip hooked over towards its head. It is
+ * in the drawing's own coordinates, so it goes inside {@link CAT_ON_LEDGE} with the body it
+ * grows from.
+ *
+ * The root runs well into the rump and is closed by a straight line inside it, so the tail can
+ * sway about {@link CAT_TAIL_RAISED_ROOT} without the root's corners coming out of the back or
+ * reaching into {@link CAT_HIND_LEG_SLIT}, which it would plug: `catArt.test.ts` checks both
+ * across more than the swing the stylesheet gives it.
+ */
+export const CAT_TAIL_RAISED =
+  "M293 586L284.4 572.4C271 552 255 524 253.5 490C252 458 259 426 279 403C298 382 330 376 352 389C363 395.5 364.3 411.2 369.3 422.1" +
+  "A19.1 19.1 0 0 1 334.7 437.9C330 427.5 326 421.5 318 421.5C306 421.5 298.5 436 298.5 456C298.5 478 304 502 313.5 523" +
+  "C318 533 322.5 539 327.6 543.6Z";
+
+/** Where {@link CAT_TAIL_RAISED} comes out of the rump, and so the point it sways about. */
+export const CAT_TAIL_RAISED_ROOT = { x: 298, y: 552 } as const;

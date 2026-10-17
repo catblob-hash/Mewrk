@@ -9,6 +9,7 @@ import {
 } from "../../lib/runtime";
 import { CODEX_SIGN_IN_CANCELLED_MESSAGES } from "../../lib/codexProvider";
 import type { ApiProvider, CodexOauthStatus } from "../../types";
+import { DocsLink } from "../DocsLink";
 
 function planLabel(planType: string | undefined): string {
   if (!planType) return "";
@@ -232,10 +233,13 @@ export function CodexLoginPanel({
         <CircleAlert size={16} aria-hidden="true" />
         <div>
           <div className="provider-field__title">{t("使用 ChatGPT 账号登录", "Sign in with your ChatGPT account")}</div>
-          <p className="provider-field__help">{t(
-            "使用 ChatGPT Plus / Pro / Team 订阅额度调用 Codex 模型。点击后会打开系统浏览器完成授权，令牌只保存在本机。",
-            "Use your ChatGPT Plus / Pro / Team subscription for Codex models. Signing in opens the system browser; tokens stay on this machine."
-          )}</p>
+          <p className="provider-field__help">
+            {t(
+              "用 ChatGPT 订阅额度调用 Codex 模型。",
+              "Uses your ChatGPT subscription for Codex models."
+            )}
+            <DocsLink inline page="providers" section="codex" />
+          </p>
         </div>
       </div>
       <div className="provider-field__row">

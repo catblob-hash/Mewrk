@@ -256,7 +256,7 @@ export function Dialog({
    * A `dialog__body--flush` body is a whole page laid out as a flex row, so it
    * takes no description: there is no column for a paragraph to lead.
    */
-  description?: string;
+  description?: ReactNode;
   footer?: ReactNode;
   onClose: () => void;
   width?: string;
@@ -383,7 +383,7 @@ export function Dialog({
   );
 }
 
-export function EmptyState({ icon, title, description }: { icon: ReactNode; title: string; description?: string }) {
+export function EmptyState({ icon, title, description }: { icon: ReactNode; title: string; description?: ReactNode }) {
   return (
     <div className="empty-state">
       <div className="empty-state__icon">{icon}</div>

@@ -35,7 +35,7 @@ type Translate = ReturnType<typeof useI18n>["t"];
 /** Localized subagent-view copy; the App summary selector and drawer use the same derivation. */
 export function subagentViewMessages(t: Translate): SubagentViewMessages {
   return {
-    fallbackLabel: (index) => t("子代理 {index}", "Subagent {index}", { index }),
+    fallbackLabel: t("子代理", "Subagent"),
     workflowStepLabel: t("工作流步骤", "Workflow step"),
     missingTask: t("未提供任务说明", "No task description provided"),
     updateReturned: t("状态已返回给主智能体", "Status returned to the primary agent"),
@@ -124,7 +124,7 @@ export function StreamedConversationView({
     const calls = workflowEntriesByCall ? Object.entries(workflowEntriesByCall) : [];
     if (calls.length === 0) return NO_WORKFLOW_PROGRESS;
     const messages = {
-      fallbackStepLabel: (index: number) => t("步骤 {number}", "Step {number}", { number: index + 1 }),
+      fallbackStepLabel: t("步骤", "Step"),
       unphasedHeading: t("未分组", "Ungrouped"),
       cachedBadge: t("已缓存", "Cached"),
       blockedBadge: t("等待中", "Waiting"),

@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { useI18n } from "../i18n";
 import type { SearchDomainFilterMode } from "../types";
 import { SearchDomainRulesWindow } from "./SearchDomainRulesWindow";
@@ -9,7 +10,7 @@ interface SearchDomainFilterRowProps {
   mode: SearchDomainFilterMode;
   includeDomains: readonly string[];
   excludeDomains: readonly string[];
-  hint: string;
+  hint: ReactNode;
   windowOpen: boolean;
   onOpenWindow: () => void;
   onCloseWindow: () => void;

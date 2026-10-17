@@ -166,7 +166,7 @@ describe("ContextUsageMeter", () => {
       expect(slider).toHaveAttribute("min", "20");
       expect(slider).toHaveAttribute("max", "97");
       // 80% of the 1m window.
-      expect(menu).toHaveTextContent("上下文达到 800k tokens 时，模型写好交接文档，在新的交接会话中继续");
+      expect(menu).toHaveTextContent("上下文达到 800k tokens 时交接");
       // A model that does not compact natively is offered only the handoff.
       expect(within(tabs).getByRole("tab", { name: "原生压缩" })).toBeDisabled();
       expect(within(menu).queryByRole("button", { name: "立即压缩" })).not.toBeInTheDocument();
@@ -274,11 +274,11 @@ describe("ContextUsageMeter", () => {
         expect(menu.querySelector(".context-usage-compact__retained")).toHaveTextContent("保留最近的token 用户消息");
         // 90% of the 1m window.
         expect(menu).toHaveTextContent(
-          "上下文达到 900k tokens 时，模型把上下文原生压缩成一个压缩项，在新会话中继续"
+          "上下文达到 900k tokens 时压缩"
         );
         // The other method's page is not shown.
         expect(within(menu).queryByRole("spinbutton", { name: "交接阈值（百分比）" })).not.toBeInTheDocument();
-        expect(menu).toHaveTextContent("方式按对话各自记");
+        expect(menu).toHaveTextContent("方式按对话记，其余设置全局生效。");
       });
 
       it("records the conversation's choice, and the numbers globally", async () => {

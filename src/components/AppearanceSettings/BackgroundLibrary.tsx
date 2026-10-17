@@ -233,8 +233,8 @@ export function BackgroundLibraryDialog({
     <Dialog
       title={t("背景", "Background")}
       description={t(
-        "纯色背景是各主题自己的底色，切换主题时会随之切换；图片不随主题变化。",
-        "Each theme has a solid ground of its own, and a solid background switches along with the theme. A picture stays as it is."
+        "纯色随主题切换，图片不变。",
+        "A solid color follows the theme; a picture stays."
       )}
       width="620px"
       onClose={onClose}
@@ -307,8 +307,8 @@ export function BackgroundLibraryDialog({
         </div>
         <p className="background-library__hint">
           {t(
-            "按窗口比例裁切，不拉伸。导入时按多级分辨率保存，窗口按屏幕像素取刚好够用的一级。",
-            "Cropped to the window's shape, never stretched. Importing saves several resolutions, and the window uses the smallest one that covers its pixels."
+            "按窗口比例裁切，不拉伸。",
+            "Cropped to the window's shape, never stretched."
           )}
         </p>
         {listError && (

@@ -18,8 +18,12 @@ import {
 import type { ModelCapability, ProviderFamily, ModelProfile, ReasoningContent } from "../../types";
 import { DEFAULT_CACHE_TTL_MINUTES } from "../../lib/toolLock";
 import { Field, Switch } from "../Common";
+import { DocsLink } from "../DocsLink";
 import { capabilityIcon, capabilityLabel } from "./capabilityMeta";
 import { Drawer } from "./Drawer";
+
+/** Where the site explains what each of the switches below does, and the protocols it applies to. */
+const modelPropertiesLink = <DocsLink inline page="providers" section="model-properties" />;
 
 function optionalPositiveInteger(value: string): number | undefined {
   if (!value.trim()) return undefined;
@@ -68,20 +72,17 @@ export function ModelProfileDrawer({
    * changes what is asked for: the request always includes `reasoning.encrypted_content`
    * (`aisdk/step.rs`) so thinking replays across tool calls. It only decides how the
    * thinking that streams back is read and shown. */
-  const reasoningHint = reasoningContentTakesEffect(family)
-    ? draft.reasoningContent === "plaintext"
-      ? t(
-          "Mewrk 总会向上游请求加密思考字段，让思考能在工具调用之间回放；这一项只决定思考怎样读取和显示。明文：端点流式返回可读的思考文字时（许多中转站和 DeepSeek 都是这样），Mewrk 把这些文字显示为思考。",
-          "Mewrk always asks for the encrypted reasoning field so thinking replays across tool calls; this setting only decides how thinking is read and shown. Plaintext: for endpoints that stream readable reasoning text (many relays, and DeepSeek), Mewrk shows that text as thinking."
-        )
-      : t(
-          "Mewrk 总会向上游请求加密思考字段，让思考能在工具调用之间回放；这一项只决定思考怎样读取和显示。端点流式返回可读的思考文字时（许多中转站和 DeepSeek 都是这样），选明文才能把这些文字显示为思考。",
-          "Mewrk always asks for the encrypted reasoning field so thinking replays across tool calls; this setting only decides how thinking is read and shown. Choose Plaintext for endpoints that stream readable reasoning text (many relays, and DeepSeek) to see that text as thinking."
-        )
-    : t(
-        "这一项只对 OpenAI Responses、OpenAI Codex 和 Azure OpenAI 有效。别的协议里思考怎么回来由上游单方面决定，客户端没有可发的开关。",
-        "This setting only takes effect on OpenAI Responses, OpenAI Codex and Azure OpenAI. On the others the upstream alone decides how thinking comes back; there is no switch to send."
-      );
+  const reasoningHint = (
+    <>
+      {reasoningContentTakesEffect(family)
+        ? t(
+            "端点流式返回可读的思考文字时，选「明文」。",
+            "Choose Plaintext if the endpoint streams readable reasoning."
+          )
+        : t("这个协议下此项无效。", "No effect on this protocol.")}
+      {modelPropertiesLink}
+    </>
+  );
 
   const reasoningContentLabel = (value: ReasoningContent) => {
     switch (value) {
@@ -124,62 +125,84 @@ export function ModelProfileDrawer({
   const modelId = draft.id.trim();
   /* Sentences run on without a space in Chinese and with one in English. */
   const sentenceGap = t("", " ");
+  /* One short line for what the switch is for, then the recognition note for the
+     typed model ID, then the link to the model-properties section. */
+  const capabilityHint = (summary: string, known?: boolean | null) => (
+    <>
+      {`${summary}${known !== undefined ? `${sentenceGap}${knownHint(known)}` : ""}`}
+      {modelPropertiesLink}
+    </>
+  );
   const toolAppendLabel = capabilityLabel(t, "tool_append");
   const toolAppendHint = toolAppendTakesEffect(family)
-    ? `${t(
-        "对话中途加入的工具经协议自己的追加接口交给模型，不改写开头的工具列表，提示词缓存保得住。没有这项能力时，工具面在首次请求后固定，自动压缩与工具发现也不可用。",
-        "Tools that join mid-conversation reach the model through the protocol's own append interface instead of rewriting the tool list at the head of the prompt, so the prompt cache survives. Without it the tool surface is fixed after the first request, and auto-compact and tool discovery are unavailable."
-      )}${modelId ? `${sentenceGap}${knownHint(knownToolAppend(family, baseUrl, modelId))}` : ""}`
+    ? capabilityHint(
+        t(
+          "让工具能在对话中途加入，且不丢提示词缓存。",
+          "Lets tools join mid-conversation, keeping the prompt cache."
+        ),
+        modelId ? knownToolAppend(family, baseUrl, modelId) : undefined
+      )
     : t(
-        "这个协议没有对话中途追加工具的接口，这一项不起作用。",
-        "This protocol has no interface for adding a tool mid-conversation, so this setting has no effect."
+        "此项无效：这个协议不能中途追加工具。",
+        "No effect: this protocol can't add tools mid-conversation."
       );
   const systemAppendLabel = capabilityLabel(t, "system_append");
   const systemAppendHint = systemAppendTakesEffect(family)
-    ? `${t(
-        "计划模式这类中途开始生效的指令，以会话中的 system 消息追加在那个位置，不改开头的系统提示词。没有这项能力时改用 user 消息里的 <system-reminder> 送达。",
-        "Instructions that start to apply mid-conversation, such as plan mode, are appended as a system message at that point instead of rewriting the system prompt. Without it they arrive as a <system-reminder> in a user message."
-      )}${modelId ? `${sentenceGap}${knownHint(knownSystemAppend(family, baseUrl, modelId))}` : ""}`
+    ? capabilityHint(
+        t(
+          "让中途生效的指令以 system 消息送达。",
+          "Sends mid-conversation instructions as system messages."
+        ),
+        modelId ? knownSystemAppend(family, baseUrl, modelId) : undefined
+      )
     : t(
-        "这个协议不能在对话中途带 system 消息，这一项不起作用。",
-        "This protocol cannot carry a system message mid-conversation, so this setting has no effect."
+        "此项无效：这个协议不能中途带 system 消息。",
+        "No effect: this protocol can't take system messages mid-conversation."
       );
   const asyncToolsLabel = capabilityLabel(t, "async_tools");
   const asyncToolsHint = asyncToolsTakeEffect(family)
-    ? `${t(
-        "子代理和工作流以异步工具声明：调用不必等结果，模型可以接着干别的，任务的结果之后作为这次调用的输出送达。没有这项能力时，结果按 Claude Code 的做法以 user 消息里的 <task-notification> 送达。",
-        "Subagents and workflows are declared as asynchronous tools: the call does not wait for its result, the model goes on with other work, and the task's result later arrives as that call's output. Without it, results arrive the way Claude Code delivers them: a <task-notification> in a user message."
-      )}${modelId ? `${sentenceGap}${knownHint(knownAsyncTools(family, baseUrl, modelId))}` : ""}`
+    ? capabilityHint(
+        t(
+          "子代理和工作流运行时，模型无需等待。",
+          "The model needn't wait while subagents and workflows run."
+        ),
+        modelId ? knownAsyncTools(family, baseUrl, modelId) : undefined
+      )
     : t(
-        "这个协议没有异步工具调用，这一项不起作用。",
-        "This protocol has no asynchronous tool calls, so this setting has no effect."
+        "此项无效：这个协议没有异步工具调用。",
+        "No effect: this protocol has no asynchronous tool calls."
       );
   const nativeCompactionLabel = capabilityLabel(t, "native_compaction");
   const nativeCompactionHint = nativeCompactionTakesEffect(family)
-    ? `${t(
-        "上下文达到原生压缩阈值时，由模型把上下文压缩成一个不透明的压缩项，保留最近的用户消息，在当前对话里继续（Codex 的做法）。没有这项能力时，自动压缩只有交接一种。",
-        "Past the native-compaction threshold, the model compacts the context into one opaque item, keeps the latest user messages, and carries on in the same conversation (the way Codex does). Without it, auto-compact only hands off."
-      )}${modelId ? `${sentenceGap}${knownHint(knownNativeCompaction(family, baseUrl, modelId))}` : ""}`
+    ? capabilityHint(
+        t(
+          "超过阈值时，由模型自己压缩上下文。",
+          "Past the threshold, the model compacts the context itself."
+        ),
+        modelId ? knownNativeCompaction(family, baseUrl, modelId) : undefined
+      )
     : t(
-        "这个协议没有原生压缩，这一项不起作用。",
-        "This protocol has no native compaction, so this setting has no effect."
+        "此项无效：这个协议没有原生压缩。",
+        "No effect: this protocol has no native compaction."
       );
   const promptCacheLabel = t("提示词缓存", "Prompt caching");
   /** Only the Messages protocol takes client-placed cache breakpoints; elsewhere the value is stored but idle. */
   const promptCacheHint = promptCacheTakesEffect(family)
-    ? t(
-        "按 Claude Code 的规则在请求里打缓存断点：系统提示词的稳定前缀与本步尾巴各一处，最后一条可打标的消息一处。Claude 只缓存客户端标记过的前缀，关掉就完全没有缓存。",
-        "Places cache breakpoints the way Claude Code does: one on the stable system-prompt prefix, one on its per-step tail, and one on the last markable message. Claude only caches what the client marks, so turning this off means no caching at all."
+    ? capabilityHint(
+        t(
+          "为请求打缓存断点；关闭后完全不缓存。",
+          "Marks cache breakpoints; turning it off means no caching."
+        )
       )
     : t(
-        "这一档今天只对 Anthropic Messages 协议有效；别的协议由上游自行决定缓存，客户端没有可发的标记。",
-        "This setting only takes effect on the Anthropic Messages protocol today; on the others the upstream decides caching on its own and there is no marker to send."
+        "此项只对 Anthropic Messages 有效。",
+        "Only takes effect on Anthropic Messages."
       );
 
   return (
     <Drawer
       title={mode === "create" ? t("添加模型", "Add model") : t("模型属性", "Model properties")}
-      subtitle={t("{provider} · 修改只会在保存后应用", "{provider} · Changes apply only after saving", { provider: providerName })}
+      subtitle={t("{provider} · 保存后生效", "{provider} · Applies on save", { provider: providerName })}
       labelledBy="model-editor-title"
       onClose={onClose}
       footer={
@@ -203,7 +226,7 @@ export function ModelProfileDrawer({
         <Field label={t("显示名", "Display name")} hint={t("留空则显示模型 ID", "Falls back to the model ID when blank")}>
           <input className="input" aria-label={t("显示名", "Display name")} value={draft.name} onChange={(event) => onChange({ ...draft, name: event.target.value })} />
         </Field>
-        <Field label={t("分组", "Group")} hint={t("模型列表里的折叠分组；留空则由 ID 推断", "The collapsible group in the model list; inferred from the ID when blank")}>
+        <Field label={t("分组", "Group")} hint={t("模型列表里的分组；留空则由 ID 推断", "Group in the model list; inferred from the ID if blank")}>
           <input className="input" aria-label={t("分组", "Group")} value={draft.group} onChange={(event) => onChange({ ...draft, group: event.target.value })} />
         </Field>
         <Field label={t("上下文窗口", "Context window")}>
@@ -214,10 +237,13 @@ export function ModelProfileDrawer({
         </Field>
         <Field
           label={t("缓存失效时间（分钟）", "Cache lifetime (minutes)")}
-          hint={t(
-            "上次请求后这么久内，对话设置里会让这个模型的提示词缓存失效的改动显示为橘色并先提醒。",
-            "For this long after a request, changes in the conversation settings that would invalidate this model's prompt cache are shown in orange and ask first."
-          )}
+          hint={<>
+            {t(
+              "这段时间内，破坏缓存的改动会先提醒。",
+              "Within this time, cache-breaking changes ask first."
+            )}
+            <DocsLink inline page="working" section="tool-lock" />
+          </>}
         >
           <input
             className="input"

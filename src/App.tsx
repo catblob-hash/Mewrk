@@ -3598,7 +3598,6 @@ function App() {
           id: locationKey(candidate.machine, result.path),
           label: candidate.workspace ? candidate.workspace.path : machineName,
           labelIsPath: Boolean(candidate.workspace),
-          hint: candidate.workspace ? `${candidate.workspace.number}` : undefined,
           description: formatAddress(candidate.machine, result.path, addressContext),
           descriptionIsPath: true,
           icon: result.kind === "directory"
@@ -3903,7 +3902,7 @@ function App() {
   );
   const workflowProgressByRun = useMemo<Record<string, WorkflowProgressView>>(() => {
     const messages = {
-      fallbackStepLabel: (index: number) => t("步骤 {number}", "Step {number}", { number: index + 1 }),
+      fallbackStepLabel: t("步骤", "Step"),
       unphasedHeading: t("未分组", "Ungrouped"),
       cachedBadge: t("已缓存", "Cached"),
       blockedBadge: t("等待中", "Waiting"),
@@ -6063,8 +6062,8 @@ function App() {
 
   /**
    * Lays a preset's opening messages onto a draft made from it, so a new task starts as the
-   * preset says — the built-in preset's engineering system prompt as its first card. Text cards
-   * become the draft's own, editable before the first send like anything written in it.
+   * preset says. Text cards become the draft's own, editable before the first send like anything
+   * written in it.
    *
    * It lands only while the draft is still made from this preset and its opening messages are
    * still untouched: empty, or still the very `replacing` array — the previous preset's opening
@@ -9101,14 +9100,11 @@ function App() {
         : null;
       const terminals = terminalTabsFor(terminalTabsState, ownerId);
       // A tab is named after the shell it runs, the way the reference shell names its tabs after
-      // the program running in them, and numbered by how many of that shell the conversation
-      // has opened: each shell counts on its own, and a closed one keeps its number.
+      // the program running in them.
       const tabLabel = (tab: TerminalTab) => {
         if (tab.name) return tab.name;
         const shell = tab.launch?.shell;
-        return shell
-          ? `${terminalShellLabel(shell)} ${tab.number}`
-          : t("终端 {n}", "Terminal {n}", { n: tab.number });
+        return shell ? terminalShellLabel(shell) : t("终端", "Terminal");
       };
       // The read-only page: a command the model ran, named the way its task row is. A command the
       // host has already let go of has nothing left to show, so its page is not drawn; the
@@ -10179,7 +10175,6 @@ function App() {
                         workspaces={activeProjectWorkspaces}
                         selected={activeWorkspaceMember}
                         sshMachines={document.globalSettings.executionEnvironments.sshMachines}
-                        showIndex={activeProjectWorkspaces.length + activeConversation.attachedWorkspaces.length > 1}
                         onSelect={(member) => setSelectedWorkspaceMembers((current) => ({
                           ...current,
                           [activeConversation.id]: member
@@ -10282,12 +10277,8 @@ function App() {
                         picker button trails them so a new one lands where the button was.
                         Both are frozen while a turn runs: the host snapshots the granted set when it
                         builds the request, so a grant given or taken back mid-run would show here
-                        without reaching the calls that turn is still making.
-
-                        The number is shown only when there is more than one workspace, which is
-                        exactly when the host states the numbers to the model — a lone chip with a
-                        "2" on it would be an address for something the model never sees. */}
-                    {activeConversation.attachedWorkspaces.map((workspace, position) => (
+                        without reaching the calls that turn is still making. */}
+                    {activeConversation.attachedWorkspaces.map((workspace) => (
                       <span
                         key={`${runEnvKey(workspace.machine)} ${workspace.path}`}
                         className="composer-chip composer-chip--static composer-chip--path"
@@ -10298,7 +10289,6 @@ function App() {
                       >
                         <GlassPlate />
                         <WorkspaceMachineIcon machine={workspace.machine} />
-                        <span className="composer-chip__index" aria-hidden="true">{position + activeProjectWorkspaceCount + 1}</span>
                         <PathText className="composer-chip__label" path={workspace.path} title={null} />
                         <button
                           type="button"

@@ -6,7 +6,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import zlib from "node:zlib";
 
 import {
@@ -14,6 +14,9 @@ import {
   AGENT_TARGETS,
   BLOB_HEADERS,
   CHANNEL_URL,
+  CLAUDE_AGENT_PLATFORM_PACKAGES,
+  CLAUDE_AGENT_RELEASE_KEY,
+  CLAUDE_AGENT_RELEASE_SCHEMA,
   DEFAULT_CHECK_TRIPLES,
   POINTER_HEADERS,
   agentFileNames,
@@ -26,12 +29,16 @@ import {
   blobPath,
   bucketKey,
   buildPointer,
+  claudeAgentReleaseDecision,
+  claudeAgentReleaseJson,
   claudeAgentSdkPin,
   compareVersions,
   describePointer,
   helloFrame,
+  isExactRelease,
   isPlainName,
   isRelativePath,
+  npmVersionUrl,
   ownAgentSource,
   ownAgentTriple,
   packFile,
@@ -49,11 +56,13 @@ import {
   publishDecision,
   selectAgentBuilds,
   shutdownFrame,
+  validateClaudeAgentRelease,
   validatePointer,
   validatePublishable,
   verifyBlob,
+  withinCaretRange,
 } from "../components-plan.mjs";
-import { checkChannel, describeEntry, httpGetText } from "../components-check.mjs";
+import { checkChannel, checkClaudeAgentRelease, checkNpmRelease, describeEntry, httpGetText, parseClaudeAgentRelease } from "../components-check.mjs";
 import { probeSidecar } from "../sidecar-probe.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -540,6 +549,117 @@ test("the agent platforms are listed once, for the builder and for the gate", ()
 });
 
 // ---------------------------------------------------------------------------
+// The Claude Agent SDK release the provider page offers
+
+test("claude-agent/version.json is a schema 1 document naming one exact release, written the way pointers are", () => {
+  assert.equal(CLAUDE_AGENT_RELEASE_KEY, "claude-agent/version.json");
+  assert.equal(CLAUDE_AGENT_RELEASE_SCHEMA, 1);
+  assert.equal(publicUrl(CLAUDE_AGENT_RELEASE_KEY), "https://dl.mewrk.dev/components/claude-agent/version.json");
+  assert.equal(bucketKey(CLAUDE_AGENT_RELEASE_KEY), "components/claude-agent/version.json");
+  assert.equal(claudeAgentReleaseJson("0.3.293"), '{\n  "schema": 1,\n  "sdkVersion": "0.3.293"\n}\n');
+  assert.equal(validateClaudeAgentRelease(JSON.parse(claudeAgentReleaseJson("10.20.30"))), "10.20.30");
+  // A document the app would refuse cannot be written.
+  for (const bad of ["0.3", "v0.3.293", " 0.3.293", "0.3.293 ", "0.3.293\n", "0.3.293-rc.1", "0.3.293+build.5", "0.3.0293", "00.3.293", "0.03.293", "1.2.3.4", "^0.3.293", "", "latest", 5, null, undefined]) {
+    assert.throws(() => claudeAgentReleaseJson(bad), /sdkVersion/u, String(bad));
+  }
+});
+
+test("the release document is checked the way the app reads it: schema 1, an exact release, nothing else", () => {
+  const ok = { schema: 1, sdkVersion: "0.3.293" };
+  assert.equal(validateClaudeAgentRelease(ok), "0.3.293");
+  assert.equal(validateClaudeAgentRelease({ sdkVersion: "1.0.0", schema: 1 }), "1.0.0");
+  assert.equal(validateClaudeAgentRelease({ schema: 1, sdkVersion: "0.0.0" }), "0.0.0");
+  const refused = (doc, pattern) => assert.throws(() => validateClaudeAgentRelease(doc), pattern, JSON.stringify(doc));
+  for (const doc of [null, undefined, "0.3.293", 5, true, [], [ok]]) refused(doc, /is not an object/u);
+  refused({ schema: 2, sdkVersion: "0.3.293" }, /schema 2, not 1/u);
+  refused({ schema: "1", sdkVersion: "0.3.293" }, /schema "1", not 1/u);
+  refused({ sdkVersion: "0.3.293" }, /schema undefined, not 1/u);
+  refused({ schema: 1 }, /sdkVersion undefined is not an exact release/u);
+  refused({ schema: 1, sdkVersion: 293 }, /sdkVersion 293 is not an exact release/u);
+  refused({ schema: 1, sdkVersion: null }, /sdkVersion null is not an exact release/u);
+  const notReleases = ["v0.3.293", "0.3.293-beta.1", "0.3.293-0", "0.3.293+sha.5", "0.3", "1", "0.3.293.1", "0.3.293 ", " 0.3.293", "0.3.293\n", "01.3.293", "0.03.293", "0.3.0293", "^0.3.293", "~0.3.293", ">=0.3.293", "*", "latest", "", "0.3.x"];
+  for (const sdkVersion of notReleases) refused({ schema: 1, sdkVersion }, /sdkVersion .* is not an exact release such as 0\.3\.293/u);
+  for (const sdkVersion of notReleases) assert.equal(isExactRelease(sdkVersion), false, JSON.stringify(sdkVersion));
+  for (const release of ["0.3.293", "0.0.0", "1.2.3", "10.20.30", "0.3.1000"]) assert.equal(isExactRelease(release), true, release);
+  refused({ schema: 1, sdkVersion: "0.3.293", channel: "beta" }, /unknown key "channel"/u);
+  refused({ schema: 1, sdkVersion: "0.3.293", a: 1, b: 2 }, /unknown keys "a", "b"/u);
+  refused({ schema: 1, sdkVersion: "0.3.293", version: "0.3.293" }, /unknown key "version"/u);
+});
+
+test("a release is inside ^pin the way npm's caret says: 0.x keeps its minor, 0.0.x is exact, 1.x keeps its major", () => {
+  const inside = (versions, pin) => versions.map((version) => withinCaretRange(version, pin));
+  assert.deepEqual(inside(["0.3.284", "0.3.285", "0.3.293", "0.3.1000"], "0.3.284"), [true, true, true, true]);
+  assert.deepEqual(inside(["0.3.283", "0.2.999", "0.4.0", "0.30.0", "1.0.0", "0.0.9"], "0.3.284"), [false, false, false, false, false, false]);
+  assert.deepEqual(inside(["0.0.3"], "0.0.3"), [true]);
+  assert.deepEqual(inside(["0.0.2", "0.0.4", "0.0.30", "0.1.3", "0.1.0", "1.0.3"], "0.0.3"), [false, false, false, false, false, false]);
+  assert.deepEqual(inside(["1.2.3", "1.2.4", "1.3.0", "1.10.0", "1.99.99"], "1.2.3"), [true, true, true, true, true]);
+  assert.deepEqual(inside(["1.2.2", "1.1.9", "2.0.0", "0.9.9", "10.2.3"], "1.2.3"), [false, false, false, false, false]);
+  for (const [version, pin] of [["0.3.293-rc.1", "0.3.284"], ["0.3.293", "^0.3.284"], ["v0.3.293", "0.3.284"], [undefined, "0.3.284"]]) {
+    assert.throws(() => withinCaretRange(version, pin), TypeError, `${version} ${pin}`);
+  }
+});
+
+test("a release is named only if it is exact, inside ^pin and not older than the one published; the one published is left alone", () => {
+  const decide = (requested, published, pin, force = false) => claudeAgentReleaseDecision({ requested, published, pin, force });
+
+  // Publishing: the first release, a newer one, the pin itself.
+  assert.deepEqual(decide("0.3.293", null, "0.3.284"), { action: "publish", reason: "the channel names no Claude Agent SDK release yet" });
+  assert.equal(decide("0.3.293", undefined, "0.3.284").action, "publish");
+  assert.deepEqual(decide("0.3.293", "0.3.290", "0.3.284"), { action: "publish", reason: "replacing 0.3.290 with 0.3.293" });
+  assert.equal(decide("0.3.1000", "0.3.999", "0.3.284").action, "publish", "numbers are compared as numbers");
+  assert.equal(decide("0.3.284", null, "0.3.284").action, "publish");
+  assert.equal(decide("1.4.0", "1.3.9", "1.2.3").action, "publish");
+
+  // Skipping: it is already there.
+  const skipped = decide("0.3.293", "0.3.293", "0.3.284");
+  assert.equal(skipped.action, "skip");
+  assert.match(skipped.reason, /already offers Claude Agent SDK 0\.3\.293 \(--force publishes it again\)/u);
+  assert.deepEqual(decide("0.3.293", "0.3.293", "0.3.284", true), { action: "publish", reason: "--force: publishing 0.3.293 again" });
+
+  // Older than the published release moves every provider page back.
+  assert.throws(() => decide("0.3.290", "0.3.293", "0.3.284"), /offers Claude Agent SDK 0\.3\.293, newer than 0\.3\.290.*move every provider page back.*--force/su);
+  assert.throws(() => decide("0.3.9", "0.3.10", "0.3.1"), /newer than 0\.3\.9/u, "9 is older than 10");
+  const downgrade = decide("0.3.290", "0.3.293", "0.3.284", true);
+  assert.equal(downgrade.action, "publish");
+  assert.equal(downgrade.reason, "--force: replacing 0.3.293 with 0.3.290; a downgrade from 0.3.293");
+
+  // Outside ^pin no host built from this tree could install it.
+  for (const requested of ["0.3.283", "0.4.0", "0.2.999", "1.0.0"]) {
+    assert.throws(() => decide(requested, null, "0.3.284"), /outside \^0\.3\.284: hosts built from this tree only take \^0\.3\.284.*--force/su, requested);
+    const forced = decide(requested, null, "0.3.284", true);
+    assert.equal(forced.action, "publish");
+    assert.match(forced.reason, /^--force: naming .*; .* is outside \^0\.3\.284/u);
+  }
+  for (const requested of ["0.0.2", "0.0.4", "0.1.0", "1.0.3"]) {
+    assert.throws(() => decide(requested, null, "0.0.3"), /outside \^0\.0\.3/u, requested);
+    assert.equal(decide(requested, null, "0.0.3", true).action, "publish");
+  }
+  assert.equal(decide("0.0.3", null, "0.0.3").action, "publish");
+  for (const requested of ["1.2.2", "2.0.0", "0.9.9"]) {
+    assert.throws(() => decide(requested, "1.2.3", "1.2.3"), /outside \^1\.2\.3/u, requested);
+    assert.equal(decide(requested, null, "1.2.3", true).action, "publish");
+  }
+  assert.equal(decide("1.9.0", "1.2.3", "1.2.3").action, "publish");
+  // Both reasons are named when --force overrides both.
+  assert.equal(
+    decide("0.4.0", "0.5.0", "0.3.284", true).reason,
+    "--force: replacing 0.5.0 with 0.4.0; 0.4.0 is outside ^0.3.284, which hosts built from this tree take; a downgrade from 0.5.0"
+  );
+  // The range is checked before the order.
+  assert.throws(() => decide("0.4.0", "0.5.0", "0.3.284"), /outside \^0\.3\.284/u);
+
+  // Anything but an exact release is refused, --force or not.
+  for (const requested of ["0.3.293-rc.1", "0.3.293+build.1", "v0.3.293", "0.3", " 0.3.293", "0.3.293\n", "latest", "^0.3.293", "", null, undefined, 3, {}]) {
+    for (const force of [false, true]) {
+      assert.throws(() => decide(requested, null, "0.3.284", force), /is not an exact release/u, `${String(requested)} force=${force}`);
+    }
+  }
+  assert.throws(() => decide("0.3.293", null, "^0.3.284"), /pin "\^0\.3\.284" is not an exact release/u);
+  assert.throws(() => decide("0.3.293", null, undefined), /pin undefined is not an exact release/u);
+  assert.throws(() => decide("0.3.293", "0.3.290-rc.1", "0.3.284", true), /on the channel .* is not an exact release/u);
+});
+
+// ---------------------------------------------------------------------------
 // The release gate
 
 function sidecarFor(triple, { protocol = 17, version = "1.2.4" } = {}) {
@@ -575,6 +695,7 @@ function completeChannel() {
   const held = {};
   for (const triple of DEFAULT_CHECK_TRIPLES) held[aisdkPointerKey(17, triple)] = sidecarFor(triple);
   for (const triple of AGENT_TARGETS) held[agentPointerKey(SOURCE, triple)] = agentFor(triple);
+  held[CLAUDE_AGENT_RELEASE_KEY] = claudeAgentReleaseJson("0.3.293");
   return held;
 }
 
@@ -583,21 +704,23 @@ test("the gate wants this protocol's sidecar on each platform and this source's 
   const result = await checkChannel({ protocol: 17, aisdkTriples: [...DEFAULT_CHECK_TRIPLES], source: SOURCE, fetchText });
   assert.deepEqual(result.missing, []);
   assert.equal(result.agentsChecked, true);
-  assert.deepEqual(result.entries.map((entry) => entry.key), [...sidecarKeys(DEFAULT_CHECK_TRIPLES), ...agentKeys()]);
-  assert.ok(result.entries.every((entry) => entry.ok && entry.problem === null && entry.pointer));
-  assert.deepEqual([...asked].sort(), [...sidecarKeys(DEFAULT_CHECK_TRIPLES), ...agentKeys()].map(publicUrl).sort());
+  // The release document is looked at last, and is not a pointer.
+  assert.deepEqual(result.entries.map((entry) => entry.key), [...sidecarKeys(DEFAULT_CHECK_TRIPLES), ...agentKeys(), CLAUDE_AGENT_RELEASE_KEY]);
+  assert.ok(result.entries.every((entry) => entry.ok && entry.problem === null && (entry.pointer || entry.component === "claude-agent")));
+  assert.deepEqual([...asked].sort(), [...sidecarKeys(DEFAULT_CHECK_TRIPLES), ...agentKeys(), CLAUDE_AGENT_RELEASE_KEY].map(publicUrl).sort());
   assert.equal(publicUrl(sidecarKeys([WINDOWS])[0]), "https://dl.mewrk.dev/components/aisdk/p17/x86_64-pc-windows-msvc.json");
   assert.equal(
     describeEntry(result.entries[0]),
     `aisdk ${WINDOWS}: ${describePointer(result.entries[0].pointer)}, protocol 17, Claude Agent SDK 0.3.284`
   );
   assert.match(describeEntry(result.entries[2]), /^remote-agent x86_64-unknown-linux-musl: build [0-9a-f]{12} .*, agent source 555555555555$/u);
+  assert.equal(describeEntry(result.entries.at(-1)), "claude-agent version.json: Claude Agent SDK 0.3.293");
 
   // The platforms asked for are the caller's, and another protocol generation is another key.
   const other = fakeChannel({ [aisdkPointerKey(16, LINUX)]: sidecarFor(LINUX, { protocol: 16 }) });
   const looked = await checkChannel({ protocol: 17, aisdkTriples: [LINUX], source: null, fetchText: other.fetchText });
-  assert.deepEqual(other.asked, [publicUrl(aisdkPointerKey(17, LINUX))]);
-  assert.equal(looked.missing.length, 1);
+  assert.deepEqual(other.asked.sort(), [publicUrl(aisdkPointerKey(17, LINUX)), publicUrl(CLAUDE_AGENT_RELEASE_KEY)].sort());
+  assert.deepEqual(looked.missing.map((entry) => entry.key), [aisdkPointerKey(17, LINUX), CLAUDE_AGENT_RELEASE_KEY]);
 });
 
 test("the gate lists what is missing, unreadable or not a pointer the app would take", async () => {
@@ -607,22 +730,25 @@ test("the gate lists what is missing, unreadable or not a pointer the app would 
   held[agentPointerKey(SOURCE, "x86_64-apple-darwin")] = { status: 503 };
   held[agentPointerKey(SOURCE, "aarch64-apple-darwin")] = "<html>sign in</html>";
   held[agentPointerKey(SOURCE, "aarch64-pc-windows-msvc")] = new Error("socket hang up");
+  delete held[CLAUDE_AGENT_RELEASE_KEY];
   const { fetchText } = fakeChannel(held);
   const result = await checkChannel({ protocol: 17, aisdkTriples: [...DEFAULT_CHECK_TRIPLES], source: SOURCE, fetchText });
-  assert.equal(result.entries.length, 8);
-  const problems = Object.fromEntries(result.missing.map((entry) => [`${entry.component}/${entry.triple}`, entry.problem]));
+  assert.equal(result.entries.length, 9);
+  const problems = Object.fromEntries(result.missing.map((entry) => [`${entry.component}/${entry.triple ?? "version.json"}`, entry.problem]));
   assert.deepEqual(problems, {
     "aisdk/aarch64-apple-darwin": "missing (HTTP 404)",
     "remote-agent/aarch64-unknown-linux-musl": "missing (HTTP 403)",
     "remote-agent/x86_64-apple-darwin": "could not be read: HTTP 503",
     "remote-agent/aarch64-apple-darwin": "the answer is not JSON",
     "remote-agent/aarch64-pc-windows-msvc": "could not be read: socket hang up",
+    "claude-agent/version.json": "missing (HTTP 404)",
   });
   assert.ok(result.missing.every((entry) => !entry.ok && entry.pointer === null));
   assert.equal(
     describeEntry(result.missing[0]),
     "aisdk aarch64-apple-darwin: missing (HTTP 404) - https://dl.mewrk.dev/components/aisdk/p17/aarch64-apple-darwin.json"
   );
+  assert.equal(describeEntry(result.missing.at(-1)), "claude-agent version.json: missing (HTTP 404) - https://dl.mewrk.dev/components/claude-agent/version.json");
 });
 
 test("the gate refuses a pointer that is for another protocol, platform, source or lacks a file", async () => {
@@ -648,10 +774,112 @@ test("without an agent source the gate checks the sidecars only and says the age
   const { fetchText, asked } = fakeChannel(completeChannel());
   const result = await checkChannel({ protocol: 17, aisdkTriples: [...DEFAULT_CHECK_TRIPLES], source: null, fetchText });
   assert.equal(result.agentsChecked, false);
-  assert.equal(result.entries.length, 2);
+  assert.equal(result.entries.length, 3);
   assert.deepEqual(result.missing, []);
-  assert.equal(asked.length, 2);
-  assert.ok(asked.every((url) => url.includes("/aisdk/")));
+  assert.equal(asked.length, 3);
+  assert.ok(asked.every((url) => url.includes("/aisdk/") || url === publicUrl(CLAUDE_AGENT_RELEASE_KEY)));
+});
+
+test("the gate reads the release document: OK with its version, missing or invalid otherwise", async () => {
+  const read = async (value) => checkClaudeAgentRelease(fakeChannel({ [CLAUDE_AGENT_RELEASE_KEY]: value }).fetchText);
+  const url = publicUrl(CLAUDE_AGENT_RELEASE_KEY);
+
+  const ok = await read(claudeAgentReleaseJson("0.3.293"));
+  assert.deepEqual(
+    { component: ok.component, triple: ok.triple, key: ok.key, url: ok.url, ok: ok.ok, state: ok.state, problem: ok.problem, version: ok.version },
+    { component: "claude-agent", triple: null, key: CLAUDE_AGENT_RELEASE_KEY, url, ok: true, state: "ok", problem: null, version: "0.3.293" }
+  );
+  assert.equal(describeEntry(ok), "claude-agent version.json: Claude Agent SDK 0.3.293");
+
+  const notAnObject = "not a valid release document: the Claude Agent SDK release document is not an object";
+  const cases = [
+    [undefined, "missing", "missing (HTTP 404)"],
+    [{ status: 403 }, "missing", "missing (HTTP 403)"],
+    [{ status: 503 }, "unreadable", "could not be read: HTTP 503"],
+    [{ status: 302 }, "unreadable", "could not be read: HTTP 302"],
+    [new Error("socket hang up"), "unreadable", "could not be read: socket hang up"],
+    ["<html>sign in</html>", "invalid", "the answer is not JSON"],
+    ["", "invalid", "the answer is not JSON"],
+    ["null", "invalid", notAnObject],
+    ["[]", "invalid", notAnObject],
+    ['{"schema":2,"sdkVersion":"0.3.293"}', "invalid", "not a valid release document: the Claude Agent SDK release document has schema 2, not 1"],
+    ['{"sdkVersion":"0.3.293"}', "invalid", "not a valid release document: the Claude Agent SDK release document has schema undefined, not 1"],
+    ['{"schema":1}', "invalid", /^not a valid release document: .*sdkVersion undefined is not an exact release/u],
+    ['{"schema":1,"sdkVersion":"0.3.0293"}', "invalid", /sdkVersion "0\.3\.0293" is not an exact release/u],
+    ['{"schema":1,"sdkVersion":"0.3.293-rc.1"}', "invalid", /sdkVersion "0\.3\.293-rc\.1" is not an exact release/u],
+    ['{"schema":1,"sdkVersion":"v0.3.293"}', "invalid", /sdkVersion "v0\.3\.293" is not an exact release/u],
+    ['{"schema":1,"sdkVersion":" 0.3.293"}', "invalid", /is not an exact release/u],
+    ['{"schema":1,"sdkVersion":293}', "invalid", /sdkVersion 293 is not an exact release/u],
+    ['{"schema":1,"sdkVersion":"0.3.293","note":"beta"}', "invalid", /unknown key "note"/u],
+  ];
+  for (const [value, state, problem] of cases) {
+    const entry = await read(value);
+    const label = typeof value === "string" ? value : String(value?.message ?? JSON.stringify(value));
+    assert.equal(entry.ok, false, label);
+    assert.equal(entry.state, state, label);
+    assert.equal(entry.version, null, label);
+    assert.equal(entry.pointer, null, label);
+    if (problem instanceof RegExp) assert.match(entry.problem, problem, label);
+    else assert.equal(entry.problem, problem, label);
+    assert.equal(describeEntry(entry), `claude-agent version.json: ${entry.problem} - ${url}`, label);
+  }
+
+  // The text on its own, as the publisher reads --out with it.
+  assert.deepEqual(parseClaudeAgentRelease(claudeAgentReleaseJson("0.3.293")), { version: "0.3.293", problem: null });
+  assert.deepEqual(parseClaudeAgentRelease("{"), { version: null, problem: "the answer is not JSON" });
+  assert.match(parseClaudeAgentRelease('{"schema":1,"sdkVersion":"1.0"}').problem, /^not a valid release document: /u);
+});
+
+test("a missing or invalid release document alone fails the gate, whatever the pointers say", async () => {
+  const run = async (override) => {
+    const held = { ...completeChannel(), ...override };
+    return checkChannel({ protocol: 17, aisdkTriples: [...DEFAULT_CHECK_TRIPLES], source: SOURCE, fetchText: fakeChannel(held).fetchText });
+  };
+  assert.deepEqual((await run({})).missing, []);
+  for (const bad of ['{"schema":1,"sdkVersion":"0.3.293-rc.1"}', '{"schema":3,"sdkVersion":"0.3.293"}', "gone", { status: 500 }, undefined]) {
+    const result = await run({ [CLAUDE_AGENT_RELEASE_KEY]: bad });
+    assert.deepEqual(result.missing.map((entry) => entry.key), [CLAUDE_AGENT_RELEASE_KEY], JSON.stringify(bad));
+    assert.equal(result.entries.length, 9);
+  }
+});
+
+test("npm must have the SDK and the CLI package of each release platform at the requested version", async () => {
+  assert.deepEqual([...CLAUDE_AGENT_PLATFORM_PACKAGES], ["@anthropic-ai/claude-agent-sdk-win32-x64", "@anthropic-ai/claude-agent-sdk-darwin-arm64"]);
+  assert.equal(npmVersionUrl("@anthropic-ai/claude-agent-sdk", "0.3.293"), "https://registry.npmjs.org/@anthropic-ai%2fclaude-agent-sdk/0.3.293");
+  assert.equal(npmVersionUrl("@anthropic-ai/claude-agent-sdk-win32-x64", "0.3.293"), "https://registry.npmjs.org/@anthropic-ai%2fclaude-agent-sdk-win32-x64/0.3.293");
+
+  const packages = ["@anthropic-ai/claude-agent-sdk", ...CLAUDE_AGENT_PLATFORM_PACKAGES];
+  const urls = packages.map((name) => npmVersionUrl(name, "0.3.293"));
+  const found = (name, version = "0.3.293") => ({ status: 200, text: JSON.stringify({ name, version, dist: { tarball: "x" } }) });
+  const registry = (answers) => {
+    const asked = [];
+    const fetchText = async (url) => {
+      asked.push(url);
+      const answer = answers[url];
+      if (answer instanceof Error) throw answer;
+      return answer ?? { status: 404, text: '{"error":"version not found: 0.3.293"}' };
+    };
+    return { fetchText, asked };
+  };
+  const everything = Object.fromEntries(packages.map((name, index) => [urls[index], found(name)]));
+
+  const complete = registry(everything);
+  assert.deepEqual(await checkNpmRelease("0.3.293", complete.fetchText), { checked: packages, problems: [] });
+  assert.deepEqual([...complete.asked].sort(), [...urls].sort());
+
+  const problemsOf = async (answers) => (await checkNpmRelease("0.3.293", registry(answers).fetchText)).problems;
+  assert.match(
+    (await problemsOf({ ...everything, [urls[0]]: undefined }))[0],
+    /^npm has no @anthropic-ai\/claude-agent-sdk 0\.3\.293 \(https:\/\/registry\.npmjs\.org\/@anthropic-ai%2fclaude-agent-sdk\/0\.3\.293\)$/u
+  );
+  assert.match((await problemsOf({ ...everything, [urls[1]]: undefined }))[0], /^npm has no @anthropic-ai\/claude-agent-sdk-win32-x64 0\.3\.293/u);
+  assert.match((await problemsOf({ ...everything, [urls[2]]: undefined }))[0], /^npm has no @anthropic-ai\/claude-agent-sdk-darwin-arm64 0\.3\.293/u);
+  assert.match((await problemsOf({ ...everything, [urls[2]]: { status: 502, text: "bad gateway" } }))[0], /darwin-arm64 0\.3\.293 could not be looked up on npm: HTTP 502/u);
+  assert.match((await problemsOf({ ...everything, [urls[1]]: new Error("socket hang up") }))[0], /win32-x64 0\.3\.293 could not be looked up on npm: socket hang up/u);
+  assert.match((await problemsOf({ ...everything, [urls[0]]: { status: 200, text: "<html>" } }))[0], /npm's answer for @anthropic-ai\/claude-agent-sdk 0\.3\.293 is not JSON/u);
+  assert.match((await problemsOf({ ...everything, [urls[0]]: found(packages[0], "0.3.292") }))[0], /is for version "0\.3\.292"/u);
+  assert.match((await problemsOf({ ...everything, [urls[0]]: { status: 200, text: "{}" } }))[0], /is for version undefined/u);
+  assert.equal((await problemsOf({})).length, 3, "all three are reported at once");
 });
 
 // ---------------------------------------------------------------------------
@@ -730,4 +958,122 @@ test("the command line has the release gate and --no-probe, and refuses what doe
   fails([], /nothing to publish: pass --aisdk and\/or --remote-agents \(or --check\)/u);
   // A platform that is nobody's computer cannot be started here, so it is not published without --no-probe.
   fails(["--aisdk", "--dry-run", "--triple", "riscv64gc-unknown-none-elf"], /cannot be started on this computer.*needs an explicit --no-probe/su);
+});
+
+test("--claude-agent-sdk is in the usage and refuses what does not fit together", () => {
+  const help = publishCli("--help");
+  assert.equal(help.status, 0);
+  assert.ok(help.out.includes("--claude-agent-sdk <version>"));
+  assert.ok(help.out.includes("claude-agent/version.json"));
+
+  const fails = (args, pattern) => {
+    const run = publishCli(...args);
+    assert.equal(run.status, 1, `${args.join(" ")}\n${run.out}`);
+    assert.match(run.out, pattern, args.join(" "));
+  };
+  fails(["--claude-agent-sdk"], /--claude-agent-sdk needs a value/u);
+  fails(["--claude-agent-sdk", "--dry-run"], /--claude-agent-sdk needs a value/u);
+  for (const version of ["v0.3.293", "0.3", "0.3.293-rc.1", "0.3.293+1", "latest", "^0.3.293", "0.3.0293"]) {
+    fails(["--claude-agent-sdk", version, "--dry-run"], /--claude-agent-sdk needs an exact release such as 0\.3\.293/u);
+  }
+  fails(["--claude-agent-sdk", "0.3.293", "--claude-agent-sdk", "0.3.294"], /--claude-agent-sdk can be given once/u);
+  fails(["--check", "--claude-agent-sdk", "0.3.293"], /--check only looks at the channel and cannot be combined with --claude-agent-sdk/u);
+  fails(["--claude-agent-sdk", "0.3.293", "--triple", WINDOWS], /--triple is about the sidecar and the agents: it needs --aisdk or --remote-agents/u);
+  fails(["--claude-agent-sdk", "0.3.293", "--no-probe"], /--no-probe is about the sidecar: it needs --aisdk/u);
+  fails([], /nothing to publish: .*--claude-agent-sdk <version>/u);
+});
+
+// A stand-in for the network, loaded into the publisher with --import: npm has what STUB_NPM lists
+// ("<package>@<version>,..."), the channel's release document is STUB_CHANNEL when set (else a 404),
+// and any other request is an error, so a run that must not touch the network is shown not to.
+const STUB_FETCH = String.raw`
+const npm = new Set((process.env.STUB_NPM ?? "").split(",").filter(Boolean));
+globalThis.fetch = async (input) => {
+  const url = String(input);
+  const found = /^https:\/\/registry\.npmjs\.org\/(@anthropic-ai%2f[^/]+)\/([^/]+)$/u.exec(url);
+  if (found) {
+    const name = decodeURIComponent(found[1]);
+    return npm.has(name + "@" + found[2]) ? new Response(JSON.stringify({ name, version: found[2] })) : new Response("{}", { status: 404 });
+  }
+  if (url === "https://dl.mewrk.dev/components/claude-agent/version.json" && process.env.STUB_CHANNEL !== undefined) return new Response(process.env.STUB_CHANNEL);
+  if (url.startsWith("https://dl.mewrk.dev/components/")) return new Response("", { status: 404 });
+  throw new Error("unexpected request " + url);
+};
+`;
+
+test("--claude-agent-sdk asks npm, then writes, skips or refuses claude-agent/version.json (--out and --dry-run, no sidecar, no credentials)", (context) => {
+  const pin = claudeAgentSdkPin(fs.readFileSync(path.join(root, "aisdk-service", "package.json"), "utf8"));
+  const [major, minor, patch] = pin.split(".").map(Number);
+  const newer = `${major}.${minor}.${patch + 1}`;
+  const outside = `${major + 1}.0.0`;
+  if (!withinCaretRange(newer, pin)) return context.skip(`pin ${pin} takes no newer release, so there is no newer one to publish`);
+
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "mewrk-claude-release-"));
+  context.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const stub = path.join(scratch, "stub-fetch.mjs");
+  fs.writeFileSync(stub, STUB_FETCH);
+  const has = (...versions) => versions.flatMap((version) => ["@anthropic-ai/claude-agent-sdk", ...CLAUDE_AGENT_PLATFORM_PACKAGES].map((name) => `${name}@${version}`)).join(",");
+  const run = (env, ...args) => {
+    const done = spawnSync(process.execPath, ["--import", pathToFileURL(stub).href, path.join(root, "scripts", "publish-components.mjs"), ...args], {
+      encoding: "utf8",
+      timeout: 60_000,
+      env: { ...process.env, CLOUDFLARE_API_TOKEN: "", CLOUDFLARE_ACCOUNT_ID: "", CLOUDFLARE_ZONE_ID: "", STUB_NPM: "", ...env },
+    });
+    return { status: done.status, out: `${done.stdout}${done.stderr}` };
+  };
+  const out = path.join(scratch, "channel");
+  const document = path.join(out, "claude-agent", "version.json");
+  const written = () => (fs.existsSync(document) ? fs.readFileSync(document, "utf8") : null);
+  const expectOk = (result, pattern) => {
+    assert.equal(result.status, 0, result.out);
+    assert.match(result.out, pattern, result.out);
+  };
+  const expectFail = (result, pattern) => {
+    assert.equal(result.status, 1, result.out);
+    assert.match(result.out, pattern, result.out);
+  };
+
+  // A first release goes under --out as the exact body, after npm was asked about all three packages.
+  const first = run({ STUB_NPM: has(pin, newer) }, "--claude-agent-sdk", newer, "--out", out);
+  expectOk(first, /wrote claude-agent\/version\.json \(Claude Agent SDK /u);
+  assert.ok(first.out.includes(`npm has @anthropic-ai/claude-agent-sdk@${newer}, ${CLAUDE_AGENT_PLATFORM_PACKAGES.map((name) => `${name}@${newer}`).join(", ")}`), first.out);
+  assert.equal(written(), claudeAgentReleaseJson(newer));
+  assert.deepEqual(fs.readdirSync(out), ["claude-agent"], "nothing but the document is written");
+  assert.deepEqual(fs.readdirSync(path.dirname(document)), ["version.json"], "no partial file is left");
+
+  // The same release again is left alone; --force writes it again.
+  expectOk(run({ STUB_NPM: has(newer) }, "--claude-agent-sdk", newer, "--out", out), /skipping claude-agent\/version\.json: the channel already offers Claude Agent SDK /u);
+  expectOk(run({ STUB_NPM: has(newer) }, "--claude-agent-sdk", newer, "--out", out, "--force"), /--force: publishing .* again/u);
+
+  // An older release is refused, and --force names the downgrade.
+  expectFail(run({ STUB_NPM: has(pin) }, "--claude-agent-sdk", pin, "--out", out), /newer than .*move every provider page back/su);
+  assert.equal(written(), claudeAgentReleaseJson(newer));
+  expectOk(run({ STUB_NPM: has(pin) }, "--claude-agent-sdk", pin, "--out", out, "--force"), /--force: replacing .*a downgrade from /u);
+  assert.equal(written(), claudeAgentReleaseJson(pin));
+
+  // One outside ^pin is refused, even though npm has it.
+  expectFail(run({ STUB_NPM: has(outside) }, "--claude-agent-sdk", outside, "--out", out), /outside \^.*hosts built from this tree only take/su);
+  assert.equal(written(), claudeAgentReleaseJson(pin));
+
+  // npm lacking one of the three packages stops the run before anything is written.
+  const fresh = path.join(scratch, "fresh");
+  const lacking = has(newer).split(",").filter((entry) => !entry.includes("darwin-arm64")).join(",");
+  expectFail(run({ STUB_NPM: lacking }, "--claude-agent-sdk", newer, "--out", fresh), /npm has no @anthropic-ai\/claude-agent-sdk-darwin-arm64 /u);
+  expectFail(run({ STUB_NPM: "" }, "--claude-agent-sdk", newer, "--out", fresh), /not on npm as the app needs it/u);
+  assert.equal(fs.existsSync(fresh), false);
+
+  // A document under --out that is no release document stops the run, unless --force replaces it.
+  fs.writeFileSync(document, '{"schema":1,"sdkVersion":"0.3.0293"}\n');
+  expectFail(run({ STUB_NPM: has(newer) }, "--claude-agent-sdk", newer, "--out", out), /not a valid release document.*pass --force/su);
+  expectOk(run({ STUB_NPM: has(newer) }, "--claude-agent-sdk", newer, "--out", out, "--force"), /--force: not relying on the release document/u);
+  assert.equal(written(), claudeAgentReleaseJson(newer));
+
+  // A dry run reads the public channel (a 404 is "none yet"), prints the body and writes nothing.
+  const dry = run({ STUB_NPM: has(newer) }, "--claude-agent-sdk", newer, "--dry-run");
+  expectOk(dry, /would publish claude-agent\/version\.json:\n\{\n  "schema": 1,\n  "sdkVersion": "/u);
+  assert.match(dry.out, /dry run complete; nothing was written/u);
+  expectOk(run({ STUB_NPM: has(newer), STUB_CHANNEL: claudeAgentReleaseJson(newer) }, "--claude-agent-sdk", newer, "--dry-run"), /skipping claude-agent\/version\.json/u);
+  expectFail(run({ STUB_NPM: has(pin), STUB_CHANNEL: claudeAgentReleaseJson(newer) }, "--claude-agent-sdk", pin, "--dry-run"), /newer than /u);
+  expectFail(run({ STUB_NPM: has(newer), STUB_CHANNEL: "<html>sign in</html>" }, "--claude-agent-sdk", newer, "--dry-run"), /the answer is not JSON/u);
+  expectOk(run({ STUB_NPM: has(newer), STUB_CHANNEL: "<html>sign in</html>" }, "--claude-agent-sdk", newer, "--dry-run", "--force"), /would publish claude-agent\/version\.json/u);
 });

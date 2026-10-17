@@ -37,7 +37,53 @@
 //! protocol, and `box` is declared from a conversation's first request on, so
 //! an instruction always has a place at its point.
 
-use crate::model::{ProviderFamily, RunModelRequest};
+use crate::model::{ContextItem, HostMessageContainer, ProviderFamily, RunModelRequest};
+
+/// The topic of the appended system prompt that says how the host's messages
+/// and background results arrive (`system.host_messages`), for a conversation
+/// whose own system prompt does not say it (`system_append::card`).
+pub(crate) const HOST_MESSAGES_TOPIC: &str = "host-messages";
+/// The same as a host notice, where the model or endpoint takes no system
+/// message mid-conversation ([`InstructionCarrier::HostMessage`]).
+pub(crate) const HOST_MESSAGES_NOTICE_KIND: &str = "host_messages";
+
+/// The `system.host_messages` text this request still owes the model, if any.
+///
+/// The section belongs to the system prompt of a run that holds a tool able to
+/// start a background task (`agents::TASK_PRODUCING_TOOL_NAMES`) and gets the
+/// host's messages as user messages. A prompt assembled without such a tool
+/// leaves it out (`ConversationToolLock::prompt_task_tools`), and cannot take it
+/// later without rewriting what every earlier round answered — so a producer
+/// enabled after the prompt opened brings the section with it, as an
+/// instruction at the round it is first offered. A child holding a producer
+/// under such a prompt is owed it at its own first round, against its own
+/// transcript. Once told, in either carrier, the transcript carries it.
+pub(crate) fn host_messages_owed<'a>(
+    request: &RunModelRequest,
+    delivered: impl IntoIterator<Item = &'a ContextItem>,
+) -> Option<String> {
+    if request.host_messages_in_prompt
+        || request.host_message_container != HostMessageContainer::User
+        || !request
+            .enabled_tools
+            .iter()
+            .any(|name| crate::agents::produces_tasks(name))
+    {
+        return None;
+    }
+    let tells = |context: &ContextItem| {
+        crate::system_append::topic(context) == Some(HOST_MESSAGES_TOPIC)
+            || crate::wire_history::host_notice_kind(context) == Some(HOST_MESSAGES_NOTICE_KIND)
+    };
+    if request.contexts.iter().any(tells) || delivered.into_iter().any(tells) {
+        return None;
+    }
+    let text = request
+        .prompt_profile
+        .text(crate::prompt_profile::PromptKey::SystemHostMessages)
+        .trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
 
 /// Whether `base_url` is the vendor's own endpoint for `family`: Anthropic's
 /// API for Anthropic Messages, OpenAI's or Azure's for the OpenAI protocols.

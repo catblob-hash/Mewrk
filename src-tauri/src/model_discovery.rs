@@ -6,9 +6,11 @@
 //!   `anthropic-version`, and `?limit=1000`.
 //! - The ChatGPT Codex backend uses `GET {base}/models?client_version=…` with
 //!   the OAuth session's Bearer token and `chatgpt-account-id`.
-//! - Claude Agent asks the bundled Claude Code for its own model picker
-//!   directly, over the CLI's control protocol; there is no HTTP catalog behind
-//!   a local CLI, and the sidecar is not involved.
+//! - Claude Agent asks the installed Claude Code for its model picker directly,
+//!   over the CLI's control protocol: for a claude.ai login, the list
+//!   Anthropic's model selector serves the account, fetched by the CLI with the
+//!   user's own login (Mewrk holds no credential to ask with); the sidecar is
+//!   not involved.
 //! - Other providers use `GET {base}/models` and an OpenAI-compatible envelope.
 //!
 //! Every list is the upstream's current state and drifts with it: a new model
@@ -308,11 +310,13 @@ fn open_ai_compatible_as(
     openai_items(&value)
 }
 
-/// The bundled Claude Code's model picker under the user's current login.
+/// The installed Claude Code's model picker under the user's current login.
 ///
-/// The CLI resolves the list against that login, so it changes when the user
-/// switches accounts or the bundled CLI learns a new model; that is the intended
-/// behaviour. The host asks the CLI itself ([`crate::aisdk::agent::list_models`]).
+/// The CLI takes the list from Anthropic's model selector for that login (its
+/// compiled list only where the selector is off: an API key, no network), so it
+/// changes when the user switches accounts or the account is offered a new
+/// model; that is the intended behaviour. The host asks the CLI itself
+/// ([`crate::aisdk::agent::list_models`]).
 fn claude_agent() -> Result<Vec<Fetched>, String> {
     Ok(claude_agent_rows(crate::aisdk::agent::list_models()?))
 }

@@ -760,8 +760,8 @@ fn run_tool(
         ),
         // Orchestration tools run inside the host model loop only. Every direct
         // execution path rejects these names instead of faking a success.
-        "subagent" | "ask_user" | "fork" | "todo" | "workflow" | "workflow_step" | "TaskCreate"
-        | "TaskUpdate" | "TaskGet" | "TaskList" => {
+        "subagent" | "ask_user" | "fork" | "todo" | "workflow" | "workflow_step" | "send_message"
+        | "TaskCreate" | "TaskUpdate" | "TaskGet" | "TaskList" => {
             Err(format!(
                 "Orchestration tool {} can only be executed by the in-app model run loop",
                 request.tool_name
@@ -6925,6 +6925,11 @@ mod tests {
                 json!({"script": "export const meta = { name: \"x\", description: \"d\" }\nreturn 1"}),
             ),
             ("workflow_step", json!({"step": "step-1"})),
+            // The main agent's message to a child: it needs a live run's pool.
+            (
+                "send_message",
+                json!({"to": "reviewer", "message": "go on"}),
+            ),
             ("todo", json!({"items": []})),
             (
                 "TaskCreate",

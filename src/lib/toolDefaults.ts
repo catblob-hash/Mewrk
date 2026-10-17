@@ -39,6 +39,7 @@ const englishParameterLabels: Record<string, string> = {
   line: "Line",
   lines: "Line limit",
   max_results: "Maximum results",
+  message: "Message",
   name: "Name",
   new_text: "New text",
   none: "Empty argument",
@@ -66,10 +67,12 @@ const englishParameterLabels: Record<string, string> = {
   serverId: "Server ID",
   start_line: "Start line",
   styles: "CSS properties",
+  summary: "Summary",
   task: "Task address",
   tasks: "Tasks",
   timeout: "Timeout (ms)",
   timeout_seconds: "Timeout (seconds)",
+  to: "Child agent",
   token_budget: "Token budget",
   uid: "Element uid",
   urls: "URLs",
@@ -200,6 +203,8 @@ const englishParameterHelp: Record<string, string> = {
     "One sentence describing what this handoff note holds. It is written into the handoff index.",
   "修改后这份交接文档的一句话说明，会刷新交接索引里的对应条目":
     "One sentence describing this handoff note after the change. It refreshes the note's entry in the handoff index.",
+  "agent_spawn 时起的名字": "Name the child was spawned with.",
+  "时间线上显示的 5–10 词预览": "Optional 5–10 word preview shown on the timeline.",
   "始终为空数组": "Always an empty list."
 };
 
@@ -215,6 +220,8 @@ const englishParameterPlaceholders: Record<string, string> = {
   "测试必须用项目自带环境运行": "Tests must run in the project's own environment",
   "调查 src/ 下的路由结构并总结关键文件": "Inspect routing under src/ and summarize the key files",
   "调查路由": "Inspect routing",
+  "改用 v2 接口再试一次，并报告结果": "Retry with the v2 endpoint and report the result",
+  "改用 v2 接口重试": "Retry with the v2 endpoint",
   "在分叉出的会话里要完成的任务": "The task to complete in the forked conversation",
   "[{\"question\":\"采用哪个方案？\",\"header\":\"实现方案\",\"options\":[{\"label\":\"方案 A\",\"description\":\"保持改动最小\"},{\"label\":\"方案 B\",\"description\":\"完整重构\"}],\"multiSelect\":false}]":
     "[{\"question\":\"Which approach should I use?\",\"header\":\"Approach\",\"options\":[{\"label\":\"Approach A\",\"description\":\"Keep the change small\"},{\"label\":\"Approach B\",\"description\":\"Perform a full rewrite\"}],\"multiSelect\":false}]"
@@ -258,6 +265,7 @@ const englishToolLabels: Record<string, string> = {
   task_wait: "Wait for tasks",
   task_list: "List tasks",
   task_stop: "Stop a task",
+  send_message: "Send message",
   box: "Background result",
   read_global_memory: "Read global memory",
   read_project_memory: "Read project memory",

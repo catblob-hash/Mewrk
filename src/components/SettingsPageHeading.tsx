@@ -9,7 +9,7 @@ export function SettingsPageHeading({
   action
 }: {
   title?: React.ReactNode;
-  description: string;
+  description: React.ReactNode;
   action?: React.ReactNode;
 }) {
   return (

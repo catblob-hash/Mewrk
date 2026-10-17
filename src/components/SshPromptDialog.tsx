@@ -82,8 +82,8 @@ export function SshPromptDialog({
           <ShieldQuestion size={15} />
           <span>
             {t(
-              "接受的密钥会加入 ~/.ssh/known_hosts。以后这台机器出示的密钥若与它不同，Mewrk 一律拒绝连接。",
-              "An accepted key is added to ~/.ssh/known_hosts. If the machine ever presents a different key, Mewrk refuses to connect."
+              "接受后记入 ~/.ssh/known_hosts；密钥日后变化会被拒绝。",
+              "Saved to ~/.ssh/known_hosts; a changed key is refused."
             )}
           </span>
         </div>
@@ -138,8 +138,8 @@ export function SshPromptDialog({
           <KeyRound size={15} />
           <span>
             {t(
-              "Mewrk 只把它保存在内存里，直到退出，用于再次连接这台机器；不会写入磁盘。",
-              "Mewrk keeps it in memory only, until it quits, to connect to this machine again; it is never written to disk."
+              "只留在内存里，直到退出 Mewrk；不写入磁盘。",
+              "Kept in memory until Mewrk quits; never written to disk."
             )}
           </span>
         </div>

@@ -115,9 +115,11 @@ describe("App — a path the transcript names", () => {
     expect(within(menu).getByText("在哪个工作区打开")).toBeInTheDocument();
     const choices = within(menu).getAllByRole("menuitem");
     expect(choices.map((choice) => choice.textContent)).toEqual([
-      `C:\\test\\Mewrk${LOCAL_ROOT}/src/main.rs1`,
-      "/srv/appdev@100.88.12.34:/srv/app/src/main.rs2"
+      `C:\\test\\Mewrk${LOCAL_ROOT}/src/main.rs`,
+      "/srv/appdev@100.88.12.34:/srv/app/src/main.rs"
     ]);
+    // Workspaces are told apart by their paths, not by a number beside each.
+    expect(menu.querySelector(".popover-menu__hint")).toBeNull();
     expect(browse.probe).toHaveBeenCalledWith([
       { machine: null, path: `${LOCAL_ROOT}/src/main.rs` },
       { machine: ubuntu, path: "/srv/app/src/main.rs" }

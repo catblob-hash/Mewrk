@@ -334,7 +334,10 @@ describe("ClaudeAgentLoginPanel", () => {
 
     expect(await screen.findByText(signedOut.loginCommand)).toBeInTheDocument();
     expect(screen.queryByText("claude auth login")).not.toBeInTheDocument();
-    expect(screen.getByText(/两者共用同一份登录/u)).toBeInTheDocument();
+    expect(screen.getByText(/复制命令到任意终端运行/u)).toBeInTheDocument();
+    // The detail the short line leaves out is one link away on the site.
+    expect(screen.getByRole("link", { name: "详情" }))
+      .toHaveAttribute("href", "https://mewrk.dev/zh-CN/providers.html#claude-agent");
     await user.click(screen.getByRole("button", { name: "打开终端登录" }));
     await waitFor(() => expect(runtimeMocks.claudeAgentOpenLogin)
       .toHaveBeenCalledWith(expect.objectContaining({ id: "provider_claude_agent" })));
@@ -640,7 +643,7 @@ describe("ClaudeAgentComponentPanel", () => {
     expect(await screen.findByText("0.3.284")).toBeInTheDocument();
     expect(screen.getByText("2.1.261")).toBeInTheDocument();
     expect(screen.getByText("正在检查更新…")).toBeInTheDocument();
-    expect(screen.queryByText("已是最新的兼容版本。")).not.toBeInTheDocument();
+    expect(screen.queryByText("已是最新版本。")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "检查更新" })).toBeDisabled();
     expect(screen.getByTestId("sign-in")).toHaveTextContent("sign-in panel 0");
     // Disk first, npm second.
@@ -648,7 +651,7 @@ describe("ClaudeAgentComponentPanel", () => {
 
     await act(async () => npm.resolve(componentStatus()));
 
-    expect(await screen.findByText("已是最新的兼容版本。")).toBeInTheDocument();
+    expect(await screen.findByText("已是最新版本。")).toBeInTheDocument();
     expect(screen.queryByText("正在检查更新…")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "检查更新" })).toBeEnabled();
     // Up to date: nothing to install or update, and the sign-in follows the components.
@@ -663,7 +666,9 @@ describe("ClaudeAgentComponentPanel", () => {
     runtimeMocks.claudeAgentComponentStatus.mockResolvedValue(notInstalled);
     renderComponents();
 
-    expect(await screen.findByText(/从 npm 下载 Anthropic 发布的官方包/u)).toBeInTheDocument();
+    expect(await screen.findByText(/先安装组件，再登录/u)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "详情" }))
+      .toHaveAttribute("href", "https://mewrk.dev/zh-CN/providers.html#claude-agent");
     expect(screen.getByText("将安装 SDK 0.3.284（Claude Code 2.1.261）。")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "安装" })).toBeEnabled();
     expect(screen.queryByTestId("sign-in")).not.toBeInTheDocument();
@@ -771,7 +776,7 @@ describe("ClaudeAgentComponentPanel", () => {
       expect(componentReads()).toEqual([false, true, false, false, true]);
       expect(await screen.findByText("0.3.290")).toBeInTheDocument();
       expect(screen.getByTestId("sign-in")).toHaveTextContent("sign-in panel 1");
-      expect(screen.getByText("已是最新的兼容版本。")).toBeInTheDocument();
+      expect(screen.getByText("已是最新版本。")).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "更新" })).not.toBeInTheDocument();
     } finally {
       vi.useRealTimers();
@@ -851,7 +856,7 @@ describe("ClaudeAgentComponentPanel", () => {
     }));
     renderComponents();
 
-    expect(await screen.findByText(/npm 上已有 SDK 0\.4\.0，但这个版本的 Mewrk 只兼容 \^0\.3\.284/u)).toBeInTheDocument();
+    expect(await screen.findByText(/Mewrk 现在提供的是 SDK 0\.4\.0，但这个版本的 Mewrk 只兼容 \^0\.3\.284/u)).toBeInTheDocument();
     expect(screen.getByText("没能检查新版本：无法连接 npm 镜像")).toBeInTheDocument();
     // An npm check that failed is not a failure of the installed components.
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -900,7 +905,7 @@ describe("ClaudeAgentComponentPanel", () => {
     const user = userEvent.setup();
     renderComponents();
     // The first check has answered, so the button is free.
-    await screen.findByText("已是最新的兼容版本。");
+    await screen.findByText("已是最新版本。");
     expect(componentReads()).toEqual([false, true]);
     const answer = deferred<ClaudeAgentComponentStatus>();
     runtimeMocks.claudeAgentComponentStatus.mockReturnValueOnce(answer.promise);
@@ -922,7 +927,7 @@ describe("ClaudeAgentComponentPanel", () => {
       const user = userEvent.setup();
       renderComponents();
       // The first showing: what is installed, then the npm check, which has answered here.
-      await screen.findByText("已是最新的兼容版本。");
+      await screen.findByText("已是最新版本。");
       expect(componentReads()).toEqual([false, true]);
 
       await user.click(screen.getByRole("button", { name: "Leave" }));
@@ -931,7 +936,7 @@ describe("ClaudeAgentComponentPanel", () => {
 
       // From the session, not from another read: the versions and the verdict are on screen at once.
       expect(screen.getByText("0.3.284")).toBeInTheDocument();
-      expect(screen.getByText("已是最新的兼容版本。")).toBeInTheDocument();
+      expect(screen.getByText("已是最新版本。")).toBeInTheDocument();
       expect(screen.queryByText("正在检查更新…")).not.toBeInTheDocument();
       expect(screen.getByTestId("sign-in")).toBeInTheDocument();
       await act(async () => undefined);
@@ -964,16 +969,16 @@ describe("ClaudeAgentComponentPanel", () => {
       expect(screen.getByText("0.3.284")).toBeInTheDocument();
       await waitFor(() => expect(componentReads()).toEqual([false, true, true]));
       expect(screen.getByText("正在检查更新…")).toBeInTheDocument();
-      expect(screen.queryByText("已是最新的兼容版本。")).not.toBeInTheDocument();
+      expect(screen.queryByText("已是最新版本。")).not.toBeInTheDocument();
 
       await act(async () => second.resolve(componentStatus()));
-      expect(await screen.findByText("已是最新的兼容版本。")).toBeInTheDocument();
+      expect(await screen.findByText("已是最新版本。")).toBeInTheDocument();
       expect(screen.queryByText("正在检查更新…")).not.toBeInTheDocument();
 
       // This time the check answered: showing the page again asks nothing.
       await user.click(screen.getByRole("button", { name: "Leave" }));
       await user.click(screen.getByRole("button", { name: "Return" }));
-      expect(screen.getByText("已是最新的兼容版本。")).toBeInTheDocument();
+      expect(screen.getByText("已是最新版本。")).toBeInTheDocument();
       expect(screen.queryByText("正在检查更新…")).not.toBeInTheDocument();
       await act(async () => undefined);
       expect(componentReads()).toEqual([false, true, true]);
@@ -982,7 +987,7 @@ describe("ClaudeAgentComponentPanel", () => {
     it("asks afresh when the settings window is opened again", async () => {
       const user = userEvent.setup();
       renderComponents();
-      await screen.findByText("已是最新的兼容版本。");
+      await screen.findByText("已是最新版本。");
       expect(componentReads()).toEqual([false, true]);
       runtimeMocks.claudeAgentComponentStatus.mockResolvedValue(componentStatus({
         installed: { sdkVersion: "0.3.290", claudeCodeVersion: "2.1.270", source: "installed", installedAt: null, compatible: true }
@@ -993,7 +998,7 @@ describe("ClaudeAgentComponentPanel", () => {
       expect(await screen.findByText("0.3.290")).toBeInTheDocument();
       // A new session starts over: disk, then npm.
       await waitFor(() => expect(componentReads()).toEqual([false, true, false, true]));
-      expect(await screen.findByText("已是最新的兼容版本。")).toBeInTheDocument();
+      expect(await screen.findByText("已是最新版本。")).toBeInTheDocument();
       expect(componentReads()).toEqual([false, true, false, true]);
     });
 
@@ -1040,7 +1045,7 @@ describe("ClaudeAgentComponentPanel", () => {
     it("reads again on returning to the window, keeping what is shown until the answer is in", async () => {
       renderComponents();
       // After the first showing's two reads, the second being the npm check.
-      await screen.findByText("已是最新的兼容版本。");
+      await screen.findByText("已是最新版本。");
       expect(componentReads()).toEqual([false, true]);
       const answer = deferred<ClaudeAgentComponentStatus>();
       runtimeMocks.claudeAgentComponentStatus.mockReturnValueOnce(answer.promise);
@@ -1060,7 +1065,7 @@ describe("ClaudeAgentComponentPanel", () => {
 
     it("does not read again on a focus that no blur preceded", async () => {
       renderComponents();
-      await screen.findByText("已是最新的兼容版本。");
+      await screen.findByText("已是最新版本。");
 
       fireEvent.focus(window);
       await act(async () => undefined);
@@ -1070,7 +1075,7 @@ describe("ClaudeAgentComponentPanel", () => {
 
     it("swallows a failed read on returning to the window", async () => {
       renderComponents();
-      await screen.findByText("已是最新的兼容版本。");
+      await screen.findByText("已是最新版本。");
       runtimeMocks.claudeAgentComponentStatus.mockRejectedValueOnce(new Error("offline"));
 
       fireEvent.blur(window);
@@ -1142,7 +1147,7 @@ describe("Claude Agent page in a settings session", () => {
     // The components are read from disk and then checked against npm: two host reads per
     // opening; the sign-in is one read.
     expect(await screen.findByText("0.3.284")).toBeInTheDocument();
-    expect(await screen.findByText("已是最新的兼容版本。")).toBeInTheDocument();
+    expect(await screen.findByText("已是最新版本。")).toBeInTheDocument();
     expect(await screen.findByRole("button", { name: "打开终端登录" })).toBeInTheDocument();
     expect(componentReads()).toEqual([false, true]);
     expect(runtimeMocks.claudeAgentLoginStatus).toHaveBeenCalledTimes(1);
@@ -1153,7 +1158,7 @@ describe("Claude Agent page in a settings session", () => {
     await user.click(screen.getByRole("button", { name: "Claude Agent" }));
 
     expect(screen.getByText("0.3.284")).toBeInTheDocument();
-    expect(screen.getByText("已是最新的兼容版本。")).toBeInTheDocument();
+    expect(screen.getByText("已是最新版本。")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "打开终端登录" })).toBeInTheDocument();
     await act(async () => undefined);
     expect(componentReads()).toEqual([false, true]);

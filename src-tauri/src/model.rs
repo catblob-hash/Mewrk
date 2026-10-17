@@ -2896,6 +2896,11 @@ pub struct ConversationPresetSettings {
     /// derives `web_search` and `web_fetch` by the conversation's own rule.
     #[serde(default)]
     pub web_search_enabled: bool,
+    /// Subagent-communication switch copied into a new conversation
+    /// ([`ConversationSettings::subagent_messaging_enabled`]). A missing key
+    /// means OFF.
+    #[serde(default)]
+    pub subagent_messaging_enabled: bool,
     /// Security-policy template copied into a new conversation.
     #[serde(default)]
     pub security_level: SecurityLevel,
@@ -2922,6 +2927,11 @@ pub struct ConversationPresetSettings {
     /// means ON.
     #[serde(default = "default_true")]
     pub file_write_guards_enabled: bool,
+    /// Environment-section template copied into a new conversation
+    /// ([`ConversationSettings::environment_prompt_enabled`]). A missing key
+    /// means ON.
+    #[serde(default = "default_true")]
+    pub environment_prompt_enabled: bool,
     // A sandbox template was copied into new conversations from here. The
     // sandbox is a setting of each workspace now, so a preset has none; an
     // old preset's key is read past and not written back.
@@ -3475,6 +3485,20 @@ pub struct ConversationSettings {
     /// presets, not a serde fallback, are where "on" is decided.
     #[serde(default)]
     pub web_search_enabled: bool,
+    /// Whether the main agent can talk to the children it starts.
+    ///
+    /// The switch for two tools at once, and neither is ever taken from the
+    /// persisted enabled-tool list: with this on **and** `agent_spawn` enabled
+    /// the host derives `send_message` for the main agent
+    /// (`RunModelRequest::subagent_messaging`), and every child it starts —
+    /// an `agent_spawn` child, a workflow step — is handed `subagent_update`
+    /// (`api::agent_child_template`). Off, or without `agent_spawn`, neither
+    /// tool exists anywhere.
+    ///
+    /// A missing key means OFF: letting a finished child resume with its full
+    /// context is something a conversation should be given deliberately.
+    #[serde(default)]
+    pub subagent_messaging_enabled: bool,
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
     #[serde(default)]
@@ -3535,6 +3559,17 @@ pub struct ConversationSettings {
     /// (`fileGuard*`) are a different shape and stay ignored.
     #[serde(default = "default_true")]
     pub file_write_guards_enabled: bool,
+    /// Whether this conversation's system prompt opens with the `# Environment`
+    /// section (`environment_prompt::environment_section`): the working
+    /// directory, the numbered workspaces, the platform and the date. A missing
+    /// key means ON: the section was unconditional before the switch existed.
+    ///
+    /// Off drops the whole section, as a prompt profile that empties its frame
+    /// does; the note on the host's messages that follows it is not part of it.
+    /// Children and workflow steps follow the conversation: their prompts open
+    /// with its block.
+    #[serde(default = "default_true")]
+    pub environment_prompt_enabled: bool,
     /// How this conversation auto-compacts ([`CompactionMethod`]). `None` on a
     /// conversation from before the choice existed, which hands off as it
     /// always did, and on the new-task draft, which has not chosen yet: the
@@ -3645,6 +3680,16 @@ pub struct ConversationToolLock {
     /// later additions had a second route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_skill_ids: Option<Vec<String>>,
+    /// Whether the tools this conversation's system prompt was assembled for
+    /// could start a background task (`agents::TASK_PRODUCING_TOOL_NAMES`),
+    /// fixed by its first run like [`Self::prompt_skill_ids`]. It decides
+    /// whether that prompt says how the host's messages and background results
+    /// arrive (`system.host_messages`); a producer enabled later is told it at
+    /// the point it joins instead (`host_append::host_messages_owed`). `None`
+    /// on a conversation that predates the pin or has not run yet, which reads
+    /// as the tools enabled now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_task_tools: Option<bool>,
     /// The search backend the last request's settings named, `None` when it
     /// had no web access. Round-tripped only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3686,6 +3731,15 @@ pub struct ConversationToolLock {
     /// how `edit` and `write` are described), on the same terms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_write_guards: Option<bool>,
+    /// Whether the last request's system prompt carried the environment
+    /// section, on the same terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_prompt: Option<bool>,
+    /// Whether the last request ran with subagent communication (it decides
+    /// whether `send_message` exists and how `agent_spawn` is described, and
+    /// whether the children hold `subagent_update`), on the same terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_messaging: Option<bool>,
 }
 
 /// Which model a conversation's last request used, and when (RFC 3339).
@@ -3747,6 +3801,8 @@ impl<'de> Deserialize<'de> for ConversationToolLock {
             #[serde(default)]
             prompt_skill_ids: Option<Vec<String>>,
             #[serde(default)]
+            prompt_task_tools: Option<bool>,
+            #[serde(default)]
             search_backend: Option<SearchProviderSelection>,
             #[serde(default)]
             fetch_backend: Option<FetchProviderSelection>,
@@ -3768,6 +3824,10 @@ impl<'de> Deserialize<'de> for ConversationToolLock {
             host_message_container: Option<HostMessageContainer>,
             #[serde(default)]
             file_write_guards: Option<bool>,
+            #[serde(default)]
+            environment_prompt: Option<bool>,
+            #[serde(default)]
+            subagent_messaging: Option<bool>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -3800,6 +3860,7 @@ impl<'de> Deserialize<'de> for ConversationToolLock {
             plan_mode: raw.plan_mode,
             skill_ids: raw.skill_ids,
             prompt_skill_ids: raw.prompt_skill_ids,
+            prompt_task_tools: raw.prompt_task_tools,
             search_backend: raw.search_backend,
             fetch_backend: raw.fetch_backend,
             web_fetch: raw.web_fetch,
@@ -3811,6 +3872,8 @@ impl<'de> Deserialize<'de> for ConversationToolLock {
             prompt_profile: raw.prompt_profile,
             host_message_container: raw.host_message_container,
             file_write_guards: raw.file_write_guards,
+            environment_prompt: raw.environment_prompt,
+            subagent_messaging: raw.subagent_messaging,
         })
     }
 }
@@ -4811,18 +4874,29 @@ pub struct RunModelRequest {
     /// and model arguments cannot set it; only the host template does.
     #[serde(skip)]
     pub native_search_call: bool,
-    /// Fetch budget for the host's one-shot native `web_fetch` request, or
-    /// `None` on every other request. The count is the number of URLs the model
-    /// asked for, so the executor cannot wander past the pages it was given.
+    /// The URLs the host's one-shot native `web_fetch` request is asked to
+    /// retrieve, or `None` on every other request. Their count is the fetch
+    /// budget, so the executor cannot wander past the pages it was given; the
+    /// list itself is what a family whose fetch the sidecar admits call by call
+    /// (Claude Agent's `WebFetch`) is held to.
     /// Like `native_search_call`, renderer IPC and model arguments cannot set it.
     #[serde(skip)]
-    pub native_fetch_call: Option<u32>,
+    pub native_fetch_call: Option<Vec<String>>,
     /// Trusted copy of this conversation's web-access switch, hydrated from the
     /// persisted document at turn start. Renderer IPC cannot assert it and the
     /// model cannot pass it as a tool argument, so a conversation the user left
     /// offline can neither be handed a web tool nor reach one by asking.
     #[serde(skip)]
     pub web_search_enabled: bool,
+    /// Whether this run's agent tree talks: the conversation's
+    /// [`ConversationSettings::subagent_messaging_enabled`] **and** the
+    /// `agent_spawn` tool enabled, decided by `trusted_run_request` from the
+    /// persisted conversation. Host-only like the switches around it — it
+    /// grants `send_message` and decides whether the children it spawns hold
+    /// `subagent_update` — so neither renderer IPC nor a model argument can
+    /// assert it. A child copies it from its parent (`api::agent_child_template`).
+    #[serde(skip)]
+    pub subagent_messaging: bool,
     /// Trusted copy of this conversation's two memory-tier switches, hydrated
     /// from the persisted document at turn start. Renderer IPC cannot assert
     /// them and the model cannot pass them as tool arguments, so a tier the
@@ -4865,6 +4939,15 @@ pub struct RunModelRequest {
     /// from the conversation's own settings.
     #[serde(skip)]
     pub host_message_container: HostMessageContainer,
+    /// Whether this run's system prompt says how the host's messages and
+    /// background results arrive (`system.host_messages`). Where it does not
+    /// and the run holds a tool that can start a background task, the round
+    /// boundary tells the model once (`host_append::host_messages_owed`).
+    /// Host-only: `trusted_run_request` decides it from the conversation's
+    /// container and tool-lock pin, and children inherit it with the prompt
+    /// they are rendered from.
+    #[serde(skip)]
+    pub host_messages_in_prompt: bool,
     /// Whether this run enforces the file write guards, and the read-record
     /// scope they consult. Host-only like the switches above:
     /// `trusted_run_request` reads the switch from the conversation's own
@@ -6514,6 +6597,15 @@ mod tests {
         let native = with_fetch(FetchProviderSelection::Native);
         assert!(!WebSearchSettings::effective(&native, &switched_off, true).fetch_withheld);
         assert!(WebSearchSettings::effective(&native, &switched_off, false).fetch_withheld);
+        // Claude Agent is one of those families: Claude Code's own `WebFetch`
+        // retrieves the page, so the conversation keeps `web_fetch` and it
+        // resolves to the native backend rather than being withheld.
+        let claude_agent = crate::web_search::family_supports_native_fetch(
+            crate::aisdk::protocol::Family::ClaudeAgent,
+        );
+        let resolved = WebSearchSettings::effective(&native, &switched_off, claude_agent);
+        assert!(!resolved.fetch_withheld);
+        assert_eq!(resolved.fetch, Some(SearchFetchBackend::Native));
     }
 
     /// The renderer writes an unknown fetch provider as `unavailable`, in a
@@ -6652,6 +6744,142 @@ mod tests {
         assert!(lock.web_fetch);
         assert_eq!(lock.model_requests.len(), 2);
         assert_eq!(serde_json::to_value(&lock).expect("serializable"), wire);
+    }
+
+    /// The subagent-communication switch is OFF unless a document says
+    /// otherwise, in a conversation and in a preset alike, and it survives a
+    /// save: a dropped key would quietly turn a conversation's children mute.
+    #[test]
+    fn the_subagent_messaging_switch_defaults_off_and_round_trips() {
+        let conversation = |wire: serde_json::Value| {
+            serde_json::from_value::<ConversationSettings>(wire).expect("settings open")
+        };
+        let preset = |wire: serde_json::Value| {
+            serde_json::from_value::<ConversationPresetSettings>(wire).expect("preset opens")
+        };
+        // A document from before the switch existed.
+        assert!(
+            !conversation(serde_json::json!({ "enabledTools": [] })).subagent_messaging_enabled
+        );
+        assert!(!preset(serde_json::json!({ "enabledTools": [] })).subagent_messaging_enabled);
+
+        let on = conversation(serde_json::json!({
+            "enabledTools": ["agent_spawn"],
+            "subagentMessagingEnabled": true
+        }));
+        assert!(on.subagent_messaging_enabled);
+        assert_eq!(
+            serde_json::to_value(&on).expect("serializable")["subagentMessagingEnabled"],
+            serde_json::json!(true)
+        );
+        let on = preset(serde_json::json!({
+            "enabledTools": ["agent_spawn"],
+            "subagentMessagingEnabled": true
+        }));
+        assert!(on.subagent_messaging_enabled);
+        assert_eq!(
+            serde_json::to_value(&on).expect("serializable")["subagentMessagingEnabled"],
+            serde_json::json!(true)
+        );
+    }
+
+    /// The lock is deserialized by hand, so a field missing from its `Raw` twin
+    /// or its closing literal is dropped without a word. `null` is an older
+    /// lock, which tones nothing; an answer either way survives a save.
+    #[test]
+    fn the_lock_round_trips_the_subagent_messaging_pin() {
+        let lock = |wire: serde_json::Value| {
+            serde_json::from_value::<ConversationToolLock>(wire).expect("a lock opens")
+        };
+        assert_eq!(lock(serde_json::json!({})).subagent_messaging, None);
+        assert_eq!(
+            serde_json::to_value(lock(serde_json::json!({})))
+                .expect("serializable")
+                .get("subagentMessaging"),
+            None,
+            "an older lock is not rewritten with an answer it never gave"
+        );
+        for answer in [true, false] {
+            let wire = serde_json::json!({ "tools": ["agent_spawn"], "subagentMessaging": answer });
+            let restored = lock(wire.clone());
+            assert_eq!(restored.subagent_messaging, Some(answer));
+            assert_eq!(
+                serde_json::to_value(&restored).expect("serializable")["subagentMessaging"],
+                answer
+            );
+            // A lock with the pin among the other fields keeps every one of them.
+            let mut full = lock(serde_json::json!({
+                "tools": ["read"],
+                "fileWriteGuards": true,
+                "subagentMessaging": answer
+            }));
+            assert_eq!(full.file_write_guards, Some(true));
+            assert_eq!(full.subagent_messaging, Some(answer));
+            full.subagent_messaging = None;
+            assert_eq!(full.file_write_guards, Some(true));
+        }
+    }
+
+    /// A document from before the environment switch opens with the section
+    /// on, as every run had it; an explicit off survives a save, in a
+    /// conversation and in a preset alike.
+    #[test]
+    fn the_environment_switch_defaults_on_and_round_trips() {
+        let conversation = |wire: serde_json::Value| {
+            serde_json::from_value::<ConversationSettings>(wire).expect("settings open")
+        };
+        let preset = |wire: serde_json::Value| {
+            serde_json::from_value::<ConversationPresetSettings>(wire).expect("preset opens")
+        };
+        assert!(conversation(serde_json::json!({ "enabledTools": [] })).environment_prompt_enabled);
+        assert!(preset(serde_json::json!({ "enabledTools": [] })).environment_prompt_enabled);
+
+        let off = conversation(serde_json::json!({
+            "enabledTools": [],
+            "environmentPromptEnabled": false
+        }));
+        assert!(!off.environment_prompt_enabled);
+        assert_eq!(
+            serde_json::to_value(&off).expect("serializable")["environmentPromptEnabled"],
+            serde_json::json!(false)
+        );
+        let off = preset(serde_json::json!({
+            "enabledTools": [],
+            "environmentPromptEnabled": false
+        }));
+        assert!(!off.environment_prompt_enabled);
+        assert_eq!(
+            serde_json::to_value(&off).expect("serializable")["environmentPromptEnabled"],
+            serde_json::json!(false)
+        );
+    }
+
+    /// The environment record and the background-task pin go through the
+    /// lock's hand-written reader like every other field: absent stays absent,
+    /// an answer either way survives a save.
+    #[test]
+    fn the_lock_round_trips_the_environment_record_and_the_task_tools_pin() {
+        let lock = |wire: serde_json::Value| {
+            serde_json::from_value::<ConversationToolLock>(wire).expect("a lock opens")
+        };
+        let older = lock(serde_json::json!({}));
+        assert_eq!(older.environment_prompt, None);
+        assert_eq!(older.prompt_task_tools, None);
+        let wire = serde_json::to_value(&older).expect("serializable");
+        assert_eq!(wire.get("environmentPrompt"), None);
+        assert_eq!(wire.get("promptTaskTools"), None);
+        for answer in [true, false] {
+            let restored = lock(serde_json::json!({
+                "tools": ["read"],
+                "environmentPrompt": answer,
+                "promptTaskTools": answer
+            }));
+            assert_eq!(restored.environment_prompt, Some(answer));
+            assert_eq!(restored.prompt_task_tools, Some(answer));
+            let wire = serde_json::to_value(&restored).expect("serializable");
+            assert_eq!(wire["environmentPrompt"], answer);
+            assert_eq!(wire["promptTaskTools"], answer);
+        }
     }
 
     /// The shaping defaults are the ones a conversation persisted before these

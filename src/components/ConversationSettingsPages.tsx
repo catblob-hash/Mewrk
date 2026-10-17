@@ -46,7 +46,6 @@ import type {
   GlobalSettings,
   McpProbeReport,
   ResourceDescriptor,
-  RunTarget,
   SshMachineConfig,
   ToolDescriptor
 } from "../types";
@@ -253,7 +252,7 @@ export function CapabilitySelectionPage<
   selectedUnavailableDetail?: string;
   searchLabel: string;
   emptyTitle: string;
-  emptyDescription: string;
+  emptyDescription: ReactNode;
   /**
    * Page-specific controls below the list, for a policy that governs the whole
    * catalog rather than one entry. Drawn whether or not the catalog has
@@ -299,13 +298,13 @@ export function CapabilitySelectionPage<
   const tone = (id: string) => toneOf?.(id, selected.has(id)) ?? null;
   /* The workspaces drawn as sections. The preset editor has no conversation, so
      it draws every workspace the catalog read something from (or tried to). */
-  const sections = useMemo((): Array<CapabilityWorkspace | { number: null; key: string; machine: RunTarget | null; path: string }> => {
+  const sections = useMemo((): Array<Pick<CapabilityWorkspace, "key" | "machine" | "path">> => {
     if (workspaces) return [...workspaces];
     const keys = [
       ...resources.map((resource) => resource.workspaceKey),
       ...unreadableLevels.map((level) => level.workspaceKey)
     ].filter((key): key is string => Boolean(key));
-    return [...new Set(keys)].map((key) => ({ number: null, key, ...parseCapabilityWorkspaceKey(key) }));
+    return [...new Set(keys)].map((key) => ({ key, ...parseCapabilityWorkspaceKey(key) }));
   }, [resources, unreadableLevels, workspaces]);
   /* The entries this conversation may select: the global level (no workspace) and
      each of its workspaces. Anything else belongs to a workspace this conversation
@@ -334,9 +333,6 @@ export function CapabilitySelectionPage<
     : ordered;
   const visibleDangling = needle ? danglingIds.filter(matches) : danglingIds;
   const rowsOf = (key: string | null) => visible.filter((resource) => (resource.workspaceKey ?? null) === key);
-  /* Numbers are what the model addresses workspaces by, stated to it only once
-     there is more than one; a lone workspace's "1" would name nothing it sees. */
-  const numbered = sections.length > 1;
 
   const toggle = (id: string, checked: boolean) => {
     if (single) onChange(checked ? [id] : []);
@@ -562,9 +558,6 @@ export function CapabilitySelectionPage<
               label={workspaceLocationTitle(workspace.path, workspace.machine, sshMachines)}
               heading={<>
                 {machineIcon(workspace.machine, 13)}
-                {numbered && workspace.number !== null && (
-                  <span className="capability-section__number" aria-hidden="true">{workspace.number}</span>
-                )}
                 <PathText className="capability-section__label" path={workspace.path} />
                 {machine && <small className="capability-section__where">{machine}</small>}
                 {sectionCount(rows)}
@@ -806,10 +799,13 @@ export function AgentRolesPage({
         onReveal={onReveal}
         searchLabel={t("搜索角色", "Search roles")}
         emptyTitle={t("尚未发现角色", "No roles discovered")}
-        emptyDescription={t(
-          "点下面的「新建角色」，或把角色 JSON 文件放进 ~/.mewrk/agents/ 或工作区的 .mewrk/agents/，列表很快会自动刷新。",
-          "Press New role below, or put role JSON files in ~/.mewrk/agents/ or the workspace's .mewrk/agents/; the list refreshes by itself shortly after."
-        )}
+        emptyDescription={<>
+          {t(
+            "点下面的「新建角色」即可添加。",
+            "Press New role below to add one."
+          )}
+          <DocsLink inline page="agents" section="roles" />
+        </>}
         rowDetail={(resource) => resource.role
           ? agentRoleModelLabel(resource.role.modelSelection, providers, t)
           : null}
@@ -848,13 +844,13 @@ export function AgentRolesPage({
             <div className="tool-toggle-row">
               <span><strong>{t("允许无角色子代理", "Allow role-less subagents")}</strong><small>{hasUsableRole
                 ? t(
-                  "关闭时 agent_spawn 与 workflow 步骤都必须点名一个角色。开启则恢复旧语义：省略角色的子代理沿用本对话的模型。",
-                  "When off, agent_spawn and workflow steps must both name a role. When on, the old behaviour returns: a subagent that names none inherits this conversation's model."
+                  "不指定角色的子代理沿用本对话的模型。",
+                  "A subagent with no role uses this conversation's model."
                 )
                 : t(
-                  "当前没有可用角色，宿主一律允许无角色执行，这个开关要等到有可用角色后才生效。",
-                  "No usable role exists, so the host allows role-less execution either way; this switch takes effect once one does."
-                )}</small></span>
+                  "当前没有可用角色，开关暂不生效。",
+                  "No usable role yet, so this switch has no effect."
+                )}<DocsLink inline page="agents" section="roles" /></small></span>
               <Switch
                 checked={Boolean(settings.allowRolelessSubagents)}
                 onChange={(allowRolelessSubagents) => onChange({ allowRolelessSubagents })}
@@ -1032,8 +1028,8 @@ export function ConversationPresetsPage({
         })}
       </CatalogList>
       <p className="capability-page__hint">{t(
-        "行首的箭头把预设的内容复制到本对话，之后改哪一边都不影响另一边；右边的设置按钮在窗口里打开那份预设。拖动整行可以排序。",
-        "The arrow at the head of a row copies that preset's contents into this conversation; editing either one afterwards does not affect the other. The settings button on the right opens that preset in a window. Drag a row to reorder."
+        "箭头把预设套用到本对话，设置按钮打开它。",
+        "The arrow applies a preset here; the settings button opens it."
       )}</p>
     </>
   );

@@ -29,6 +29,7 @@ import type {
   ThemePreference
 } from "../../types";
 import { IconButton, Switch } from "../Common";
+import { DocsLink } from "../DocsLink";
 import { SettingsPageHeading } from "../SettingsPageHeading";
 import { BackgroundLibraryDialog, BackgroundPreview, useBackgroundPicture } from "./BackgroundLibrary";
 import { CodeThemePreview } from "./CodeThemePreview";
@@ -317,8 +318,8 @@ export function AppearanceSettings({
         <SettingRow
           title={t("液态玻璃", "Liquid glass")}
           description={t(
-            "侧栏和面板变成半透明的玻璃，透出下面的背景。",
-            "The sidebar and panes turn to translucent glass over the background."
+            "侧栏和面板变成半透明玻璃。",
+            "Translucent glass sidebar and panes."
           )}
         >
           <Switch
@@ -330,8 +331,8 @@ export function AppearanceSettings({
         <SettingRow
           title={t("自定义背景", "Custom background")}
           description={t(
-            "纯色背景随主题切换，图片不随主题变化。",
-            "A solid background switches along with the theme; a picture stays."
+            "纯色随主题切换，图片不变。",
+            "A solid color follows the theme; a picture stays."
           )}
         >
           <div className="appearance-settings-page__background-control">
@@ -425,8 +426,8 @@ export function AppearanceSettings({
         <SettingRow
           title={t("代码外观", "Code appearance")}
           description={t(
-            "代码与差异的配色：左侧用于浅色主题，右侧用于深色主题。",
-            "The colours of code and diffs: the left one for the light theme, the right one for the dark theme."
+            "代码与差异的配色：左浅色，右深色。",
+            "Code and diff colors: light on the left, dark on the right."
           )}
           vertical
         >
@@ -700,9 +701,11 @@ export function AppearanceSettings({
       <SettingsCard title={t("自定义 CSS", "Custom CSS")}>
         <SettingRow
           title={t("样式表", "Stylesheet")}
-          description={t(
-            "通过 constructable stylesheet 应用，可在严格 CSP 下持续生效。",
-            "Applied through a constructable stylesheet so it survives the app's strict CSP."
+          description={(
+            <>
+              {t("边输入边生效，可加载的资源有限。", "Applies as you type; what it can load is limited.")}
+              <DocsLink inline page="settings" section="appearance" />
+            </>
           )}
           vertical
         >

@@ -2,11 +2,11 @@ import { type ReactNode, useState } from "react";
 import { useI18n } from "../i18n";
 import {
   SEARCH_COMPRESSION_CUTOFF_CEILING,
-  searchProviderCapability,
-  searchProviderEntry
+  searchProviderCapability
 } from "../lib/searchProviders";
-import type { FetchProviderSelection, SearchProviderKind, SearchProviderSelection } from "../types";
+import type { FetchProviderSelection, SearchProviderSelection } from "../types";
 import { Field } from "./Common";
+import { DocsLink } from "./DocsLink";
 
 /**
  * A whole-number row whose value is edited in place.
@@ -34,7 +34,7 @@ function NumberField({
 }: {
   label: string;
   ariaLabel: string;
-  hint: string;
+  hint: ReactNode;
   value: number;
   max: number;
   normalize: (next: number) => number;
@@ -115,7 +115,7 @@ function CompressionRow({
   ariaLabel: string;
   value: number;
   floor: number;
-  hint: string;
+  hint: ReactNode;
   onChange: (next: number) => void;
 }) {
   const { t } = useI18n();
@@ -133,22 +133,6 @@ function CompressionRow({
     />
   );
 }
-
-/**
- * The name each catalog backend gives its own result-count parameter, for the
- * hint to quote. SearXNG is absent on purpose: its API has no count, so its hint
- * says what mewrk does with the number instead of naming a field.
- */
-const RESULT_COUNT_FIELD: Partial<Record<SearchProviderKind, string>> = {
-  zhipu: "count",
-  tavily: "max_results",
-  exa: "numResults",
-  "exa-mcp": "numResults",
-  bocha: "count",
-  querit: "count",
-  jina: "count",
-  firecrawl: "limit"
-};
 
 /** The rows of one leg sit under that leg's selector, as a group that reads as belonging to it. */
 function LegParams({ children }: { children: ReactNode }) {
@@ -185,53 +169,34 @@ export function SearchLegParams({
   const { t } = useI18n();
 
   let count: { ceiling: number; hint: string } | null = null;
-  let compression: { floor: number; hint: string } | null = null;
+  let compression: { floor: number; hint: ReactNode } | null = null;
 
   if (selection.kind === "explicit") {
     const kind = selection.providerKind;
     const spec = searchProviderCapability(kind, "searchKeywords");
-    const label = searchProviderEntry(kind).label;
     if (spec?.maxResults != null) {
-      const field = RESULT_COUNT_FIELD[kind];
       count = {
         ceiling: spec.maxResults,
         hint: kind === "searxng"
           ? t(
-            "SearXNG 的接口没有结果数参数，这里是 mewrk 自己读取的结果页面数；0 表示返回多少读多少，最多 {max}。",
-            "SearXNG's API has no result-count parameter; this is how many result pages mewrk reads itself. 0 reads every result; at most {max}.",
+            "读取的结果页数，最多 {max}；0 为全部。",
+            "Result pages to read, up to {max}; 0 reads all.",
             { max: spec.maxResults }
           )
           : t(
-            "作为 {label} 的 {field} 发送，0 表示不发送、用 {label} 自己的默认值；最多 {max}。",
-            "Sent as {label}'s {field}; 0 sends nothing and leaves {label}'s own default. At most {max}.",
-            { label, field: field ?? "", max: spec.maxResults }
+            "最多 {max}；0 使用后端默认值。",
+            "Up to {max}; 0 uses the backend's default.",
+            { max: spec.maxResults }
           )
       };
     }
     if (spec?.minContentTokens != null) {
-      const min = spec.minContentTokens;
       compression = {
-        floor: min,
-        hint: kind === "exa"
-          ? t(
-            "每条结果正文最多多少 token，按约 4 字符一个 token 换算成 Exa 的 contents.text.maxCharacters 发送；0 表示不设限，Exa 会返回整页正文。",
-            "The most tokens of body text per result, converted at about 4 characters a token into Exa's contents.text.maxCharacters. 0 means no limit, and Exa returns each page's full text."
-          )
-          : kind === "jina"
-            ? t(
-              "每条结果正文最多多少 token，作为 Jina 的 X-Max-Tokens 请求头发送，至少 {min}；0 表示不设限，Jina 会返回整页正文。",
-              "The most tokens of body text per result, sent as Jina's X-Max-Tokens header (at least {min}). 0 means no limit, and Jina returns each page's full text.",
-              { min }
-            )
-            : kind === "searxng"
-              ? t(
-                "每个结果页面正文最多多少 token。SearXNG 只给链接，页面由 mewrk 自己读取并在本地截断；0 表示不设限。",
-                "The most tokens of body text per result page. SearXNG only returns links; mewrk reads the pages itself and truncates them locally. 0 means no limit."
-              )
-              : t(
-                "每条结果正文最多多少 token，0 表示不设限。只有带正文长度参数的后端会用它（Exa、Jina、SearXNG），其它后端原样返回。",
-                "The most tokens of body text kept per result; 0 means no limit. Only backends with a length parameter use it (Exa, Jina, SearXNG); the rest return what they return."
-              )
+        floor: spec.minContentTokens,
+        hint: <>
+          {t("每条结果最多保留多少 token；0 不设限。", "Most tokens kept per result; 0 means no limit.")}
+          <DocsLink inline page="web" section="results" />
+        </>
       };
     }
   }
@@ -290,46 +255,29 @@ export function FetchLegParams({
 }) {
   const { t } = useI18n();
 
-  const genericHint = t(
-    "抓取一个页面最多保留多少 token，0 表示不设限。只有带这个参数的后端会用它（Jina、本地 fetch、Anthropic 家族的原生抓取）。",
-    "The most tokens kept from one fetched page; 0 means no limit. Only backends with this parameter use it (Jina, local fetch, and native fetch on the Anthropic family)."
-  );
-  let compression: { floor: number; hint: string } | null = null;
+  let compression: { floor: number; hint: ReactNode } | null = null;
 
   if (selection.kind === "native") {
     if (nativeOffered) {
       compression = {
         floor: 1,
-        hint: t(
-          "作为 Anthropic web_fetch 的 max_content_tokens 发送，超出部分由上游截掉；0 表示不设限。",
-          "Sent as Anthropic web_fetch's max_content_tokens; the upstream truncates the page to it. 0 means no limit."
-        ) + (forRole
+        hint: forRole
           ? t(
-            " 只有这个角色的模型属于 Anthropic 家族时才会发出。",
-            " It is only sent when this role's model is in the Anthropic family."
+            "每页上限，仅 Anthropic 家族模型会发送。",
+            "Per-page cap, sent only on Anthropic-family models."
           )
-          : "")
+          : t("每个页面最多保留多少 token；0 不设限。", "Most tokens kept per page; 0 means no limit.")
       };
     }
   } else if (selection.kind === "explicit") {
-    const kind = selection.providerKind;
-    const spec = searchProviderCapability(kind, "fetchUrls");
+    const spec = searchProviderCapability(selection.providerKind, "fetchUrls");
     if (spec?.minContentTokens != null) {
-      const min = spec.minContentTokens;
       compression = {
-        floor: min,
-        hint: kind === "jina"
-          ? t(
-            "作为 Jina Reader 的 X-Max-Tokens 请求头发送，超出部分由 Jina 截掉，至少 {min}；0 表示不设限。",
-            "Sent as Jina Reader's X-Max-Tokens header; Jina truncates the page to it (at least {min}). 0 means no limit.",
-            { min }
-          )
-          : kind === "fetch"
-            ? t(
-              "mewrk 在本地抓取页面后截断到这么多 token；0 表示不设限，整页进入上下文。",
-              "mewrk fetches the page locally and truncates it to this many tokens. 0 means no limit, and the whole page enters the context."
-            )
-            : genericHint
+        floor: spec.minContentTokens,
+        hint: <>
+          {t("每个页面最多保留多少 token；0 不设限。", "Most tokens kept per page; 0 means no limit.")}
+          <DocsLink inline page="web" section="results" />
+        </>
       };
     }
   }

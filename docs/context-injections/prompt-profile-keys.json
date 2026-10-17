@@ -1,5 +1,5 @@
 {
-  "keyCount": 443,
+  "keyCount": 453,
   "keys": [
     {
       "description": "Frame of the environment block at the head of the host system prompt: the heading and the sentence introducing the fact list. `{facts}` is the list, one ` - ` item per `system.environment.*` line. Emptying this key removes the whole block, facts included.",
@@ -227,7 +227,7 @@
       "placeholders": []
     },
     {
-      "description": "Section of the system prompt of every run whose host messages come as user messages (the conversation's host-message container is `user`) saying what the user-role messages the host writes are: `<system-reminder>` notices, and background task results as `<task-notification>` behind Claude Code's `[SYSTEM NOTIFICATION - NOT USER INPUT]` preamble. None of them is the user speaking. Where they come in `box`, `tool.box.description` says it instead.",
+      "description": "Section of the system prompt of every run whose host messages come as user messages (the conversation's host-message container is `user`) and whose prompt was assembled with a tool that can start a background task (`agent_spawn`, `workflow`, a shell, `preview_start`), saying what the user-role messages the host writes are: `<system-reminder>` notices, and background task results as `<task-notification>` behind Claude Code's `[SYSTEM NOTIFICATION - NOT USER INPUT]` preamble. None of them is the user speaking. Such a tool enabled after the prompt was assembled without one brings the same text with it, as a system prompt appended where it joins (a `<system-reminder>` on a model that takes no system message mid-conversation). Where host messages come in `box`, `tool.box.description` says it instead.",
       "id": "system.host_messages",
       "placeholders": []
     },
@@ -877,6 +877,26 @@
       "placeholders": []
     },
     {
+      "description": "Root description of the `send_message` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `send_message` overrides this key. Declared only to a top-level run whose conversation has subagent communication on and `agent_spawn` enabled.",
+      "id": "tool.send_message.description",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `send_message`'s `to` parameter: the name the child was spawned with.",
+      "id": "tool.send_message.param.to",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `send_message`'s `message` parameter.",
+      "id": "tool.send_message.param.message",
+      "placeholders": []
+    },
+    {
+      "description": "Description of `send_message`'s `summary` parameter: the short preview the timeline shows.",
+      "id": "tool.send_message.param.summary",
+      "placeholders": []
+    },
+    {
       "description": "Root description of the `box` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `box` overrides this key. Declared only where the conversation's host messages come in `box`.",
       "id": "tool.box.description",
       "placeholders": []
@@ -1209,7 +1229,7 @@
       "placeholders": []
     },
     {
-      "description": "Addendum appended (after a `---` separator) to the system prompt of every spawned subagent and workflow step.",
+      "description": "Addendum appended (after a `---` separator) to the system prompt of every spawned subagent and workflow step. What depends on the conversation's subagent communication is marked with the child's update tool, which a child holds only while that is on: `{?subagent_update}…{/}` wraps what only such a child is told (that the main agent's later messages reach it and carry instructions, and the sentence telling it to report progress with the update tool), `{!subagent_update}…{/}` what every other child is told instead.",
       "id": "subagent.addendum",
       "placeholders": []
     },
@@ -1761,6 +1781,48 @@
       "placeholders": [
         "task",
         "detail"
+      ]
+    },
+    {
+      "description": "Result of a `send_message` call that put its message in front of a child still running: `{to}` is the child's name. Nothing starts; the child reads the message before its next model request.",
+      "id": "task.send.queued",
+      "placeholders": [
+        "to"
+      ]
+    },
+    {
+      "description": "Result of a `send_message` call to a child that had finished and was delivered: the child is resumed in the background with its full earlier context and the message. `{to}` is the child's name. Its new result arrives like any task result.",
+      "id": "task.send.resumed",
+      "placeholders": [
+        "to"
+      ]
+    },
+    {
+      "description": "Refusal of a `send_message` call to a child that has just finished but whose result has not reached the model yet. Nothing changed. `{to}` is the child's name.",
+      "id": "task.send.result_pending",
+      "placeholders": [
+        "to"
+      ]
+    },
+    {
+      "description": "Refusal of a `send_message` call to a child the user stopped, which is not resumed. `{to}` is the child's name.",
+      "id": "task.send.user_stopped",
+      "placeholders": [
+        "to"
+      ]
+    },
+    {
+      "description": "Refusal of a `send_message` call naming no child agent of this conversation. `{to}` is the name the call gave.",
+      "id": "task.send.unknown_target",
+      "placeholders": [
+        "to"
+      ]
+    },
+    {
+      "description": "Refusal of a `send_message` call naming a task that is not a child agent (a workflow run, a shell command, a dev server). `{to}` is the name or address the call gave.",
+      "id": "task.send.not_an_agent",
+      "placeholders": [
+        "to"
       ]
     },
     {

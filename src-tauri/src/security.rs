@@ -279,9 +279,11 @@ fn classify_placed(
         }
         // Orchestration and agent tools are executed by the model run loop
         // itself; manual execution and approval requests must not treat them
-        // as ordinary tools. The retired `subagent`, `todo`, `agent_send`,
-        // `send_message` and `followup_task` names stay rejected so legacy
-        // timeline entries cannot be re-executed either.
+        // as ordinary tools. `send_message` is one of them: it messages a child
+        // of a live run's pool, so a manual execution has nobody to address.
+        // The retired `subagent`, `todo`, `agent_send` and `followup_task`
+        // names stay rejected so legacy timeline entries cannot be
+        // re-executed either.
         "subagent" | "subagent_update" | "structured_output" | "ask_user" | "todo"
         | "agent_spawn" | "agent_send" | "send_message" | "followup_task" | "task_wait"
         | "task_list" | "task_stop" | "box" | "workflow" | "workflow_step" | "skill"
@@ -1021,6 +1023,19 @@ fn classify_model_call_placed(
             Reason::new(
                 "会停止本代理自己启动的一个后台任务，不启动新的操作",
                 "Stops a background task this agent started itself; starts nothing new",
+            ),
+        )),
+        // The main agent talking to a child it started: a running child is
+        // handed a user message, a finished one is resumed with its earlier
+        // context. The child's own tool calls re-enter this classifier under
+        // the conversation's level like any other child's, and the message
+        // runs no tool of this agent's, so no level asks.
+        "send_message" => Some(internal_decision(
+            RiskLevel::Medium,
+            "host.local_state_change",
+            Reason::new(
+                "会向本对话启动的子代理发消息，可能让已结束的子代理带着原上下文继续运行；它的工具调用仍受本对话安全策略约束",
+                "Messages a child agent this conversation started, which can resume a finished child with its earlier context; its tool calls still follow this conversation's security policy",
             ),
         )),
         // Child-only progress reporting: never in the public catalog, but the
@@ -6449,6 +6464,10 @@ mod tests {
             ("plan", json!({"action": "write", "content": "# Plan"})),
             ("create_global_memory", json!({})),
             ("agent_spawn", json!({})),
+            (
+                "send_message",
+                json!({"to": "reviewer", "message": "go on"}),
+            ),
             ("workflow", json!({})),
             ("web_search", json!({"query": "rust"})),
             ("web_fetch", json!({"urls": ["https://example.com"]})),
@@ -7065,6 +7084,48 @@ mod tests {
                 .classify_model_call(level, "agent_spawn", json!({}))
                 .unwrap();
             assert!(!auto.requires_approval, "{level:?}");
+        }
+    }
+
+    /// The main agent talking to its own child asks at no level: the message runs
+    /// no tool of the sender's, and whatever a resumed child then does is
+    /// classified call by call under the conversation's level like any child's.
+    /// A manual execution has no pool to address, so it is refused outright.
+    #[test]
+    fn send_message_asks_at_no_level_and_cannot_be_run_by_hand() {
+        let fixture = Fixture::new();
+        let input = json!({"to": "reviewer", "message": "go on"});
+        for level in [
+            SecurityLevel::RequestApproval,
+            SecurityLevel::AllowEdits,
+            SecurityLevel::FullAccess,
+        ] {
+            let decision = fixture
+                .classify_model_call(level, "send_message", input.clone())
+                .unwrap();
+            assert!(
+                !decision.requires_approval && !decision.mandatory_prompt,
+                "{level:?}"
+            );
+            assert_eq!(decision.rule_id, "host.local_state_change", "{level:?}");
+            assert_eq!(decision.risk_level, RiskLevel::Medium, "{level:?}");
+            assert!(is_unrestricted(&decision), "{level:?}");
+            assert!(decision
+                .reason
+                .text(ResolvedLanguage::EnUs)
+                .contains("resume a finished child"));
+            assert!(decision
+                .reason
+                .text(ResolvedLanguage::ZhCn)
+                .contains("子代理"));
+
+            let manual = fixture
+                .classify(level, "send_message", input.clone())
+                .unwrap_err();
+            assert!(
+                manual.contains("may only be scheduled by the model run loop"),
+                "{level:?}: {manual}"
+            );
         }
     }
 

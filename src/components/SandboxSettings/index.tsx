@@ -1,5 +1,5 @@
 import { RotateCcw, ShieldCheck } from "lucide-react";
-import type { JSX } from "react";
+import type { JSX, ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { useI18n } from "../../i18n";
 import {
@@ -17,6 +17,7 @@ import type {
   SandboxSupport
 } from "../../types";
 import { Switch } from "../Common";
+import { DocsLink } from "../DocsLink";
 import "./SandboxSettings.css";
 
 interface SandboxSettingsProps {
@@ -43,7 +44,7 @@ function ListField({
   onChange
 }: {
   label: string;
-  description: string;
+  description: ReactNode;
   value: readonly string[];
   placeholder: string;
   onChange: (value: string[]) => void;
@@ -183,10 +184,10 @@ export function SandboxSettings({ machine, machineName, path, settings, onChange
           <div className="sandbox-settings-page__row">
             <div className="sandbox-settings-page__copy">
               <strong>{t("设置 Windows 沙箱", "Set up the Windows sandbox")}</strong>
-              <small>{t(
-                "只需一次，需要管理员批准：创建一个隐藏的本地账户（srt-sandbox），沙箱里的命令以它的身份运行；再加几条防火墙规则，让它只能连 Mewrk 的代理。同一台电脑上的其他程序（如 Claude Code）已设置过的会直接沿用。",
-                "Once, with an administrator's approval: creates a hidden local account (srt-sandbox) that sandboxed commands run as, and firewall rules that let it reach nothing but Mewrk's proxy. A setup another program on this computer made (Claude Code's, for one) is used as it is."
-              )}</small>
+              <small>
+                {t("一次性设置，需要管理员批准。", "One-time setup; needs administrator approval.")}
+                <DocsLink inline page="security" section="sandbox" />
+              </small>
               {setupError && (
                 <small className="sandbox-settings-page__status sandbox-settings-page__status--unavailable" role="alert">
                   {setupError}
@@ -203,26 +204,29 @@ export function SandboxSettings({ machine, machineName, path, settings, onChange
             <strong>{t("沙箱里的命令", "What sandboxed commands can do")}</strong>
             <ul className="sandbox-settings-page__list">
               <li>{t(
-                "只能写这个工作区、自己的临时目录和包缓存——以及同一对话里、同一台机器上沙箱设置与它完全相同的其他工作区；工作区里会在沙箱外执行的文件（.git/hooks、.git/config、.mewrk、.vscode、.envrc 等）仍然只读。",
-                "Write only this workspace, their own temporary directory and package caches — and any other workspace of the same conversation on the machine whose sandbox is set exactly the same — but not the files in them that run outside the sandbox later (.git/hooks, .git/config, .mewrk, .vscode, .envrc and the like)."
+                "只能写这个工作区、临时目录和包缓存。",
+                "Write only to this workspace, temp folders and package caches."
               )}</li>
               <li>{t(
-                "读不到凭据：SSH 与 GPG 密钥、云与包仓库令牌、钥匙串、浏览器资料、Mewrk 自己的密钥库和数据；名字像密钥的环境变量也会被去掉。",
-                "Cannot read credentials: SSH and GPG keys, cloud and registry tokens, keychains, browser profiles, Mewrk's own vault and data. Environment variables named like secrets are removed."
+                "读不到 SSH 密钥、令牌等凭据。",
+                "Cannot read credentials such as SSH keys and tokens."
               )}</li>
               <li>{t(
-                "只能经沙箱外的代理联网，代理按下面的网络规则放行，且不连回环、内网或云元数据地址。",
-                "Reach the network only through a proxy outside the sandbox, which applies the rules below and never connects to loopback, private or cloud-metadata addresses."
+                "只能经代理联网，遵循下面的网络规则。",
+                "Reach the network only through a proxy, by the rules below."
               )}</li>
               <li>{t(
-                "看不到、也碰不到沙箱外的进程：Mewrk、代理进程，以及其他对话的进程——每个对话在这个工作区里各有自己的沙箱进程。",
-                "Cannot see or touch processes outside the sandbox: Mewrk, its agent, other conversations' — each conversation working here has sandboxed processes of its own."
+                "看不到沙箱外的进程。",
+                "Cannot see processes outside the sandbox."
               )}</li>
             </ul>
-            <small>{t(
-              "适用于在这个工作区里运行的 shell 工具和后台命令，由 Mewrk 在工作区所在机器上的代理进程执行；文件工具（ls、grep、find、read、write、edit）也受同样的限制——在 WSL 和 SSH 机器上同样在沙箱里执行，在这台电脑上由 Mewrk 按同一套规则检查。Linux 与 WSL 需要系统自带的 bubblewrap；Windows 需要设置一次：这台电脑在这里设置，SSH 连接的 Windows 机器要在那台机器上以管理员身份设置（上面会给出要运行的命令）。机器不能沙箱时，命令会被拒绝，而不是在沙箱外运行；WSL 和 SSH 机器上的文件工具也一样。预览服务器、LSP、MCP 服务器、hooks 和你自己打开的终端不在沙箱里。",
-              "Applies to the shell tool and background commands run in this workspace, carried out by Mewrk's agent on the workspace's machine. The file tools (ls, grep, find, read, write, edit) meet the same limits: on WSL and SSH machines they run in the sandbox too, and on this computer Mewrk checks them against the same rules. Linux and WSL need the system's bubblewrap; Windows needs setting up once — this computer here, a Windows machine over SSH by an administrator on that machine (the status above names what to run). On a machine that cannot sandbox, commands are refused rather than run outside it, and so are file tools on WSL and SSH machines. Preview servers, language servers, MCP servers, hooks and terminals you open yourself are not sandboxed."
-            )}</small>
+            <small>
+              {t(
+                "适用于 shell 命令、后台命令和文件工具。",
+                "Applies to shell commands, background commands and file tools."
+              )}
+              <DocsLink inline page="security" section="sandbox" />
+            </small>
           </div>
         </div>
       </section>
@@ -231,8 +235,8 @@ export function SandboxSettings({ machine, machineName, path, settings, onChange
           <div className="sandbox-settings-page__copy">
             <strong>{t("网络", "Network")}</strong>
             <small>{t(
-              "按主机名放行：放行 github.com 就放行了经 github.com 能做的一切。",
-              "Decided by host name: allowing github.com allows whatever can be done through github.com."
+              "放行一个主机，就放行经它的一切。",
+              "Allowing a host allows everything done through it."
             )}</small>
           </div>
           <select
@@ -250,10 +254,13 @@ export function SandboxSettings({ machine, machineName, path, settings, onChange
           <>
             <ListField
               label={t("白名单", "Allowlist")}
-              description={t(
-                "一行一个：example.com、*.example.com（只匹配子域），可加 :端口。回环或内网地址只有写明地址（如 localhost:5432）才可达。在 macOS 和 Windows 上，沙箱连本机的 localhost——包括它自己起的开发服务器——也要经代理，所以要写上 localhost 或 localhost:端口；Linux 与 WSL 上沙箱有自己的回环，里面的进程可以直接互连。",
-                "One per line: example.com, *.example.com (subdomains only), optionally with :port. A loopback or private address is reachable only when named itself (localhost:5432). On macOS and Windows, the sandbox reaches this computer's localhost — its own dev servers included — through the proxy too, so list localhost or localhost:port; on Linux and WSL it has a loopback of its own, where its processes connect directly."
-              )}
+              description={<>
+                {t(
+                  "一行一个主机，可通配子域、可加端口。",
+                  "One host per line; subdomain wildcards and ports allowed."
+                )}
+                <DocsLink inline page="security" section="sandbox" />
+              </>}
               value={current.network.allow}
               placeholder={"github.com\n*.npmjs.org\nlocalhost:5432"}
               onChange={(allow) => updateNetwork({ allow })}
@@ -283,8 +290,8 @@ export function SandboxSettings({ machine, machineName, path, settings, onChange
         <ListField
           label={t("额外可写目录", "Further writable directories")}
           description={t(
-            "这个工作区的沙箱也可以写这些目录，指的是工作区所在机器上的路径。绝对路径或以 ~ 开头。",
-            "Writable by this workspace's sandbox too: paths on the workspace's machine. Absolute, or starting with ~."
+            "工作区所在机器上的绝对路径或 ~ 路径。",
+            "Absolute or ~ paths on the workspace's machine."
           )}
           value={current.writable}
           placeholder={"~/shared-data"}
@@ -293,8 +300,8 @@ export function SandboxSettings({ machine, machineName, path, settings, onChange
         <ListField
           label={t("额外禁读路径", "Further unreadable paths")}
           description={t(
-            "内置的凭据位置之外，这个工作区的沙箱也读不到这些。",
-            "Besides the built-in credential locations, this workspace's sandbox cannot read these."
+            "内置凭据位置之外，沙箱也读不到这些。",
+            "Also unreadable, beyond the built-in credential locations."
           )}
           value={current.denyRead}
           placeholder={"~/secrets"}

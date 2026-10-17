@@ -71,7 +71,7 @@ describe("RewindDialog", () => {
 
     expect(await screen.findByText("这条消息之后没有可恢复的文件改动")).toBeInTheDocument();
     expect(screen.queryByRole("list")).not.toBeInTheDocument();
-    expect(screen.getByText("只包含 write / edit 工具做的改动；shell 命令和远端工作区里的改动不会被恢复。")).toBeInTheDocument();
+    expect(screen.getByText("只恢复 write / edit 工具的改动。")).toBeInTheDocument();
     expect(button("仅恢复文件")).toBeDisabled();
     expect(button("恢复对话和文件")).toBeDisabled();
     expect(button("仅恢复对话")).toBeEnabled();

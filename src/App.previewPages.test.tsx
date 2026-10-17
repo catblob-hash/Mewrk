@@ -164,7 +164,7 @@ describe("preview pages across a conversation's workspaces", () => {
     await user.click(within(toolbar()).getByRole("button", { name: "预览" }));
     const menu = await screen.findByRole("menu", { name: "打开预览" });
     expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent))
-      .toEqual(["C:\\test\\Mewrk1", "/srv/api2", "打开预览面板"]);
+      .toEqual(["C:\\test\\Mewrk", "/srv/api", "打开预览面板"]);
 
     await user.click(within(menu).getByRole("menuitem", { name: /^\/srv\/api/ }));
 
@@ -195,7 +195,7 @@ describe("preview pages across a conversation's workspaces", () => {
     const menu = await screen.findByRole("menu", { name: "为哪个工作区打开预览" });
     // The same workspaces, and no pane row: the pane is already open.
     expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent))
-      .toEqual(["C:\\test\\Mewrk1", "/srv/api2"]);
+      .toEqual(["C:\\test\\Mewrk", "/srv/api"]);
     await user.click(within(menu).getByRole("menuitem", { name: /^C:\\test\\Mewrk/ }));
 
     await waitFor(() => expect(screen.getAllByRole("tab")).toHaveLength(2));

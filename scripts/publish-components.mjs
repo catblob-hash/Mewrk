@@ -4,10 +4,13 @@
 // carries neither of them: the app fetches the sidecar at every start and an
 // agent the first time a machine needs one. Layout, pointer format and
 // validation are in components-plan.mjs; the app reads them with
-// src-tauri/src/components/.
+// src-tauri/src/components/. The channel also holds one hand-set document,
+// claude-agent/version.json, naming the Claude Agent SDK release the app's
+// provider page offers (see --claude-agent-sdk below).
 //
 // Usage:
 //   node scripts/publish-components.mjs [--aisdk] [--remote-agents]
+//                                       [--claude-agent-sdk <version>]
 //                                       [--triple <target triple>] [--no-probe]
 //                                       [--out <dir>] [--dry-run] [--force]
 //   node scripts/publish-components.mjs --check [--triple <target triple> ...]
@@ -18,6 +21,11 @@
 //   --remote-agents   publish every agent build in src-tauri/remote-agents/
 //                     (built by `npm run build:remote-agents -- --release`)
 //                     made from the same agent source as this computer's own
+//   --claude-agent-sdk <version>
+//                     name this exact release (such as 0.3.293) as the Claude
+//                     Agent SDK the provider page offers, by writing
+//                     claude-agent/version.json; alone or with --aisdk and/or
+//                     --remote-agents (see below)
 //   --triple <t>      the sidecar's triple when it is not this computer's (a
 //                     build made elsewhere, copied into aisdk-service/dist/;
 //                     needs --no-probe); with --remote-agents, publish only
@@ -30,7 +38,10 @@
 //                     MEWRK_COMPONENTS_MIRROR to that address to try it
 //   --dry-run         print what would be published, change nothing
 //   --force           publish a build whose pointer is already on the channel,
-//                     or replace a pointer of a newer version (see below)
+//                     or replace a pointer of a newer version (see below);
+//                     with --claude-agent-sdk, also a release that is older
+//                     than the published one, outside ^<this tree's pin>, or
+//                     over a document that cannot be read
 //   --check           the release gate (npm run check:components): look on the
 //                     public channel for what this tree needs, change nothing,
 //                     exit non-zero listing what is missing (see below)
@@ -47,13 +58,26 @@
 // version than this tree's root package.json (the same version with another
 // build is a rebuild or a hotfix and goes on), unless --force.
 //
+// --claude-agent-sdk sets the one release the provider page offers; the app
+// downloads the SDK and the CLI from npm itself, with npm's signatures checked,
+// and prompts an update when the installed SDK is older. The document is
+// { "schema": 1, "sdkVersion": "<version>" }, kept 60 s like a pointer. Before
+// anything is written, npm is asked over public HTTPS GET whether it has that
+// release of @anthropic-ai/claude-agent-sdk and of the CLI packages of the
+// platforms the app is released for (CLAUDE_AGENT_PLATFORM_PACKAGES in
+// components-plan.mjs). The version must be an exact release, inside the caret
+// range of this tree's aisdk-service pin (hosts built from this tree take
+// nothing else), and not older than the one already on the channel; the one
+// already there is left alone. It needs neither a sidecar build nor, with --out
+// or --dry-run, credentials.
+//
 // --check looks, over public HTTPS GET and without credentials, for the sidecar
 // pointer of this tree's protocol on each --triple (default: the Windows x64 and
 // Apple silicon builds the app is released for), and for the agent pointer of
 // this tree's agent source on every platform the agent is built for
 // (AGENT_TARGETS in components-plan.mjs). The agent source is read from this
 // computer's own agent build, as publishing does; with no such build the agent
-// part is reported as skipped.
+// part is reported as skipped. It also wants a valid claude-agent/version.json.
 //
 // Per build, the order is: compressed files first (a file already stored with
 // the same size is kept), each checked at its public address, then the pointer,
@@ -78,6 +102,7 @@ import {
   AGENT_TARGETS,
   BLOB_HEADERS,
   CHANNEL_URL,
+  CLAUDE_AGENT_RELEASE_KEY,
   DEFAULT_CHECK_TRIPLES,
   POINTER_HEADERS,
   agentFileNames,
@@ -89,7 +114,10 @@ import {
   blobKey,
   buildPointer,
   bucketKey,
+  claudeAgentReleaseDecision,
+  claudeAgentReleaseJson,
   claudeAgentSdkPin,
+  isExactRelease,
   ownAgentSource,
   ownAgentTriple,
   packFile,
@@ -104,7 +132,7 @@ import {
   validatePointer,
   verifyBlob,
 } from "./components-plan.mjs";
-import { checkChannel, describeEntry, httpGetText } from "./components-check.mjs";
+import { checkChannel, checkClaudeAgentRelease, checkNpmRelease, describeEntry, httpGetText, parseClaudeAgentRelease } from "./components-check.mjs";
 import { MIRROR } from "./release-mirror-plan.mjs";
 import { createR2Client, sha256Hex } from "./r2-client.mjs";
 import { probeSidecar } from "./sidecar-probe.mjs";
@@ -115,19 +143,24 @@ const sidecarDirectory = path.join(root, "aisdk-service", "dist");
 const agentsDirectory = path.join(root, "src-tauri", "remote-agents");
 const bundledAgentsDirectory = path.join(root, "src-tauri", "bundled-agents");
 
-const USAGE = `usage: node scripts/publish-components.mjs [--aisdk] [--remote-agents] [--triple <target triple>] [--no-probe] [--out <dir>] [--dry-run] [--force]
+const USAGE = `usage: node scripts/publish-components.mjs [--aisdk] [--remote-agents] [--claude-agent-sdk <version>] [--triple <target triple>] [--no-probe] [--out <dir>] [--dry-run] [--force]
        node scripts/publish-components.mjs --check [--triple <target triple> ...]
   --aisdk           publish the AI SDK sidecar built by \`npm run build:sidecar\`
   --remote-agents   publish the agent builds in src-tauri/remote-agents/ (\`npm run build:remote-agents -- --release\`)
+  --claude-agent-sdk <version>
+                    name this exact release as the Claude Agent SDK the provider page offers (claude-agent/version.json);
+                    npm must have it, it must be inside the caret range of aisdk-service's pin and not older than the published one
   --triple <t>      the sidecar's target triple (default: this computer's); with --remote-agents, only that triple;
                     with --check, repeatable: the sidecar platforms to look for (default: ${DEFAULT_CHECK_TRIPLES.join(", ")})
   --no-probe        publish a sidecar built for another platform, which cannot be started here, without the handshake:
                     this checkout's protocol and Claude Agent SDK pin are stamped on it unchecked
   --out <dir>       write the channel under <dir> instead of uploading (stands in for ${CHANNEL_URL} via MEWRK_COMPONENTS_MIRROR)
   --dry-run         print the plan, change nothing
-  --force           publish a build whose pointer is already on the channel, or replace a pointer of a newer version
-  --check           release gate (npm run check:components): are this tree's sidecar pointers (protocol and --triple) and
-                    agent pointers (agent source, every agent platform) on ${CHANNEL_URL}? Exits 1 listing what is missing`;
+  --force           publish a build whose pointer is already on the channel, or replace a pointer of a newer version;
+                    with --claude-agent-sdk, also an older, out-of-range or over-an-unreadable-document release
+  --check           release gate (npm run check:components): are this tree's sidecar pointers (protocol and --triple),
+                    agent pointers (agent source, every agent platform) and claude-agent/version.json on ${CHANNEL_URL}?
+                    Exits 1 listing what is missing`;
 
 const log = (message) => console.log(`${label} ${message}`);
 const warn = (message) => console.warn(`${label} ${message}`);
@@ -138,7 +171,7 @@ function fail(message) {
 }
 
 function parseArguments(argv) {
-  const options = { aisdk: false, remoteAgents: false, triples: [], triple: null, noProbe: false, out: null, dryRun: false, force: false, check: false };
+  const options = { aisdk: false, remoteAgents: false, claudeAgentSdk: null, triples: [], triple: null, noProbe: false, out: null, dryRun: false, force: false, check: false };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--help" || argument === "-h") {
@@ -150,12 +183,16 @@ function parseArguments(argv) {
     else if (argument === "--force") options.force = true;
     else if (argument === "--no-probe") options.noProbe = true;
     else if (argument === "--check") options.check = true;
-    else if (argument === "--triple" || argument === "--out") {
+    else if (argument === "--triple" || argument === "--out" || argument === "--claude-agent-sdk") {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) fail(`${argument} needs a value\n${USAGE}`);
       index += 1;
       if (argument === "--triple") options.triples.push(value);
-      else options.out = path.resolve(value);
+      else if (argument === "--claude-agent-sdk") {
+        if (options.claudeAgentSdk !== null) fail(`--claude-agent-sdk can be given once\n${USAGE}`);
+        if (!isExactRelease(value)) fail(`--claude-agent-sdk needs an exact release such as 0.3.293 (MAJOR.MINOR.PATCH, no prerelease, build metadata, "v" or spaces), not ${JSON.stringify(value)}\n${USAGE}`);
+        options.claudeAgentSdk = value;
+      } else options.out = path.resolve(value);
     } else fail(`Unsupported argument: ${argument}\n${USAGE}`);
   }
   for (const triple of options.triples) {
@@ -166,14 +203,17 @@ function parseArguments(argv) {
     }
   }
   if (options.check) {
-    const publishOnly = { "--aisdk": options.aisdk, "--remote-agents": options.remoteAgents, "--no-probe": options.noProbe, "--out": options.out, "--dry-run": options.dryRun, "--force": options.force };
+    const publishOnly = { "--aisdk": options.aisdk, "--remote-agents": options.remoteAgents, "--claude-agent-sdk": options.claudeAgentSdk, "--no-probe": options.noProbe, "--out": options.out, "--dry-run": options.dryRun, "--force": options.force };
     for (const [flag, given] of Object.entries(publishOnly)) {
       if (given) fail(`--check only looks at the channel and cannot be combined with ${flag}\n${USAGE}`);
     }
     options.triples = [...new Set(options.triples)];
     return options;
   }
-  if (!options.aisdk && !options.remoteAgents) fail(`nothing to publish: pass --aisdk and/or --remote-agents (or --check)\n${USAGE}`);
+  if (!options.aisdk && !options.remoteAgents && !options.claudeAgentSdk) {
+    fail(`nothing to publish: pass --aisdk and/or --remote-agents (or --check), or --claude-agent-sdk <version>\n${USAGE}`);
+  }
+  if (options.triples.length && !options.aisdk && !options.remoteAgents) fail(`--triple is about the sidecar and the agents: it needs --aisdk or --remote-agents\n${USAGE}`);
   if (options.triples.length > 1) fail(`--triple can be given once when publishing (several only with --check)\n${USAGE}`);
   options.triple = options.triples[0] ?? null;
   if (options.noProbe && !options.aisdk) fail(`--no-probe is about the sidecar: it needs --aisdk\n${USAGE}`);
@@ -340,6 +380,56 @@ async function currentPointer(key) {
 }
 
 // ---------------------------------------------------------------------------
+// The Claude Agent SDK release the provider page offers
+
+const fetchPublic = (url) => httpGetText(url);
+
+/**
+ * The release the channel (or --out) names now: `{ version, problem, unreadable }`.
+ * `version` is null when there is none yet; `problem` says why the document
+ * there is no good (not readable, not a release document), `unreadable` when it
+ * could not be read at all.
+ */
+async function currentRelease() {
+  if (options.out) {
+    const file = path.join(options.out, CLAUDE_AGENT_RELEASE_KEY);
+    if (!fs.existsSync(file)) return { version: null, problem: null, unreadable: false };
+    const { version, problem } = parseClaudeAgentRelease(fs.readFileSync(file, "utf8"));
+    return { version, problem: problem ? `${file}: ${problem}` : null, unreadable: false };
+  }
+  const entry = await checkClaudeAgentRelease(fetchPublic);
+  if (entry.ok) return { version: entry.version, problem: null, unreadable: false };
+  if (entry.state === "missing") return { version: null, problem: null, unreadable: false };
+  return { version: null, problem: `${entry.url}: ${entry.problem}`, unreadable: entry.state === "unreadable" };
+}
+
+/**
+ * Checks that npm has the requested release (the SDK and the CLI packages of the
+ * release platforms), weighs it against the one on the channel and this tree's
+ * pin, and builds the document. Throws when npm lacks it or the decision refuses.
+ */
+async function prepareRelease() {
+  const requested = options.claudeAgentSdk;
+  const pin = claudeAgentSdkPin(readText("aisdk-service", "package.json"));
+  log(`checking npm for Claude Agent SDK ${requested}`);
+  const npm = await checkNpmRelease(requested, fetchPublic);
+  if (npm.problems.length) throw new Error(`Claude Agent SDK ${requested} is not on npm as the app needs it:\n  ${npm.problems.join("\n  ")}`);
+  log(`npm has ${npm.checked.map((name) => `${name}@${requested}`).join(", ")}`);
+
+  const current = await currentRelease();
+  let unknown = false;
+  if (current.problem) {
+    if (options.force) warn(`--force: not relying on the release document on the channel (${current.problem})`);
+    else if (options.dryRun && current.unreadable) unknown = true;
+    else throw new Error(`${current.problem}\nso whether ${requested} is older than what the channel offers cannot be told; pass --force to publish it regardless`);
+  }
+  log(`${CLAUDE_AGENT_RELEASE_KEY} offers ${current.version ? `Claude Agent SDK ${current.version}` : "no release yet"}; this tree pins ${pin}, so hosts built from it take ^${pin}`);
+  const decision = claudeAgentReleaseDecision({ requested, published: current.version, pin, force: options.force });
+  if (unknown) decision.reason = "(the channel could not be read, so which release it offers now is unknown)";
+  return { requested, decision, body: claudeAgentReleaseJson(requested) };
+}
+
+// ---------------------------------------------------------------------------
 // Writing it
 
 function writeFileAtomic(file, bytes) {
@@ -392,6 +482,30 @@ async function uploadToBucket(credentials, build) {
   log(`${pointerUrl} serves the new pointer`);
 }
 
+/** Writes the release document under --out the way R2 would hold it, then reads it back the way the app would. */
+function writeReleaseToDirectory(release) {
+  const file = path.join(options.out, CLAUDE_AGENT_RELEASE_KEY);
+  writeFileAtomic(file, release.body);
+  const { version, problem } = parseClaudeAgentRelease(fs.readFileSync(file, "utf8"));
+  if (problem || version !== release.requested) throw new Error(`${file} does not read back as Claude Agent SDK ${release.requested}: ${problem ?? version}`);
+  log(`wrote ${CLAUDE_AGENT_RELEASE_KEY} (Claude Agent SDK ${version})`);
+}
+
+async function uploadRelease(credentials, release) {
+  const bytes = Buffer.from(release.body);
+  const sha256 = sha256Hex(bytes);
+  await r2.putObject(credentials, bucketKey(CLAUDE_AGENT_RELEASE_KEY), bytes, sha256, POINTER_HEADERS);
+  log(`${bucketKey(CLAUDE_AGENT_RELEASE_KEY)} uploaded`);
+  const url = publicUrl(CLAUDE_AGENT_RELEASE_KEY);
+  await r2.purge([url]).catch((error) => warn(error.message));
+  try {
+    await r2.checkPublic(url, bytes.length, sha256);
+  } catch (error) {
+    throw new Error(`${error.message}\nthe document is stored; if the CDN still holds the previous one it expires within 60 s`);
+  }
+  log(`${url} serves Claude Agent SDK ${release.requested}`);
+}
+
 function describe(build) {
   const { pointer } = build;
   const facts = pointer.component === "aisdk" ? `protocol ${pointer.protocol}, Claude Agent SDK ${pointer.claudeAgentSdk}` : `agent source ${pointer.source.slice(0, 12)}`;
@@ -403,9 +517,11 @@ function describe(build) {
 // Run: publishing
 
 async function runPublish() {
-  const host = hostTriple();
-  const version = JSON.parse(readText("package.json")).version;
-  if (!parseSemver(version)) throw new Error(`the root package.json version ${JSON.stringify(version)} is not a semantic version, so it cannot be told from a newer one already on the channel`);
+  // The sidecar and the agents are built here and carry this tree's version; the SDK release document is neither.
+  const withBuilds = options.aisdk || options.remoteAgents;
+  const host = withBuilds ? hostTriple() : null;
+  const version = withBuilds ? JSON.parse(readText("package.json")).version : null;
+  if (withBuilds && !parseSemver(version)) throw new Error(`the root package.json version ${JSON.stringify(version)} is not a semantic version, so it cannot be told from a newer one already on the channel`);
   const upload = !options.dryRun && !options.out;
   if (upload) {
     if (!process.env.CLOUDFLARE_ACCOUNT_ID) throw new Error("CLOUDFLARE_ACCOUNT_ID is not set");
@@ -415,12 +531,16 @@ async function runPublish() {
   // Credentials first: a bad token should not wait behind the compression below.
   const credentials = upload ? await r2.s3Credentials() : null;
 
+  const target = options.dryRun ? "dry run" : options.out ? `writing under ${options.out}` : `${MIRROR.bucket}/components/ -> ${CHANNEL_URL}`;
+  // Cheap and decisive, so before the compression below.
+  const release = options.claudeAgentSdk ? await prepareRelease() : null;
+
   const builds = [];
   if (options.aisdk) builds.push(await prepareSidecar(host, version));
   if (options.remoteAgents) builds.push(...prepareAgents(host, version));
 
-  const target = options.dryRun ? "dry run" : options.out ? `writing under ${options.out}` : `${MIRROR.bucket}/components/ -> ${CHANNEL_URL}`;
-  log(`${builds.length} build${builds.length === 1 ? "" : "s"}, version ${version}, ${target}`);
+  if (withBuilds) log(`${builds.length} build${builds.length === 1 ? "" : "s"}, version ${version}, ${target}`);
+  if (release) log(`Claude Agent SDK release ${release.requested}, ${target}`);
 
   // Every build is weighed against the channel before any is written, so a refusal leaves all of them unpublished.
   const planned = [];
@@ -452,6 +572,24 @@ async function runPublish() {
     if (options.out) writeToDirectory(build);
     else await uploadToBucket(credentials, build);
     published.push(build.pointerKey);
+  }
+
+  if (release) {
+    const { action, reason } = release.decision;
+    if (action === "skip") {
+      log(`skipping ${CLAUDE_AGENT_RELEASE_KEY}: ${reason}`);
+      skipped.push(CLAUDE_AGENT_RELEASE_KEY);
+    } else {
+      log(reason);
+      if (options.dryRun) {
+        log(`would publish ${CLAUDE_AGENT_RELEASE_KEY}:`);
+        console.log(release.body);
+      } else {
+        if (options.out) writeReleaseToDirectory(release);
+        else await uploadRelease(credentials, release);
+        published.push(CLAUDE_AGENT_RELEASE_KEY);
+      }
+    }
   }
 
   if (options.dryRun) log("dry run complete; nothing was written");
@@ -491,7 +629,7 @@ async function runCheck() {
   const triples = options.triples.length ? options.triples : [...DEFAULT_CHECK_TRIPLES];
   const agent = localAgentSource(hostTriple());
 
-  log(`checking ${CHANNEL_URL} for this tree: protocol ${protocol}, sidecars for ${triples.join(", ")}`);
+  log(`checking ${CHANNEL_URL} for this tree: protocol ${protocol}, sidecars for ${triples.join(", ")}, and ${CLAUDE_AGENT_RELEASE_KEY}`);
   if (agent.source) log(`agent source ${agent.source} (read from this computer's ${agent.reference} agent, ${agent.from}), agents for ${AGENT_TARGETS.length} platforms`);
   else warn(`SKIPPING the agent pointers: ${agent.skip}`);
 
@@ -499,11 +637,11 @@ async function runCheck() {
   for (const entry of result.entries) if (entry.ok) log(`ok   ${describeEntry(entry)}`);
 
   if (result.missing.length) {
-    console.error(`${label} ${result.missing.length} of ${result.entries.length} pointers are missing or invalid:`);
+    console.error(`${label} ${result.missing.length} of ${result.entries.length} pointers and documents are missing or invalid:`);
     for (const entry of result.missing) console.error(`${label}   - ${describeEntry(entry)}`);
     process.exitCode = 1;
   } else {
-    log(`all ${result.entries.length} pointers are on the channel`);
+    log(`all ${result.entries.length} pointers and documents are on the channel`);
   }
   if (!result.agentsChecked) warn(`the agent pointers were NOT checked (${agent.skip}): the channel is not known to be complete`);
 }

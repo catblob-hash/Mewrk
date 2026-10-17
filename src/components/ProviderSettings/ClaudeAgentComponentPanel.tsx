@@ -10,13 +10,14 @@ import {
 } from "../../lib/runtime";
 import type { ClaudeAgentComponentStatus } from "../../types";
 import { IconButton } from "../Common";
+import { DocsLink } from "../DocsLink";
 import { formatBytes } from "../FilePreview/format";
 import { useSettingsSession } from "../settingsSession";
 import { useWindowRefocus } from "./useWindowRefocus";
 
 /** Where the settings session keeps the last component status (the components are not per provider). */
 export const CLAUDE_AGENT_COMPONENTS_KEY = "claude-agent:components";
-/** Set once this settings session's npm check has answered. */
+/** Set once this settings session's update check has answered. */
 const CLAUDE_AGENT_COMPONENTS_CHECKED_KEY = "claude-agent:components:checked";
 
 /** How often a running install's progress is read. */
@@ -27,7 +28,7 @@ function errorText(reason: unknown): string {
 }
 
 /**
- * An answer to a status read that did not ask npm (`latest` and friends come back
+ * An answer to a status read that did not check for updates (`latest` and friends come back
  * empty) must not erase what the last check found. While the installed version is
  * the same the check still describes it; once it changed (an install finished) the
  * old verdict no longer applies, and the re-check that follows fills it in.
@@ -86,11 +87,13 @@ export interface ClaudeAgentComponentsView {
 
 /**
  * The Claude Agent SDK and the Claude Code CLI Mewrk drives. The installer does not
- * carry them: this panel installs them from npm and keeps them current, and shows
+ * carry them: this panel installs them from npm, at the one version Mewrk's component
+ * channel offers (set by hand, so a release reaches users once it has been tried), offers
+ * an update when what is installed is older than that version, and shows
  * `children` (the sign-in panel, which needs the CLI) only once they are there.
  *
  * Refresh rule: the first time the panel is shown in a settings session it asks the
- * host (checking npm for the newest compatible version); showing it again in the same
+ * host (asking Mewrk's channel which version it offers); showing it again in the same
  * session reuses that answer, and a new session starts over. Coming back to the app
  * window after leaving it asks again, keeping what is on screen until the answer is in.
  * While an install runs, its progress is polled.
@@ -119,7 +122,7 @@ export function ClaudeAgentComponentPanel({
   const [freshInstall, setFreshInstall] = useState(false);
   const mountedRef = useRef(true);
   const statusRef = useRef(status);
-  // Answers are applied in the order their requests started: a slow npm check must not
+  // Answers are applied in the order their requests started: a slow update check must not
   // overwrite the newer progress a poll has shown meanwhile.
   const issuedRef = useRef(0);
   const appliedRef = useRef(0);
@@ -152,7 +155,7 @@ export function ClaudeAgentComponentPanel({
   }, [show]);
 
   /**
-   * A task ended: read the status afresh (npm included). `replaced` says a copy was
+   * A task ended: read the status afresh (the update check included). `replaced` says a copy was
    * installed before the task began, so a sign-in panel is already up and reads again
    * (the CLI behind it is another one now); after a first install the panel has only
    * just appeared and its own first read is the current one.
@@ -173,7 +176,7 @@ export function ClaudeAgentComponentPanel({
   }, [request]);
 
   // The first time the panel is shown in this settings session: what is installed
-  // (on disk, at once), then the npm check, which can take as long as the network
+  // (on disk, at once), then the update check, which can take as long as the network
   // does and so must not hold the versions back. A page shown again in the session
   // asks nothing; one left before its check answered checks on its next showing.
   useEffect(() => {
@@ -269,7 +272,7 @@ export function ClaudeAgentComponentPanel({
     setStarting(true);
     setActionError(null);
     try {
-      // The host picks the newest compatible version itself when it gets none.
+      // The host installs the version Mewrk's channel offers when it gets none.
       await installClaudeAgentComponent(null);
       // Anything asked before the task began describes a world without it.
       appliedRef.current = issuedRef.current + 1;
@@ -367,10 +370,10 @@ export function ClaudeAgentComponentPanel({
             )}
 
             {status && !installed && (
-              <p className="provider-field__help">{t(
-                "Claude Agent 需要 Claude Agent SDK 和 Claude Code。Mewrk 的安装包不带它们：点「安装」，从 npm 下载 Anthropic 发布的官方包，装好后再登录。",
-                "Claude Agent needs the Claude Agent SDK and Claude Code. Mewrk's installer does not include them: choose Install to download Anthropic's official packages from npm, then sign in."
-              )}</p>
+              <p className="provider-field__help">
+                {t("先安装组件，再登录。", "Install the components first, then sign in.")}
+                <DocsLink inline page="providers" section="claude-agent" />
+              </p>
             )}
 
             {installed && (
@@ -406,7 +409,7 @@ export function ClaudeAgentComponentPanel({
                 )}</p>
               ) : status.latest ? (
                 <p className="provider-field__help">{installed
-                  ? t("已是最新的兼容版本。", "You have the newest compatible version.")
+                  ? t("已是最新版本。", "You have the latest version.")
                   : t("将安装 {versions}。", "Will install {versions}.", { versions: versionsText(t, status.latest) })}</p>
               ) : status.latestError ? (
                 <p className="provider-field__help">{t(
@@ -418,8 +421,8 @@ export function ClaudeAgentComponentPanel({
             )}
             {status?.newerIncompatible && (
               <p className="provider-field__help">{t(
-                "npm 上已有 SDK {version}，但这个版本的 Mewrk 只兼容 {range}；更新 Mewrk 后才能用它。",
-                "SDK {version} is on npm, but this version of Mewrk only supports {range}; update Mewrk to use it.",
+                "Mewrk 现在提供的是 SDK {version}，但这个版本的 Mewrk 只兼容 {range}；更新 Mewrk 后才能用它。",
+                "Mewrk now offers SDK {version}, but this version of Mewrk only supports {range}; update Mewrk to use it.",
                 { version: status.newerIncompatible, range: status.compatible }
               )}</p>
             )}

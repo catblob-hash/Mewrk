@@ -109,8 +109,9 @@ export function nativeSearchTool(
     case "openai-compatible":
       return null;
     case "claude-agent":
-      // Claude Code's own WebSearch is a built-in tool the host switches off; the
-      // host performs searches itself for this family.
+      // Never reached: this family's steps run in `claude-agent.ts`, where a
+      // native-search session switches on Claude Code's own `WebSearch` instead
+      // of attaching an AI SDK tool.
       return null;
     default: {
       const exhaustive: never = family;
@@ -129,7 +130,8 @@ export function familySupportsNativeSearch(family: ProviderFamily): boolean {
     family === "bedrock" ||
     family === "google" ||
     family === "vertex" ||
-    family === "xai"
+    family === "xai" ||
+    family === "claude-agent"
   );
 }
 
@@ -177,7 +179,11 @@ export function nativeFetchTool(
 /**
  * Whether this family has a server-side fetch tool the host can read text out of.
  * Must match the host's `web_search.rs::family_supports_native_fetch` exactly.
+ *
+ * `claude-agent` is on the list without a `nativeFetchTool` of its own: its
+ * steps run in `claude-agent.ts`, where a native-fetch session switches on
+ * Claude Code's own `WebFetch` instead of attaching an AI SDK tool.
  */
 export function familySupportsNativeFetch(family: ProviderFamily): boolean {
-  return family === "anthropic" || family === "bedrock";
+  return family === "anthropic" || family === "bedrock" || family === "claude-agent";
 }

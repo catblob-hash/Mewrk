@@ -65,6 +65,9 @@ describe("InlineQuestionEditor", () => {
     );
 
     expect(screen.getAllByRole("heading", { level: 3 })).toHaveLength(2);
+    // Questions and options are headed by their kind alone; their place says which is which.
+    expect(screen.getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent)).toEqual(["问题", "问题"]);
+    expect(screen.getAllByText("选项", { selector: "strong" })).toHaveLength(2);
     expect(screen.queryByRole("button", { name: /增加问题|删除问题|Add question|Remove question/ })).not.toBeInTheDocument();
     expect(screen.getByLabelText("第 1 题回答")).toHaveValue("稳健");
     expect(screen.getByLabelText("第 2 题回答")).toHaveValue("搜索, 导出");

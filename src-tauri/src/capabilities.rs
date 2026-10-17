@@ -982,13 +982,15 @@ pub struct RoleBasis {
     /// run's own does — in the wording of the run's own profile.
     pub environment: String,
     /// What `environment` was rendered from: the id of the profile it is
-    /// worded in, the facts it states, and whether it says the host's
+    /// worded in, the facts it states, whether it states them at all (the
+    /// conversation's environment switch), and whether it says the host's
     /// messages come as user messages. A role that chooses another
-    /// tool-description file opens with the same facts in its own wording
+    /// tool-description file opens with the same block in its own wording
     /// ([`Self::environment_for`]); the run's facts are read once, at its
     /// start, for every child alike.
     pub prompt_profile_id: String,
     pub environment_facts: crate::environment_prompt::EnvironmentFacts,
+    pub environment_enabled: bool,
     pub host_messages_in_user: bool,
     /// The conversation's selections the run was resolved from, which a role
     /// takes for any kind it leaves to its caller: the ones the caller runs
@@ -1013,6 +1015,7 @@ impl Default for RoleBasis {
             environment: String::new(),
             prompt_profile_id: crate::prompt_profile::BUILTIN_ID.to_owned(),
             environment_facts: Default::default(),
+            environment_enabled: true,
             host_messages_in_user: false,
             skill_ids: Vec::new(),
             mcp_ids: Vec::new(),
@@ -1032,7 +1035,12 @@ impl RoleBasis {
         if profile.id == self.prompt_profile_id {
             return self.environment.clone();
         }
-        crate::run_environment_block(profile, &self.environment_facts, self.host_messages_in_user)
+        crate::run_environment_block(
+            profile,
+            &self.environment_facts,
+            self.environment_enabled,
+            self.host_messages_in_user,
+        )
     }
 }
 
@@ -4890,6 +4898,7 @@ mod tests {
             environment: String::new(),
             prompt_profile_id: profile.id.clone(),
             environment_facts: Default::default(),
+            environment_enabled: true,
             host_messages_in_user: false,
             skill_ids: conversation.settings.skill_ids.clone(),
             mcp_ids: conversation.settings.mcp_ids.clone(),

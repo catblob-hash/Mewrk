@@ -18,6 +18,7 @@ import { isDeletedMachine, runEnvKey } from "../lib/workspaces";
 import type { MachineUsage } from "../lib/workspaces";
 import type { AttachedWorkspace, RunTarget, SshMachineConfig, WslDistro } from "../types";
 import { Dialog, IconButton } from "./Common";
+import { DocsLink } from "./DocsLink";
 import { MachineSettingsDialog, SshMachineDialog, type MachineShellsControl } from "./MachineDialogs";
 import { PathText } from "./PathText";
 import { PopoverMenu } from "./PopoverMenu";
@@ -209,17 +210,16 @@ export function ProjectDialog({
   const typedPath = (row: ProjectRow) => !row.machine && !nativePicker && !row.locked;
   const submittedPath = (row: ProjectRow) => (typedPath(row) ? row.path.trim() : row.path);
 
-  /** Row id → 1-based number of the earlier row it repeats. */
+  /** Ids of the rows that repeat an earlier row's directory. */
   const duplicates = useMemo(() => {
-    const seen = new Map<string, number>();
-    const found = new Map<string, number>();
-    rows.forEach((row, index) => {
-      if (!row.path.trim()) return;
+    const seen = new Set<string>();
+    const found = new Set<string>();
+    for (const row of rows) {
+      if (!row.path.trim()) continue;
       const key = projectWorkspaceKey(row.machine, row.path);
-      const first = seen.get(key);
-      if (first === undefined) seen.set(key, index + 1);
-      else found.set(row.id, first);
-    });
+      if (seen.has(key)) found.add(row.id);
+      else seen.add(key);
+    }
     return found;
   }, [rows]);
 
@@ -307,7 +307,7 @@ export function ProjectDialog({
     ];
   };
 
-  const renderPath = (row: ProjectRow, index: number) => {
+  const renderPath = (row: ProjectRow) => {
     if (typedPath(row)) {
       return (
         <input
@@ -315,9 +315,7 @@ export function ProjectDialog({
           className="project-dialog__path-input"
           value={row.path}
           spellCheck={false}
-          aria-label={t("工作区 {index} 的绝对路径", "Absolute path of workspace {index}", {
-            index: String(index + 1)
-          })}
+          aria-label={t("工作区的绝对路径", "Absolute path of the workspace")}
           placeholder={t("绝对路径，如 C:\\Projects\\app 或 /home/me/app", "Absolute path, e.g. C:\\Projects\\app or /home/me/app")}
           onChange={(event) => setRowPath(row.id, event.target.value)}
         />
@@ -330,8 +328,8 @@ export function ProjectDialog({
         className="composer-chip project-dialog__path"
         title={row.path || undefined}
         aria-label={row.path
-          ? t("工作区 {index}：{path}", "Workspace {index}: {path}", { index: String(index + 1), path: row.path })
-          : t("为工作区 {index} 选择目录", "Choose a directory for workspace {index}", { index: String(index + 1) })}
+          ? t("工作区：{path}", "Workspace: {path}", { path: row.path })
+          : t("为工作区选择目录", "Choose a directory for the workspace")}
         disabled={row.locked || picking}
         onClick={() => {
           if (row.machine) setRemotePickerRow(row.id);
@@ -354,10 +352,13 @@ export function ProjectDialog({
     <>
       <Dialog
         title={mode === "create" ? t("新建项目", "New project") : t("编辑项目", "Edit project")}
-        description={t(
-          "项目由一个或多个工作区组成，每个工作区是某台机器上的一个目录。文件、搜索和命令工具以这些目录作为安全边界。",
-          "A project is one or more workspaces, each a directory on some machine. File, search, and command tools use these directories as their security boundary."
-        )}
+        description={<>
+          {t(
+            "项目由工作区组成，每个是某台机器上的目录。",
+            "A project groups workspaces: directories on any machine."
+          )}
+          <DocsLink inline page="workspaces" section="projects" />
+        </>}
         width="560px"
         dismissible={!menuOpen}
         onClose={onClose}
@@ -385,7 +386,7 @@ export function ProjectDialog({
           <ol className="project-dialog__rows">
             {rows.map((row, index) => {
               const label = machineLabel(row.machine);
-              const duplicateOf = duplicates.get(row.id);
+              const duplicate = duplicates.has(row.id);
               const error = pickErrors[row.id];
               const machineDeleted = isDeletedMachine(row.machine, machines);
               return (
@@ -399,10 +400,7 @@ export function ProjectDialog({
                         <span className="composer-chip__label">{label}</span>
                         <ChevronDown size={11} className="composer-chip__caret" />
                       </>}
-                      triggerLabel={t("工作区 {index} 的机器：{name}", "Machine for workspace {index}: {name}", {
-                        index: String(index + 1),
-                        name: label
-                      })}
+                      triggerLabel={t("工作区的机器：{name}", "Machine for the workspace: {name}", { name: label })}
                       triggerTitle={row.locked
                         ? t("项目的第一个工作区不能更换", "The project's first workspace cannot be changed")
                         : undefined}
@@ -416,10 +414,12 @@ export function ProjectDialog({
                       onPanelRectChange={trackMenu}
                       sections={[{ id: "machines", items: menuItems(row) }]}
                     />
-                    {renderPath(row, index)}
+                    {renderPath(row)}
                     {index > 0 && !row.locked && (
                       <IconButton
-                        label={t("移除工作区 {index}", "Remove workspace {index}", { index: String(index + 1) })}
+                        label={row.path
+                          ? t("移除工作区 {path}", "Remove workspace {path}", { path: row.path })
+                          : t("移除工作区", "Remove workspace")}
                         className="project-dialog__remove"
                         onClick={() => removeRow(row.id)}
                       >
@@ -435,12 +435,11 @@ export function ProjectDialog({
                       )}
                     </p>
                   )}
-                  {duplicateOf !== undefined && (
+                  {duplicate && (
                     <p className="project-dialog__row-error" role="alert">
                       {t(
-                        "与工作区 {other} 是同一台机器上的同一个目录",
-                        "Same directory on the same machine as workspace {other}",
-                        { other: String(duplicateOf) }
+                        "与上面的工作区是同一台机器上的同一个目录",
+                        "Same directory on the same machine as a workspace above"
                       )}
                     </p>
                   )}

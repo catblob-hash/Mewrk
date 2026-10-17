@@ -1,5 +1,6 @@
 //! Conversation-scoped background subagent runtime backing the `agent` tool
-//! group: `agent_spawn`, `task_wait`, `task_list`, and `task_stop`.
+//! group: `agent_spawn`, `task_wait`, `task_list`, `task_stop`, and — where the
+//! conversation's subagent communication is on — `send_message`.
 //!
 //! A task is stopped at one place, [`stop_task_by_address`]: the user's stop
 //! button reaches it through `stop_conversation_task` over IPC and the model's
@@ -20,15 +21,25 @@
 //! later turn rehydrates it from the conversation timeline so `task_wait` can
 //! still address the agent.
 //!
-//! Communication model: a child is one-shot. The parent hands it its whole
-//! task at spawn and never speaks to it again — the parent cannot see inside a
-//! child, so a mid-run instruction or a second task could only be written
-//! blind. The only channel runs the other way:
-//! - child → parent: `subagent_update` progress envelopes plus an automatic
-//!   final-result envelope, both drained by `task_wait`;
+//! Communication model: by default a child is one-shot. The parent hands it its
+//! whole task at spawn and never speaks to it again. The channels are:
+//! - child → parent: an automatic final-result envelope, drained by `task_wait`
+//!   or folded at a round boundary, plus `subagent_update` progress envelopes
+//!   where the conversation's subagent communication is on;
+//! - parent → child, only where that switch is on: the main agent's
+//!   `send_message` ([`AgentPool::send_message`]). A child with a run still
+//!   going reads it through its own mailbox ([`AgentMailbox`]) before its next
+//!   model request; a finished child whose result was delivered is resumed as a
+//!   new incarnation of the same task, its transcript plus the message;
 //! - worker → current or future run: the conversation-scoped task surface
 //!   (`AppState::task_surface`) drops idle sinks and rejects idle approvals;
 //!   see `api.rs` `agent_worker_loop`.
+//!
+//! What belongs to one incarnation rather than to the task: its identity, its
+//! stop flag and stop mark, its mailbox, and the call that owns its record.
+//! A resume replaces all of them under the core lock, so whatever a previous
+//! incarnation's worker still holds — a flag it polls, a mailbox it drains —
+//! can never reach the new one.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -163,12 +174,49 @@ pub fn apply_task_runtime_tools(
     }
 }
 
+/// The tool the subagent-communication switch grants, by name. Host-derived like
+/// the task-runtime tools — never a picker row, stripped from every persisted
+/// enabled list, re-derived by the trusted request builder — but on its own
+/// rule, so it is not one of [`TASK_RUNTIME_TOOL_NAMES`]. Mirrored by TS
+/// `src/lib/taskTools.ts`.
+pub fn is_subagent_messaging_tool_name(name: &str) -> bool {
+    name == crate::api::SEND_MESSAGE_TOOL
+}
+
+/// Whether a top-level run's agent tree talks: the conversation's
+/// subagent-communication switch, and `agent_spawn` among the tools the
+/// conversation enables. Without `agent_spawn` there is no child to message and
+/// no child to hand an update tool, so the switch alone grants nothing.
+///
+/// `enabled_tools` is the conversation's own list, read before any host
+/// derivation, so a stale persisted `send_message` can never be what makes it
+/// true.
+pub fn subagent_messaging_granted(switch: bool, enabled_tools: &[String]) -> bool {
+    switch && enabled_tools.iter().any(|name| name == "agent_spawn")
+}
+
+/// Rewrites an enabled-tool list for the subagent-communication rule: strip
+/// `send_message` first, then push it exactly when the run's agent tree talks
+/// (`RunModelRequest::subagent_messaging`). Strip-then-derive, like
+/// [`apply_task_runtime_tools`], so the grant never depends on whether a
+/// persisted list happened to carry the name. Depth 0 only — a child never holds
+/// the tool (`api::SUBAGENT_DISABLED_TOOL_NAMES`).
+pub fn apply_subagent_messaging_tool(enabled_tools: &mut Vec<String>, subagent_messaging: bool) {
+    enabled_tools.retain(|name| !is_subagent_messaging_tool_name(name));
+    if subagent_messaging {
+        enabled_tools.push(crate::api::SEND_MESSAGE_TOOL.to_owned());
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentToolKind {
     Spawn,
     Wait,
     List,
     Stop,
+    /// The main agent's `send_message`: a message into a running child, or the
+    /// resumption of a finished one ([`AgentPool::send_message`]).
+    SendMessage,
 }
 
 pub fn agent_tool_kind(name: &str) -> Option<AgentToolKind> {
@@ -177,6 +225,7 @@ pub fn agent_tool_kind(name: &str) -> Option<AgentToolKind> {
         "task_wait" => Some(AgentToolKind::Wait),
         "task_list" => Some(AgentToolKind::List),
         "task_stop" => Some(AgentToolKind::Stop),
+        crate::api::SEND_MESSAGE_TOOL => Some(AgentToolKind::SendMessage),
         _ => None,
     }
 }
@@ -385,35 +434,99 @@ pub struct MailboxMessage {
     pub created_at: Option<String>,
 }
 
-/// The user's steer queue for a running top-level turn. A handle is attached to
-/// `RunModelRequest`, and the model loop drains it before every model round.
+/// A steer queue a model loop drains before every model round, attached to
+/// `RunModelRequest` as `steer_mailbox`. Two kinds of run hold one:
+///
+/// - a top-level turn, where it is the user's queue: `push_message` puts a
+///   message in whatever state the run is in, and the loop drains it while it
+///   runs, exactly as before child mailboxes existed;
+/// - a child agent's run, where the main agent's `send_message` writes it
+///   through [`Self::try_push`], which a closed mailbox refuses.
+///
+/// Closing is what makes "the child will read this" decidable. A child run
+/// that is about to end for good closes its mailbox in the same critical
+/// section that finds it empty ([`Self::close_if_empty`]); a run that ends any
+/// other way is closed by its worker before its result settles. So a message
+/// is either accepted while a run that will still drain it exists, or refused,
+/// and the sender then knows the run has ended — never accepted into a queue
+/// nobody reads. A closed mailbox keeps what it holds: a run that stopped with
+/// messages unread hands them to the next incarnation ([`AgentPool::send_message`]).
 #[derive(Debug, Default)]
 pub struct AgentMailbox {
-    messages: Mutex<Vec<MailboxMessage>>,
+    inner: Mutex<MailboxInner>,
+}
+
+#[derive(Debug, Default)]
+struct MailboxInner {
+    messages: Vec<MailboxMessage>,
+    /// Set once the run reading this mailbox has stopped draining it. Only
+    /// [`AgentMailbox::try_push`] reads it.
+    closed: bool,
 }
 
 impl AgentMailbox {
+    /// A mailbox no run reads: a settled or rehydrated child's.
+    pub(crate) fn new_closed() -> Self {
+        Self {
+            inner: Mutex::new(MailboxInner {
+                messages: Vec::new(),
+                closed: true,
+            }),
+        }
+    }
+
+    /// Queues `message` whatever the mailbox's state: the user's steer path,
+    /// unchanged by closing.
     pub fn push_message(&self, message: MailboxMessage) {
-        self.messages
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(message);
+        self.lock().messages.push(message);
+    }
+
+    /// Queues `message` only while the run reading this mailbox still drains it,
+    /// handing it back otherwise.
+    pub(crate) fn try_push(&self, message: MailboxMessage) -> Result<(), MailboxMessage> {
+        let mut inner = self.lock();
+        if inner.closed {
+            return Err(message);
+        }
+        inner.messages.push(message);
+        Ok(())
     }
 
     pub fn drain(&self) -> Vec<MailboxMessage> {
-        std::mem::take(
-            &mut *self
-                .messages
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
+        std::mem::take(&mut self.lock().messages)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.messages
+        self.lock().messages.is_empty()
+    }
+
+    /// Closes the mailbox if, and only if, nothing is waiting in it, as one
+    /// step: `true` means it is closed and empty, so nothing accepted can be
+    /// stranded by the run ending now; `false` means a message is waiting and
+    /// the run has to go on to read it.
+    pub(crate) fn close_if_empty(&self) -> bool {
+        let mut inner = self.lock();
+        if !inner.messages.is_empty() {
+            return false;
+        }
+        inner.closed = true;
+        true
+    }
+
+    /// Closes the mailbox, keeping whatever it holds.
+    pub(crate) fn close(&self) {
+        self.lock().closed = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MailboxInner> {
+        self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty()
     }
 }
 
@@ -455,9 +568,21 @@ struct AgentCore {
     contexts: Vec<ContextItem>,
     updates: Vec<SubagentUpdate>,
     outbox: Vec<AgentEnvelope>,
-    /// The agent tool call that created the child; the persisted record is
-    /// backfilled onto this tool context.
+    /// The agent tool call that created the child — or, after a resume, the
+    /// `send_message` call that resumed it; the persisted record is backfilled
+    /// onto this tool context.
     latest_call_id: String,
+    /// Whether `latest_call_id` is the call that launched this task (an
+    /// `agent_spawn` or a workflow), as opposed to a `send_message` that resumed
+    /// it. Only a launch can be owed its task's result as its own output on a
+    /// model that takes asynchronous calls (`api::deferred_launch_call`).
+    latest_call_launched: bool,
+    /// The steer queue of this incarnation's run, for a task the main agent can
+    /// message (an ordinary child agent); `None` for every other kind. Open
+    /// while the run still drains it, closed once it ends. A resume puts a new
+    /// open one here, so a previous incarnation's worker can never drain a
+    /// message meant for the new run.
+    mailbox: Option<Arc<AgentMailbox>>,
     /// Timeline id of the tool card `latest_call_id` produced, recorded when
     /// the parent run minted that card. Round-boundary record checkpoints use
     /// it to find the card of a child that outlived its spawning request —
@@ -563,6 +688,12 @@ impl StopMark {
             _ => None,
         }
     }
+
+    /// Forgets every stop: a resumed task's new incarnation was stopped by
+    /// nobody. The one place a mark falls.
+    fn reset(&self) {
+        self.0.store(0, Ordering::Release);
+    }
 }
 
 /// Shared state of one agent, owned jointly by the pool, the dispatching
@@ -572,14 +703,20 @@ pub struct AgentShared {
     pub name: String,
     pub label: String,
     pub task: String,
-    /// Stop flag shared by value with synchronous blocking operations in the
-    /// task turn, including shell processes, hook commands, and approval cards.
-    /// Use [`Self::cancel_flag`] to obtain a clone for polling.
-    pub cancel: Arc<AtomicBool>,
+    /// Stop flag of the incumbent incarnation, shared by value with synchronous
+    /// blocking operations in its turn, including shell processes, hook
+    /// commands, and approval cards. [`Self::cancel_flag`] hands out a clone
+    /// for polling and [`Self::is_cancelled`] reads it.
+    ///
+    /// Per incarnation, not per task: a resume installs a fresh flag rather than
+    /// lowering this one, so a previous incarnation's worker that is still
+    /// winding down keeps seeing its own stop. Locked only on its own, or
+    /// inside the core lock — never the other way round.
+    cancel: Mutex<Arc<AtomicBool>>,
     /// Who asked for the stop, when it was somebody the result should name: the
     /// user's sidebar close or the model's `task_stop`. A host cancellation is
     /// not recorded, so the settled result never credits anyone with it. Set by
-    /// [`Self::request_stop`] and [`Self::stop_task`].
+    /// [`Self::request_stop`] and [`Self::stop_task`]; cleared only by a resume.
     stop_mark: StopMark,
     /// Prototype child request (provider, tools, hooks, depth…) with empty
     /// contexts; the child turn clones it and fills in the transcript.
@@ -624,6 +761,21 @@ impl RunSlots {
         self.lock_turns().waiting.push_back(Arc::downgrade(agent));
     }
 
+    /// Puts a resumed subagent back in line, at the end, like a new spawn. The
+    /// entries its previous incarnation left are dropped first: they are pruned
+    /// only once their task is no longer running, which a resume has just made
+    /// untrue again, and a stale `running` entry would let the new run start
+    /// without taking a slot.
+    fn requeue(&self, agent: &Arc<AgentShared>) {
+        let mut turns = self.lock_turns();
+        let other = |entry: &std::sync::Weak<AgentShared>| {
+            !std::ptr::eq(entry.as_ptr(), Arc::as_ptr(agent))
+        };
+        turns.running.retain(other);
+        turns.waiting.retain(other);
+        turns.waiting.push_back(Arc::downgrade(agent));
+    }
+
     /// `Some(true)` once `agent` holds a slot, `Some(false)` when it was stopped
     /// before it got one, `None` while it still has to wait.
     fn try_take(&self, agent: &Arc<AgentShared>) -> Option<bool> {
@@ -639,9 +791,9 @@ impl RunSlots {
             still_running(queued)
                 && queued
                     .upgrade()
-                    .is_some_and(|queued| !queued.cancel.load(Ordering::Acquire))
+                    .is_some_and(|queued| !queued.is_cancelled())
         });
-        if agent.cancel.load(Ordering::Acquire) {
+        if agent.is_cancelled() {
             return Some(false);
         }
         let holds = |entry: &std::sync::Weak<AgentShared>| {
@@ -744,6 +896,12 @@ impl AgentShared {
                 .filter(|context| matches!(context, ContextItem::Tool { .. }))
                 .count();
             core.contexts.extend(new_contexts);
+            // A settled incarnation reads no more messages. Its worker closed
+            // the mailbox already when the run returned; this keeps "settled
+            // means closed" true for every other caller.
+            if let Some(mailbox) = core.mailbox.as_ref() {
+                mailbox.close();
+            }
             if core.status != AgentLiveStatus::Running {
                 // Preserve the transcript after same-generation terminal
                 // settlement, but do not replace its status or emit another envelope.
@@ -839,14 +997,21 @@ impl AgentShared {
     fn settle_cancelled_incarnation(&self, expected: Option<TaskIdentity>) {
         let settled = {
             let mut core = self.lock_core();
+            // The identity is compared first: a grace timer left over from an
+            // incarnation a resume has since replaced must settle nothing, and
+            // the flag read after it is then the one its own stop raised.
             if core.status != AgentLiveStatus::Running
                 || expected.is_some_and(|identity| {
-                    core.identity != identity || !self.cancel.load(Ordering::Acquire)
+                    core.identity != identity || !self.is_cancelled()
                 })
             {
                 return;
             }
             core.status = AgentLiveStatus::Stopped;
+            // The worker that ignored its stop will not read another message.
+            if let Some(mailbox) = core.mailbox.as_ref() {
+                mailbox.close();
+            }
             let identity = core.identity;
             let reason = self
                 .caller_prompt_profile()
@@ -881,7 +1046,7 @@ impl AgentShared {
     /// same flag returned by [`Self::cancel_flag`]. See [`crate::cancel`].
     pub fn request_stop(&self, origin: StopOrigin) {
         self.stop_mark.record(origin);
-        self.cancel.store(true, Ordering::Release);
+        self.raise_cancel();
         self.notify();
     }
 
@@ -902,7 +1067,14 @@ impl AgentShared {
             // arrives while the model's grace timer runs still has to win the
             // wording.
             self.stop_mark.record(origin);
-            self.cancel.store(true, Ordering::Release);
+            self.raise_cancel();
+            // A stopping run will not read another message: from here a
+            // `send_message` is told the result is on its way instead of being
+            // promised a read that never comes. What is already queued stays
+            // for a later resume.
+            if let Some(mailbox) = core.mailbox.as_ref() {
+                mailbox.close();
+            }
             if core.stop_timer == Some(core.identity) {
                 return;
             }
@@ -934,9 +1106,34 @@ impl AgentShared {
         self.stop_mark.attributed()
     }
 
-    /// Stop flag passed by value to synchronous blocking points in the task turn.
+    /// The incumbent incarnation's stop flag, passed by value to synchronous
+    /// blocking points in its turn. A worker takes it once, at the start of its
+    /// turn, and polls only that copy: after a resume this returns the new
+    /// incarnation's flag, which an old worker must never read.
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancel)
+        Arc::clone(&self.lock_cancel())
+    }
+
+    /// Whether the incumbent incarnation was asked to stop.
+    pub fn is_cancelled(&self) -> bool {
+        self.lock_cancel().load(Ordering::Acquire)
+    }
+
+    /// Raises the incumbent incarnation's stop flag, recording no origin.
+    pub(crate) fn raise_cancel(&self) {
+        self.lock_cancel().store(true, Ordering::Release);
+    }
+
+    /// The incumbent incarnation's mailbox, for a task the main agent can
+    /// message. The worker attaches it to its run once, at the start of its turn.
+    pub(crate) fn mailbox(&self) -> Option<Arc<AgentMailbox>> {
+        self.lock_core().mailbox.clone()
+    }
+
+    /// Whether the call that owns this task's record launched it, rather than a
+    /// `send_message` that resumed it. See `AgentCore::latest_call_launched`.
+    pub(crate) fn latest_call_launched(&self) -> bool {
+        self.lock_core().latest_call_launched
     }
 
     pub fn latest_call_id(&self) -> String {
@@ -1126,6 +1323,12 @@ impl AgentShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn lock_cancel(&self) -> std::sync::MutexGuard<'_, Arc<AtomicBool>> {
+        self.cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 /// Ensures a worker thread that unwinds (panic or early exit) leaves its agent
@@ -1134,15 +1337,23 @@ impl AgentShared {
 pub struct RunningTurnGuard {
     shared: Arc<AgentShared>,
     incarnation: TaskIdentity,
+    /// The incarnation's mailbox, closed before the guard settles anything: a
+    /// turn that never reached its own close must not leave a message accepted
+    /// into a queue no run will read.
+    mailbox: Option<Arc<AgentMailbox>>,
     defused: bool,
 }
 
 impl RunningTurnGuard {
     pub fn new(shared: Arc<AgentShared>) -> Self {
-        let incarnation = shared.identity();
+        let (incarnation, mailbox) = {
+            let core = shared.lock_core();
+            (core.identity, core.mailbox.clone())
+        };
         Self {
             shared,
             incarnation,
+            mailbox,
             defused: false,
         }
     }
@@ -1156,6 +1367,9 @@ impl Drop for RunningTurnGuard {
     fn drop(&mut self) {
         if self.defused {
             return;
+        }
+        if let Some(mailbox) = self.mailbox.as_ref() {
+            mailbox.close();
         }
         // A panicking worker is a host error. Record it as Failed with an
         // envelope and reason, and notify the settlement observer. It must not
@@ -1212,6 +1426,25 @@ impl Drop for RunningTurnGuard {
 pub struct WaitOutcome {
     pub envelopes: Vec<AgentEnvelope>,
     pub timed_out: bool,
+}
+
+/// What [`AgentPool::send_message`] made of a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+    /// Queued in the mailbox of a run that drains it before its next model request.
+    Queued,
+    /// The finished agent was resumed as this new incarnation; its worker is
+    /// the caller's to start.
+    Resumed(TaskIdentity),
+    /// The run has ended but its result has not reached the model yet. Nothing
+    /// changed.
+    ResultPending,
+    /// The user stopped the agent; it is not resumed. Nothing changed.
+    UserStopped,
+    /// The task has no mailbox: it is not an ordinary child agent.
+    NotAnAgent,
+    /// The conversation was deleted.
+    Retired,
 }
 
 /// What ends a wait. The two modes differ only in whether a progress update
@@ -1444,11 +1677,22 @@ impl AgentPool {
         // Registration mints the identity from the task text. Rehydration
         // follows the same path.
         let identity = TaskIdentity::mint(&name, 1, [task.as_str()]);
+        // Only an ordinary child agent can be messaged. Its mailbox is open
+        // exactly while a run of it is going to drain it: from a running
+        // registration on, and never for a rehydrated, settled one — that one
+        // opens when a message resumes it.
+        let mailbox = (kind == SubagentRunKind::General).then(|| {
+            Arc::new(if status == AgentLiveStatus::Running {
+                AgentMailbox::default()
+            } else {
+                AgentMailbox::new_closed()
+            })
+        });
         let shared = Arc::new(AgentShared {
             name,
             label,
             task,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             stop_mark: StopMark::default(),
             template,
             kind,
@@ -1460,6 +1704,8 @@ impl AgentPool {
                 updates: initial_updates,
                 outbox: Vec::new(),
                 latest_call_id: call_id,
+                latest_call_launched: true,
+                mailbox,
                 latest_context_id: None,
                 usage: ModelUsage::default(),
                 lifetime_usage: ModelUsage::default(),
@@ -1562,6 +1808,93 @@ impl AgentPool {
                 ) && agent.label == label
             })
             .cloned()
+    }
+
+    /// Hands the main agent's `message` to `agent`, deciding atomically what it
+    /// becomes (see [`SendOutcome`] for each answer):
+    ///
+    /// 1. a run of the agent will still drain its mailbox → queued there;
+    /// 2. its mailbox is closed and its last result has not been delivered —
+    ///    the run is still settling, or the envelope still waits in the outbox
+    ///    → refused, nothing changes. Resuming now would put a new incarnation
+    ///    over an undelivered result (the kernel's `BAD_SPAWN_OVERWRITE_DONE`);
+    /// 3. the result was delivered and the user stopped the task → refused;
+    /// 4. otherwise → resumed: a new incarnation of the same task, in the same
+    ///    slot, with the next generation's identity, a fresh stop flag, a clean
+    ///    stop mark, a new open mailbox holding whatever the previous run left
+    ///    unread and then `message`, and `call_id` as the call that owns the
+    ///    record. The caller starts its worker.
+    ///
+    /// A result counts as delivered once it left the outbox: drained by a
+    /// `task_wait`, folded at a round boundary, or claimed for a launch call.
+    ///
+    /// The steps take the roster lock, then the agent's core lock, then its
+    /// mailbox lock — the order `register` and every pool scan use. Holding the
+    /// core lock from the push attempt to the transition is what makes two
+    /// messages to a finished agent resume it once and queue the second, and a
+    /// message racing the run's end either land in the open mailbox before the
+    /// run closes it or find it closed. Holding the roster lock makes a resume
+    /// and the conversation's retirement linearize, as registration does.
+    pub(crate) fn send_message(
+        &self,
+        agent: &Arc<AgentShared>,
+        message: MailboxMessage,
+        call_id: &str,
+    ) -> SendOutcome {
+        let resumed = {
+            let _roster = self.lock_agents();
+            if self.retired.load(Ordering::Acquire) {
+                return SendOutcome::Retired;
+            }
+            let mut core = agent.lock_core();
+            let Some(mailbox) = core.mailbox.clone() else {
+                return SendOutcome::NotAnAgent;
+            };
+            let message = match mailbox.try_push(message) {
+                Ok(()) => return SendOutcome::Queued,
+                Err(message) => message,
+            };
+            let undelivered = core
+                .outbox
+                .iter()
+                .any(|envelope| matches!(envelope.kind, EnvelopeKind::Result(_)));
+            if core.status == AgentLiveStatus::Running || undelivered {
+                return SendOutcome::ResultPending;
+            }
+            if agent.stop_mark.attributed() == Some(StopOrigin::User) {
+                return SendOutcome::UserStopped;
+            }
+            let identity = TaskIdentity::mint(
+                &agent.name,
+                core.identity.generation + 1,
+                [agent.task.as_str(), message.content.as_str()],
+            );
+            // What the previous run never read goes ahead of the new message.
+            // Nothing can be pushed into the old mailbox meanwhile: it is
+            // closed, and every `try_push` holds this core lock.
+            let next = AgentMailbox::default();
+            for unread in mailbox.drain() {
+                next.push_message(unread);
+            }
+            next.push_message(message);
+            core.mailbox = Some(Arc::new(next));
+            core.identity = identity;
+            core.status = AgentLiveStatus::Running;
+            core.stop_timer = None;
+            core.latest_call_id = call_id.to_owned();
+            core.latest_call_launched = false;
+            core.latest_context_id = None;
+            *agent.lock_cancel() = Arc::new(AtomicBool::new(false));
+            agent.stop_mark.reset();
+            identity
+        };
+        // Outside the core lock: a pool's turn-taking reads statuses while it
+        // holds its own lock.
+        if let Some(slots) = agent.run_slots.as_ref() {
+            slots.requeue(agent);
+        }
+        agent.notify();
+        SendOutcome::Resumed(resumed)
     }
 
     /// Test helper that waits, without cancellation, for every pool entry to
@@ -1811,7 +2144,7 @@ impl AgentPool {
             agents.clone()
         };
         for agent in agents {
-            agent.cancel.store(true, Ordering::Release);
+            agent.raise_cancel();
         }
         self.notify();
     }
@@ -1819,7 +2152,7 @@ impl AgentPool {
     /// Requests cancellation of every running agent.
     pub fn cancel_all(&self) {
         for agent in self.lock_agents().iter() {
-            agent.cancel.store(true, Ordering::Release);
+            agent.raise_cancel();
         }
         self.notify();
     }
@@ -2073,6 +2406,78 @@ pub(crate) mod tests {
         );
     }
 
+    /// `send_message` follows the subagent-communication switch and nothing
+    /// else — the same strip-then-derive shape as the task-runtime tools, in
+    /// the two halves `trusted_run_request` applies. The switch alone grants
+    /// nothing without `agent_spawn`, a persisted name never grants anything,
+    /// and re-deriving twice does not duplicate.
+    #[test]
+    fn send_message_is_derived_only_from_the_switch_with_agent_spawn_enabled() {
+        let list = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        // (switch, tools the conversation enables) -> does the run talk?
+        for (switch, enabled, talks) in [
+            (true, vec!["agent_spawn", "read"], true),
+            (true, vec!["agent_spawn"], true),
+            // No `agent_spawn`: there is no child to message.
+            (true, vec!["read", "workflow"], false),
+            (true, vec![], false),
+            // The switch off: `agent_spawn` alone grants nothing.
+            (false, vec!["agent_spawn", "read"], false),
+            (false, vec![], false),
+        ] {
+            assert_eq!(
+                subagent_messaging_granted(switch, &list(&enabled)),
+                talks,
+                "switch {switch}, tools {enabled:?}"
+            );
+        }
+        // A persisted `send_message` is not an enabled `agent_spawn` and is not a grant.
+        assert!(!subagent_messaging_granted(true, &list(&["send_message"])));
+
+        // Derive: a persisted name never survives a run that does not talk...
+        let mut enabled = list(&["read", "send_message", "agent_spawn"]);
+        apply_subagent_messaging_tool(&mut enabled, false);
+        assert_eq!(enabled, list(&["read", "agent_spawn"]));
+        // ...and the grant does not depend on the renderer having written it.
+        let mut enabled = list(&["read", "agent_spawn"]);
+        apply_subagent_messaging_tool(&mut enabled, true);
+        assert_eq!(enabled, list(&["read", "agent_spawn", "send_message"]));
+        // Idempotent: a persisted copy plus the grant is still one.
+        let mut enabled = list(&["send_message", "agent_spawn"]);
+        apply_subagent_messaging_tool(&mut enabled, true);
+        apply_subagent_messaging_tool(&mut enabled, true);
+        assert_eq!(enabled, list(&["agent_spawn", "send_message"]));
+
+        // It is host-derived by name, and nothing else is.
+        assert!(is_subagent_messaging_tool_name("send_message"));
+        assert!(!is_subagent_messaging_tool_name("subagent_update"));
+        assert!(!is_task_runtime_tool_name("send_message"));
+        // The whole chain `trusted_run_request` runs, over the full catalog.
+        let mut enabled = crate::catalog::tool_catalog()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        let talks = subagent_messaging_granted(true, &enabled);
+        apply_task_runtime_tools(&mut enabled, crate::model::HostMessageContainer::User);
+        apply_subagent_messaging_tool(&mut enabled, talks);
+        assert_eq!(
+            enabled
+                .iter()
+                .filter(|name| *name == "send_message")
+                .count(),
+            1
+        );
+        let talks = subagent_messaging_granted(false, &enabled);
+        apply_subagent_messaging_tool(&mut enabled, talks);
+        assert!(!enabled.iter().any(|name| name == "send_message"));
+    }
+
     /// The one stop the sidebar button and `task_stop` share: it reaches only what is
     /// running in the pool it is given, or the conversation's own command row, and it
     /// stops the same way whoever asked. What differs is the origin recorded for the
@@ -2109,8 +2514,8 @@ pub(crate) mod tests {
         let planner = register(&pool, "planner", AgentLiveStatus::Running);
         assert!(stop(Some(&pool), "conv", "reviewer", StopOrigin::User));
         assert!(stop(Some(&pool), "conv", "planner", StopOrigin::Model));
-        assert!(reviewer.cancel.load(Ordering::Acquire));
-        assert!(planner.cancel.load(Ordering::Acquire));
+        assert!(reviewer.is_cancelled());
+        assert!(planner.is_cancelled());
         assert_eq!(reviewer.stop_attribution(), Some(StopOrigin::User));
         assert_eq!(planner.stop_attribution(), Some(StopOrigin::Model));
     }
@@ -2156,6 +2561,7 @@ pub(crate) mod tests {
             web_search: Default::default(),
             native_search_call: false,
             web_search_enabled: false,
+            subagent_messaging: false,
             native_fetch_call: None,
             run_environment: Default::default(),
             prompt_profile: Default::default(),
@@ -2166,6 +2572,7 @@ pub(crate) mod tests {
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
             host_message_container: Default::default(),
+            host_messages_in_prompt: true,
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
             model: ModelProfile {
@@ -2298,7 +2705,7 @@ pub(crate) mod tests {
             start.wait();
             pool.retire();
             if let Ok(agent) = worker.join().unwrap() {
-                assert!(agent.cancel.load(Ordering::Acquire));
+                assert!(agent.is_cancelled());
             }
             assert!(pool
                 .preflight_registration("late", &template(), AgentLiveStatus::Running)
@@ -2396,8 +2803,8 @@ pub(crate) mod tests {
             );
         });
         crate::conversations::delete(&state, &anchor, &workspace.id, &conversation.id).unwrap();
-        assert!(running.cancel.load(Ordering::Acquire));
-        assert!(!survivor.cancel.load(Ordering::Acquire));
+        assert!(running.is_cancelled());
+        assert!(!survivor.is_cancelled());
         release.send(()).unwrap();
         worker.join().unwrap();
         state.recheck_task_wake(&conversation.id);
@@ -3051,7 +3458,7 @@ pub(crate) mod tests {
         let host_stopped = register(&pool, "a1", AgentLiveStatus::Running);
         host_stopped.request_stop(StopOrigin::Host);
         assert!(
-            host_stopped.cancel.load(Ordering::Acquire),
+            host_stopped.is_cancelled(),
             "仍然要真的取消"
         );
         assert_eq!(
@@ -3062,12 +3469,12 @@ pub(crate) mod tests {
 
         let user_stopped = register(&pool, "a2", AgentLiveStatus::Running);
         user_stopped.request_stop(StopOrigin::User);
-        assert!(user_stopped.cancel.load(Ordering::Acquire));
+        assert!(user_stopped.is_cancelled());
         assert_eq!(user_stopped.stop_attribution(), Some(StopOrigin::User));
 
         let model_stopped = register(&pool, "a3", AgentLiveStatus::Running);
         model_stopped.request_stop(StopOrigin::Model);
-        assert!(model_stopped.cancel.load(Ordering::Acquire));
+        assert!(model_stopped.is_cancelled());
         assert_eq!(model_stopped.stop_attribution(), Some(StopOrigin::Model));
     }
 
@@ -3200,7 +3607,7 @@ pub(crate) mod tests {
         let elapsed = started.elapsed();
 
         assert!(elapsed < Duration::from_secs(2), "spun for {elapsed:?}");
-        assert!(stubborn.cancel.load(Ordering::Acquire), "cancel re-issued");
+        assert!(stubborn.is_cancelled(), "cancel re-issued");
         assert_eq!(stubborn.status(), AgentLiveStatus::Stopped);
         // Escalation forces a terminal status; it must never drop the record.
         let record = stubborn.record();
@@ -3682,7 +4089,7 @@ pub(crate) mod tests {
             let shared = Arc::clone(&shared);
             move || {
                 // Simulates a worker observing its cancellation flag.
-                while !shared.cancel.load(Ordering::Acquire) {
+                while !shared.is_cancelled() {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 let guard = RunningTurnGuard::new(shared);
@@ -4003,5 +4410,371 @@ pub(crate) mod tests {
         });
         assert_eq!(shared.record().usage.total_tokens, Some(150));
         assert_eq!(shared.take_usage(), ModelUsage::default());
+    }
+
+    fn message(content: &str) -> MailboxMessage {
+        MailboxMessage {
+            id: None,
+            content: content.into(),
+            images: Vec::new(),
+            files: Vec::new(),
+            created_at: None,
+        }
+    }
+
+    fn contents(messages: Vec<MailboxMessage>) -> Vec<String> {
+        messages
+            .into_iter()
+            .map(|message| message.content)
+            .collect()
+    }
+
+    fn register_kind(
+        pool: &AgentPool,
+        name: &str,
+        kind: SubagentRunKind,
+        status: AgentLiveStatus,
+    ) -> Arc<AgentShared> {
+        pool.register(
+            name.into(),
+            name.into(),
+            "task".into(),
+            template(),
+            kind,
+            &AppState::default(),
+            Vec::new(),
+            Vec::new(),
+            status,
+            format!("call-{name}"),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Settles `agent`'s incumbent incarnation the way its worker does: the run
+    /// closes the mailbox, then the result lands.
+    fn settle(agent: &AgentShared, text: &str) {
+        if let Some(mailbox) = agent.mailbox() {
+            mailbox.close();
+        }
+        agent.complete_turn(
+            agent.identity(),
+            Vec::new(),
+            text.into(),
+            AgentLiveStatus::Idle,
+            &ModelUsage::default(),
+            1,
+            None,
+        );
+    }
+
+    /// The primitive the child's mailbox rests on. A closed mailbox refuses
+    /// `send_message`'s push and keeps what it holds; closing succeeds only on
+    /// an empty mailbox; the user's steer push of a top-level turn ignores the
+    /// flag, so that path is what it always was.
+    #[test]
+    fn a_mailbox_closes_only_when_empty_and_then_refuses_without_losing_anything() {
+        let mailbox = AgentMailbox::default();
+        assert!(!mailbox.is_closed());
+        assert!(mailbox.try_push(message("first")).is_ok());
+        // A message is waiting: the run must go on to read it.
+        assert!(!mailbox.close_if_empty());
+        assert!(!mailbox.is_closed());
+        assert!(mailbox.try_push(message("second")).is_ok());
+        assert_eq!(contents(mailbox.drain()), ["first", "second"]);
+        assert!(mailbox.close_if_empty());
+        assert!(mailbox.is_closed());
+        // Refused, and handed back whole.
+        let refused = mailbox.try_push(message("late")).unwrap_err();
+        assert_eq!(refused.content, "late");
+        assert!(mailbox.is_empty());
+        // A plain close keeps what is inside, for a later resume.
+        let kept = AgentMailbox::default();
+        kept.try_push(message("unread")).unwrap();
+        kept.close();
+        assert!(kept.try_push(message("after")).is_err());
+        assert_eq!(contents(kept.drain()), ["unread"]);
+        // The user's queue of a top-level turn: closing changes nothing for it.
+        let user_queue = AgentMailbox::default();
+        assert!(user_queue.close_if_empty());
+        user_queue.push_message(message("steer"));
+        assert_eq!(contents(user_queue.drain()), ["steer"]);
+        assert!(AgentMailbox::new_closed().is_closed());
+    }
+
+    /// A message racing the run's end is never stranded: every push the
+    /// mailbox accepted is drained by the run before it closes, and every push
+    /// it refused comes back to the sender. Run many times so the two threads
+    /// interleave every way they can.
+    #[test]
+    fn a_message_racing_the_runs_end_is_either_read_or_refused() {
+        for _ in 0..300 {
+            let mailbox = Arc::new(AgentMailbox::default());
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let sender = {
+                let mailbox = Arc::clone(&mailbox);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    (0..4)
+                        .filter(|index| mailbox.try_push(message(&format!("m{index}"))).is_ok())
+                        .count()
+                })
+            };
+            start.wait();
+            // The run's loop: drain at the round head, then try to end.
+            let mut read = 0;
+            loop {
+                read += mailbox.drain().len();
+                if mailbox.close_if_empty() {
+                    break;
+                }
+            }
+            let accepted = sender.join().unwrap();
+            assert_eq!(accepted, read, "an accepted message was never read");
+            assert!(mailbox.is_empty());
+        }
+    }
+
+    /// Only an ordinary child agent has a mailbox, and it is open exactly while
+    /// a run of it is to come. Registration does not look at the conversation's
+    /// switch: a child of a conversation that does not talk is unreachable
+    /// because nobody holds `send_message` there, not because its mailbox differs.
+    #[test]
+    fn registration_opens_a_mailbox_for_a_running_child_agent_only() {
+        let pool = AgentPool::new();
+        let running = register(&pool, "a1", AgentLiveStatus::Running);
+        assert!(!running.mailbox().unwrap().is_closed());
+        assert!(!template().subagent_messaging);
+        let rehydrated = register(&pool, "a2", AgentLiveStatus::Idle);
+        assert!(rehydrated.mailbox().unwrap().is_closed());
+        for (name, kind) in [
+            ("a3", SubagentRunKind::ShellCommand),
+            ("wf", SubagentRunKind::WorkflowStep),
+        ] {
+            let task = register_kind(&pool, name, kind, AgentLiveStatus::Running);
+            assert!(task.mailbox().is_none(), "{name}");
+            assert_eq!(
+                pool.send_message(&task, message("hi"), "call-send"),
+                SendOutcome::NotAnAgent,
+                "{name}"
+            );
+            assert_eq!(task.identity().generation, 1);
+        }
+    }
+
+    /// The whole state machine on one child: queued while it runs, refused while
+    /// its result is undelivered, resumed once it is delivered — as the next
+    /// generation, with a fresh stop flag, a new open mailbox holding the
+    /// message, and the resuming call as the record's owner — and queued again
+    /// into the resumed run. The previous incarnation's late writes are
+    /// discarded.
+    #[test]
+    fn a_child_is_messaged_while_running_and_resumed_once_its_result_is_delivered() {
+        let pool = AgentPool::new();
+        let agent = register(&pool, "a1", AgentLiveStatus::Running);
+        let first = agent.identity();
+        assert!(agent.latest_call_launched());
+
+        assert_eq!(
+            pool.send_message(&agent, message("also check b"), "call-1"),
+            SendOutcome::Queued
+        );
+        assert_eq!(
+            agent.latest_call_id(),
+            "call-a1",
+            "a queued message owns nothing"
+        );
+        let mailbox = agent.mailbox().unwrap();
+        // The run reads it and then ends.
+        assert!(!mailbox.close_if_empty());
+        assert_eq!(contents(mailbox.drain()), ["also check b"]);
+        assert!(mailbox.close_if_empty());
+        // Ended but not yet settled: the result is on its way.
+        assert_eq!(
+            pool.send_message(&agent, message("too early"), "call-2"),
+            SendOutcome::ResultPending
+        );
+        settle(&agent, "first result");
+        // Settled but undelivered: still on its way, and nothing changed.
+        assert_eq!(
+            pool.send_message(&agent, message("still early"), "call-3"),
+            SendOutcome::ResultPending
+        );
+        assert_eq!(agent.identity(), first);
+        assert_eq!(agent.status(), AgentLiveStatus::Idle);
+        assert!(mailbox.is_empty(), "a refused message is not kept");
+        assert_eq!(agent.latest_call_id(), "call-a1");
+
+        // Delivered (the fold claims it): the next message resumes the child.
+        assert_eq!(agent.take_undelivered_results().len(), 1);
+        agent.record_call_context("call-a1", "spawn-card");
+        let SendOutcome::Resumed(second) = pool.send_message(&agent, message("go on"), "call-4")
+        else {
+            panic!("a delivered child resumes");
+        };
+        assert_eq!(second.generation, 2);
+        assert_ne!(second.params_digest, first.params_digest);
+        assert_eq!(agent.identity(), second);
+        assert_eq!(agent.status(), AgentLiveStatus::Running);
+        assert_eq!(agent.latest_call_id(), "call-4");
+        assert!(!agent.latest_call_launched());
+        assert_eq!(
+            agent.latest_context_id(),
+            None,
+            "the new card is minted later"
+        );
+        assert!(!agent.is_cancelled());
+        let resumed = agent.mailbox().unwrap();
+        assert!(
+            !Arc::ptr_eq(&resumed, &mailbox),
+            "a new mailbox per incarnation"
+        );
+        assert!(mailbox.is_closed());
+        // A second message joins the resumed run instead of resuming it again.
+        assert_eq!(
+            pool.send_message(&agent, message("and this"), "call-5"),
+            SendOutcome::Queued
+        );
+        assert_eq!(agent.identity(), second);
+        assert_eq!(contents(resumed.drain()), ["go on", "and this"]);
+
+        // The first incarnation's late writes reach nothing.
+        agent.complete_turn(
+            first,
+            Vec::new(),
+            "stale".into(),
+            AgentLiveStatus::Failed,
+            &ModelUsage::default(),
+            1,
+            None,
+        );
+        agent.push_update(first, "stale progress".into(), "now".into());
+        assert_eq!(agent.status(), AgentLiveStatus::Running);
+        assert!(
+            !resumed.is_closed(),
+            "a stale settle closes nothing of the new run"
+        );
+        assert!(agent.take_undelivered_results().is_empty());
+        assert_eq!(agent.latest_update(), None);
+
+        // The resumed run settles like any.
+        settle(&agent, "second result");
+        let results = agent.take_undelivered_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].identity, second);
+        assert_eq!(results[0].content, "second result");
+    }
+
+    /// The user's stop is final: its child is not resumed. The model's own
+    /// `task_stop` is not — that child resumes as a new incarnation nobody has
+    /// stopped, with what its stopped run never read ahead of the new message,
+    /// and the grace timer the stop left behind settles nothing of it.
+    #[test]
+    fn a_user_stopped_child_stays_stopped_and_a_model_stopped_one_resumes() {
+        let pool = AgentPool::new();
+        let user = register(&pool, "user", AgentLiveStatus::Running);
+        user.stop_task_with_grace(StopOrigin::User, Duration::from_secs(60));
+        // A stopping run reads no more messages: the result is on its way.
+        assert!(user.mailbox().unwrap().is_closed());
+        assert_eq!(
+            pool.send_message(&user, message("m"), "call-u1"),
+            SendOutcome::ResultPending
+        );
+        settle(&user, "partial");
+        user.take_undelivered_results();
+        assert_eq!(
+            pool.send_message(&user, message("m"), "call-u2"),
+            SendOutcome::UserStopped
+        );
+        assert_eq!(user.identity().generation, 1);
+        assert_eq!(user.status(), AgentLiveStatus::Idle);
+        assert_eq!(user.latest_call_id(), "call-user");
+
+        let model = register(&pool, "model", AgentLiveStatus::Running);
+        let first = model.identity();
+        model
+            .mailbox()
+            .unwrap()
+            .try_push(message("unread"))
+            .unwrap();
+        model.stop_task_with_grace(StopOrigin::Model, Duration::from_millis(300));
+        settle(&model, "stopped early");
+        model.take_undelivered_results();
+        let SendOutcome::Resumed(second) = pool.send_message(&model, message("resume"), "call-m")
+        else {
+            panic!("a model-stopped child resumes");
+        };
+        assert_eq!(model.stop_attribution(), None);
+        assert!(!model.is_cancelled());
+        assert_eq!(
+            contents(model.mailbox().unwrap().drain()),
+            ["unread", "resume"]
+        );
+        // The first incarnation's grace timer fires into the second: nothing.
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(model.identity(), second);
+        assert_ne!(second, first);
+        assert_eq!(model.status(), AgentLiveStatus::Running);
+        assert!(model.take_undelivered_results().is_empty());
+        // A stop of the new incarnation raises the new flag and is its own.
+        model.stop_task_with_grace(StopOrigin::Model, Duration::from_secs(60));
+        assert!(model.is_cancelled());
+        assert_eq!(model.stop_attribution(), Some(StopOrigin::Model));
+    }
+
+    /// A resumed child takes its turn like a new spawn: at the end of the line,
+    /// never through the slot entry its previous run left behind.
+    #[test]
+    fn a_resumed_child_waits_for_a_run_slot_behind_earlier_spawns() {
+        let pool = AgentPool::new();
+        let running = fill_run_slots(&pool);
+        let resumed = &running[0];
+        settle(resumed, "done");
+        resumed.take_undelivered_results();
+        let waiter = register(&pool, "waiter", AgentLiveStatus::Running);
+        assert!(matches!(
+            pool.send_message(resumed, message("again"), "call-again"),
+            SendOutcome::Resumed(_)
+        ));
+        let waiter_started = wait_in_background(&waiter);
+        assert!(waiter_started.recv_timeout(Duration::from_secs(2)).unwrap());
+        let resumed_started = wait_in_background(resumed);
+        assert!(
+            resumed_started
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "the resumed child must not run on its previous run's slot"
+        );
+        finish(&running[1]);
+        assert!(resumed_started
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap());
+    }
+
+    /// A deleted conversation resumes nothing, and a panicking or abandoned
+    /// worker leaves its mailbox closed rather than accepting messages nobody
+    /// will read.
+    #[test]
+    fn a_retired_pool_and_an_abandoned_run_accept_no_message() {
+        let pool = AgentPool::new();
+        let idle = register(&pool, "idle", AgentLiveStatus::Running);
+        settle(&idle, "done");
+        idle.take_undelivered_results();
+        let abandoned = register(&pool, "abandoned", AgentLiveStatus::Running);
+        drop(RunningTurnGuard::new(Arc::clone(&abandoned)));
+        assert!(abandoned.mailbox().unwrap().is_closed());
+        assert_eq!(abandoned.status(), AgentLiveStatus::Interrupted);
+        // Interrupted without a result envelope: resumable.
+        assert!(matches!(
+            pool.send_message(&abandoned, message("retry"), "call-retry"),
+            SendOutcome::Resumed(_)
+        ));
+        pool.retire();
+        assert_eq!(
+            pool.send_message(&idle, message("late"), "call-late"),
+            SendOutcome::Retired
+        );
+        assert_eq!(idle.identity().generation, 1);
     }
 }

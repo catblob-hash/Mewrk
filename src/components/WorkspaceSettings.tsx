@@ -4,6 +4,7 @@ import { useI18n } from "../i18n";
 import { workspaceLocationTitle, workspaceMachineLabel } from "../lib/workspaces";
 import type { RunTarget, SandboxSettings as SandboxSettingsType, SshMachineConfig } from "../types";
 import { Dialog } from "./Common";
+import { DocsLink } from "./DocsLink";
 import { SandboxSettings } from "./SandboxSettings";
 import { SettingsLayout, SettingsNavigation } from "./SettingsLayout";
 import { SettingsPageHeading } from "./SettingsPageHeading";
@@ -143,10 +144,13 @@ function EnvironmentVariablesCard({
     <section className="settings-card workspace-settings__variables">
       {/* Titled by the section heading above it; the field keeps the name for assistive tech. */}
       <div className="workspace-settings__copy">
-        <small>{t(
-          "每行一条 KEY=value。这些变量会注入在这个工作区里执行的 shell 命令，沙箱里的也一样；名字像密钥的变量进不了沙箱。",
-          "One KEY=value per line. These variables are injected into shell commands run in this workspace, sandboxed ones included — though variables named like secrets never reach the sandbox."
-        )}</small>
+        <small>
+          {t(
+            "每行一条 KEY=value，用于这个工作区的命令。",
+            "One KEY=value per line, set for this workspace's commands."
+          )}
+          <DocsLink inline page="workspaces" section="environment" />
+        </small>
       </div>
       <textarea
         className="run-location__env-input"
@@ -243,8 +247,8 @@ export function WorkspaceSettingsDialog({
             <SettingsPageHeading
               title={t("环境", "Environment")}
               description={t(
-                "这个工作区（{location}）里的命令在什么环境里运行：是否进沙箱，带哪些环境变量。同一台机器上的其他工作区不受影响。",
-                "How commands run in this workspace ({location}): whether in the sandbox, and with which environment variables. Other workspaces on the same machine are unaffected.",
+                "{location} 里的命令怎样运行：沙箱和环境变量。",
+                "How commands run in {location}: sandbox and environment variables.",
                 { location: workspaceLocationTitle(path, machine, sshMachines) }
               )}
             />

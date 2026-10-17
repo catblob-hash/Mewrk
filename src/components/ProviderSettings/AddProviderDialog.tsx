@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useI18n } from "../../i18n";
 import type { ProviderFamily } from "../../types";
 import { Field } from "../Common";
+import { DocsLink } from "../DocsLink";
 import { DialogShell } from "./DialogShell";
 import { API_FORMAT_OPTIONS } from "./endpointMeta";
 
@@ -31,8 +32,8 @@ export function AddProviderDialog({
     <DialogShell
       title={t("添加提供商", "Add provider")}
       subtitle={t(
-        "填一个名字，选它说哪种对话协议。API 地址与 Key 在右栏填。",
-        "Give it a name and pick the chat protocol it speaks. The API address and key go in the right pane."
+        "填名称、选协议，地址与 Key 稍后填。",
+        "Name it and pick a protocol; address and key come next."
       )}
       labelledBy="add-provider-title"
       onClose={onClose}
@@ -66,10 +67,10 @@ export function AddProviderDialog({
 
       <Field
         label={t("对话协议", "Chat protocol")}
-        hint={t(
-          "宿主按它决定对话请求走哪个端点。建好之后在右栏还能改。",
-          "The host uses this to decide which endpoint chat requests go to. It stays editable in the right pane."
-        )}
+        hint={<>
+          {t("决定对话请求走哪个端点，建好后仍可改。", "Picks the chat endpoint; you can change it later.")}
+          <DocsLink inline page="providers" section="protocols" />
+        </>}
       >
         <select
           className="input"

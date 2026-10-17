@@ -2,9 +2,11 @@ import type {
   ApiKeyStatus,
   ContextItem,
   ConversationWebSearchSettings,
+  FetchProviderSelection,
   ProviderFamily,
   SearchCapability,
   SearchProviderKind,
+  SearchProviderSelection,
   WebSearchAssets
 } from "../types";
 import { hasBackendRuntime, invoke } from "./backend";
@@ -15,14 +17,15 @@ import { searchProviderSupports } from "./searchProviders";
  * host can read as text.
  *
  * Mirrors Rust `web_search::family_supports_native_fetch`. Only Anthropic both
- * exposes fetching as its own server tool and returns the page as plain text;
+ * exposes fetching as its own server tool and returns the page as plain text,
+ * and the Claude Agent family borrows the same from the CLI's own `WebFetch`;
  * the Responses API has no page-fetch tool at all, and neither do Google or
  * xAI. Search is deliberately not symmetrical with this — no family's *search*
  * results carry readable page text — so this answers only "can this
  * conversation fetch a page without borrowing a provider".
  */
 export function familySupportsNativeFetch(family: ProviderFamily | undefined): boolean {
-  return family === "anthropic" || family === "bedrock";
+  return family === "anthropic" || family === "bedrock" || family === "claude_agent";
 }
 
 /**
@@ -69,6 +72,123 @@ export function grantsWebFetch(
     case "unavailable":
       return true;
   }
+}
+
+/** The two web legs, each with a switch and a backend selector of its own. */
+export type WebLeg = "search" | "fetch";
+
+/**
+ * Whether a fetch selection is one this model can serve as drawn. Only native
+ * can fail it: on a family without a fetch tool of its own, native grants no
+ * `web_fetch`, so the advanced tools page draws that leg as switched off and
+ * its menu has no native row.
+ */
+export function fetchSelectionOffered(
+  selection: FetchProviderSelection,
+  nativeFetchOffered: boolean
+): boolean {
+  return selection.kind !== "disabled" && (selection.kind !== "native" || nativeFetchOffered);
+}
+
+/**
+ * Whether a web leg's switch is drawn on: web access on (a role has no switch
+ * of its own, `webAccess` null), and a backend named that this model can serve.
+ *
+ * Native fetch on a model without one reads as off without being rewritten:
+ * the selection stays native, so moving back to a model that has it finds the
+ * leg on again, exactly as it was left — unless it was touched meanwhile.
+ */
+export function webLegOn(
+  leg: WebLeg,
+  webAccess: boolean | null,
+  settings: ConversationWebSearchSettings,
+  nativeFetchOffered: boolean
+): boolean {
+  if (webAccess === false) return false;
+  return leg === "search"
+    ? settings.provider.kind !== "disabled"
+    : fetchSelectionOffered(settings.fetchProvider, nativeFetchOffered);
+}
+
+/** The backends a leg switched off was carrying, for switching it back on. */
+export interface RememberedWebLegs {
+  search?: SearchProviderSelection;
+  fetch?: FetchProviderSelection;
+}
+
+/** What flipping one leg's switch writes. */
+export interface WebLegSwitch {
+  /** The web access switch after the flip; null where the surface has none. */
+  webAccess: boolean | null;
+  patch: Partial<ConversationWebSearchSettings>;
+  remembered: RememberedWebLegs;
+}
+
+/**
+ * Flips one web leg's switch.
+ *
+ * Off is the leg's backend reading `disabled`, so the backend it had is kept in
+ * `remembered` and comes back when the switch does. Web access is the union of
+ * the two legs: it goes off with the last leg that names a backend — leaving
+ * that backend in place, since access off already withholds it — and on with
+ * the first one switched on, which also stops the other leg's backend from
+ * quietly coming back with it.
+ *
+ * A leg drawn off only because this model lacks native fetch still names a
+ * backend, so switching the search leg off keeps access on for it: moving back
+ * to a model with native fetch finds fetching on again.
+ */
+export function switchWebLeg(
+  leg: WebLeg,
+  on: boolean,
+  current: {
+    webAccess: boolean | null;
+    settings: ConversationWebSearchSettings;
+    nativeFetchOffered: boolean;
+    /** Catalog providers switched on that can fetch, in menu order. */
+    fetchProviders: readonly SearchProviderKind[];
+    remembered: RememberedWebLegs;
+  }
+): WebLegSwitch {
+  const { webAccess, settings, nativeFetchOffered, fetchProviders } = current;
+  const remembered = { ...current.remembered };
+  const patch: Partial<ConversationWebSearchSettings> = {};
+  /* Puts a leg's backend aside and switches the leg off. */
+  const setAside = (which: WebLeg) => {
+    if (which === "search") {
+      remembered.search = settings.provider;
+      patch.provider = { kind: "disabled" };
+    } else {
+      remembered.fetch = settings.fetchProvider;
+      patch.fetchProvider = { kind: "disabled" };
+    }
+  };
+  const otherNamed = (leg === "search" ? settings.fetchProvider : settings.provider).kind !== "disabled";
+
+  if (!on) {
+    if (webAccess !== null && !otherNamed) return { webAccess: false, patch, remembered };
+    setAside(leg);
+    return { webAccess, patch, remembered };
+  }
+
+  /* The leg's own selection first: while it still names a backend — access
+     was off, or native fetch waits for a model that has it — that is the one
+     the leg was left on, and anything remembered is older. */
+  if (leg === "search") {
+    patch.provider = [settings.provider, remembered.search]
+      .find((selection) => selection !== undefined && selection.kind !== "disabled")
+      ?? { kind: "native" };
+    delete remembered.search;
+  } else {
+    patch.fetchProvider = [settings.fetchProvider, remembered.fetch]
+      .find((selection) => selection !== undefined && fetchSelectionOffered(selection, nativeFetchOffered))
+      ?? (nativeFetchOffered
+        ? { kind: "native" }
+        : { kind: "explicit", providerKind: fetchProviders[0] ?? "fetch" });
+    delete remembered.fetch;
+  }
+  if (webAccess === false && otherNamed) setAside(leg === "search" ? "fetch" : "search");
+  return { webAccess: webAccess === null ? null : true, patch, remembered };
 }
 
 /**

@@ -1085,6 +1085,94 @@ fn scenario_traces() {
     );
 }
 
+/// `send_message` resume (CSP `SCEN_RESUME_AFTER_DELIVER`): a resumed task is a
+/// new run spawned into a slot whose previous result was delivered. While the
+/// previous result is still owed — the run still finishing or done undelivered —
+/// the slot refuses the spawn, so the host refuses the resume with an ordinary
+/// receipt and no task event.
+#[test]
+fn send_message_resume_is_a_new_run_after_delivery() {
+    use KernelEvent as E;
+    let exporter = Exporter::from_env();
+    let mut t = Driven::new();
+    drive(
+        &mut t,
+        &[E::TurnStart, E::RoundStart, E::AgentSpawn { a: 1, r: 2 }],
+    );
+    assert_refused_unchanged(
+        &mut t,
+        &exporter,
+        "scenario-resume-running.refused.prob2trace",
+        E::AgentSpawn { a: 1, r: 1 },
+        "agentPhase[a] = \"none\"",
+    );
+    // The refused send_message is an ordinary call whose window holds no task event.
+    drive(
+        &mut t,
+        &[
+            E::AgentComplete { a: 1, r: 2 },
+            E::ToolRequest { c: 1, d: false },
+            E::ToolAllow { c: 1 },
+            E::ToolExecStart { c: 1 },
+        ],
+    );
+    assert_refused_unchanged(
+        &mut t,
+        &exporter,
+        "scenario-resume-pending.refused.prob2trace",
+        E::AgentSpawn { a: 1, r: 1 },
+        "agentPhase[a] = \"none\"",
+    );
+    drive(
+        &mut t,
+        &[
+            E::ToolExecEnd { c: 1 },
+            E::ToolSettle { c: 1 },
+            E::RoundEnd,
+            E::AgentFold { a: 1, r: 2 },
+            E::RoundStart,
+            E::RoundEnd,
+            E::TurnEnd,
+            // A later turn resumes the delivered task inside the send_message
+            // call's execution window, with a fresh identity.
+            E::TurnStart,
+            E::RoundStart,
+            E::ToolRequest { c: 1, d: false },
+            E::ToolAllow { c: 1 },
+            E::ToolExecStart { c: 1 },
+        ],
+    );
+    assert_refused_unchanged(
+        &mut t,
+        &exporter,
+        "scenario-resume-stale-tid.refused.prob2trace",
+        E::AgentSpawn { a: 1, r: 2 },
+        "r # taskRid[a]",
+    );
+    drive(
+        &mut t,
+        &[
+            E::AgentSpawn { a: 1, r: 1 },
+            E::ToolExecEnd { c: 1 },
+            E::ToolSettle { c: 1 },
+            E::RoundEnd,
+            E::RoundStart,
+            E::RoundEnd,
+            E::TurnEnd,
+            E::AgentComplete { a: 1, r: 1 },
+            E::TurnStart,
+            E::AgentFold { a: 1, r: 1 },
+            E::RoundStart,
+            E::RoundEnd,
+            E::TurnEnd,
+        ],
+    );
+    exporter.write(
+        "scenario-resume-after-deliver.prob2trace",
+        &t.recorder.to_prob_json(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Fixed-seed random walk; ProB is the oracle.
 // ---------------------------------------------------------------------------

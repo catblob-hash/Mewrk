@@ -218,6 +218,17 @@ describe("AppearanceSettings", () => {
     expect(within(card).getAllByText("Theme")).toHaveLength(1);
   });
 
+  it("describes a setting in one short line, and points the stylesheet at the docs", () => {
+    renderSettings();
+    expect(screen.getByText("Translucent glass sidebar and panes.")).toBeInTheDocument();
+    expect(screen.getByText("A solid color follows the theme; a picture stays.")).toBeInTheDocument();
+    const stylesheet = screen.getByText("Applies as you type; what it can load is limited.");
+    expect(within(stylesheet).getByRole("link", { name: "Learn more" })).toHaveAttribute(
+      "href",
+      "https://mewrk.dev/en/settings.html#appearance"
+    );
+  });
+
   it("turns the panes to glass without touching the theme or the background", async () => {
     const user = userEvent.setup();
     const { getSettings } = renderSettings();
@@ -236,6 +247,8 @@ describe("AppearanceSettings", () => {
 
     await user.click(screen.getByRole("button", { name: "Choose background…" }));
     const dialog = await screen.findByRole("dialog", { name: "Background" });
+    expect(within(dialog).getByText("A solid color follows the theme; a picture stays.")).toBeInTheDocument();
+    expect(within(dialog).getByText("Cropped to the window's shape, never stretched.")).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "Under the desk" }));
     expect(getSettings().appearance.background).toBe("builtin:desk");
     expect(within(dialog).getByRole("button", { name: "Under the desk" })).toHaveAttribute("aria-pressed", "true");
@@ -396,6 +409,25 @@ describe("AppearanceSettings", () => {
       localModelMocks.controller.defaultPrompts.mockResolvedValue({ title: "Default title prompt", shell: "Default shell prompt", error: "Default error prompt" });
     });
 
+    it("describes each use in one line and points to the docs for the rest", () => {
+      localModelMocks.setStatus(modelStatus());
+      renderSettings();
+      const docs = "https://mewrk.dev/en/settings.html#local-model";
+      for (const [use, line] of [
+        ["Name conversations automatically", "Names new conversations with the local model."],
+        ["Explain errors", "Says why a call failed in a few words, as the card title."],
+        ["Also for subagents", "Extends the uses above to subagents and workflows."]
+      ]) {
+        const row = screen.getByRole("switch", { name: use }).closest(".appearance-settings-page__row") as HTMLElement;
+        expect(within(row).getByText(line)).toBeInTheDocument();
+        expect(within(row).getByRole("link", { name: "Learn more" })).toHaveAttribute("href", docs);
+      }
+      const shell = screen.getByRole("switch", { name: "Explain shell commands" })
+        .closest(".appearance-settings-page__row") as HTMLElement;
+      expect(within(shell).getByText("Explains each shell command in one line, as the card title.")).toBeInTheDocument();
+      expect(within(shell).queryByRole("link")).not.toBeInTheDocument();
+    });
+
     it("asks which build to download when a use is turned on without a model", async () => {
       localModelMocks.setStatus(modelStatus());
       const user = userEvent.setup();
@@ -403,6 +435,11 @@ describe("AppearanceSettings", () => {
       await user.click(screen.getByRole("switch", { name: "Name conversations automatically" }));
       const dialog = await screen.findByRole("dialog", { name: "Download the local model?" });
       expect(within(dialog).getByText("This Mac: Apple M4 (Mac16,1) · 16-core Neural Engine · macOS 15.4")).toBeInTheDocument();
+      expect(within(dialog).getByText("Qwen3.5-0.8B runs on this computer and sends nothing out.")).toBeInTheDocument();
+      expect(within(dialog).getByRole("link", { name: "Learn more" })).toHaveAttribute(
+        "href",
+        "https://mewrk.dev/en/settings.html#local-model"
+      );
       expect(within(dialog).getByRole("radio", { name: /Neural Engine build \(Core ML\)/ })).toBeChecked();
       expect(within(dialog).getByRole("radio", { name: /GPU build \(MLX\)/ })).not.toBeChecked();
       expect(getSettings().appearance.localModel.titles).toBe(false);

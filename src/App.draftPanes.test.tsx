@@ -218,7 +218,7 @@ describe("the new task's panes", () => {
     await user.click(history);
     const ledger = await screen.findByRole("region", { name: "历史记录" });
     // Nothing has happened yet, so the history is simply empty.
-    expect(await within(ledger).findByText(/这个对话还没有历史记录/)).toBeInTheDocument();
+    expect(await within(ledger).findByText(/还没有历史记录，从下一次发送或编辑开始/)).toBeInTheDocument();
   });
 
   it("shows tasks and history as the two fixed tabs of one pane, tasks on the left", async () => {
@@ -239,7 +239,7 @@ describe("the new task's panes", () => {
 
     await user.click(tabs[0]);
     expect(await screen.findByRole("region", { name: "任务" })).toBe(pane);
-    expect(within(pane).queryByText(/这个对话还没有历史记录/)).not.toBeInTheDocument();
+    expect(within(pane).queryByText(/还没有历史记录，从下一次发送或编辑开始/)).not.toBeInTheDocument();
     expect(screen.getAllByRole("region").filter((region) => region.classList.contains("side-pane"))).toHaveLength(1);
 
     // The menu's two rows are the pane's two tabs: the other row switches, the shown one closes.

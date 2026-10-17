@@ -839,7 +839,23 @@ struct ManagedSessionKey {
     conversation_id: String,
     artifact_id: String,
     server_id: String,
+    /// Where the server runs — its transport, machine and stdio folder —
+    /// without how it is configured. See [`ManagedSessionKey::same_slot`].
+    placement_fingerprint: [u8; 32],
     config_fingerprint: [u8; 32],
+}
+
+impl ManagedSessionKey {
+    /// Whether `other` is this conversation's same server in the same place:
+    /// the session a configuration change replaces. Instances in different
+    /// folders — a `"workspace": true` server's, or a task's worktree — are
+    /// different slots and live side by side.
+    fn same_slot(&self, other: &Self) -> bool {
+        self.conversation_id == other.conversation_id
+            && self.artifact_id == other.artifact_id
+            && self.server_id == other.server_id
+            && self.placement_fingerprint == other.placement_fingerprint
+    }
 }
 
 impl fmt::Debug for ManagedSessionKey {
@@ -849,6 +865,7 @@ impl fmt::Debug for ManagedSessionKey {
             .field("conversation_id", &self.conversation_id)
             .field("artifact_id", &self.artifact_id)
             .field("server_id", &self.server_id)
+            .field("placement_fingerprint", &"<redacted>")
             .field("config_fingerprint", &"<redacted>")
             .finish()
     }
@@ -1277,6 +1294,7 @@ impl McpSessionManager {
             }
             return report;
         }
+        self.retire_superseded(conversation_id, servers);
         let deadline = Instant::now()
             .checked_add(self.inner.options.discovery_timeout)
             .unwrap_or_else(Instant::now);
@@ -1385,6 +1403,77 @@ impl McpSessionManager {
             .map_err(|error| error.for_server(&binding.server))
     }
 
+    /// Ends the sessions this conversation's `servers` replace: one in the
+    /// same slot as a server here, started from an earlier configuration of
+    /// it, which would otherwise keep its process until the idle TTL. A run's
+    /// discovery is where the current configuration arrives, so this is done
+    /// here and not per call: a call bound before the change still reaches
+    /// the session it was discovered on — started again if it was retired —
+    /// rather than retiring the current one. A retired session a call is
+    /// still running on ends when that call returns.
+    fn retire_superseded(&self, conversation_id: &str, servers: &[RuntimeMcpServer]) {
+        let mut current = HashSet::new();
+        for server in servers.iter().take(MAX_SERVERS) {
+            current.insert(managed_session_key(conversation_id, server));
+            if server.takes_a_workspace() {
+                for (member, _) in &server.workspace_folders {
+                    if let Ok(instance) = server.instance_for(Some(*member)) {
+                        current.insert(managed_session_key(conversation_id, &instance));
+                    }
+                }
+            }
+        }
+        let removed = {
+            let mut entries = self
+                .inner
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let superseded = entries
+                .keys()
+                .filter(|existing| {
+                    !current.contains(*existing)
+                        && current.iter().any(|key| key.same_slot(existing))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            superseded
+                .into_iter()
+                .filter_map(|key| entries.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        drop(removed);
+    }
+
+    /// Ends every conversation's sessions of the servers whose configuration
+    /// was removed, every folder's instance included, rather than leaving
+    /// them to the idle TTL. A call still running on one ends with it.
+    pub fn evict_servers<'a>(&self, artifact_ids: impl IntoIterator<Item = &'a str>) {
+        let requested = artifact_ids
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        if requested.is_empty() {
+            return;
+        }
+        let removed = {
+            let mut entries = self
+                .inner
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let keys = entries
+                .keys()
+                .filter(|key| requested.contains(&key.artifact_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| entries.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        drop(removed);
+    }
+
     pub fn evict_conversations<'a>(&self, conversation_ids: impl IntoIterator<Item = &'a str>) {
         let requested = conversation_ids
             .into_iter()
@@ -1433,6 +1522,15 @@ impl McpSessionManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
+    }
+
+    #[cfg(test)]
+    fn has_session(&self, conversation_id: &str, server: &RuntimeMcpServer) -> bool {
+        self.inner
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&managed_session_key(conversation_id, server))
     }
 
     fn worker(
@@ -1851,8 +1949,40 @@ fn managed_session_key(conversation_id: &str, server: &RuntimeMcpServer) -> Mana
         conversation_id: conversation_id.to_owned(),
         artifact_id: server.artifact_id.clone(),
         server_id: server.server_id.clone(),
+        placement_fingerprint: runtime_server_placement(server),
         config_fingerprint: runtime_server_fingerprint(server),
     }
+}
+
+/// The part of [`runtime_server_fingerprint`] that says where the server runs
+/// rather than how: its transport, the machine it runs on and a stdio
+/// server's folder.
+fn runtime_server_placement(server: &RuntimeMcpServer) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    fingerprint_field(&mut hasher, b"mewrk-mcp-placement-v1");
+    fingerprint_field(&mut hasher, server.artifact_id.as_bytes());
+    fingerprint_field(&mut hasher, server.server_id.as_bytes());
+    match &server.transport {
+        RuntimeMcpTransport::Stdio {
+            cwd, on_machine, ..
+        } => {
+            fingerprint_field(&mut hasher, b"stdio");
+            if let Some(machine) = on_machine {
+                fingerprint_field(&mut hasher, machine.machine.as_bytes());
+            }
+            match cwd {
+                Some(cwd) => fingerprint_field(&mut hasher, cwd.as_bytes()),
+                None => fingerprint_field(&mut hasher, b"<no-cwd>"),
+            }
+        }
+        RuntimeMcpTransport::Http { on_machine, .. } => {
+            fingerprint_field(&mut hasher, b"http");
+            if let Some(machine) = on_machine {
+                fingerprint_field(&mut hasher, machine.machine.as_bytes());
+            }
+        }
+    }
+    hasher.finalize().into()
 }
 
 fn runtime_server_fingerprint(server: &RuntimeMcpServer) -> [u8; 32] {
@@ -3295,6 +3425,13 @@ struct ManagedStdioProcess {
     child: Mutex<ManagedChild>,
     #[cfg(windows)]
     process_job: WindowsProcessJob,
+    /// The process group a server on this computer leads on macOS and Linux:
+    /// what reaches the processes it starts (`npx`'s node, a wrapper's
+    /// server), and what ends them with Mewrk however Mewrk ends, as the job
+    /// does on Windows. Declared after `child` so it is unregistered only
+    /// after the leader was reaped. `None` for a remote server.
+    #[cfg(unix)]
+    group: Option<crate::process_groups::GroupRegistration>,
 }
 
 /// The process a stdio session talks to: a child of this host, or a server on
@@ -3330,13 +3467,23 @@ impl ManagedChild {
 
 impl ManagedStdioProcess {
     fn terminate(&self) {
-        #[cfg(windows)]
-        self.process_job.terminate();
+        self.end_tree();
         let mut child = self
             .child
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         child.kill();
+    }
+
+    /// Kills every process the server started on this computer, the server
+    /// included: its job on Windows, its process group on macOS and Linux.
+    fn end_tree(&self) {
+        #[cfg(windows)]
+        self.process_job.terminate();
+        #[cfg(unix)]
+        if let Some(group) = &self.group {
+            group.signal(libc::SIGKILL);
+        }
     }
 }
 
@@ -3398,12 +3545,30 @@ impl StdioSession {
         }
         #[cfg(windows)]
         configure_windows_managed_child(&mut process);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Its own session, so ending the server reaches what it started
+            // — `npx` runs the server as its child — with the negative-pid
+            // group kill, and Mewrk's exit and watchdog end it too.
+            // SAFETY: `setsid` is async-signal-safe and touches no Rust state.
+            unsafe {
+                process.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = process.spawn().map_err(|error| {
             McpError::new(
                 McpErrorKind::Transport,
                 format!("Could not start MCP stdio process: {}", error.kind()),
             )
         })?;
+        #[cfg(unix)]
+        let group = crate::process_groups::register(child.id());
         #[cfg(windows)]
         if let Err(error) = process_job.assign(&child) {
             let _ = child.kill();
@@ -3436,6 +3601,8 @@ impl StdioSession {
             child: Mutex::new(ManagedChild::Local(child)),
             #[cfg(windows)]
             process_job,
+            #[cfg(unix)]
+            group,
         });
         Self::attach(
             process,
@@ -3497,6 +3664,9 @@ impl StdioSession {
             child: Mutex::new(ManagedChild::Remote(child)),
             #[cfg(windows)]
             process_job: WindowsProcessJob::new()?,
+            // The machine's agent or transport signals the server's group there.
+            #[cfg(unix)]
+            group: None,
         });
         Self::attach(
             process,
@@ -3955,12 +4125,13 @@ impl Drop for StdioSession {
             .child
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match child.wait_timeout(self.shutdown_timeout) {
-            Ok(Some(_)) => return,
-            Ok(None) | Err(_) => {}
+        let exited = matches!(child.wait_timeout(self.shutdown_timeout), Ok(Some(_)));
+        // What the server started goes with it either way: one that exits at
+        // end of input can still leave its children behind.
+        self.process.end_tree();
+        if exited {
+            return;
         }
-        #[cfg(windows)]
-        self.process.process_job.terminate();
         let _ = child.kill();
         let _ = child.wait_timeout(self.shutdown_timeout);
     }
@@ -6007,6 +6178,206 @@ process.stdin.on("data", (chunk) => {
             .is_empty());
         manager.clear();
         assert_eq!(manager.session_count(), 0);
+    }
+
+    /// Editing a server's configuration replaces its session in the
+    /// conversation whose run brought the new configuration, at once rather
+    /// than at the idle TTL. The server in another folder, another
+    /// conversation's session and the current configuration's are left alone.
+    #[test]
+    fn a_changed_configuration_retires_only_the_session_it_replaces() {
+        let manager = McpSessionManager::new(test_options(), 8, Duration::from_secs(30)).unwrap();
+        let server = mock_server();
+        let mut changed = server.clone();
+        let RuntimeMcpTransport::Stdio { env, .. } = &mut changed.transport else {
+            unreachable!()
+        };
+        env.insert("MCP_MOCK_REVISION".into(), "2".into());
+        let mut elsewhere = server.clone();
+        let RuntimeMcpTransport::Stdio { cwd, .. } = &mut elsewhere.transport else {
+            unreachable!()
+        };
+        *cwd = Some(env!("CARGO_MANIFEST_DIR").into());
+        for (conversation_id, server) in [
+            ("conversation-config-a", &server),
+            ("conversation-config-a", &elsewhere),
+            ("conversation-config-b", &server),
+        ] {
+            drop(manager.worker(conversation_id, server).unwrap());
+        }
+        assert_eq!(manager.session_count(), 3);
+
+        manager.retire_superseded("conversation-config-a", &[changed.clone()]);
+        assert!(!manager.has_session("conversation-config-a", &server));
+        assert!(manager.has_session("conversation-config-a", &elsewhere));
+        assert!(manager.has_session("conversation-config-b", &server));
+
+        drop(manager.worker("conversation-config-a", &changed).unwrap());
+        manager.retire_superseded("conversation-config-a", &[changed.clone()]);
+        assert!(manager.has_session("conversation-config-a", &changed));
+        assert_eq!(manager.session_count(), 3);
+    }
+
+    /// A `"workspace": true` server's instances, one per folder, all belong to
+    /// its current configuration: a run with that configuration keeps every
+    /// one of them, and a changed configuration retires every one.
+    #[test]
+    fn workspace_instances_are_kept_and_replaced_together() {
+        let manager = McpSessionManager::new(test_options(), 8, Duration::from_secs(30)).unwrap();
+        let first = std::env::temp_dir().to_string_lossy().into_owned();
+        let mut server = mock_server();
+        server.wants_workspace = true;
+        server.workspace_folders = vec![
+            (1, first.clone()),
+            (2, env!("CARGO_MANIFEST_DIR").to_owned()),
+        ];
+        let RuntimeMcpTransport::Stdio { cwd, .. } = &mut server.transport else {
+            unreachable!()
+        };
+        *cwd = Some(first);
+        for member in [1, 2] {
+            let instance = server.instance_for(Some(member)).unwrap();
+            drop(manager.worker("conversation-instances", &instance).unwrap());
+        }
+        manager.retire_superseded("conversation-instances", &[server.clone()]);
+        assert_eq!(manager.session_count(), 2);
+
+        let mut changed = server.clone();
+        let RuntimeMcpTransport::Stdio { args, .. } = &mut changed.transport else {
+            unreachable!()
+        };
+        args.push("--revision=2".into());
+        manager.retire_superseded("conversation-instances", &[changed]);
+        assert_eq!(manager.session_count(), 0);
+    }
+
+    #[test]
+    fn removing_a_server_ends_its_sessions_in_every_conversation() {
+        let manager = McpSessionManager::new(test_options(), 8, Duration::from_secs(30)).unwrap();
+        let server = mock_server();
+        let mut other = mock_server();
+        other.artifact_id = "plugin:default/other@latest".into();
+        other.server_id = "plugin:default/other@latest:mcp:echo".into();
+        for conversation_id in ["conversation-removed-a", "conversation-removed-b"] {
+            drop(manager.worker(conversation_id, &server).unwrap());
+            drop(manager.worker(conversation_id, &other).unwrap());
+        }
+        manager.evict_servers([server.artifact_id.as_str()]);
+        assert_eq!(manager.session_count(), 2);
+        assert!(manager.has_session("conversation-removed-a", &other));
+        assert!(manager.has_session("conversation-removed-b", &other));
+    }
+
+    #[test]
+    fn discovery_with_a_changed_configuration_replaces_the_running_session() {
+        if !node_available() {
+            return;
+        }
+        let manager = McpSessionManager::new(test_options(), 4, Duration::from_secs(30)).unwrap();
+        let server = mock_server();
+        let mut changed = server.clone();
+        let RuntimeMcpTransport::Stdio { env, .. } = &mut changed.transport else {
+            unreachable!()
+        };
+        env.insert("MCP_MOCK_REVISION".into(), "2".into());
+        let before = manager.discover_for_conversation(
+            "conversation-replaced",
+            &[server],
+            crate::cancel::CancelSignal::default(),
+        );
+        assert!(before.failures.is_empty(), "{:?}", before.failures);
+
+        let after = manager.discover_for_conversation(
+            "conversation-replaced",
+            &[changed.clone()],
+            crate::cancel::CancelSignal::default(),
+        );
+        assert!(after.failures.is_empty(), "{:?}", after.failures);
+        assert_eq!(manager.session_count(), 1);
+        assert!(manager.has_session("conversation-replaced", &changed));
+        let echo = after
+            .bindings
+            .iter()
+            .find(|binding| binding.remote_name == "echo")
+            .unwrap();
+        let result = manager
+            .call_for_conversation(
+                "conversation-replaced",
+                echo,
+                json!({ "value": "current", "envNames": ["MCP_MOCK_REVISION"] }),
+                crate::cancel::CancelSignal::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.structured_content.unwrap()["environment"]["MCP_MOCK_REVISION"],
+            "2"
+        );
+    }
+
+    /// Starts the mock server the way `npx` starts a package's server, as a
+    /// process under this one, and first leaves behind a helper that would
+    /// outlive both, writing its id to the file named by the second argument.
+    const MOCK_WRAPPER: &str = r#"
+const { spawn } = require("node:child_process");
+const helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+require("node:fs").writeFileSync(process.argv[2], String(helper.pid));
+const server = spawn(process.execPath, [process.argv[1]], { stdio: "inherit" });
+server.on("exit", (code) => process.exit(code ?? 0));
+"#;
+
+    fn process_alive(pid: &str) -> bool {
+        Command::new("node")
+            .args([
+                "-e",
+                "try { process.kill(Number(process.argv[1]), 0) } catch { process.exit(1) }",
+                pid,
+            ])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Ending a session ends what its server started, not only the server:
+    /// the job does it on Windows, the server's process group on macOS and
+    /// Linux. Here the server exits at end of input, as most do, and leaves
+    /// its helper behind for the session to end.
+    #[test]
+    fn ending_a_session_ends_the_processes_its_server_started() {
+        if !node_available() {
+            return;
+        }
+        let pid_file = std::env::temp_dir().join(format!(
+            "mewrk-mcp-helper-{}.pid",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut server = mock_server();
+        let RuntimeMcpTransport::Stdio { args, .. } = &mut server.transport else {
+            unreachable!()
+        };
+        let mock = args[0].clone();
+        *args = vec![
+            "-e".into(),
+            MOCK_WRAPPER.into(),
+            mock,
+            pid_file.to_string_lossy().into_owned(),
+        ];
+        let manager = McpSessionManager::new(test_options(), 2, Duration::from_secs(30)).unwrap();
+        let report = manager.discover_for_conversation(
+            "conversation-tree",
+            &[server],
+            crate::cancel::CancelSignal::default(),
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        let helper = std::fs::read_to_string(&pid_file).unwrap();
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(process_alive(&helper));
+
+        manager.evict_conversations(["conversation-tree"]);
+        // A killed helper whose parent is gone is reaped by init on its own time.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(&helper) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!process_alive(&helper), "helper {helper} outlived its session");
     }
 
     #[test]

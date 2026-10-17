@@ -291,7 +291,7 @@ describe("UsageStatsCard", () => {
   });
 
   it("says the ledger is empty instead of inventing a comparison", () => {    render(<UsageStatsCard statistics={{ ...statistics, usage: [] }} />);
-    expect(screen.getByText(/还没有记录到任何 token 用量/)).toBeInTheDocument();
+    expect(screen.getByText("还没有记录到 token 用量。")).toBeInTheDocument();
     expect(tile("总 token")).toBe("0");
   });
 

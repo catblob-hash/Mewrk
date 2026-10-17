@@ -179,7 +179,7 @@ describe("HistoryPane", () => {
   it("says recording has not started rather than showing an empty list", async () => {
     runtime.listHistoryEntries.mockResolvedValue([]);
     render(<HistoryPane {...paneProps()} />);
-    expect(await screen.findByText(/这个对话还没有历史记录/)).toBeInTheDocument();
+    expect(await screen.findByText(/还没有历史记录，从下一次发送或编辑开始/)).toBeInTheDocument();
   });
 
   it("lays a turn out as the messages it added, with no request among them", async () => {
@@ -287,6 +287,8 @@ describe("HistoryPane", () => {
     render(<HistoryPane {...paneProps()} />);
 
     await waitFor(() => expect(barTitles()).toEqual(["claude-opus-5", "意外中断"]));
+    // A bar's hover text counts requests and never numbers its turn.
+    expect(bars().map((bar) => bar.getAttribute("title"))).toEqual(["发出 1 次请求", "最后一次请求没有等到回复"]);
     // Nothing settled, so what came back is all there is to show.
     await screen.findByText("我先看看");
     expect(listShape()).toEqual(["assistant", "tool"]);
@@ -435,14 +437,14 @@ describe("HistoryPane", () => {
   it("reads the conversation's own history when no agent is named", async () => {
     runtime.listHistoryEntries.mockResolvedValue([]);
     render(<HistoryPane {...paneProps()} />);
-    await screen.findByText(/这个对话还没有历史记录/);
+    await screen.findByText(/还没有历史记录，从下一次发送或编辑开始/);
     expect(runtime.listHistoryEntries).toHaveBeenCalledWith("conv_1", undefined);
   });
 
   it("reads one agent's history, and says so when that agent has done nothing", async () => {
     runtime.listHistoryEntries.mockResolvedValue([]);
     const { rerender } = render(<HistoryPane {...paneProps()} owners={["reviewer"]} />);
-    expect(await screen.findByText(/这个子代理还没有历史记录/)).toBeInTheDocument();
+    expect(await screen.findByText(/还没有历史记录，从它的第一次请求开始/)).toBeInTheDocument();
     expect(runtime.listHistoryEntries).toHaveBeenCalledWith("conv_1", ["reviewer"]);
 
     // The host separates a child's traffic from the session's own, so an agent

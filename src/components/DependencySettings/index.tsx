@@ -20,6 +20,7 @@ import type {
   EnvironmentToolSnapshot
 } from "../../types";
 import { Dialog, Field, IconButton } from "../Common";
+import { DocsLink } from "../DocsLink";
 import { SettingsPageHeading } from "../SettingsPageHeading";
 import "./DependencySettings.css";
 
@@ -82,7 +83,7 @@ function AddToolDialog({
   return (
     <Dialog
       title={t("添加工具", "Add tool")}
-      description={t("添加一个要在 PATH 上检测的命令行工具。", "Add a command-line tool to detect on PATH.")}
+      description={t("添加要在 PATH 上检测的工具。", "Add a tool to detect on PATH.")}
       onClose={onClose}
       width="480px"
       footer={(
@@ -132,7 +133,7 @@ function AddToolDialog({
         </Field>
         <Field
           label={t("版本参数", "Version arguments")}
-          hint={t("多个参数请用空格分隔；留空时使用 --version。", "Separate arguments with spaces; leave blank to use --version.")}
+          hint={t("用空格分隔多个参数，留空即 --version。", "Separate with spaces; blank uses --version.")}
         >
           <input
             aria-label={t("版本参数", "Version arguments")}
@@ -322,7 +323,12 @@ export function DependencySettings({
     <section className="settings-page dependency-settings">
       <SettingsPageHeading
         title={headingTitle}
-        description={t("检测这些命令行工具是否在 PATH 上。本页只做检测，不会下载或安装任何东西。", "Check whether these command-line tools are on PATH. This page only detects them and never downloads or installs anything.")}
+        description={(
+          <>
+            {t("检测这些命令行工具是否在 PATH 上。", "Checks whether these tools are on PATH.")}
+            <DocsLink inline page="settings" section="dependencies" />
+          </>
+        )}
         action={(
           <div className="settings-page-heading__actions">
             <IconButton

@@ -10,11 +10,15 @@
 // `request.apiKey` / `request.baseURL` are set too, with values that must appear
 // nowhere upstream. When the platform package is absent (an install that skipped
 // optional dependencies) the section is skipped with a warning so the rest of the
-// selfcheck stays meaningful.
+// selfcheck stays meaningful. The native-fetch check is the one where the CLI
+// itself goes out to the web (its `WebFetch`); there `agent.env` points it at a
+// local proxy that answers for every host it may reach, Anthropic's domain check
+// included, so nothing leaves this machine there either.
 
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
+import { Server as HttpsServer } from "node:https";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -91,7 +95,8 @@ export function resolveClaudeExecutable() {
 // ---------------------------------------------------------------- fake Anthropic upstream
 //
 // Answers `POST /v1/messages` with a scripted SSE stream. Each scripted response
-// is a list of blocks: text | thinking (with signature) | tool_use. A response may
+// is a list of blocks: text | thinking (with signature) | tool_use | the two
+// server-side search blocks, server_tool_use and web_search_tool_result. A response may
 // instead carry `status` for an error body, or `delayMs` to stall before the first
 // byte (used by the cancel check).
 
@@ -203,12 +208,17 @@ function writeSse(res, response, model) {
         delta: { type: "signature_delta", signature: block.signature ?? "sig_fake" },
       });
       send("content_block_stop", { type: "content_block_stop", index });
-    } else if (block.type === "tool_use") {
-      stop = "tool_use";
+    } else if (block.type === "web_search_tool_result") {
+      // Arrives whole, in its start event.
+      send("content_block_start", { type: "content_block_start", index, content_block: block });
+      send("content_block_stop", { type: "content_block_stop", index });
+    } else if (block.type === "tool_use" || block.type === "server_tool_use") {
+      // The server runs its own tool within the message, which then goes on.
+      if (block.type === "tool_use") stop = "tool_use";
       send("content_block_start", {
         type: "content_block_start",
         index,
-        content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+        content_block: { type: block.type, id: block.id, name: block.name, input: {} },
       });
       for (const piece of chunk(JSON.stringify(block.input ?? {}), 11)) {
         send("content_block_delta", {
@@ -234,6 +244,86 @@ function chunk(text, size) {
   for (let index = 0; index < text.length; index += size) out.push(text.slice(index, index + size));
   if (out.length === 0) out.push("");
   return out;
+}
+
+// ---------------------------------------------------------------- fake web for WebFetch
+//
+// `WebFetch` runs inside the CLI: it asks Anthropic whether a domain may be
+// fetched (`api.anthropic.com/api/web/domain_info`), then fetches the page over
+// HTTPS — always HTTPS, it upgrades plain HTTP itself. Both go through the proxy
+// named in `HTTPS_PROXY`, so a local proxy that answers every CONNECT with a TLS
+// server of its own stands in for the whole web; the CLI trusts that server
+// through `NODE_EXTRA_CA_CERTS`.
+
+/**
+ * A throwaway self-signed certificate for `hosts`, made with `openssl` in a
+ * temporary directory, or `null` where there is no `openssl` to make one.
+ */
+function throwawayCertificate(hosts) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "mewrk-selfcheck-tls-"));
+  const keyFile = path.join(dir, "key.pem");
+  const certFile = path.join(dir, "cert.pem");
+  try {
+    execFileSync("openssl", [
+      "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", keyFile, "-out", certFile, "-days", "1",
+      "-subj", "/CN=mewrk-selfcheck", "-addext", `subjectAltName=${hosts.map((host) => `DNS:${host}`).join(",")}`,
+    ], { stdio: "ignore", env: { ...process.env, MSYS_NO_PATHCONV: "1" } });
+    return { dir, file: certFile, key: readFileSync(keyFile), cert: readFileSync(certFile) };
+  } catch {
+    rmSync(dir, { recursive: true, force: true });
+    return null;
+  }
+}
+
+/**
+ * The proxy and the web behind it. Every host's domain check passes; `pages`
+ * maps a path to the HTML served there, and any other path is a 404. `seen`
+ * records each tunnel (`CONNECT host:port`) and each request inside one.
+ */
+function startFakeWeb(certificate, pages) {
+  const seen = [];
+  const web = new HttpsServer({ key: certificate.key, cert: certificate.cert }, (req, res) => {
+    seen.push(`${req.method} ${req.headers.host}${req.url}`);
+    if (req.url?.startsWith("/api/web/domain_info")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ can_fetch: true }));
+    } else if (req.url && Object.hasOwn(pages, req.url)) {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(pages[req.url]);
+    } else {
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end("not found");
+    }
+  });
+  const proxy = createServer((req, res) => {
+    // A plain-HTTP proxy request: nothing the CLI should send.
+    seen.push(`PROXY ${req.method} ${req.url}`);
+    res.writeHead(403);
+    res.end();
+  });
+  const tunnels = new Set();
+  proxy.on("connect", (req, socket, head) => {
+    seen.push(`CONNECT ${req.url}`);
+    tunnels.add(socket);
+    socket.on("close", () => tunnels.delete(socket));
+    socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    if (head?.length) socket.unshift(head);
+    web.emit("connection", socket);
+  });
+  return new Promise((resolve) => {
+    proxy.listen(0, "127.0.0.1", () => {
+      resolve({
+        url: `http://127.0.0.1:${proxy.address().port}`,
+        seen,
+        close: () => {
+          // A tunnel left to the server would hold `close` open.
+          for (const socket of tunnels) socket.destroy();
+          proxy.closeAllConnections();
+          return new Promise((done) => proxy.close(done));
+        },
+      });
+    });
+  });
 }
 
 // ---------------------------------------------------------------- checks
@@ -1317,6 +1407,197 @@ export async function runClaudeAgentChecks({ sc, check, V, executable, sdk }) {
       && (expectedUser === undefined || resumedEnv.USER === expectedUser),
     JSON.stringify(resumedEnv),
   );
+
+  // 30o: native search. The host's isolated search request carries
+  // `nativeSearch` and no host tools, and its session gets Claude Code's own
+  // `WebSearch` and nothing else. The CLI answers that tool itself, with a
+  // second API request holding the server-side `web_search`, so the step spans
+  // the whole turn. The permission callback holds the budget (one use: the
+  // second of two parallel calls is refused), the hits become the step's
+  // sources, and the usage counts the CLI's own search request too.
+  const searchCallsBefore = upstream.calls.length;
+  upstream.push(
+    {
+      blocks: [
+        { type: "text", text: "Searching." },
+        { type: "tool_use", id: "toolu_ws_a", name: "WebSearch", input: { query: "mewrk native search" } },
+        { type: "tool_use", id: "toolu_ws_b", name: "WebSearch", input: { query: "mewrk native search again" } },
+      ],
+    },
+    {
+      blocks: [
+        { type: "server_tool_use", id: "srvtoolu_01", name: "web_search", input: { query: "mewrk native search" } },
+        {
+          type: "web_search_tool_result",
+          tool_use_id: "srvtoolu_01",
+          content: [
+            { type: "web_search_result", title: "Result A", url: "https://a.example/page", encrypted_content: "enc_a", page_age: null },
+            { type: "web_search_result", title: "Result B", url: "https://b.example/doc", encrypted_content: "enc_b", page_age: null },
+          ],
+        },
+        { type: "text", text: "Two pages matched." },
+      ],
+    },
+    { blocks: [{ type: "text", text: "Findings: see https://a.example/page" }] },
+  );
+  sc.send(stepFrame("ca-search", "ca-search", [{ role: "user", content: "Search the web for: mewrk native search" }], {
+    tools: [],
+    nativeSearch: { maxUses: 1 },
+  }));
+  const searched = await sc.wait(terminal("ca-search"), 60000);
+  sc.send({ v: V, type: "release", session: "ca-search" });
+  const searchCalls = upstream.calls.slice(searchCallsBefore).map((entry) => entry.body);
+  const searchResult = searched.type === "done" ? searched.result : undefined;
+  check(
+    "30 claude-agent：原生搜索一步跑完整个 CLI 回合，一次放行的 WebSearch 记作一次用量",
+    searchResult?.finishReason === "stop" && searchResult.text === "Searching.\n\nFindings: see https://a.example/page"
+      && searchResult.calls.length === 0 && searchResult.nativeSearchUses === 1
+      && searchResult.nativeSearchCallIds?.length === 1
+      && ["toolu_ws_a", "toolu_ws_b"].includes(searchResult.nativeSearchCallIds[0])
+      && searchCalls.length === 3,
+    describe(searched),
+  );
+  check(
+    "30 claude-agent：原生搜索的命中（标题与 URL）成为这一步的 sources",
+    JSON.stringify(searchResult?.sources ?? null) === JSON.stringify([
+      { id: "search:https://a.example/page", url: "https://a.example/page", title: "Result A" },
+      { id: "search:https://b.example/doc", url: "https://b.example/doc", title: "Result B" },
+    ]),
+    JSON.stringify(searchResult?.sources ?? null),
+  );
+  const searchTools = (searchCalls[0]?.tools ?? []).map((tool) => tool.name);
+  const innerTools = (searchCalls[1]?.tools ?? []).map((tool) => tool.type);
+  check(
+    "30 claude-agent：搜索会话只有 CLI 自己的 WebSearch，它再用服务端 web_search 发第二次请求",
+    JSON.stringify(searchTools) === JSON.stringify(["WebSearch"])
+      && innerTools.length === 1 && /^web_search_\d{8}$/.test(innerTools[0] ?? ""),
+    `outer=${JSON.stringify(searchTools)} inner=${JSON.stringify(innerTools)}`,
+  );
+  const answered = (Array.isArray(lastTurnMessage(searchCalls[2]?.messages)?.content)
+    ? lastTurnMessage(searchCalls[2].messages).content
+    : []).filter((block) => block.type === "tool_result");
+  const refusedText = (block) => (typeof block.content === "string" ? block.content : textOf(block));
+  check(
+    "30 claude-agent：超出搜索预算的 WebSearch 被权限回调拒绝，模型收到预算用尽",
+    answered.length === 2
+      && answered.filter((block) => refusedText(block).includes("search budget for this query is spent")).length === 1,
+    JSON.stringify(answered).slice(0, 400),
+  );
+  check(
+    "30 claude-agent：原生搜索的用量含 CLI 自己的搜索请求（三次请求各 150 输入）",
+    searchResult?.usage?.inputTokens === 450 && searchResult.usage.cacheReadTokens === 60,
+    JSON.stringify(searchResult?.usage ?? null),
+  );
+
+  // 30p: native fetch. The host's isolated fetch request carries `nativeFetch`
+  // with the pages it names and no host tools, and its session gets Claude
+  // Code's own `WebFetch` and nothing else. The permission callback holds it to
+  // those pages: a listed page spelled differently is admitted and fetched as
+  // the host spelled it, a second call for it is refused, and so is an address
+  // nobody named — here one on the CLI's preapproved documentation list, which
+  // the CLI would let through without asking were the callback not consulted for
+  // every call. Each admitted call runs under the sidecar's own prompt; the CLI
+  // renders the fetched page with its own model (one more request to the
+  // upstream), and that rendering becomes the step's `webDocuments`, while the
+  // page that is gone becomes a `web_fetch` failure.
+  const certificate = throwawayCertificate(["api.anthropic.com", "example.com", "docs.python.org"]);
+  if (certificate === null) {
+    process.stdout.write("警告：找不到 openssl，无法给本机假网页签发证书，跳过 claude-agent 原生抓取判别器\n");
+  } else {
+    const web = await startFakeWeb(certificate, {
+      "/a": "<html><head><title>Page A</title></head><body><nav>menu</nav><h1>Page A</h1><p>The body of page A.</p></body></html>",
+    });
+    const fetchCallsBefore = upstream.calls.length;
+    upstream.push(
+      {
+        blocks: [
+          { type: "text", text: "Fetching." },
+          { type: "tool_use", id: "toolu_wf_a", name: "WebFetch", input: { url: "http://EXAMPLE.com/a#intro", prompt: "Only the title." } },
+          { type: "tool_use", id: "toolu_wf_b", name: "WebFetch", input: { url: "https://example.com/b", prompt: "All of it." } },
+          { type: "tool_use", id: "toolu_wf_c", name: "WebFetch", input: { url: "https://docs.python.org/3/", prompt: "All of it." } },
+          { type: "tool_use", id: "toolu_wf_d", name: "WebFetch", input: { url: "https://example.com/a", prompt: "All of it." } },
+        ],
+      },
+      // The CLI's own model, rendering page A.
+      { blocks: [{ type: "text", text: "# Page A\n\nThe body of page A." }] },
+      { blocks: [{ type: "text", text: "https://example.com/b could not be fetched (404)." }] },
+    );
+    const fetchAgent = agentFor("ca-fetch");
+    sc.send(stepFrame("ca-fetch", "ca-fetch", [
+      { role: "user", content: "Fetch each of these URLs, one call per URL:\n\nhttps://example.com/a\nhttps://example.com/b" },
+    ], {
+      tools: [],
+      nativeFetch: { maxUses: 2, urls: ["https://example.com/a", "https://example.com/b"] },
+      agent: {
+        ...fetchAgent,
+        env: {
+          ...fetchAgent.env,
+          HTTPS_PROXY: web.url,
+          HTTP_PROXY: web.url,
+          NO_PROXY: "127.0.0.1,localhost",
+          NODE_EXTRA_CA_CERTS: certificate.file,
+        },
+      },
+    }));
+    const fetched = await sc.wait(terminal("ca-fetch"), 90000);
+    sc.send({ v: V, type: "release", session: "ca-fetch" });
+    await web.close();
+    rmSync(certificate.dir, { recursive: true, force: true });
+    const fetchCalls = upstream.calls.slice(fetchCallsBefore).map((entry) => entry.body);
+    const fetchResult = fetched.type === "done" ? fetched.result : undefined;
+    check(
+      "30 claude-agent：原生抓取一步跑完整个 CLI 回合，点名的页面按宿主的写法成为 webDocuments，正文是 WebFetch 的结果",
+      fetchResult?.finishReason === "stop" && fetchResult.calls.length === 0
+        && JSON.stringify(fetchResult.webDocuments ?? null)
+          === JSON.stringify([{ url: "https://example.com/a", text: "# Page A\n\nThe body of page A." }])
+        && fetchResult.nativeSearchUses === undefined && fetchCalls.length === 3,
+      describe(fetched),
+    );
+    check(
+      "30 claude-agent：不存在的页面（404）记作 web_fetch 的 providerToolErrors",
+      fetchResult?.providerToolErrors?.length === 1 && fetchResult.providerToolErrors[0].toolName === "web_fetch"
+        && fetchResult.providerToolErrors[0].message.startsWith("https://example.com/b: HTTP 404"),
+      JSON.stringify(fetchResult?.providerToolErrors ?? null),
+    );
+    const fetchTools = (fetchCalls[0]?.tools ?? []).map((tool) => tool.name);
+    const rendering = JSON.stringify(fetchCalls[1]?.messages ?? null);
+    check(
+      "30 claude-agent：抓取会话只有 CLI 自己的 WebFetch；页面交给 CLI 的模型时带侧车的提示词而不是执行者写的",
+      JSON.stringify(fetchTools) === JSON.stringify(["WebFetch"])
+        && rendering.includes("The body of page A.") && rendering.includes("Reproduce this page's main content")
+        && !rendering.includes("Only the title."),
+      `tools=${JSON.stringify(fetchTools)} rendering=${rendering.slice(0, 300)}`,
+    );
+    const fetchAnswers = (Array.isArray(lastTurnMessage(fetchCalls[2]?.messages)?.content)
+      ? lastTurnMessage(fetchCalls[2].messages).content
+      : []).filter((block) => block.type === "tool_result");
+    const answerOf = (id) => {
+      const block = fetchAnswers.find((entry) => entry.tool_use_id === id);
+      return block ? refusedText(block) : "";
+    };
+    check(
+      "30 claude-agent：未点名的地址（含 CLI 预先放行的文档站）和重复抓取都被权限回调拒绝",
+      fetchAnswers.length === 4
+        && answerOf("toolu_wf_c").includes("may fetch only the URLs it was given")
+        && answerOf("toolu_wf_c").includes("https://example.com/b")
+        && ["toolu_wf_a", "toolu_wf_d"].filter((id) => answerOf(id).includes("already fetched")).length === 1,
+      JSON.stringify(fetchAnswers).slice(0, 600),
+    );
+    const tunnels = web.seen.filter((entry) => entry.startsWith("CONNECT "));
+    check(
+      "30 claude-agent：WebFetch 只经本机代理出网，域名检查与抓取都只到点名的主机",
+      tunnels.length > 0
+        && tunnels.every((entry) => entry === "CONNECT api.anthropic.com:443" || entry === "CONNECT example.com:443")
+        && web.seen.includes("GET example.com/a") && !web.seen.some((entry) => entry.includes("docs.python.org"))
+        && !web.seen.some((entry) => entry.startsWith("PROXY ")),
+      JSON.stringify(web.seen),
+    );
+    check(
+      "30 claude-agent：原生抓取的用量含 CLI 渲染页面的那次请求（三次请求各 150 输入）",
+      fetchResult?.usage?.inputTokens === 450 && fetchResult.usage.cacheReadTokens === 60,
+      JSON.stringify(fetchResult?.usage ?? null),
+    );
+  }
 
   // 30m: every frame above carried `apiKey`/`baseURL` on the request. The CLI is
   // authenticated by the loopback stub key from `agent.env` — proof that the

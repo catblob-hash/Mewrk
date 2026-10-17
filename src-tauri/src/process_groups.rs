@@ -72,6 +72,16 @@ impl Groups {
 #[derive(Debug)]
 pub(crate) struct GroupRegistration(i32);
 
+impl GroupRegistration {
+    /// Sends `signal` to every process still in the group, its leader included.
+    pub(crate) fn signal(&self, signal: libc::c_int) {
+        // SAFETY: `kill` with a negative id only signals the processes of that group.
+        unsafe {
+            libc::kill(-self.0, signal);
+        }
+    }
+}
+
 impl Drop for GroupRegistration {
     fn drop(&mut self) {
         let mut groups = groups();

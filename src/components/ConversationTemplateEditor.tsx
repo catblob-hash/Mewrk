@@ -451,8 +451,8 @@ export function ConversationTemplateEditor({
         <Dialog
           title={t("模板里有未启用的工具", "This template uses tools that are not enabled")}
           description={t(
-            "保存没问题，但这些工具在当前设置里是关着的，套用之后模型看得见这些调用却用不了它们。",
-            "Saving is fine, but these tools are switched off here: once the template is applied the model can see the calls and cannot make them."
+            "这些工具当前是关闭的，套用后模型无法调用。",
+            "These tools are off, so the model can't call them once applied."
           )}
           onClose={() => setUnenabledTools(null)}
           footer={(

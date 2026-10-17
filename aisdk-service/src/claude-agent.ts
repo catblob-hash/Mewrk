@@ -4,13 +4,29 @@
 //!
 //! Boundary. One host round is still one sidecar `step`, and inside the CLI it is
 //! one Claude API call. Claude Code's own behaviour is switched off (no built-in
-//! tools, no CLAUDE.md/settings/hooks, no user MCP servers, no compaction, no
+//! tools but native search's and native fetch's, below; no CLAUDE.md/settings/hooks,
+//! no user MCP servers, no compaction, no
 //! background tasks); the host keeps owning approvals, tool execution, hooks and
 //! the round loop. The CLI's tool loop is only borrowed: every host tool is
 //! published by one in-process MCP server, and when the model calls one the
 //! handler *parks*. The step then ends with `done` carrying `calls`; the host
 //! executes them; the next step for the same `agent.session` resolves the parked
 //! handlers with the results and streams the following model reply.
+//!
+//! Native search and fetch. The only built-in tools the CLI is ever given are
+//! its own `WebSearch` and `WebFetch`, one at a time, and only in the isolated
+//! one-shot requests the host mints for a Native `web_search` call
+//! (`request.nativeSearch`) or a Native `web_fetch` call (`request.nativeFetch`).
+//! Such a request carries no host tools and gets a session of its own, whose
+//! step spans the whole CLI turn and ends at its `result`. `WebSearch` is this
+//! family's provider-executed search: the CLI runs it as a second Claude API
+//! call with the server-side `web_search` tool, under the user's own login;
+//! `NativeSearchLedger` holds the budget, counts the calls and keeps the sites
+//! they retrieved. `WebFetch` is its page fetch: the CLI retrieves the page
+//! itself and has its own model render it to text; `NativeFetchLedger` lets it
+//! open the URLs the host named and nothing else, once each, and hands the host
+//! each page's text as `webDocuments`. Both are admitted by the permission
+//! callback (`NativeLedger`), the one place the CLI asks before using a tool.
 //!
 //! Version. Neither the SDK nor the CLI is part of this sidecar. The host
 //! installs both from npm as one matched pair — the SDK, and the CLI inside its
@@ -78,12 +94,15 @@ import { randomUUID } from "node:crypto";
 // runtime module is the one `loadClaudeAgentSdk` loads from `agent.sdk`.
 import type {
   McpSdkServerConfigWithInstance,
+  ModelUsage,
   Options,
+  PermissionResult,
   Query,
   SpawnOptions,
   SDKMessage,
   SDKUserMessage,
   SessionStoreEntry,
+  Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 
 import { contextPluginDir } from "./claude-context-plugin.js";
@@ -164,6 +183,44 @@ const BOX_TOOL_NAME = "box";
 const NO_CONTENT_PLACEHOLDER = "(no content)";
 /** Lines of CLI stderr retained for error messages. */
 const STDERR_TAIL_LINES = 40;
+/** The CLI's built-in search tool, switched on only for native-search sessions. */
+const CLI_SEARCH_TOOL = "WebSearch";
+/** Retained sources per search step; the same cap as `main.ts`'s `MAX_SOURCES`. */
+const MAX_SEARCH_SOURCES = 64;
+/** What a `WebSearch` call past the host's budget is answered with. */
+const SEARCH_BUDGET_SPENT =
+  "The search budget for this query is spent. Answer from the results you already have.";
+/** The CLI's built-in page fetch, switched on only for native-fetch sessions. */
+const CLI_FETCH_TOOL = "WebFetch";
+/** Retained pages per fetch step; the same cap as `main.ts`'s `MAX_SOURCES`. */
+const MAX_FETCH_DOCUMENTS = 64;
+/** Longest failure text kept per fetch, so one error page cannot crowd the report. */
+const MAX_FETCH_FAILURE_CHARS = 1000;
+/**
+ * The `prompt` every admitted `WebFetch` call runs with, in place of whatever
+ * the executor wrote. `WebFetch` does not return the page: the CLI converts it
+ * to Markdown and hands that, with this prompt, to a model of its own, whose
+ * reply is the call's `result` — only a small Markdown page from a host on the
+ * CLI's preapproved documentation list comes back as is. So what reaches the
+ * host is that model's rendering, under instructions the CLI wraps around this
+ * one (it asks for a concise answer and, for most hosts, limits how much may be
+ * quoted word for word). This prompt asks for the most faithful rendering those
+ * allow: the page's whole main content, in its own words and order, rather than
+ * an answer about it — the host reads it as the page, and on the Messages
+ * families that is exactly what it gets.
+ */
+const FETCH_PROMPT =
+  "Reproduce this page's main content as completely and faithfully as you can, as Markdown: " +
+  "all of its text, in its original wording, language and order, keeping headings, lists, tables, " +
+  "code blocks and link targets. Leave out only site navigation, ads, cookie notices and similar page chrome. " +
+  "Do not summarize, shorten, translate, explain or comment; where something cannot be reproduced, " +
+  "say what was left out instead of paraphrasing it.";
+/** What a `WebFetch` call for an address the host did not name is answered with. */
+const FETCH_NOT_ASKED = "This request may fetch only the URLs it was given, exactly as written:";
+/** What a second `WebFetch` call for an address already fetched is answered with. */
+const FETCH_ALREADY_DONE = "This URL was already fetched in this request; its result is above. Do not fetch it again.";
+/** What a `WebFetch` call past the host's budget is answered with. */
+const FETCH_BUDGET_SPENT = "The fetch budget for this request is spent; no further pages may be fetched.";
 /** Authentication channels that must never reach the CLI from the sidecar's own environment. */
 const CREDENTIAL_ENV = [
   "ANTHROPIC_API_KEY",
@@ -1297,6 +1354,271 @@ interface StepOutcome {
   result: StepResult;
 }
 
+/**
+ * The admission and record of a native-search or native-fetch session: the one
+ * CLI built-in it switches on, what the permission callback answers for each
+ * call to it, and what the step reports beside its text.
+ *
+ * The callback only hears about a call the CLI would otherwise ask about, so a
+ * session also makes the CLI ask about every call to `tool` (see `nativeSettings`):
+ * left to itself `WebFetch` lets a host on its preapproved list through unasked.
+ */
+interface NativeLedger {
+  readonly tool: string;
+  /** The permission callback's answer for one call to `tool`. */
+  admit(toolUseId: string, input: Record<string, unknown>): PermissionResult;
+  /** Reads what an admitted call returned, from the user message carrying its result. */
+  observe(message: SDKUserMessage): void;
+  /** The step result's fields this session fills. */
+  report(): Partial<StepResult>;
+}
+
+/** The ledger a native request's session keeps, or `null` for every other request. */
+function nativeLedger(request: StepRequest): NativeLedger | null {
+  // The host never sends both: each is its own one-shot request.
+  if (request.nativeSearch) return new NativeSearchLedger(request.nativeSearch.maxUses);
+  if (request.nativeFetch) return new NativeFetchLedger(request.nativeFetch.maxUses, request.nativeFetch.urls ?? []);
+  return null;
+}
+
+/**
+ * Flag settings that route every call to the session's built-in through the
+ * permission callback: an `ask` rule for the whole tool is consulted before a
+ * tool's own permission check, so `WebFetch`'s preapproved hosts cannot skip
+ * the ledger and neither can anything a later CLI starts allowing on its own.
+ */
+function nativeSettings(native: NativeLedger | null): Pick<Settings, "permissions"> {
+  return native ? { permissions: { ask: [native.tool] } } : {};
+}
+
+/**
+ * Budget and record of a native-search session's `WebSearch` calls.
+ *
+ * One use is one `WebSearch` call the CLI was allowed to run: that is what the
+ * permission callback can count and refuse, and its tool_use id is the call id
+ * the host's budget accounting dedupes on. Inside that call the CLI runs its own
+ * Claude API request, which may search more than once (its `searchCount`)
+ * under a cap the CLI sets itself; nothing on this side reaches that cap.
+ *
+ * Sources are read off the call's structured output (`tool_use_result`), not
+ * its tool_result text: the titles and URLs there are the hits the server-side
+ * search returned, which is the part of a server-side search the host can
+ * check, as on the Messages families.
+ */
+class NativeSearchLedger implements NativeLedger {
+  readonly tool = CLI_SEARCH_TOOL;
+  private readonly admitted = new Set<string>();
+  private readonly found: StepResult["sources"] = [];
+  private readonly foundUrls = new Set<string>();
+
+  /** `maxUses` is the host's remaining budget; zero means unlimited. */
+  constructor(private readonly maxUses: number) {}
+
+  /** The permission callback's answer for one `WebSearch` call. */
+  admit(toolUseId: string, input: Record<string, unknown>): PermissionResult {
+    if (this.maxUses > 0 && this.admitted.size >= this.maxUses) {
+      return { behavior: "deny", message: SEARCH_BUDGET_SPENT };
+    }
+    this.admitted.add(toolUseId);
+    return { behavior: "allow", updatedInput: input };
+  }
+
+  /** Keeps the hits of an admitted call, from the user message carrying its result. */
+  observe(message: SDKUserMessage): void {
+    const content = (message.message as { content?: unknown }).content;
+    const answers = Array.isArray(content)
+      && content.some((block) => isObject(block) && block.type === "tool_result"
+        && typeof block.tool_use_id === "string" && this.admitted.has(block.tool_use_id));
+    const output = message.tool_use_result;
+    if (!answers || !isObject(output) || !Array.isArray(output.results)) return;
+    for (const entry of output.results) {
+      if (!isObject(entry) || !Array.isArray(entry.content)) continue;
+      for (const hit of entry.content) {
+        if (isObject(hit)) this.addSource(hit.url, hit.title);
+      }
+    }
+  }
+
+  private addSource(url: unknown, title: unknown): void {
+    if (this.found.length >= MAX_SEARCH_SOURCES) return;
+    if (typeof url !== "string" || url.length > 2048 || this.foundUrls.has(url)) return;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+    } catch {
+      // Search output is untrusted; a malformed URL is not a source.
+      return;
+    }
+    this.foundUrls.add(url);
+    this.found.push({
+      id: `search:${url}`,
+      url,
+      ...(typeof title === "string" && title.length > 0 ? { title: title.slice(0, 512) } : {}),
+    });
+  }
+
+  /** The step result's native-search fields. */
+  report(): Pick<StepResult, "nativeSearchUses" | "nativeSearchCallIds" | "sources"> {
+    return {
+      nativeSearchUses: this.admitted.size,
+      nativeSearchCallIds: [...this.admitted],
+      sources: [...this.found],
+    };
+  }
+}
+
+/**
+ * The address a fetch is compared by, or `null` for one that cannot be
+ * fetched at all. Parsing normalizes spelling (case of scheme and host, an
+ * empty path, percent-encoding); the fragment is dropped because it never
+ * reaches the server; and `http:` reads as `https:` because `WebFetch` upgrades
+ * every plain-HTTP address before fetching it, so the two name the same request.
+ */
+function fetchKey(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > 8192) return null;
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    return null;
+  }
+  if (url.protocol === "http:") url.protocol = "https:";
+  else if (url.protocol !== "https:") return null;
+  url.hash = "";
+  return url.href;
+}
+
+/** A tool_result block's text, whether it came as a string or as text blocks. */
+function toolResultText(block: JsonObject): string {
+  if (typeof block.content === "string") return block.content;
+  if (!Array.isArray(block.content)) return "";
+  return block.content
+    .filter((part): part is JsonObject => isObject(part) && part.type === "text" && typeof part.text === "string")
+    .map((part) => String(part.text))
+    .join("\n");
+}
+
+/**
+ * Admission and record of a native-fetch session's `WebFetch` calls.
+ *
+ * The host names the pages (`nativeFetch.urls`) and the permission callback
+ * holds the CLI to them: a call is admitted only for one of those addresses
+ * (compared by `fetchKey`), only once per address, and only within `maxUses`;
+ * anything else is refused with a message saying why, before the CLI opens
+ * anything. An admitted call runs with the host's own spelling of the address
+ * and with `FETCH_PROMPT` in place of the executor's prompt. A request that
+ * names no pages fetches nothing.
+ *
+ * Each admitted call's outcome is read off its structured output
+ * (`tool_use_result`, Claude Code's `{ url, code, codeText, result, bytes, … }`)
+ * into the same shape the Messages families' `web_fetch_result` becomes in
+ * `main.ts`: a 2xx answer with text is a page — `{ url, text }`, where `url` is
+ * the address the host asked for and `text` the call's `result`; there is no
+ * title to report — and anything else is a `providerToolErrors` entry under the
+ * host's own tool name, `web_fetch`: an HTTP failure (a redirect to another
+ * host included, which `WebFetch` reports instead of following), an empty
+ * page, or a call that failed outright. A host that gets no page reports the
+ * first of those.
+ */
+class NativeFetchLedger implements NativeLedger {
+  readonly tool = CLI_FETCH_TOOL;
+  /** `fetchKey` of each page the host asked for → the host's spelling of it. */
+  private readonly asked = new Map<string, string>();
+  /** Admitted tool_use id → the page it fetches, in the host's spelling. */
+  private readonly admitted = new Map<string, string>();
+  /** Keys already admitted once. */
+  private readonly opened = new Set<string>();
+  /** Admitted calls whose outcome has been read. */
+  private readonly settled = new Set<string>();
+  private readonly documents: NonNullable<StepResult["webDocuments"]> = [];
+  private readonly failures: NonNullable<StepResult["providerToolErrors"]> = [];
+
+  /** `maxUses` is the host's budget, one per page; zero leaves only the list to bound it. */
+  constructor(private readonly maxUses: number, urls: readonly string[]) {
+    for (const url of urls) {
+      const key = fetchKey(url);
+      if (key !== null && !this.asked.has(key)) this.asked.set(key, url);
+    }
+  }
+
+  /** The permission callback's answer for one `WebFetch` call. */
+  admit(toolUseId: string, input: Record<string, unknown>): PermissionResult {
+    const already = this.admitted.get(toolUseId);
+    if (already !== undefined) return { behavior: "allow", updatedInput: { ...input, url: already, prompt: FETCH_PROMPT } };
+    const key = fetchKey(input.url);
+    const page = key === null ? undefined : this.asked.get(key);
+    if (key === null || page === undefined) {
+      const listed = [...this.asked.values()];
+      return { behavior: "deny", message: `${FETCH_NOT_ASKED}\n${listed.length > 0 ? listed.join("\n") : "(none)"}` };
+    }
+    if (this.opened.has(key)) return { behavior: "deny", message: FETCH_ALREADY_DONE };
+    if (this.maxUses > 0 && this.admitted.size >= this.maxUses) {
+      return { behavior: "deny", message: FETCH_BUDGET_SPENT };
+    }
+    this.opened.add(key);
+    this.admitted.set(toolUseId, page);
+    return { behavior: "allow", updatedInput: { ...input, url: page, prompt: FETCH_PROMPT } };
+  }
+
+  /** Records the outcome of an admitted call, from the user message carrying its result. */
+  observe(message: SDKUserMessage): void {
+    const content = (message.message as { content?: unknown }).content;
+    if (!Array.isArray(content)) return;
+    const answers = content.filter((block): block is JsonObject => isObject(block) && block.type === "tool_result"
+      && typeof block.tool_use_id === "string" && this.admitted.has(block.tool_use_id)
+      && !this.settled.has(block.tool_use_id));
+    // `tool_use_result` is the structured output of the message's one result;
+    // a message answering several calls at once is read from their text alone.
+    const structured = answers.length === 1 ? message.tool_use_result : undefined;
+    for (const block of answers) this.record(block, structured);
+  }
+
+  private record(block: JsonObject, output: unknown): void {
+    const id = String(block.tool_use_id);
+    const url = this.admitted.get(id);
+    if (url === undefined) return;
+    this.settled.add(id);
+    if (block.is_error === true) {
+      const detail = toolResultText(block).replace(/<\/?tool_use_error>/g, "").trim()
+        || (typeof output === "string" ? output.trim() : "");
+      this.fail(url, detail.length > 0 ? detail : "Claude Code's WebFetch failed");
+      return;
+    }
+    const fetched = isObject(output) ? output : undefined;
+    const code = number(fetched?.code);
+    const text = typeof fetched?.result === "string" ? fetched.result : toolResultText(block);
+    if (code !== undefined && (code < 200 || code > 299)) {
+      const reason = typeof fetched?.codeText === "string" ? fetched.codeText.trim() : "";
+      const status = reason.length > 0 ? `HTTP ${code} ${reason}` : `HTTP ${code}`;
+      // A redirect's text names its target; keep it, so the model can ask again.
+      this.fail(url, text.trim().length > 0 ? `${status}: ${text.trim()}` : status);
+      return;
+    }
+    if (text.trim().length === 0) {
+      this.fail(url, "Claude Code's WebFetch returned no content");
+      return;
+    }
+    if (this.documents.length >= MAX_FETCH_DOCUMENTS) return;
+    this.documents.push({ url: url.slice(0, 2048), text: text.slice(0, MAX_STREAM_TEXT) });
+  }
+
+  private fail(url: string, detail: string): void {
+    const message = `${url}: ${detail}`;
+    this.failures.push({
+      toolName: "web_fetch",
+      message: message.length > MAX_FETCH_FAILURE_CHARS ? `${message.slice(0, MAX_FETCH_FAILURE_CHARS)}…` : message,
+    });
+  }
+
+  /** The step result's native-fetch fields. */
+  report(): Pick<StepResult, "webDocuments" | "providerToolErrors"> {
+    return {
+      ...(this.documents.length > 0 ? { webDocuments: [...this.documents] } : {}),
+      ...(this.failures.length > 0 ? { providerToolErrors: [...this.failures] } : {}),
+    };
+  }
+}
+
 class StepTranslator {
   private text = "";
   private readonly reasoning: string[] = [];
@@ -1323,6 +1645,8 @@ class StepTranslator {
     private readonly id: string,
     private readonly io: AgentIo,
     private readonly knownTools: ReadonlySet<string>,
+    /** Set on a native-search or native-fetch session; its report rides in the result. */
+    private readonly native: NativeLedger | null = null,
   ) {
     let resolve!: (outcome: StepOutcome | StepError) => void;
     this.outcome = new Promise<StepOutcome | StepError>((done) => {
@@ -1384,6 +1708,9 @@ class StepTranslator {
         }
         break;
       }
+      case "user":
+        if (message.parent_tool_use_id === null) this.native?.observe(message);
+        break;
       case "result": {
         const failed = message.is_error || message.subtype !== "success";
         if (failed) {
@@ -1392,6 +1719,15 @@ class StepTranslator {
             : [message.subtype, ...(message.errors ?? [])].join(": ");
           this.fail({ kind: "permanent", message: detail.length > 0 ? detail : "Claude Code 回合失败" });
           break;
+        }
+        // The CLI's own search request, like the model call that renders a
+        // fetched page, streams nothing here, so only the turn's per-model
+        // totals count it; a native session is one fresh turn, which makes
+        // those totals exactly this step's.
+        const total = this.native ? usageOfModels(message.modelUsage) : undefined;
+        if (total) {
+          this.usage = total;
+          this.io.emit(this.id, { k: "usage", usage: this.usage });
         }
         this.settle("stop");
         break;
@@ -1406,6 +1742,10 @@ class StepTranslator {
       case "message_start": {
         const message = isObject(event.message) ? event.message : {};
         if (typeof message.model === "string") this.model = message.model;
+        // A native step spans the turn's messages; a search step's text is the
+        // host's findings, read as one report, so each message's text starts a
+        // paragraph. (A fetch step's text is not read at all.)
+        if (this.native && this.text.length > 0 && !this.text.endsWith("\n\n")) this.text += "\n\n";
         this.closeThinkingRun();
         this.blocks = new Map();
         this.messageStopped = false;
@@ -1673,6 +2013,7 @@ class StepTranslator {
       ...(this.stopReason ? { rawFinishReason: this.stopReason } : {}),
       responseMessages: this.parts.length > 0 ? [{ role: "assistant", content: this.parts }] : [],
       sources: [],
+      ...this.native?.report(),
     };
     this.finish({ kind: "done", result });
   }
@@ -1712,6 +2053,34 @@ function usageOf(usage: JsonObject): Usage {
     inputTokens: inputTotal,
     outputTokens: output,
     totalTokens: inputTotal === undefined && output === undefined ? undefined : (inputTotal ?? 0) + (output ?? 0),
+    reasoningTokens: reasoning,
+    cacheReadTokens: cacheRead,
+  };
+}
+
+/**
+ * A `result` message's per-model totals → host usage, on the same terms as
+ * `usageOf`. `undefined` when there are none to read.
+ */
+function usageOfModels(models: Record<string, ModelUsage> | undefined): Usage | undefined {
+  const entries = Object.values(models ?? {});
+  if (entries.length === 0) return undefined;
+  let input = 0;
+  let output = 0;
+  let cacheRead = 0;
+  let reasoning: number | undefined;
+  for (const model of entries) {
+    input += (number(model.inputTokens) ?? 0) + (number(model.cacheReadInputTokens) ?? 0)
+      + (number(model.cacheCreationInputTokens) ?? 0);
+    output += number(model.outputTokens) ?? 0;
+    cacheRead += number(model.cacheReadInputTokens) ?? 0;
+    const thinking = number(model.thinkingTokens);
+    if (thinking !== undefined) reasoning = (reasoning ?? 0) + thinking;
+  }
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    totalTokens: input + output,
     reasoningTokens: reasoning,
     cacheReadTokens: cacheRead,
   };
@@ -1778,11 +2147,18 @@ interface Session {
   knownTools: ReadonlySet<string>;
   /** Model id the host requested; keys the served-model cache. */
   modelId: string;
+  /** Set when this session serves a native-search or native-fetch request. */
+  native: NativeLedger | null;
 }
 
-/** Messages worth buffering between steps. Everything else is chatter. */
+/**
+ * Messages worth buffering between steps. Everything else is chatter. `user`
+ * is among them for the results a native-search session reads its sources off,
+ * and a native-fetch session its pages.
+ */
 function isStepMessage(message: SDKMessage): boolean {
-  return message.type === "stream_event" || message.type === "assistant" || message.type === "result";
+  return message.type === "stream_event" || message.type === "assistant" || message.type === "result"
+    || message.type === "user";
 }
 
 /**
@@ -1941,6 +2317,7 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
     const plugin = contextPluginDir(agent.cwd);
     const tools = request.tools ?? [];
     const knownTools = new Set(tools.map((tool) => tool.name));
+    const native = nativeLedger(request);
     const abort = new AbortController();
     const input = new InputQueue();
     const stderr = new StderrTail();
@@ -1990,7 +2367,9 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
       // rebuilds its prompt every step (the environment it states follows the
       // machines a run is on), and only the text it sent may reach the model.
       systemPrompt: { type: "custom", prompt: fullSystemPrompt(request) ?? "", snapshot: false },
-      tools: [],
+      // No built-in tool, except the CLI's own search or page fetch where this
+      // session is the host's native-search or native-fetch request.
+      tools: native ? [native.tool] : [],
       settingSources: [],
       strictMcpConfig: true,
       // The one plugin the CLI loads: `settingSources: []` keeps every installed one
@@ -2009,12 +2388,17 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
       // The host has already approved every call it sends back, so the CLI's own
       // permission layer answers "allow" for everything. The callback rather than
       // `allowedTools` rules: rules are matched by name syntax, the callback is not.
-      canUseTool: async (_toolName, toolInput) => ({ behavior: "allow", updatedInput: toolInput }),
+      // The CLI's own search and fetch are the exception, held to the host's
+      // search budget and to the pages it named (`NativeLedger`).
+      canUseTool: async (toolName, toolInput, { toolUseID }) =>
+        native && toolName === native.tool
+          ? native.admit(toolUseID, toolInput)
+          : { behavior: "allow", updatedInput: toolInput },
       permissionMode: "default",
       includePartialMessages: true,
       model: cliModel,
       ...reasoningOptions(request.reasoning),
-      settings: { totalTokensReminder: "off" },
+      settings: { totalTokensReminder: "off", ...nativeSettings(native) },
       ...(resumed
         ? {
             resume: sessionId,
@@ -2050,6 +2434,7 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
       executable: agent.executable,
       knownTools,
       modelId: request.modelId,
+      native,
     };
     sessionRef.current = session;
     session.pump = pump(session);
@@ -2059,7 +2444,7 @@ export function createClaudeAgentRuntime(io: AgentIo): ClaudeAgentRuntime {
 
   /** Runs one step against a session: attach, drain the inbox, wait for the outcome. */
   async function runAttached(session: Session, id: string, controller: AbortController): Promise<void> {
-    const translator = new StepTranslator(id, io, session.knownTools);
+    const translator = new StepTranslator(id, io, session.knownTools, session.native);
     session.step = translator;
     const onAbort = (): void => {
       translator.fail({ kind: "cancelled", message: "请求已取消" });

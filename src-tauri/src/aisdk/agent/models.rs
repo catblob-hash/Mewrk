@@ -6,26 +6,61 @@
 //! long enough to read the picker, and kills it. No prompt is ever sent, so
 //! nothing is billed.
 //!
-//! The picker is resolved against the user's current login and the installed
-//! CLI's release, so the list drifts with both. That is the point: a model the
-//! login gains shows up on the next fetch.
+//! # The served picker
+//!
+//! For a claude.ai login, Claude Code takes its picker from Anthropic's model
+//! selector (`/api/organizations/<org>/model_selector/cc`): the models this
+//! account is offered today, older ones included, kept in
+//! `<config>/cache/model-catalog/<…>-cc.json` and refreshed about hourly. Only
+//! where that is off — an API key, no network — does it fall back to the list
+//! compiled into its release. The CLI turns the served picker off whenever
+//! non-essential traffic or telemetry is (the latter switches off the feature
+//! flag that enables it), so the rows are read by a CLI with both on
+//! ([`served_env`]); the CLI's own updater and error reports stay off.
+//!
+//! A CLI starting headless serves the cached list as it is, however old, and
+//! refreshes the cache in the background for the next process. So when the
+//! cache was already stale, the listing waits for that refresh to land and
+//! reads the picker again from a new CLI: what the selector serves now, not
+//! what it served the last time a Claude Code ran under this login.
+//!
+//! Context windows are read afterwards by a CLI with the network off
+//! ([`listing_env`]), as they always were: switching models must never be the
+//! thing that sends a request.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{installed_cli, probe_env, session_cwd, with_stderr_tail};
+use super::{config_dir, installed_cli, probe_env, session_cwd, with_stderr_tail};
 
 /// How long the whole listing may take. The CLI answers from local state in
 /// under a second; the bound only covers one that hangs while starting.
 const LIST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a stale served picker is given to refresh: the CLI gives the
+/// selector 5 s, and it usually answers in well under one.
+const REFRESH_WAIT: Duration = Duration::from_secs(6);
+
+/// The probe switches a served-picker read goes without: either one makes the
+/// CLI serve its compiled list.
+const SERVED_PICKER_OFF: &[&str] = &["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY"];
+
+/// Pinned for a served-picker read in their place: what the CLI would report
+/// on its own is not this read's to send.
+const SERVED_CONTROL_ENV: &[(&str, &str)] = &[("DISABLE_ERROR_REPORTING", "1")];
+
+/// The served picker's cache, under the CLI's configuration directory: one
+/// file per login and surface, the CLI's own (`cc`) ending in this.
+const CATALOG_DIR: &[&str] = &["cache", "model-catalog"];
+const CATALOG_SUFFIX: &str = "-cc.json";
 
 /// A CLI that only answers control requests: the SDK's stream-json transport,
 /// and none of the CLI's own tools, settings files, MCP servers or transcript —
@@ -71,7 +106,8 @@ pub(crate) struct AgentModel {
 }
 
 /// The environment the listing CLI runs with: the login probe's, which carries
-/// no credential, plus [`LIST_CONTROL_ENV`].
+/// no credential, plus [`LIST_CONTROL_ENV`]. With the network off it serves the
+/// picker compiled into its release; it reads the context windows.
 fn listing_env() -> BTreeMap<String, String> {
     let mut env = probe_env();
     for (name, value) in LIST_CONTROL_ENV {
@@ -80,29 +116,84 @@ fn listing_env() -> BTreeMap<String, String> {
     env
 }
 
+/// [`listing_env`] with the network on, so that the CLI serves the picker
+/// Anthropic's model selector offers this login: without
+/// [`SERVED_PICKER_OFF`], plus [`SERVED_CONTROL_ENV`]. Still no credential.
+fn served_env() -> BTreeMap<String, String> {
+    let mut env = listing_env();
+    for name in SERVED_PICKER_OFF {
+        env.remove(*name);
+    }
+    for (name, value) in SERVED_CONTROL_ENV {
+        env.insert((*name).to_owned(), (*value).to_owned());
+    }
+    env
+}
+
 /// The installed Claude Code's model picker under the user's current login.
 pub(crate) fn list_models() -> Result<Vec<AgentModel>, String> {
     #[cfg_attr(not(feature = "browser-dev"), allow(unused_mut))]
-    let mut env = listing_env();
+    let (mut served, mut offline) = (served_env(), listing_env());
     #[cfg(feature = "browser-dev")]
-    env.extend(super::test_upstream_env()?);
+    {
+        let upstream = super::test_upstream_env()?;
+        served.extend(upstream.clone());
+        offline.extend(upstream);
+    }
+    let catalog = CATALOG_DIR.iter().fold(PathBuf::from(config_dir()), |path, part| path.join(part));
     // A fetch has no app data path; the fallback directory is private to Mewrk,
     // and `--no-session-persistence` keeps the CLI from writing anything there.
-    list_models_with(&installed_cli()?, &session_cwd("")?, &env)
+    list_models_with(&installed_cli()?, &session_cwd("")?, &served, &offline, &catalog)
 }
 
+/// The picker as `served` makes the CLI serve it ([`read_served_picker`]), with
+/// the context windows of its alias rows read by a CLI started with `offline`.
 fn list_models_with(
     executable: &Path,
     cwd: &Path,
-    env: &BTreeMap<String, String>,
+    served: &BTreeMap<String, String>,
+    offline: &BTreeMap<String, String>,
+    catalog: &Path,
 ) -> Result<Vec<AgentModel>, String> {
-    let mut cli = ControlSession::start(executable, cwd, env)?;
-    let listed = read_picker(&mut cli);
+    let mut models = read_served_picker(executable, cwd, served, catalog)?;
+    if models.iter().all(|model| is_explicit_id(&model.value)) {
+        return Ok(models);
+    }
+    let mut cli = ControlSession::start(executable, cwd, offline)?;
+    let read = read_windows(&mut cli, &mut models);
     let stderr = cli.stop();
-    listed.map_err(|error| with_stderr_tail(&error, &stderr))
+    read.map_err(|error| with_stderr_tail(&error, &stderr))?;
+    Ok(models)
 }
 
-fn read_picker(cli: &mut ControlSession) -> Result<Vec<AgentModel>, String> {
+/// The picker rows a CLI started with `env` serves. When the served picker's
+/// cache under `catalog` was already stale, the CLI that served it from there
+/// is kept until its background refresh has written the cache again (for at
+/// most [`REFRESH_WAIT`]), and a new CLI is asked: one already running keeps
+/// the list it started with.
+fn read_served_picker(
+    executable: &Path,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    catalog: &Path,
+) -> Result<Vec<AgentModel>, String> {
+    let before = catalog_entries(catalog);
+    let stale = refresh_expected(&before, now_millis());
+    let mut cli = ControlSession::start(executable, cwd, env)?;
+    let read = read_rows(&mut cli);
+    let refreshed = read.is_ok() && stale && wait_for_refresh(catalog, &before, REFRESH_WAIT);
+    let stderr = cli.stop();
+    let rows = read.map_err(|error| with_stderr_tail(&error, &stderr))?;
+    if !refreshed {
+        return Ok(rows);
+    }
+    let mut cli = ControlSession::start(executable, cwd, env)?;
+    let read = read_rows(&mut cli);
+    let stderr = cli.stop();
+    read.map_err(|error| with_stderr_tail(&error, &stderr))
+}
+
+fn read_rows(cli: &mut ControlSession) -> Result<Vec<AgentModel>, String> {
     let initialized = cli
         .request(json!({ "subtype": "initialize" }))?
         .map_err(|error| format!("Claude Code 拒绝了初始化请求：{error}"))?;
@@ -110,12 +201,91 @@ fn read_picker(cli: &mut ControlSession) -> Result<Vec<AgentModel>, String> {
         .get("models")
         .cloned()
         .ok_or("Claude Code 的初始化回答里没有模型列表")?;
-    let mut models: Vec<AgentModel> = serde_json::from_value(rows)
-        .map_err(|error| format!("无法解析 Claude Code 的模型列表：{error}"))?;
-    for model in &mut models {
+    serde_json::from_value(rows).map_err(|error| format!("无法解析 Claude Code 的模型列表：{error}"))
+}
+
+/// Fills in the context window of each of `models` the CLI tells
+/// ([`context_window_of`]).
+fn read_windows(cli: &mut ControlSession, models: &mut [AgentModel]) -> Result<(), String> {
+    cli.request(json!({ "subtype": "initialize" }))?
+        .map_err(|error| format!("Claude Code 拒绝了初始化请求：{error}"))?;
+    for model in models {
         model.context_window = context_window_of(cli, model)?;
     }
-    Ok(models)
+    Ok(())
+}
+
+/// One file of the served picker's cache, as far as it is read: when it was
+/// fetched and when the CLI takes it for stale, in Unix milliseconds.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CatalogEntry {
+    #[serde(skip)]
+    name: String,
+    fetched_at: u64,
+    stale_at: u64,
+}
+
+/// The CLI's own (`cc`) files of the served picker's cache under `catalog`,
+/// one per login; any it cannot read are left out.
+fn catalog_entries(catalog: &Path) -> Vec<CatalogEntry> {
+    let Ok(entries) = std::fs::read_dir(catalog) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(CATALOG_SUFFIX) {
+                return None;
+            }
+            let bytes = std::fs::read(entry.path()).ok()?;
+            let parsed: CatalogEntry = serde_json::from_slice(&bytes).ok()?;
+            Some(CatalogEntry { name, ..parsed })
+        })
+        .collect()
+}
+
+/// Whether a CLI starting now will serve the picker from a stale cache and
+/// refresh it behind: the latest fetch — the current login's, as a rule — is
+/// past its stale point. With no cache at all the CLI fetches before it
+/// answers, and a login the selector does not serve (an API key) has none.
+fn refresh_expected(entries: &[CatalogEntry], now: u64) -> bool {
+    entries
+        .iter()
+        .max_by_key(|entry| entry.fetched_at)
+        .is_some_and(|latest| latest.stale_at <= now)
+}
+
+/// Waits up to `limit` for a cache file under `catalog` fetched later than
+/// `before` says, and whole: the file is read back, not just looked at.
+fn wait_for_refresh(catalog: &Path, before: &[CatalogEntry], limit: Duration) -> bool {
+    let until = Instant::now() + limit;
+    loop {
+        let refreshed = catalog_entries(catalog).iter().any(|entry| {
+            let known = before.iter().find(|known| known.name == entry.name);
+            known.is_none_or(|known| entry.fetched_at > known.fetched_at)
+        });
+        if refreshed {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A row named by an explicit model id rather than an alias.
+fn is_explicit_id(value: &str) -> bool {
+    value.to_ascii_lowercase().starts_with("claude-")
 }
 
 /// The context window the CLI uses for one picker row: switch the idle CLI to
@@ -129,7 +299,7 @@ fn read_picker(cli: &mut ControlSession) -> Result<Vec<AgentModel>, String> {
 /// than the row's; the row itself is still offered. A CLI that stopped
 /// answering fails the whole listing.
 fn context_window_of(cli: &mut ControlSession, model: &AgentModel) -> Result<Option<u64>, String> {
-    if model.value.to_ascii_lowercase().starts_with("claude-") {
+    if is_explicit_id(&model.value) {
         return Ok(None);
     }
     if cli
@@ -352,21 +522,33 @@ mod tests {
     /// The listing, end to end against the installed CLI (the source tree's in
     /// a test): the picker's rows, an alias row's window read by switching to
     /// it, and no model request. A loopback stub key keeps the developer's own
-    /// login out of it, and the stub records whatever the CLI asked for.
+    /// login out of it (and so the served picker, which a stub is not), and the
+    /// stub records whatever the CLI asked for. Telemetry stays off in a test.
     #[test]
     fn the_cli_answers_its_picker_without_a_model_request() {
         let (address, seen) = recording_upstream();
-        let mut env = listing_env();
-        env.insert("ANTHROPIC_BASE_URL".to_owned(), address);
-        env.insert(
-            "ANTHROPIC_API_KEY".to_owned(),
-            "sk-ant-fake-listing".to_owned(),
-        );
+        let stub = |mut env: BTreeMap<String, String>| {
+            env.insert("ANTHROPIC_BASE_URL".to_owned(), address.clone());
+            env.insert(
+                "ANTHROPIC_API_KEY".to_owned(),
+                "sk-ant-fake-listing".to_owned(),
+            );
+            env.insert("DISABLE_TELEMETRY".to_owned(), "1".to_owned());
+            env
+        };
         let executable =
             installed_cli().expect("测试里应能找到 aisdk-service/node_modules 的 Claude Code");
         let cwd = session_cwd("").expect("工作目录");
+        let catalog = tempfile::tempdir().expect("缓存目录");
 
-        let models = list_models_with(&executable, &cwd, &env).expect("CLI 应回答模型列表");
+        let models = list_models_with(
+            &executable,
+            &cwd,
+            &stub(served_env()),
+            &stub(listing_env()),
+            catalog.path(),
+        )
+        .expect("CLI 应回答模型列表");
 
         assert!(!models.is_empty(), "CLI 没有列出任何模型");
         assert!(
@@ -389,6 +571,77 @@ mod tests {
             seen.iter().all(|line| !line.contains("/v1/messages")),
             "列模型发起了模型请求: {seen:?}"
         );
+    }
+
+    #[test]
+    fn the_served_picker_is_read_with_the_network_on_and_no_credential() {
+        let env = served_env();
+        for name in SERVED_PICKER_OFF {
+            assert!(!env.contains_key(*name), "{name} 会让 CLI 退回编译进去的列表");
+        }
+        for name in env.keys() {
+            assert!(!name.starts_with("ANTHROPIC_"), "{name} 会改写列出的账号");
+            assert_ne!(name, "CLAUDE_CODE_OAUTH_TOKEN");
+            assert_ne!(name, "CLAUDE_CODE_MODEL_CATALOG");
+        }
+        assert_eq!(env.get("DISABLE_AUTOUPDATER").map(String::as_str), Some("1"));
+        assert_eq!(env.get("DISABLE_ERROR_REPORTING").map(String::as_str), Some("1"));
+        assert_eq!(env.get("CLAUDE_CODE_ENTRYPOINT").map(String::as_str), Some("sdk-ts"));
+        // The windows are still read with the network off.
+        let offline = listing_env();
+        for name in SERVED_PICKER_OFF {
+            assert_eq!(offline.get(*name).map(String::as_str), Some("1"));
+        }
+    }
+
+    fn write_catalog(dir: &Path, name: &str, fetched_at: u64, stale_at: u64) {
+        let body = json!({ "version": 2, "fetchedAt": fetched_at, "staleAt": stale_at, "catalog": {} });
+        std::fs::write(dir.join(name), body.to_string()).unwrap();
+    }
+
+    #[test]
+    fn only_a_stale_cache_of_the_clis_own_picker_is_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!refresh_expected(&catalog_entries(dir.path()), 1_000), "没有缓存时 CLI 先取再答");
+        write_catalog(dir.path(), "org-acct-ccd.json", 10, 20);
+        std::fs::write(dir.path().join("org-acct-cc.headless-failed.json"), "{}").unwrap();
+        assert!(catalog_entries(dir.path()).is_empty(), "只认 CLI 自己（cc）的缓存");
+
+        write_catalog(dir.path(), "org-acct-cc.json", 100, 200);
+        assert!(!refresh_expected(&catalog_entries(dir.path()), 150));
+        assert!(refresh_expected(&catalog_entries(dir.path()), 200));
+        // Another login's older cache does not decide it: the latest fetch does.
+        write_catalog(dir.path(), "org-other-cc.json", 50, 60);
+        assert!(!refresh_expected(&catalog_entries(dir.path()), 150));
+    }
+
+    #[test]
+    fn a_refresh_is_seen_once_a_whole_newer_cache_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(dir.path(), "org-acct-cc.json", 100, 200);
+        let before = catalog_entries(dir.path());
+        assert!(!wait_for_refresh(dir.path(), &before, Duration::from_millis(200)));
+        // Half written, or another surface's: not yet.
+        std::fs::write(dir.path().join("org-acct-cc.json"), "{\"version\":2,\"fetchedAt\":3").unwrap();
+        write_catalog(dir.path(), "org-acct-ccd.json", 300, 400);
+        assert!(!wait_for_refresh(dir.path(), &before, Duration::from_millis(200)));
+
+        let writer = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                write_catalog(&dir, "org-acct-cc.json", 300, 400);
+            })
+        };
+        let started = Instant::now();
+        assert!(wait_for_refresh(dir.path(), &before, Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        writer.join().unwrap();
+
+        // A login with no cache before gets its first.
+        let before = catalog_entries(dir.path());
+        write_catalog(dir.path(), "org-new-cc.json", 10, 20);
+        assert!(wait_for_refresh(dir.path(), &before, Duration::from_millis(200)));
     }
 
     #[test]

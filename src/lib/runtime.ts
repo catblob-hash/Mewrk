@@ -14,8 +14,10 @@ import {
   emptyConversationPresetSettings
 } from "./conversationPresets";
 import { isHostDerivedToolName, isWebToolName } from "./taskTools";
+import { environmentPromptEnabledOf } from "./environmentPrompt";
 import { fileWriteGuardsEnabledOf } from "./fileWriteGuards";
 import { hostMessageContainerOf } from "./hostMessages";
+import { subagentMessagingEnabledOf } from "./subagentMessaging";
 import type { HostMessageContainer, JsonValue, SandboxSettings, SandboxSupport, ShellBackend } from "../types";
 import type {
   AutoCompactSettings,
@@ -227,7 +229,11 @@ function normalizeConversationPresetSettings(
     // Absent on a preset written before the choice existed: Claude Code's form.
     hostMessageContainer: hostMessageContainerOf(input as { hostMessageContainer?: HostMessageContainer }),
     // Absent on a preset written before the switch existed: guards on.
-    fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(input as { fileWriteGuardsEnabled?: boolean })
+    fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(input as { fileWriteGuardsEnabled?: boolean }),
+    // Absent on a preset written before the switch existed: the environment section on.
+    environmentPromptEnabled: environmentPromptEnabledOf(input as { environmentPromptEnabled?: boolean }),
+    // Absent on a preset written before the switch existed: subagent communication off.
+    subagentMessagingEnabled: subagentMessagingEnabledOf(input as { subagentMessagingEnabled?: boolean })
   };
 }
 
@@ -1484,6 +1490,8 @@ export function normalizeDocument(value: unknown): AppDocument {
       promptSkillIds: Array.isArray(lockInput.promptSkillIds)
         ? uniqueStringIds(lockInput.promptSkillIds)
         : null,
+      // Absent on the same terms: the host then reads the tools enabled now.
+      promptTaskTools: typeof lockInput.promptTaskTools === "boolean" ? lockInput.promptTaskTools : null,
       searchBackend: lockInput.searchBackend === undefined || lockInput.searchBackend === null
         ? null
         : normalizeSearchProviderSelection(lockInput.searchBackend),
@@ -1520,7 +1528,13 @@ export function normalizeDocument(value: unknown): AppDocument {
         : null,
       // Absent on a lock from before the switch: nothing is known of whether
       // that request's tool descriptions carried the guard rules.
-      fileWriteGuards: typeof lockInput.fileWriteGuards === "boolean" ? lockInput.fileWriteGuards : null
+      fileWriteGuards: typeof lockInput.fileWriteGuards === "boolean" ? lockInput.fileWriteGuards : null,
+      // Absent on a lock from before the switch: nothing is known of whether
+      // that request's system prompt opened with the environment section.
+      environmentPrompt: typeof lockInput.environmentPrompt === "boolean" ? lockInput.environmentPrompt : null,
+      // Absent on a lock from before the switch: nothing is known of whether
+      // that request carried `send_message` and the messaging wording.
+      subagentMessaging: typeof lockInput.subagentMessaging === "boolean" ? lockInput.subagentMessaging : null
     };
   };
   const normalizeConversationSettingsValue = (value: unknown): ConversationSettings => {
@@ -1574,6 +1588,10 @@ export function normalizeDocument(value: unknown): AppDocument {
       hostMessageContainer: hostMessageContainerOf(settingsInput as { hostMessageContainer?: HostMessageContainer }),
       // Absent means the guards are on, the host's own default.
       fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(settingsInput as { fileWriteGuardsEnabled?: boolean }),
+      // Absent means the environment section is on, the host's own default.
+      environmentPromptEnabled: environmentPromptEnabledOf(settingsInput as { environmentPromptEnabled?: boolean }),
+      // Absent means subagent communication is off, the host's own default.
+      subagentMessagingEnabled: subagentMessagingEnabledOf(settingsInput as { subagentMessagingEnabled?: boolean }),
       // Absent on a conversation from before the choice (it hands off) and on
       // the draft, which settles it by the model when it becomes a conversation.
       ...(settingsInput.compactionMethod === "handoff" || settingsInput.compactionMethod === "native"

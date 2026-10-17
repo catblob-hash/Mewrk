@@ -1,12 +1,13 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { useRef, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import { DRAFT_CLIPBOARD_TYPE, expandPastedTexts, type PastedText } from "../lib/pastedText";
+import { DRAFT_CLIPBOARD_TYPE, expandPastedTexts, pastedTextIdMark, type PastedText } from "../lib/pastedText";
 import { usePastedTextTags } from "./PastedTextTags";
 
-const NBSP = " ";
+const NBSP = "\u00a0";
+// A tag reads as its name alone; the paste's number rides along as invisible marks.
 const tagLabel = (id: number, extraLines: number) => (
-  `${NBSP}粘贴文本${NBSP}#${id}${extraLines ? `${NBSP}+${extraLines}${NBSP}行` : ""}${NBSP}`
+  `${NBSP}粘贴文本${extraLines ? `${NBSP}+${extraLines}${NBSP}行` : ""}${pastedTextIdMark(id)}${NBSP}`
 );
 
 function Box({ initial = "", label = "box" }: { initial?: string; label?: string }) {
@@ -148,7 +149,7 @@ describe("usePastedTextTags", () => {
     expect(fireEvent.paste(to, {
       clipboardData: clipboard({ "text/plain": `a${long}b`, [DRAFT_CLIPBOARD_TYPE]: draft })
     })).toBe(false);
-    // The copied tag takes the next number here rather than colliding with #1.
+    // The copied tag takes the next number here (its marks) rather than colliding with paste 1's.
     expect(to).toHaveValue(`${tagLabel(1, 0)}a${tagLabel(2, 29)}b`);
     expect(screen.getByRole("status", { name: "to sends" }).textContent).toBe(`${"y".repeat(900)}a${long}b`);
   });
@@ -165,8 +166,25 @@ describe("usePastedTextTags", () => {
     fireEvent.cut(box, { clipboardData: clipboard({}) });
     expect(box).toHaveValue("");
     expect(pasteLong(box, `a${long}b`)).toBe(false);
-    // The tag's text is already this draft's #1, so it comes back as #1.
+    // The tag's text is already this draft's first paste, so it comes back as that one.
     expect(box).toHaveValue(value);
+  });
+
+  it("tells two tags that read alike apart by their invisible marks, and sends each one's own text", () => {
+    const other = long.replace("line 0", "LINE 0");
+    render(<Box />);
+    const box = screen.getByRole<HTMLTextAreaElement>("textbox", { name: "box" });
+    box.focus();
+    pasteLong(box, long);
+    pasteLong(box, other);
+
+    const tags = Array.from(screen.getByTestId("box-host").querySelectorAll(".pasted-text-tag"), (tag) => tag.textContent);
+    expect(tags).toEqual([tagLabel(1, 29), tagLabel(2, 29)]);
+    // Same name, no number; only the marks differ.
+    expect(tags[0]).not.toBe(tags[1]);
+    expect(tags[0]!.replace(pastedTextIdMark(1), "")).toBe(tags[1]!.replace(pastedTextIdMark(2), ""));
+    expect(tags[0]).not.toContain("#");
+    expect(screen.getByRole("status", { name: "box sends" }).textContent).toBe(`${long}${other}`);
   });
 
   it("does not fold long plain text copied out of a box", () => {

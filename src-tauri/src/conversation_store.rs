@@ -2219,7 +2219,8 @@ impl ConversationStore {
     /// already holding a record of that name, else its `agent_spawn` card — found by the
     /// provider call id the spawn carried, then by the name it was given. A child that
     /// settles within its first round never had a record written, so its spawn card is the
-    /// only place to put one.
+    /// only place to put one. The call id may also be that of a `send_message` that
+    /// resumed the child, whose card owns the record from the resume on.
     pub(crate) fn task_card_owner(
         &self,
         conversation_id: &str,
@@ -2246,7 +2247,13 @@ impl ConversationStore {
         }
         let spawn = "json_extract(data, '$.toolName') = 'agent_spawn' AND ";
         if let Some(call_id) = spawn_call_id {
-            if let Some(id) = find(&format!("{spawn}json_extract(data, '$.providerCallId')"), call_id)? {
+            // The ledger names the call that owns the child: its spawn, or the
+            // `send_message` that resumed it.
+            let owner = "json_extract(data, '$.toolName') IN ('agent_spawn', 'send_message') AND ";
+            if let Some(id) = find(
+                &format!("{owner}json_extract(data, '$.providerCallId')"),
+                call_id,
+            )? {
                 return Ok(Some(id));
             }
         }

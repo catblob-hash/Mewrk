@@ -8,9 +8,12 @@ import type {
   SearchProviderSelection,
   ToolLockRequest
 } from "../types";
+import { environmentPromptEnabledOf } from "./environmentPrompt";
 import { fileWriteGuardsEnabledOf } from "./fileWriteGuards";
 import { hostMessageContainerOf } from "./hostMessages";
 import { appendsTools } from "./modelCapabilities";
+import { SUBAGENT_SPAWN_TOOL, subagentMessagingEnabledOf } from "./subagentMessaging";
+import { producesTasks } from "./taskTools";
 import { familySupportsNativeFetch } from "./webSearch";
 
 /**
@@ -31,14 +34,15 @@ import { familySupportsNativeFetch } from "./webSearch";
  * rewrites it just as surely, and the lock covers the whole surface in both
  * directions (`ToolLockState.wholeSurface`).
  *
- * Three fields are pins rather than parts of the surface — native search,
- * native fetch, and which skills the system prompt was built with. Each is
+ * Four fields are pins rather than parts of the surface — native search,
+ * native fetch, which skills the system prompt was built with, and whether it
+ * was built for a tool that can start a background task. Each is
  * `null` until the run that sets it and never moves afterwards, whatever model
  * is selected: a second answer would contradict the transcript rather than
  * extend it. Native search pins only once the transcript holds a report it
  * produced (`nativeSearchRan`), and only while it does — offering `web_search`
- * is not enough, because on a family without native search (Claude Agent,
- * Chat Completions, OpenAI Compatible) every such call fails and nothing is
+ * is not enough, because on a family without native search (Chat
+ * Completions, OpenAI Compatible) every such call fails and nothing is
  * sealed, and the fix the failure asks for is choosing a catalog provider.
  * A host-run search or fetch
  * backend is not a pin: its results are ordinary tool output any backend can
@@ -60,6 +64,7 @@ export const EMPTY_TOOL_LOCK: ConversationToolLock = {
   planMode: false,
   skillIds: [],
   promptSkillIds: null,
+  promptTaskTools: null,
   searchBackend: null,
   fetchBackend: null,
   webFetch: false,
@@ -70,7 +75,9 @@ export const EMPTY_TOOL_LOCK: ConversationToolLock = {
   hookIds: null,
   promptProfile: null,
   hostMessageContainer: null,
-  fileWriteGuards: null
+  fileWriteGuards: null,
+  environmentPrompt: null,
+  subagentMessaging: null
 };
 
 /**
@@ -158,6 +165,7 @@ export function toolLockOf(settings: ConversationSettings): ConversationToolLock
     planMode: lock.planMode === true,
     skillIds: lock.skillIds ?? [],
     promptSkillIds: lock.promptSkillIds ?? null,
+    promptTaskTools: typeof lock.promptTaskTools === "boolean" ? lock.promptTaskTools : null,
     searchBackend: lock.searchBackend ?? null,
     fetchBackend: lock.fetchBackend ?? null,
     webFetch: lock.webFetch === true,
@@ -170,7 +178,9 @@ export function toolLockOf(settings: ConversationSettings): ConversationToolLock
     hookIds: lock.hookIds ?? null,
     promptProfile: lock.promptProfile ?? null,
     hostMessageContainer: lock.hostMessageContainer ?? null,
-    fileWriteGuards: typeof lock.fileWriteGuards === "boolean" ? lock.fileWriteGuards : null
+    fileWriteGuards: typeof lock.fileWriteGuards === "boolean" ? lock.fileWriteGuards : null,
+    environmentPrompt: typeof lock.environmentPrompt === "boolean" ? lock.environmentPrompt : null,
+    subagentMessaging: typeof lock.subagentMessaging === "boolean" ? lock.subagentMessaging : null
   };
 }
 
@@ -200,6 +210,11 @@ function toolExposureOf(
     /* What the system prompt would be built from if this were the first run.
        The merge below keeps whatever the first run actually used. */
     promptSkillIds: settings.skillIds,
+    /* Likewise whether it would be built for a tool that can start a
+       background task, which decides whether it says how their results and
+       the host's messages arrive. `withRunToolLock` reads it off the tools
+       the request actually sends. */
+    promptTaskTools: settings.enabledTools.some(producesTasks),
     /* Both selections are recorded whether or not their tool went out: on a
        model that cannot take a tool mid-conversation the whole surface is put
        back from them, and "off" is part of it. */
@@ -224,7 +239,15 @@ function toolExposureOf(
     hostMessageContainer: hostMessageContainerOf(settings),
     /* Not a tool either, but the `edit` and `write` descriptions carry the guard
        rules only while it is on, and those sit in the cached prefix. */
-    fileWriteGuards: fileWriteGuardsEnabledOf(settings)
+    fileWriteGuards: fileWriteGuardsEnabledOf(settings),
+    /* Not a tool either, but the environment section heads the cached system
+       prompt. */
+    environmentPrompt: environmentPromptEnabledOf(settings),
+    /* The switch itself, as the run saw it. It reaches the wire only with
+       `agent_spawn` among the tools (`send_message` joins them and the
+       `agent_spawn` wording changes), so the tone and the restore read it
+       together with the lock's tool list rather than this bit alone. */
+    subagentMessaging: subagentMessagingEnabledOf(settings)
   };
 }
 
@@ -253,6 +276,7 @@ function nextToolLock(
     planMode: lock.planMode || exposure.planMode,
     skillIds: [...new Set(exposure.skillIds)],
     promptSkillIds: lock.promptSkillIds ?? exposure.promptSkillIds,
+    promptTaskTools: lock.promptTaskTools ?? exposure.promptTaskTools,
     searchBackend: exposure.searchBackend,
     fetchBackend: exposure.fetchBackend,
     webFetch: exposure.webFetch,
@@ -263,7 +287,9 @@ function nextToolLock(
     hookIds: [...new Set(exposure.hookIds ?? [])],
     promptProfile: exposure.promptProfile,
     hostMessageContainer: exposure.hostMessageContainer,
-    fileWriteGuards: exposure.fileWriteGuards
+    fileWriteGuards: exposure.fileWriteGuards,
+    environmentPrompt: exposure.environmentPrompt,
+    subagentMessaging: exposure.subagentMessaging
   };
 }
 
@@ -336,6 +362,7 @@ function sameToolLock(left: ConversationToolLock, right: ConversationToolLock): 
     && left.planMode === right.planMode
     && sameIdSet(left.skillIds, right.skillIds)
     && sameIdList(left.promptSkillIds, right.promptSkillIds)
+    && left.promptTaskTools === right.promptTaskTools
     && sameSelection(left.searchBackend, right.searchBackend)
     && sameSelection(left.fetchBackend, right.fetchBackend)
     && left.webFetch === right.webFetch
@@ -347,7 +374,9 @@ function sameToolLock(left: ConversationToolLock, right: ConversationToolLock): 
     && sameIdList(left.hookIds, right.hookIds)
     && left.promptProfile === right.promptProfile
     && left.hostMessageContainer === right.hostMessageContainer
-    && left.fileWriteGuards === right.fileWriteGuards;
+    && left.fileWriteGuards === right.fileWriteGuards
+    && left.environmentPrompt === right.environmentPrompt
+    && left.subagentMessaging === right.subagentMessaging;
 }
 
 function sameRequest(left: ToolLockRequest | null, right: ToolLockRequest | null): boolean {
@@ -393,7 +422,7 @@ export function withRunToolLock(
   const current = toolLockOf(settings);
   const next = nextToolLock(
     current,
-    { ...toolExposureOf(settings, context), tools },
+    { ...toolExposureOf(settings, context), tools, promptTaskTools: tools.some(producesTasks) },
     context,
     context.nativeSearched
   );
@@ -492,6 +521,12 @@ export function modelCacheWarmUntil(
  *   declared or dropped with it.
  * - `fileWriteGuards`: either way rewrites the prefix — the `edit` and `write`
  *   descriptions gain or lose the guard rules with the switch.
+ * - `environment`: either way rewrites the prefix — the environment section
+ *   heads the system prompt.
+ * - `subagentMessaging`: either way rewrites the prefix — with `agent_spawn`
+ *   among the tools the switch adds or drops `send_message` and rewrites the
+ *   `agent_spawn` description. Without `agent_spawn` it changes nothing, so it
+ *   is drawn only while both the last request and the settings hold that tool.
  */
 export type LockedSettingKind =
   | "tool"
@@ -504,7 +539,9 @@ export type LockedSettingKind =
   | "hook"
   | "profile"
   | "hostMessages"
-  | "fileWriteGuards";
+  | "fileWriteGuards"
+  | "environment"
+  | "subagentMessaging";
 
 /**
  * The one tone the lock draws: orange, a warning that the change throws a warm
@@ -522,7 +559,9 @@ const EITHER_WAY: ReadonlySet<LockedSettingKind> = new Set([
   "hook",
   "profile",
   "hostMessages",
-  "fileWriteGuards"
+  "fileWriteGuards",
+  "environment",
+  "subagentMessaging"
 ]);
 
 /** The kinds that are no part of the tool surface, whose additions no model folds into the declared list. */
@@ -589,6 +628,44 @@ export function fileWriteGuardsTone(state: ToolLockState, settings: Conversation
 }
 
 /**
+ * How the environment switch is drawn: orange while the cache is warm and it
+ * still stands where the last request had it. A lock from before the switch
+ * was recorded knows nothing to protect.
+ */
+export function environmentPromptTone(state: ToolLockState, settings: ConversationSettings): LockTone | null {
+  if (state.lock.environmentPrompt === null) return null;
+  return lockTone(
+    state,
+    "environment",
+    state.lock.environmentPrompt === environmentPromptEnabledOf(settings),
+    true
+  );
+}
+
+/** Whether the lock's request and these settings both hold `agent_spawn`, the tool the messaging switch rides on. */
+function holdsSubagentSpawn(lock: ConversationToolLock, settings: ConversationSettings): boolean {
+  return lock.tools.includes(SUBAGENT_SPAWN_TOOL) && settings.enabledTools.includes(SUBAGENT_SPAWN_TOOL);
+}
+
+/**
+ * How the subagent-communication switch is drawn: orange while the cache is
+ * warm, it still stands where the last request had it, and `agent_spawn` is
+ * there for it to act on — in the last request and in these settings alike.
+ * Without that tool the switch changes nothing on the wire, and a tool added
+ * or removed since is tinted by its own row. A lock from before the switch was
+ * recorded knows nothing to protect.
+ */
+export function subagentMessagingTone(state: ToolLockState, settings: ConversationSettings): LockTone | null {
+  if (state.lock.subagentMessaging === null || !holdsSubagentSpawn(state.lock, settings)) return null;
+  return lockTone(
+    state,
+    "subagentMessaging",
+    state.lock.subagentMessaging === subagentMessagingEnabledOf(settings),
+    true
+  );
+}
+
+/**
  * How the composer's plan-mode switch is drawn. Its pair is sticky — once
  * offered it stays offered, and its guidance is an appended system prompt — so
  * switching plan mode off never touches the cache, and switching it on touches
@@ -622,6 +699,16 @@ export function backendTone(
   const last = leg === "search" ? state.lock.searchBackend : state.lock.fetchBackend;
   if (!sameSelection(last, current)) return null;
   return legSent(state.lock, leg) || state.wholeSurface ? "cache" : null;
+}
+
+/**
+ * How a web leg's switch is drawn: like a tool's own row, orange while the
+ * cache is warm and the leg still stands where the last request had it — on
+ * when its tool went out, or off on a model that folds an added tool into the
+ * declared list. The selector under it is toned on its own (`backendTone`).
+ */
+export function webLegTone(state: ToolLockState, leg: WebBackendLeg, on: boolean): LockTone | null {
+  return lockTone(state, "webSearch", legSent(state.lock, leg), on);
 }
 
 /** Whether the last request offered this leg's tool. */
@@ -716,10 +803,25 @@ export function restoreLockedSettings(
     && lock.fileWriteGuards !== fileWriteGuardsEnabledOf(settings)
     ? { fileWriteGuardsEnabled: lock.fileWriteGuards }
     : {};
+  /* The environment switch goes back the same way: the section heads the
+     cached system prompt. */
+  const environment: Partial<ConversationSettings> = lock.environmentPrompt !== null
+    && lock.environmentPrompt !== environmentPromptEnabledOf(settings)
+    ? { environmentPromptEnabled: lock.environmentPrompt }
+    : {};
+  /* The messaging switch goes back only where it acted: the last request held
+     `agent_spawn`, which the restore below puts back among the tools too. */
+  const messaging: Partial<ConversationSettings> = lock.subagentMessaging !== null
+    && lock.tools.includes(SUBAGENT_SPAWN_TOOL)
+    && lock.subagentMessaging !== subagentMessagingEnabledOf(settings)
+    ? { subagentMessagingEnabled: lock.subagentMessaging }
+    : {};
   const next: ConversationSettings = {
     ...settings,
     ...container,
     ...guards,
+    ...environment,
+    ...messaging,
     enabledTools: whole ? [...lock.tools] : union(settings.enabledTools, lock.tools),
     mcpIds: [...lock.mcpIds],
     globalMemoryEnabled: lock.globalMemory,
@@ -760,7 +862,9 @@ function sameSurface(left: ConversationSettings, right: ConversationSettings): b
     && sameIdSet(left.hookIds, right.hookIds)
     && promptProfileOf(left) === promptProfileOf(right)
     && hostMessageContainerOf(left) === hostMessageContainerOf(right)
-    && fileWriteGuardsEnabledOf(left) === fileWriteGuardsEnabledOf(right);
+    && fileWriteGuardsEnabledOf(left) === fileWriteGuardsEnabledOf(right)
+    && environmentPromptEnabledOf(left) === environmentPromptEnabledOf(right)
+    && subagentMessagingEnabledOf(left) === subagentMessagingEnabledOf(right);
 }
 
 /** The selection lists a dangling row can belong to. */
@@ -867,6 +971,12 @@ export function lockTouch(
   }
   if (fileWriteGuardsEnabledOf(before) !== fileWriteGuardsEnabledOf(after)) {
     note(fileWriteGuardsTone(state, before));
+  }
+  if (environmentPromptEnabledOf(before) !== environmentPromptEnabledOf(after)) {
+    note(environmentPromptTone(state, before));
+  }
+  if (subagentMessagingEnabledOf(before) !== subagentMessagingEnabledOf(after)) {
+    note(subagentMessagingTone(state, before));
   }
   const legs: Array<[WebBackendLeg, SearchProviderSelection | FetchProviderSelection, SearchProviderSelection | FetchProviderSelection]> = [
     ["search", before.webSearch.provider, after.webSearch.provider],

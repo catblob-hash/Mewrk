@@ -167,7 +167,7 @@ export function ProviderRail({
         <SettingsRailEmpty
           icon={<Search size={18} />}
           title={t("没有匹配的提供商", "No matching provider")}
-          description={t("搜索会匹配提供商名与它下面的模型 ID。", "Search matches provider names and the model IDs under them.")}
+          description={t("可按提供商名或模型 ID 搜索。", "Search by provider name or model ID.")}
         />
       )}
     </SettingsRail>

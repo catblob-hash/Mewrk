@@ -571,7 +571,7 @@ describe("App model run flow — agents", () => {
     await user.click(ledgerButton);
     const ledgerPane = await screen.findByRole("region", { name: `${label} 的历史记录` });
     expect(
-      await within(ledgerPane).findByText("这个子代理还没有历史记录。记录从它发出的第一次请求开始。")
+      await within(ledgerPane).findByText("还没有历史记录，从它的第一次请求开始。")
     ).toBeInTheDocument();
     expect(ledgerButton).toHaveAttribute("aria-pressed", "true");
     expect(within(selectedPanel).getByText(streamedText)).toBeInTheDocument();

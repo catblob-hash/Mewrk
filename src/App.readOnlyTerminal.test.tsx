@@ -89,13 +89,13 @@ describe("the terminal pane's read-only page", () => {
     await user.click(screen.getByRole("button", { name: "新建终端" }));
     await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
       .getByRole("menuitem", { name: "zsh" }));
-    expect(tabNames()).toEqual(["bash", "zsh 1"]);
+    expect(tabNames()).toEqual(["bash", "zsh"]);
     expect(screen.getByTestId("read-only-output")).toHaveAttribute("data-open", "false");
 
     // Another command's row points the one page at that command rather than adding a second.
     const [, secondRow] = within(tasks).getAllByRole("button", { name: "打开“bash”" });
     await user.click(secondRow);
-    expect(tabNames()).toEqual(["bash", "zsh 1"]);
+    expect(tabNames()).toEqual(["bash", "zsh"]);
     expect(screen.getAllByTestId("read-only-output")).toHaveLength(1);
     expect(screen.getByTestId("read-only-output")).toHaveTextContent("cargo build");
     expect(screen.getByRole("tab", { name: "bash" })).toHaveAttribute("aria-selected", "true");
@@ -103,9 +103,9 @@ describe("the terminal pane's read-only page", () => {
     // Closing the page ends nothing: the command runs on and the shell stays.
     await user.click(within(screen.getByRole("tab", { name: "bash" }).closest(".page-tab") as HTMLElement)
       .getByRole("button", { name: "关闭只读终端" }));
-    await waitFor(() => expect(tabNames()).toEqual(["zsh 1"]));
+    await waitFor(() => expect(tabNames()).toEqual(["zsh"]));
     expect(terminalMocks.closeTerminal).not.toHaveBeenCalled();
-    expect(screen.getByRole("tab", { name: "zsh 1" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "zsh" })).toHaveAttribute("aria-selected", "true");
   });
 
   it("goes with the host's output, taking the pane along when it was the last tab", async () => {
@@ -132,6 +132,6 @@ describe("the terminal pane's read-only page", () => {
     await user.click(within(toolbar).getByRole("button", { name: "终端" }));
     await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
       .getByRole("menuitem", { name: "显示终端面板" }));
-    expect(tabNames()).toEqual(["zsh 1"]);
+    expect(tabNames()).toEqual(["zsh"]);
   });
 });

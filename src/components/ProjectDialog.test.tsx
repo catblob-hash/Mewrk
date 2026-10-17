@@ -62,9 +62,9 @@ function renderDialog(props: Partial<ProjectDialogProps> = {}) {
 
 const submitButton = () => screen.getByRole("button", { name: "创建项目" });
 const rows = () => Array.from(document.querySelectorAll<HTMLElement>(".project-dialog__row"));
-const machineChip = (index: number) => screen.getByRole("button", {
-  name: new RegExp(`^工作区 ${index} 的机器：`)
-});
+// Rows carry no number in their labels, so a row is found by its place in the list.
+const inRow = (index: number) => within(rows()[index - 1]);
+const machineChip = (index: number) => inRow(index).getByRole("button", { name: /^工作区的机器：/ });
 
 beforeEach(() => {
   configureI18n("zh-CN");
@@ -88,6 +88,16 @@ describe("projectWorkspaceKey", () => {
 });
 
 describe("ProjectDialog", () => {
+  it("states what a project is in one line and leaves the rest to the documentation", () => {
+    renderDialog();
+    const dialog = screen.getByRole("dialog", { name: "新建项目" });
+    expect(dialog).toHaveTextContent("项目由工作区组成，每个是某台机器上的目录。");
+    expect(within(dialog).getByRole("link", { name: /详情/ })).toHaveAttribute(
+      "href",
+      "https://mewrk.dev/zh-CN/workspaces.html#projects"
+    );
+  });
+
   it("starts with one empty local row and adds and removes rows", async () => {
     const user = userEvent.setup();
     renderDialog();
@@ -98,20 +108,23 @@ describe("ProjectDialog", () => {
     expect(rows()).toHaveLength(1);
     expect(machineChip(1)).toHaveTextContent("本机");
     expect(machineChip(1)).toHaveClass("composer-chip");
-    expect(screen.getByRole("button", { name: "为工作区 1 选择目录" })).toHaveTextContent("选择目录…");
+    expect(screen.getByRole("button", { name: "为工作区选择目录" })).toHaveTextContent("选择目录…");
     // The primary row has nothing to remove.
-    expect(screen.queryByRole("button", { name: "移除工作区 1" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "移除工作区" })).toBeNull();
     expect(submitButton()).toBeDisabled();
 
     await user.click(screen.getByRole("button", { name: "添加工作区" }));
     await user.click(screen.getByRole("button", { name: "添加工作区" }));
     expect(rows()).toHaveLength(3);
     expect(machineChip(3)).toHaveTextContent("本机");
-    expect(screen.getByRole("button", { name: "移除工作区 2" })).toBeInTheDocument();
+    // The rows are told apart by place, not by a number in their labels.
+    expect(screen.getAllByRole("button", { name: "移除工作区" })).toHaveLength(2);
+    expect(inRow(1).queryByRole("button", { name: "移除工作区" })).toBeNull();
+    expect(inRow(2).getByRole("button", { name: "移除工作区" })).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "移除工作区 2" }));
+    await user.click(inRow(2).getByRole("button", { name: "移除工作区" }));
     expect(rows()).toHaveLength(2);
-    expect(screen.queryByRole("button", { name: "移除工作区 3" })).toBeNull();
+    expect(screen.getAllByRole("button", { name: "移除工作区" })).toHaveLength(1);
   });
 
   it("stops adding rows at the per-project limit", async () => {
@@ -158,7 +171,7 @@ describe("ProjectDialog", () => {
     await user.click(within(ssh).getByRole("menuitemradio", { name: "devbox" }));
     expect(screen.queryByRole("menu", { name: "选择机器" })).toBeNull();
     expect(machineChip(1)).toHaveTextContent("devbox");
-    expect(screen.getByRole("button", { name: "为工作区 1 选择目录" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "为工作区选择目录" })).toBeInTheDocument();
   });
 
   it("opens the machine menu above its chip when there is room there", async () => {
@@ -269,7 +282,7 @@ describe("ProjectDialog", () => {
     expect(onDeleteSshMachine).toHaveBeenCalledWith(devbox.id);
     expect(screen.queryByRole("dialog", { name: /SSH 机器/ })).toBeNull();
     expect(machineChip(2)).toHaveTextContent("本机");
-    expect(screen.getByRole("button", { name: "为工作区 2 选择目录" })).toBeInTheDocument();
+    expect(inRow(2).getByRole("button", { name: "为工作区选择目录" })).toBeInTheDocument();
     expect(machineChip(1)).toHaveTextContent("本机");
   });
 
@@ -299,7 +312,7 @@ describe("ProjectDialog", () => {
     const path = "C:\\Users\\me\\very\\deep\\projects\\app";
     renderDialog({ initialWorkspaces: [{ path }] });
 
-    const button = screen.getByRole("button", { name: `工作区 1：${path}` });
+    const button = screen.getByRole("button", { name: `工作区：${path}` });
     expect(button).toHaveClass("composer-chip", "project-dialog__path");
     expect(button).toHaveAttribute("title", path);
     const text = button.querySelector(".project-dialog__path-text");
@@ -315,21 +328,21 @@ describe("ProjectDialog", () => {
     const { onPickLocalDirectory, onSubmit } = renderDialog();
     onPickLocalDirectory.mockResolvedValueOnce(null);
 
-    await user.click(screen.getByRole("button", { name: "为工作区 1 选择目录" }));
+    await user.click(screen.getByRole("button", { name: "为工作区选择目录" }));
     expect(onPickLocalDirectory).toHaveBeenCalledTimes(1);
     // Cancelling leaves the row empty.
-    expect(screen.getByRole("button", { name: "为工作区 1 选择目录" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "为工作区选择目录" })).toBeInTheDocument();
     expect(submitButton()).toBeDisabled();
 
     onPickLocalDirectory.mockResolvedValueOnce("/Users/me/app");
-    await user.click(screen.getByRole("button", { name: "为工作区 1 选择目录" }));
-    expect(await screen.findByRole("button", { name: "工作区 1：/Users/me/app" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "为工作区选择目录" }));
+    expect(await screen.findByRole("button", { name: "工作区：/Users/me/app" })).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "添加工作区" }));
     expect(submitButton()).toBeDisabled();
     onPickLocalDirectory.mockResolvedValueOnce("/Users/me/lib");
-    await user.click(screen.getByRole("button", { name: "为工作区 2 选择目录" }));
-    await screen.findByRole("button", { name: "工作区 2：/Users/me/lib" });
+    await user.click(inRow(2).getByRole("button", { name: "为工作区选择目录" }));
+    await screen.findByRole("button", { name: "工作区：/Users/me/lib" });
 
     await user.type(screen.getByPlaceholderText("留空时使用第一个工作区的文件夹名称"), "  My app  ");
     expect(submitButton()).toBeEnabled();
@@ -345,7 +358,7 @@ describe("ProjectDialog", () => {
     const { onPickLocalDirectory } = renderDialog();
     onPickLocalDirectory.mockRejectedValueOnce(new Error("portal unavailable"));
 
-    await user.click(screen.getByRole("button", { name: "为工作区 1 选择目录" }));
+    await user.click(screen.getByRole("button", { name: "为工作区选择目录" }));
     expect(await within(rows()[0]).findByRole("alert"))
       .toHaveTextContent("无法打开目录选择器：portal unavailable");
   });
@@ -362,13 +375,13 @@ describe("ProjectDialog", () => {
       initialWorkspaces: [{ machine: { kind: "ssh", machineId: devbox.id }, path: "" }]
     });
 
-    await user.click(screen.getByRole("button", { name: "为工作区 1 选择目录" }));
+    await user.click(screen.getByRole("button", { name: "为工作区选择目录" }));
     const picker = await screen.findByRole("dialog", { name: "选择 devbox 上的工作区" });
     expect(mocks.listRemoteDirectory).toHaveBeenCalledWith({ kind: "ssh", machineId: devbox.id }, "~");
     await waitFor(() => expect(within(picker).getByRole("button", { name: "选择" })).toBeEnabled());
     await user.click(within(picker).getByRole("button", { name: "选择" }));
 
-    expect(await screen.findByRole("button", { name: "工作区 1：/home/dev" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "工作区：/home/dev" })).toBeInTheDocument();
     await user.click(submitButton());
     expect(onSubmit).toHaveBeenCalledWith("", [{ machine: { kind: "ssh", machineId: devbox.id }, path: "/home/dev" }]);
   });
@@ -383,12 +396,12 @@ describe("ProjectDialog", () => {
       ]
     });
 
-    expect(within(rows()[1]).getByRole("alert")).toHaveTextContent("与工作区 1 是同一台机器上的同一个目录");
+    expect(within(rows()[1]).getByRole("alert")).toHaveTextContent("与上面的工作区是同一台机器上的同一个目录");
     // The same path on another machine is another directory.
     expect(within(rows()[2]).queryByRole("alert")).toBeNull();
     expect(submitButton()).toBeDisabled();
 
-    await user.click(screen.getByRole("button", { name: "移除工作区 2" }));
+    await user.click(screen.getByRole("button", { name: "移除工作区 c:\\work\\app" }));
     expect(screen.queryByRole("alert")).toBeNull();
     expect(submitButton()).toBeEnabled();
   });
@@ -408,16 +421,16 @@ describe("ProjectDialog", () => {
     expect(screen.getByRole("dialog", { name: "编辑项目" })).toBeInTheDocument();
     expect(screen.getByDisplayValue("Shop")).toBeInTheDocument();
     expect(machineChip(1)).toBeDisabled();
-    expect(screen.getByRole("button", { name: "工作区 1：/Users/me/shop" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "移除工作区 1" })).toBeNull();
+    expect(screen.getByRole("button", { name: "工作区：/Users/me/shop" })).toBeDisabled();
+    expect(inRow(1).queryByRole("button", { name: /^移除工作区/ })).toBeNull();
     expect(machineChip(2)).toBeEnabled();
     expect(machineChip(2)).toHaveTextContent("devbox");
 
-    await user.click(screen.getByRole("button", { name: "移除工作区 3" }));
+    await user.click(screen.getByRole("button", { name: "移除工作区 /Users/me/shared" }));
     await user.click(screen.getByRole("button", { name: "添加工作区" }));
     const save = screen.getByRole("button", { name: "保存" });
     expect(save).toBeDisabled();
-    await user.click(screen.getByRole("button", { name: "移除工作区 3" }));
+    await user.click(inRow(3).getByRole("button", { name: "移除工作区" }));
     expect(save).toBeEnabled();
 
     await user.click(save);
@@ -445,7 +458,7 @@ describe("ProjectDialog", () => {
 
     await user.click(machineChip(1));
     await user.click(screen.getByRole("menuitemradio", { name: "本机" }));
-    expect(screen.getByRole("button", { name: "为工作区 1 选择目录" })).toBeEnabled();
+    expect(inRow(1).getByRole("button", { name: "为工作区选择目录" })).toBeEnabled();
     expect(rows()[0]).not.toHaveTextContent("这台机器已删除");
     expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
   });
@@ -468,14 +481,14 @@ describe("ProjectDialog", () => {
 
     expect(machineChip(1)).toBeEnabled();
     expect(machineChip(1)).toHaveTextContent("本机");
-    expect(screen.getByRole("button", { name: "为工作区 1 选择目录" })).toBeEnabled();
+    expect(inRow(1).getByRole("button", { name: "为工作区选择目录" })).toBeEnabled();
   });
 
   it("takes a typed absolute path for a local row in the browser preview", async () => {
     const user = userEvent.setup();
     const { onSubmit, onPickLocalDirectory } = renderDialog({ nativePicker: false });
 
-    const input = screen.getByRole("textbox", { name: "工作区 1 的绝对路径" });
+    const input = screen.getByRole("textbox", { name: "工作区的绝对路径" });
     await user.type(input, "  /tmp/project ");
     await user.click(submitButton());
     expect(onPickLocalDirectory).not.toHaveBeenCalled();

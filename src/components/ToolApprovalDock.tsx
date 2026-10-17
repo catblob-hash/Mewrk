@@ -146,8 +146,8 @@ function ToolApprovalDockContent({
       {!planExit && pending.mandatory && (
         <p className="tool-approval-dock__reason">
           {t(
-            "这一条无论安全层级如何都会询问：完全访问也不会跳过它。",
-            "This one is asked at every security level: full access does not skip it."
+            "任何安全层级都会询问这一条。",
+            "Asked at every security level."
           )}
         </p>
       )}

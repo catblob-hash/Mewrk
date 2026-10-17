@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Dialog } from "./Common";
+import { DocsLink } from "./DocsLink";
 import { PathText } from "./PathText";
 import { useI18n } from "../i18n";
 import { createId } from "../lib/id";
@@ -123,20 +124,7 @@ function MachineShellsSection({ machine, shells, agentShell }: MachineShellsSect
           )
           : (
             <p className="machine-shells__pending">
-              {!machine
-                ? t(
-                  "还没有探测结果。Mewrk 启动时会探测本机，也可以现在探测。",
-                  "No probe yet. Mewrk probes this machine at startup, or probe it now."
-                )
-                : machine.kind === "wsl"
-                  ? t(
-                    "还没有探测过这个发行版。首次在它上面运行时会自动探测，也可以现在探测。",
-                    "This distribution has not been probed yet. It is probed the first time something runs on it, or probe it now."
-                  )
-                  : t(
-                    "还没有探测过这台机器。首次连接时会自动探测，也可以现在探测。",
-                    "This machine has not been probed yet. It is probed on first connection, or probe it now."
-                  )}
+              {t("还没有探测结果，可以现在探测。", "Not probed yet; you can probe now.")}
             </p>
           )}
     </section>
@@ -220,10 +208,13 @@ export function SshMachineDialog({
       title={machine
         ? t("配置 SSH 机器", "Configure SSH machine")
         : t("添加 SSH 机器", "Add SSH machine")}
-      description={t(
-        "认证材料不落盘：连接时由 OpenSSH 按身份文件、~/.ssh/config 与 agent 解析。工作目录、环境变量和沙箱不在这里设——它们属于工作区：在项目里为这台机器选一个目录。",
-        "No credentials are stored: OpenSSH resolves the identity file, ~/.ssh/config and the agent at connect time. The working directory, environment variables and sandbox are not set here — they belong to a workspace: pick a directory on this machine in a project."
-      )}
+      description={<>
+        {t(
+          "通过 OpenSSH 连接，Mewrk 不保存认证信息。",
+          "Connects through OpenSSH; Mewrk stores no credentials."
+        )}
+        <DocsLink inline page="workspaces" section="add-ssh" />
+      </>}
       width="460px"
       onClose={onClose}
       footer={<>
@@ -453,18 +444,12 @@ export function MachineSettingsDialog({
       ? machine.distro
       : t("已删除的机器", "Deleted machine");
   const description = !machine
-    ? t(
-      "运行 Mewrk 的这台电脑。它随 Mewrk 而在，不需要登记，也没有要配置的连接。",
-      "The computer running Mewrk. It is always there, needs no registration, and has no connection to configure."
-    )
+    ? t("运行 Mewrk 的这台电脑。", "The computer running Mewrk.")
     : machine.kind === "wsl"
-      ? t(
-        "这台电脑上的一个 WSL 发行版。发行版由系统枚举，不需要登记，也没有要配置的连接。",
-        "A WSL distribution on this computer. Distributions are enumerated from the system, need no registration, and have no connection to configure."
-      )
+      ? t("这台电脑上的一个 WSL 发行版。", "A WSL distribution on this computer.")
       : t(
-        "这台 SSH 机器已从登记中删除，它上面的工作区在重新选择之前都无法使用。",
-        "This SSH machine was deleted from the catalog; its workspaces cannot be used until they are chosen again."
+        "这台 SSH 机器已删除，其上的工作区需重新选择才能使用。",
+        "This SSH machine was deleted; choose another for its workspaces."
       );
   const kind = !machine
     ? t("本机", "This machine")
@@ -508,9 +493,10 @@ export function MachineSettingsDialog({
       )}
       <p className="machine-settings__note">
         {t(
-          "环境变量和沙箱属于工作区，不属于机器：在输入框上方的工作区菜单里，点工作区右侧的齿轮来设置。",
-          "Environment variables and the sandbox belong to a workspace, not to its machine: set them from the gear beside a workspace in the workspace menu above the message box."
+          "环境变量和沙箱属于工作区，在工作区旁的齿轮里设置。",
+          "Environment variables and the sandbox belong to a workspace; set them from its gear."
         )}
+        <DocsLink inline page="workspaces" section="environment" />
       </p>
     </Dialog>
   );

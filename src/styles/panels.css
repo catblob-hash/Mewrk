@@ -167,6 +167,10 @@
 .docs-link { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; margin-left: auto; color: var(--faint); font-size: 8.5px; white-space: nowrap; }
 .docs-link:hover { color: var(--text); text-decoration: underline; }
 .docs-link > svg { flex: 0 0 auto; }
+/* The "Learn more" that trails a short description: the description's own size,
+   right after its last word, and coloured as a link because it is one. */
+.docs-link--inline { display: inline-flex; gap: 2px; margin-left: 0.4em; color: var(--accent); font-size: inherit; vertical-align: baseline; }
+.docs-link--inline:hover { color: var(--accent); }
 /* Rules between groups only: the list is a page of its own, and the page's own
    edges (the header's rule above it, the pane's end below) already bound it. */
 .tool-settings-group + .tool-settings-group { border-top: 1px solid var(--color-eeeeea); }

@@ -89,8 +89,8 @@ export function ModelManagerDrawer({
     <Drawer
       title={t("发现模型", "Discover models")}
       subtitle={t(
-        "{installed} 个已装 · 目录共 {total} 个 · 点一行加入或移出这家提供商",
-        "{installed} installed · {total} in the catalog · click a row to add it to or remove it from this provider",
+        "{installed} 个已装 · 目录共 {total} 个 · 点一行添加或移除",
+        "{installed} installed · {total} in the catalog · click a row to add or remove",
         { installed: provider.models.length, total: catalog.length }
       )}
       labelledBy="model-manager-title"

@@ -204,6 +204,15 @@ pub(crate) const TASK_WAIT_TOOL: &str = "task_wait";
 /// has to disclaim being one. The host signs every such delivery card under
 /// this name and writes the matching call itself.
 pub(crate) const BOX_TOOL: &str = "box";
+/// The main agent's way of talking to a child it started with `agent_spawn`:
+/// a message into a running child, or the resumption of a finished one.
+///
+/// Host-derived, never user-selectable: the trusted request builder grants it
+/// exactly while the conversation's subagent-communication switch is on and
+/// `agent_spawn` is enabled (`RunModelRequest::subagent_messaging`,
+/// `agents::apply_subagent_messaging_tool`). It stays on the child deny-list
+/// below, because only the main agent ever holds it.
+pub(crate) const SEND_MESSAGE_TOOL: &str = "send_message";
 /// Cap on one executor's findings before they reach the caller. The findings
 /// are opaque text, so this length bound is the only thing standing between a
 /// runaway executor and the caller's context.
@@ -222,9 +231,14 @@ const WEB_RESULT_MAX_CONTENT: usize = 64 * 1024;
 const SUBAGENT_DISABLED_TOOL_NAMES: &[&str] = &[
     "subagent",
     "agent_spawn",
-    // The retired messaging tools. A child could never hold them, and they stay
-    // listed so a fork does not replay the main session's old calls to a child.
-    "send_message",
+    // `send_message` is the main agent's tool (granted by the conversation's
+    // subagent-communication switch): a child never holds it, so it can never
+    // direct a sibling or its own parent. It stays listed so a fork does not
+    // replay the main session's calls to it to a child.
+    //
+    // `followup_task` is the retired messaging tool of the same family, listed
+    // for the same replay reason.
+    SEND_MESSAGE_TOOL,
     "followup_task",
     "task_wait",
     "task_list",
@@ -2026,7 +2040,9 @@ impl SubagentTranscriptSink {
                 let current_owner = card.id() == owner;
                 let ContextItem::Tool { tool_name, subagent, .. } = card else { return false; };
                 if current_owner {
-                    if tool_name != "agent_spawn"
+                    // The spawn's card, or the `send_message` card that resumed
+                    // the child and owns its record from then on.
+                    if (tool_name != "agent_spawn" && tool_name != SEND_MESSAGE_TOOL)
                         || subagent.as_ref().is_some_and(|previous| previous.name.as_deref() != Some(shared.name.as_str()))
                     {
                         return false;
@@ -3189,6 +3205,10 @@ fn run_model_inner(
                 // the instruction is added here, after everything above, and
                 // the plan tools it introduces join just below.
                 reconcile_plan_mode(&mut request, state, round, &mut exchanges, &mut generated);
+                // A tool that can start a background task, held under a system
+                // prompt that does not say how its results arrive: said here,
+                // once, ahead of the tool joining just below.
+                deliver_host_messages_note(&mut request, state, round, &mut exchanges, &mut generated);
                 // Last, so a tool that joined this boundary (the handoff tools
                 // armed just above, an MCP schema `tool_search` handed out, the
                 // plan pair) is appended after everything else the model is owed.
@@ -4755,6 +4775,24 @@ fn run_model_inner(
                         &generated,
                         &mut generated_checkpoint,
                     );
+                    exchanges.clear();
+                    continue;
+                }
+                // A child agent's run ends here for good, so its mailbox closes
+                // in the same step that finds it empty: a `send_message` from
+                // the main agent either landed before this and is read next
+                // round, or arrives after it and is refused as a result on its
+                // way — never accepted into a queue nobody reads. The user's
+                // steer queue of a top-level run is not closed; it behaves as
+                // it always has.
+                if request.subagent_depth > 0
+                    && request
+                        .steer_mailbox
+                        .0
+                        .as_ref()
+                        .is_some_and(|mailbox| !mailbox.close_if_empty())
+                {
+                    sync_generated_contexts(&mut request, &generated, &mut generated_checkpoint);
                     exchanges.clear();
                     continue;
                 }
@@ -7254,6 +7292,9 @@ fn web_search_request_template(
         // does not re-derive the host's own web tools, so the switch that grants
         // those is irrelevant here and stays off.
         web_search_enabled: false,
+        // A one-shot search request holds no client tools, so there is nobody
+        // for it to message and no child to give an update tool.
+        subagent_messaging: false,
         // Search proxy calls do not enable shell tools, so a run environment has no effect.
         run_environment: Default::default(),
         workspaces: Default::default(),
@@ -7269,6 +7310,7 @@ fn web_search_request_template(
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
             host_message_container: Default::default(),
+            host_messages_in_prompt: false,
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
         // A search call reports as prose, not through `structured_output`.
@@ -7348,7 +7390,10 @@ fn web_search_request_template(
 ///
 /// The URLs go into the request's own user context because Anthropic will only
 /// fetch an address that already appeared in the conversation; putting them in
-/// the task body is what makes them eligible.
+/// the task body is what makes them eligible. They also ride on the request
+/// itself (`native_fetch_call`), because on the Claude Agent family it is the
+/// sidecar, not the upstream, that decides which addresses Claude Code's own
+/// `WebFetch` may open, and it must not have to read them back out of prose.
 fn web_fetch_request_template(parent: &RunModelRequest, urls: &[String]) -> RunModelRequest {
     let (provider, model) = resolve_native_search_endpoint(parent);
     let task = parent.prompt_profile.render(
@@ -7359,7 +7404,7 @@ fn web_fetch_request_template(parent: &RunModelRequest, urls: &[String]) -> RunM
         native_search_call: false,
         // One fetch per URL, and no budget to wander: the executor cannot
         // retrieve a page the model did not name.
-        native_fetch_call: Some(urls.len().min(u32::MAX as usize) as u32),
+        native_fetch_call: Some(urls.to_vec()),
         assembled_system_prompt: parent
             .prompt_profile
             .text(PromptKey::WebFetchExecutorSystemPrompt)
@@ -7566,6 +7611,12 @@ fn perform_web_search_request(
         event_sink(ModelStreamEvent::Ping)
     };
     let quiet_sink: &ModelEventSink<'_> = &quiet;
+    // The Claude Agent family runs this request in a CLI session of its own,
+    // never the parent run's: the sidecar gives only this one Claude Code's
+    // `WebSearch`. Dropping the lease on any exit tears that session down.
+    let agent_lease =
+        crate::aisdk::agent::SessionLease::acquire(&request.provider, &request.app_data_path)
+            .map_err(ModelRequestError::Fatal)?;
     // Native search is a host-minted model request that consumes tokens. Route it
     // through the gateway and record one `web_search` ledger row.
     let gateway_ledger = crate::token_ledger::GatewayRecorder::new(
@@ -7638,6 +7689,7 @@ fn perform_web_search_request(
             audit,
         );
         step.headers = credential.headers;
+        step.agent = agent_lease.session(&request.model);
         let mut parsed = post_model_request_with_validator(
             &step,
             key.as_deref(),
@@ -7761,8 +7813,12 @@ fn perform_web_search_request(
 /// What differs is the deliverable. The executor's prose is discarded; the
 /// result is `web_documents`, the pages the upstream already converted to text.
 /// That is the whole point of taking this path instead of the catalog pipeline —
-/// no second model reads the pages and writes them up, so nothing is lost or
-/// invented between the page and the tool result.
+/// on the Messages families no second model reads the pages and writes them up,
+/// so nothing is lost or invented between the page and the tool result. The
+/// Claude Agent family is the one exception the upstream imposes: Claude Code's
+/// `WebFetch` hands back its own model's rendering of the page, which the
+/// sidecar asks to be the page's full main content, verbatim (`claude-agent.ts`,
+/// `NativeFetchLedger`).
 fn perform_web_fetch_request(
     request: &RunModelRequest,
     event_sink: &ModelEventSink<'_>,
@@ -7787,6 +7843,13 @@ fn perform_web_fetch_request(
         event_sink(ModelStreamEvent::Ping)
     };
     let quiet_sink: &ModelEventSink<'_> = &quiet;
+    // As for search: the Claude Agent family runs this request in a CLI session
+    // of its own, never the parent run's, and there the sidecar gives Claude
+    // Code its own `WebFetch` and nothing else, held to the URLs this request
+    // names. Dropping the lease on any exit tears that session down.
+    let agent_lease =
+        crate::aisdk::agent::SessionLease::acquire(&request.provider, &request.app_data_path)
+            .map_err(ModelRequestError::Fatal)?;
     let gateway_ledger = crate::token_ledger::GatewayRecorder::new(
         &request.app_data_path,
         crate::token_ledger::UsageOrigin::WebSearch,
@@ -7831,6 +7894,7 @@ fn perform_web_fetch_request(
             audit,
         );
         step.headers = credential.headers;
+        step.agent = agent_lease.session(&request.model);
         let parsed = post_model_request_with_validator(
             &step,
             key.as_deref(),
@@ -9754,14 +9818,16 @@ fn apply_role_prompt_profile(
     }
     template.prompt_profile = Arc::new(profile);
     // `agent_child_template` worded the child's progress tool in the caller's
-    // profile, and the child is the one that reads it.
-    let update = subagent_update_descriptor(&template.prompt_profile);
+    // profile, and the child is the one that reads it. A conversation whose
+    // agent tree does not talk (`subagent_messaging` off) minted none, so there
+    // is nothing to re-word and nothing is added: the tool is never put back
+    // here, only replaced where the template already holds it.
     if let Some(tool) = template
         .tools
         .iter_mut()
         .find(|tool| tool.name == SUBAGENT_UPDATE_TOOL)
     {
-        *tool = update;
+        *tool = subagent_update_descriptor(&template.prompt_profile);
     }
 }
 
@@ -10302,26 +10368,39 @@ pub(crate) fn agent_child_template(parent: &RunModelRequest) -> RunModelRequest 
         .filter(|tool| tool.name != "workflow")
         .cloned()
         .collect::<Vec<_>>();
+    // The update tool exists only while the conversation's agent tree talks
+    // (`parent.subagent_messaging`: the subagent-communication switch with
+    // `agent_spawn` enabled, copied down from the top-level run). Otherwise a
+    // child has no channel to its parent but its final reply, and neither the
+    // descriptor nor the enabled name may be here — not even one `parent`
+    // carried, so a template rehydrated after the user turned the switch off
+    // follows the switch as it stands now. Both directions are idempotent:
     // `parent` may already be a child request whose descriptor vector contains
-    // `subagent_update`; preserve idempotence.
-    if !child_tools
-        .iter()
-        .any(|tool| tool.name == SUBAGENT_UPDATE_TOOL)
-    {
-        child_tools.push(subagent_update_descriptor(&parent.prompt_profile));
+    // `subagent_update`.
+    if parent.subagent_messaging {
+        if !child_tools
+            .iter()
+            .any(|tool| tool.name == SUBAGENT_UPDATE_TOOL)
+        {
+            child_tools.push(subagent_update_descriptor(&parent.prompt_profile));
+        }
+    } else {
+        child_tools.retain(|tool| tool.name != SUBAGENT_UPDATE_TOOL);
     }
     let mut child_enabled_tools = parent
         .enabled_tools
         .iter()
         .filter(|name| !subagent_tool_is_disabled(name))
+        .filter(|name| parent.subagent_messaging || name.as_str() != SUBAGENT_UPDATE_TOOL)
         .cloned()
         .collect::<Vec<_>>();
     // This function also creates accounting templates for background shell and
     // search work, where `parent` may already contain `subagent_update`. Keep the
     // insertion idempotent after inherited-tool filtering.
-    if !child_enabled_tools
-        .iter()
-        .any(|name| name == SUBAGENT_UPDATE_TOOL)
+    if parent.subagent_messaging
+        && !child_enabled_tools
+            .iter()
+            .any(|name| name == SUBAGENT_UPDATE_TOOL)
     {
         child_enabled_tools.push(SUBAGENT_UPDATE_TOOL.into());
     }
@@ -10359,6 +10438,11 @@ pub(crate) fn agent_child_template(parent: &RunModelRequest) -> RunModelRequest 
         native_search_call: false,
         native_fetch_call: None,
         web_search_enabled: parent.web_search_enabled,
+        // Inherited, and the whole of what a child knows about the switch: it
+        // decides whether this child holds `subagent_update` (above), and it
+        // is copied on to the child's own children, which a child cannot have
+        // but an accounting template can.
+        subagent_messaging: parent.subagent_messaging,
         // Children share the conversation-level run environment; synchronous shell
         // execution location does not vary by derivation depth.
         run_environment: parent.run_environment.clone(),
@@ -10407,6 +10491,11 @@ pub(crate) fn agent_child_template(parent: &RunModelRequest) -> RunModelRequest 
         // host talks to the model: a child's host messages — its truncated
         // replies, a missing structured result, its hooks — come in it too.
         host_message_container: parent.host_message_container,
+        // Inherited with the prompt it describes: the child's is rendered from
+        // the parent's. A child holding a tool that can start a task under a
+        // prompt that does not say how its results arrive is told at its own
+        // first round (`host_append::host_messages_owed`).
+        host_messages_in_prompt: parent.host_messages_in_prompt,
         // The guards are inherited, on or off; the read record is not shared. A
         // child gets a scope of its own, seeded from the parent's on first use —
         // the parent's reads are what the child may edit, but what the child
@@ -11100,6 +11189,33 @@ fn forward_child_event(
         return event_sink(ModelStreamEvent::Ping);
     }
 
+    // A message the main agent sent with `send_message`, drained into the
+    // child's transcript at a round head. The event that announces a queued
+    // message crossing into a top-level turn has no meaning inside a child's
+    // stream — there is no queue card for it to retire — so the child's live
+    // view gets the user context it became, as the host's own addition to that
+    // transcript, in its transcript order.
+    let event = match event {
+        ModelStreamEvent::UserInputReceived {
+            round: child_round,
+            id,
+            content,
+            images,
+            files,
+            created_at,
+        } => ModelStreamEvent::HostContextAdded {
+            round: child_round,
+            context: Box::new(ContextItem::User {
+                id,
+                content,
+                images,
+                files,
+                created_at,
+            }),
+        },
+        event => event,
+    };
+
     // Keep the complete nested event envelope: flattening or dropping an
     // already nested event would hide a live child timeline until final
     // settlement. Debug request bodies remain process-local diagnostics.
@@ -11145,6 +11261,12 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
     // This child turn's incarnation identity gates all result, progress, and
     // cleanup writes, rejecting stale-worker writes at the core boundary.
     let incarnation = shared.identity();
+    // This incarnation's own stop flag and mailbox, taken once. A resume
+    // replaces both on the task, and a worker still winding down after its
+    // incarnation was settled must keep seeing its own stop and must never
+    // drain a message meant for the run that replaced it.
+    let cancel = shared.cancel_flag();
+    let mailbox = shared.mailbox();
     let guard = RunningTurnGuard::new(Arc::clone(shared));
     // Past the conversation's running limit this waits for another subagent to
     // end. Everything below reads the conversation as it is when the turn
@@ -11161,7 +11283,11 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
     child_request.subagent_call_id = Some(call_id.clone());
     // This round belongs to this task. Its task signal lets running shell and
     // hook commands observe the sidebar stop action promptly.
-    child_request.task_cancel = CancelSignal::from_flag(shared.cancel_flag());
+    child_request.task_cancel = CancelSignal::from_flag(Arc::clone(&cancel));
+    // The main agent's `send_message` reaches the run through this: the loop
+    // drains it before every model request, like the user's steer queue of a
+    // top-level turn, and closes it when it ends for good.
+    child_request.steer_mailbox = AgentMailboxHandle(mailbox.clone());
     let memory_preflight = refresh_named_agent_memory(&mut child_request, state);
 
     // Reacquire the surface for each child round to use the latest registered
@@ -11173,7 +11299,7 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
     let child_tool_calls: Mutex<HashMap<String, (String, Option<JsonObject>)>> =
         Mutex::new(HashMap::new());
     let child_sink = |event: ModelStreamEvent| -> Result<(), String> {
-        if shared.cancel.load(std::sync::atomic::Ordering::Acquire) {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
             return Err("The subagent was stopped.".into());
         }
         let sink: &ModelEventSink<'_> = match surface.as_ref() {
@@ -11204,12 +11330,12 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
     let approval: &DangerousToolApproval<'_> = match surface.as_ref() {
         Some(surface) => {
             let approve = Arc::clone(&surface.approve);
-            let flag_owner = Arc::clone(shared);
+            let flag = Arc::clone(&cancel);
             bound_approval = move |request: &ToolExecutionRequest,
                                    descriptor: &ToolDescriptor,
                                    requester: ApprovalRequester<'_>|
                   -> Result<bool, String> {
-                approve(request, descriptor, requester, Some(&flag_owner.cancel))
+                approve(request, descriptor, requester, Some(&flag))
             };
             &bound_approval
         }
@@ -11235,6 +11361,15 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
         }
         Err(error) => Err(ChildRunError::Preflight(error)),
     };
+    // The run is over, whichever way it ended: a run that finished normally
+    // closed its mailbox as it found it empty, and every other exit is closed
+    // here, before the result settles. From now on a `send_message` is told the
+    // result is on its way rather than promised a read that will not happen;
+    // anything that arrived since the run's last drain stays in the mailbox
+    // and goes ahead of the message that resumes this task.
+    if let Some(mailbox) = mailbox.as_ref() {
+        mailbox.close();
+    }
     let turn_duration_ms = turn_started.elapsed().as_millis() as u64;
     let status = match child_run {
         Ok(response) => {
@@ -11249,7 +11384,7 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
                     _ => None,
                 })
                 .unwrap_or_default();
-            let reported = if shared.cancel.load(std::sync::atomic::Ordering::Acquire) {
+            let reported = if cancel.load(std::sync::atomic::Ordering::Acquire) {
                 SubagentRunStatus::Interrupted
             } else {
                 subagent_run_status(response.stop_reason.as_deref())
@@ -11323,7 +11458,7 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
             // before the turn started; stops during a turn settle as
             // `Ok(stop_reason = "cancelled")`. Record failures as `Failed` with
             // error text unless the task signal is already set.
-            let (status, text) = if shared.cancel.load(std::sync::atomic::Ordering::Acquire) {
+            let (status, text) = if cancel.load(std::sync::atomic::Ordering::Acquire) {
                 (
                     AgentLiveStatus::Interrupted,
                     match shared.stop_attribution() {
@@ -11365,6 +11500,12 @@ fn agent_worker_loop(shared: &Arc<AgentShared>, state: &AppState, round: usize) 
         }
     };
     guard.defuse();
+    // A worker whose incarnation was settled without it (a forced stop) and
+    // then replaced by a resume no longer speaks for the task: the status and
+    // the card are the new run's.
+    if shared.identity() != incarnation {
+        return;
+    }
     // Incumbent guards may discard this write. Renderer receipts and self-claim
     // checks must use the recorded state rather than a locally predicted state.
     let applied_status = shared.status();
@@ -11406,12 +11547,14 @@ fn agent_worker_loop_scoped(
 ) {
     // Bind the step's task signal into approvals. Skipping a step or stopping the
     // workflow must release a pending card rather than holding the run open.
-    let flag_owner = Arc::clone(shared);
+    // A step is never resumed, so its one incarnation's flag is the step's.
+    let cancel = shared.cancel_flag();
+    let flag = Arc::clone(&cancel);
     let bound_approval = move |request: &ToolExecutionRequest,
                                descriptor: &ToolDescriptor,
                                requester: ApprovalRequester<'_>|
           -> Result<bool, String> {
-        approve_dangerous_tool(request, descriptor, requester, Some(&flag_owner.cancel))
+        approve_dangerous_tool(request, descriptor, requester, Some(&flag))
     };
     let approve_dangerous_tool: &DangerousToolApproval<'_> = &bound_approval;
     let call_id = shared.latest_call_id();
@@ -11425,13 +11568,13 @@ fn agent_worker_loop_scoped(
     child_request.subagent_call_id = Some(call_id.clone());
     // Skipping a step or cancelling race losers must reach commands and hooks
     // currently running for this step.
-    child_request.task_cancel = CancelSignal::from_flag(shared.cancel_flag());
+    child_request.task_cancel = CancelSignal::from_flag(Arc::clone(&cancel));
     let memory_preflight = refresh_named_agent_memory(&mut child_request, state);
 
     let child_tool_calls: Mutex<HashMap<String, (String, Option<JsonObject>)>> =
         Mutex::new(HashMap::new());
     let child_sink = |event: ModelStreamEvent| -> Result<(), String> {
-        if shared.cancel.load(std::sync::atomic::Ordering::Acquire) {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
             return Err("The subagent was stopped.".into());
         }
         forward_child_event(
@@ -11464,7 +11607,7 @@ fn agent_worker_loop_scoped(
                     _ => None,
                 })
                 .unwrap_or_default();
-            let reported = if shared.cancel.load(std::sync::atomic::Ordering::Acquire) {
+            let reported = if cancel.load(std::sync::atomic::Ordering::Acquire) {
                 SubagentRunStatus::Interrupted
             } else {
                 subagent_run_status(response.stop_reason.as_deref())
@@ -11522,7 +11665,7 @@ fn agent_worker_loop_scoped(
             // As in `agent_worker_loop`, `Err` means a real failure because
             // stopping settles as `Ok + cancelled`; retain its text as `Failed`
             // unless the cancellation signal is set.
-            let (status, text) = if shared.cancel.load(std::sync::atomic::Ordering::Acquire) {
+            let (status, text) = if cancel.load(std::sync::atomic::Ordering::Acquire) {
                 (
                     AgentLiveStatus::Interrupted,
                     "(Subagent run interrupted)".into(),
@@ -11683,6 +11826,165 @@ fn run_agent_tool(
         }
         agents::AgentToolKind::List => Ok(run_task_list(pool, parent, call, state)),
         agents::AgentToolKind::Stop => Ok(run_task_stop(pool, parent, call, state)),
+        agents::AgentToolKind::SendMessage => {
+            run_send_message(pool, shadow, parent, call, state, event_sink, round)
+        }
+    }
+}
+
+/// `send_message`: the main agent's message to a child it started with
+/// `agent_spawn`, by the child's name.
+///
+/// The decision is the pool's ([`AgentPool::send_message`]) and is made in one
+/// critical section: a run that will still read its mailbox gets the message
+/// queued there; a run that has ended but whose result has not reached the
+/// model yet refuses it with nothing changed; a child the user stopped is not
+/// resumed; any other finished child is resumed with the message, as a new
+/// incarnation of the same task.
+///
+/// A resume is a spawn into the slot the delivered result emptied, with the
+/// next generation's identity — `AgentSpawn` in the kernel's terms, observed
+/// here, inside this call's execution, exactly where `run_agent_spawn` observes
+/// its own — and from then on the task is this call's: its live stream and its
+/// cumulative record go to this call's card, the ledger names this call, and
+/// its result is delivered as an ordinary task result. Only a launch can be owed
+/// a result as its own output on a model that takes asynchronous calls, and a
+/// resume is not one.
+///
+/// Needs no approval: the message only reaches a child of this conversation,
+/// whose own calls stay under the conversation's security policy.
+fn run_send_message(
+    pool: &AgentPool,
+    shadow: &crate::kernel_shadow::KernelShadow,
+    parent: &RunModelRequest,
+    call: ToolCall,
+    state: &AppState,
+    event_sink: &ModelEventSink<'_>,
+    round: usize,
+) -> Result<ToolExecution, String> {
+    if parent.subagent_depth >= 1 {
+        // A child never holds the tool (`SUBAGENT_DISABLED_TOOL_NAMES`); this is
+        // the defense-in-depth stop for any future call path.
+        return Ok(failed_tool_execution(
+            call,
+            "Subagents cannot message other agents.".into(),
+        ));
+    }
+    if !parent.subagent_messaging {
+        // Only granted where the conversation's subagent communication is on;
+        // the enabled-tool gate refuses it before this in every other run.
+        return Ok(failed_tool_execution(
+            call,
+            "send_message is not enabled in this conversation.".into(),
+        ));
+    }
+    let spec = match orchestration::parse_send_message(&call.input) {
+        Ok(spec) => spec,
+        Err(error) => return Ok(failed_tool_execution(call, error)),
+    };
+    let profile = &parent.prompt_profile;
+    let refuse = |call: ToolCall, key: PromptKey, to: &str| {
+        Ok(failed_tool_execution(
+            call,
+            profile.render(key, &[("to", to)]),
+        ))
+    };
+    let name = match orchestration::TaskRef::parse(&spec.to) {
+        Ok(orchestration::TaskRef::Agent(name)) => name,
+        // A workflow run, a shell command, a terminal or a dev server.
+        Ok(_) => return refuse(call, PromptKey::TaskSendNotAnAgent, &spec.to),
+        // Not even the shape of an agent's name: no child is called that.
+        Err(_) => return refuse(call, PromptKey::TaskSendUnknownTarget, &spec.to),
+    };
+    // The same names `task_stop` answers to: an ordinary child of this
+    // conversation, live or from its history. A workflow driver's pool name and a
+    // background command's host-chosen `aN` are tasks, not children.
+    let shared = match pool.find(&name) {
+        Some(shared) if shared.kind != SubagentRunKind::General => {
+            return refuse(call, PromptKey::TaskSendNotAnAgent, &name)
+        }
+        Some(_) => find_or_rehydrate_agent(pool, parent, state, &name),
+        None => match historical_agent_records(&parent.contexts).get(&name) {
+            Some(record) if record.kind != SubagentRunKind::General => {
+                return refuse(call, PromptKey::TaskSendNotAnAgent, &name)
+            }
+            Some(_) => find_or_rehydrate_agent(pool, parent, state, &name),
+            None => Ok(None),
+        },
+    };
+    let shared = match shared {
+        Ok(Some(shared)) => shared,
+        Ok(None) => return refuse(call, PromptKey::TaskSendUnknownTarget, &name),
+        Err(error) => return Ok(failed_tool_execution(call, error)),
+    };
+    let message = agents::MailboxMessage {
+        id: None,
+        content: spec.message,
+        images: Vec::new(),
+        files: Vec::new(),
+        created_at: Some(Utc::now().to_rfc3339()),
+    };
+    let identity = match pool.send_message(&shared, message, &call.id) {
+        agents::SendOutcome::Queued => {
+            return Ok(succeeded_send_message(
+                call,
+                profile.render(PromptKey::TaskSendQueued, &[("to", &name)]),
+            ))
+        }
+        agents::SendOutcome::ResultPending => {
+            return refuse(call, PromptKey::TaskSendResultPending, &name)
+        }
+        agents::SendOutcome::UserStopped => {
+            return refuse(call, PromptKey::TaskSendUserStopped, &name)
+        }
+        agents::SendOutcome::NotAnAgent => {
+            return refuse(call, PromptKey::TaskSendNotAnAgent, &name)
+        }
+        agents::SendOutcome::Retired => {
+            return Ok(failed_tool_execution(
+                call,
+                "This conversation was deleted, so nothing was sent.".into(),
+            ))
+        }
+        agents::SendOutcome::Resumed(identity) => identity,
+    };
+    // The resumed incarnation's spawn, in the slot its delivered result emptied.
+    shadow.agent_spawned(&name, identity);
+    // As `run_agent_spawn` does: the record as the resume made it, before the
+    // worker can move it on, for a startup that has to report the child lost.
+    let resume_record = (!parent.app_data_path.is_empty()).then(|| shared.record());
+    // Publishes `running` on this call's card before the child can produce any
+    // event, then starts the worker, which runs from the transcript plus the
+    // message waiting in its new mailbox.
+    start_registered_agent_worker(Arc::clone(&shared), state, event_sink, round, &call.id)?;
+    if let Some(resume_record) = resume_record {
+        crate::subagent_ledger::record_spawned(
+            Path::new(&parent.app_data_path),
+            &parent.conversation_id,
+            &name,
+            &call.id,
+            &resume_record,
+        );
+        state.note_ledgered_subagent(&parent.conversation_id, &name);
+    }
+    Ok(succeeded_send_message(
+        call,
+        profile.render(PromptKey::TaskSendResumed, &[("to", &name)]),
+    ))
+}
+
+fn succeeded_send_message(call: ToolCall, output: String) -> ToolExecution {
+    ToolExecution {
+        call,
+        result: ToolResult {
+            success: true,
+            output,
+            images: Vec::new(),
+            diff: None,
+            executed_at: Utc::now().to_rfc3339(),
+            duration_ms: 0,
+        },
+        subagent: None,
     }
 }
 
@@ -12389,12 +12691,8 @@ fn drive_background_shell(
     let _context = context;
     let incarnation = shared.identity();
     let started = Instant::now();
-    let cancel_shared = Arc::clone(&shared);
-    let cancel_probe = move || {
-        cancel_shared
-            .cancel
-            .load(std::sync::atomic::Ordering::Acquire)
-    };
+    let cancel_flag = shared.cancel_flag();
+    let cancel_probe = move || cancel_flag.load(std::sync::atomic::Ordering::Acquire);
     // The command's result is its caller's to read, in the caller's wording.
     let profile = shared.caller_prompt_profile();
     // An output too long to deliver is saved beside the conversation's other
@@ -12493,8 +12791,9 @@ fn drive_background_shell(
 /// The prepared `web_fetch` backends, resolved before spawn.
 ///
 /// The two are not variations on one request: `Native` asks the conversation's
-/// own upstream to retrieve the page with its server-side fetch tool, which
-/// hands back the page already converted to plain text, while `Provider` runs
+/// own upstream to retrieve the page with its server-side fetch tool (on Claude
+/// Agent, Claude Code's own `WebFetch`), which hands back the page already
+/// converted to plain text, while `Provider` runs
 /// the host's own HTTP pipeline against a catalog provider. Only families in
 /// [`crate::web_search::family_supports_native_fetch`] can take the first path.
 enum PreparedWebFetchBackend {
@@ -13207,6 +13506,10 @@ fn run_task_wait(
     // wait's own result: the wait claimed it — so it is delivered in the
     // kernel's terms — and the next round boundary places it on its call, in
     // the same request as this result. The wait says only that it arrived.
+    //
+    // A child that a `send_message` resumed was not started by the call that
+    // owns it now, and no launch is owed its new result: that result is part
+    // of this wait's own, like any task's on any other model.
     let mut on_calls = Vec::new();
     if crate::async_tools::takes_async_tools(&parent.provider, &parent.model) {
         let (to_calls, kept): (Vec<_>, Vec<_>) =
@@ -13220,6 +13523,7 @@ fn run_task_wait(
                                     agent.kind,
                                     SubagentRunKind::General | SubagentRunKind::WorkflowStep
                                 )
+                                && agent.latest_call_launched()
                         })
                 });
         outcome.envelopes = kept;
@@ -14476,6 +14780,31 @@ fn deliver_handoff_index(
     deliver_instruction(request, state, round, exchanges, generated, instruction);
 }
 
+/// Says how the host's messages and background results arrive
+/// (`system.host_messages`) where this run's system prompt does not and it now
+/// holds a tool that can start a background task: one enabled after the
+/// conversation opened without any, or a child holding one under such a
+/// prompt (`host_append::host_messages_owed`). An instruction, like the
+/// section it stands in for, so it takes the carrier one takes here.
+fn deliver_host_messages_note(
+    request: &mut RunModelRequest,
+    state: &AppState,
+    round: usize,
+    exchanges: &mut [Exchange],
+    generated: &mut Vec<ContextItem>,
+) {
+    let Some(content) = crate::host_append::host_messages_owed(request, generated.iter()) else {
+        return;
+    };
+    let instruction = Instruction {
+        topic: crate::host_append::HOST_MESSAGES_TOPIC,
+        notice_kind: crate::host_append::HOST_MESSAGES_NOTICE_KIND,
+        notice_id: None,
+        content,
+    };
+    deliver_instruction(request, state, round, exchanges, generated, instruction);
+}
+
 /// An instruction the host adds partway through a conversation, in both the
 /// forms it can take (`host_append.rs`).
 struct Instruction {
@@ -15232,7 +15561,8 @@ fn finalize_agent_pool(
                         tool_name.as_str(),
                         // `web_search` does not backfill a subagent record. Its
                         // durable surface is the registry row and folded notification.
-                        "agent_spawn" | "workflow"
+                        // A `send_message` owns the record of the child it resumed.
+                        "agent_spawn" | "workflow" | SEND_MESSAGE_TOOL
                     )
                 {
                     *subagent = record.take();
@@ -15379,13 +15709,17 @@ fn checkpoint_terminal_agent_records(
         else {
             continue;
         };
-        let owns_record = matches!(
-            &*card,
-            ContextItem::Tool { tool_name, .. } if matches!(
-                tool_name.as_str(),
-                "agent_spawn" | "workflow"
-            )
-        );
+        let (owns_record, resumed) = match &*card {
+            ContextItem::Tool { tool_name, .. } => (
+                matches!(
+                    tool_name.as_str(),
+                    // A `send_message` owns the record of the child it resumed.
+                    "agent_spawn" | "workflow" | SEND_MESSAGE_TOOL
+                ),
+                tool_name == SEND_MESSAGE_TOOL,
+            ),
+            _ => (false, false),
+        };
         if !owns_record {
             continue;
         }
@@ -15394,22 +15728,29 @@ fn checkpoint_terminal_agent_records(
             &*card,
             ContextItem::Tool { subagent: Some(existing), .. } if *existing == record
         );
-        if unchanged {
+        // A resumed child's earlier cards — its spawn's, an earlier resume's —
+        // may still hold a record when this one already does: the run that
+        // settled it backfilled only its own new card at its end, with no
+        // boundary left to clear the others. So for a resume the clearing
+        // below runs even when the owner's record is unchanged.
+        if unchanged && !resumed {
             continue;
         }
         let agent_name = record.name.clone();
-        if let ContextItem::Tool { subagent, .. } = &mut *card {
-            *subagent = Some(record);
+        if !unchanged {
+            if let ContextItem::Tool { subagent, .. } = &mut *card {
+                *subagent = Some(record);
+            }
+            publish_settled_card(
+                card,
+                conversation_id,
+                workspace_path,
+                state,
+                event_sink,
+                round,
+            );
+            updates.push(card.clone());
         }
-        publish_settled_card(
-            card,
-            conversation_id,
-            workspace_path,
-            state,
-            event_sink,
-            round,
-        );
-        updates.push(card.clone());
         let Some(agent_name) = agent_name else {
             continue;
         };
@@ -17079,6 +17420,7 @@ mod tests {
             web_search: Default::default(),
             native_search_call: false,
             web_search_enabled: false,
+            subagent_messaging: false,
             native_fetch_call: None,
             run_environment: Default::default(),
             workspaces: Default::default(),
@@ -17090,6 +17432,7 @@ mod tests {
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
             host_message_container: Default::default(),
+            host_messages_in_prompt: true,
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
             model: {
@@ -17458,6 +17801,111 @@ mod tests {
         reconcile_plan_mode(&mut request, &state, 3, &mut [], &mut generated);
         assert_eq!(kinds(&request.contexts), ["plan_mode", "plan_mode_exit"]);
         assert!(!crate::plan_mode::transcript_in_plan_mode(request.contexts.iter()));
+    }
+
+    /// A system prompt assembled without a tool that can start a background
+    /// task does not say how background results and the host's messages
+    /// arrive. The first boundary that offers such a tool says it, once, in
+    /// the carrier an instruction takes there — and the system prompt itself
+    /// does not move.
+    #[test]
+    fn a_task_tool_joining_a_prompt_without_the_host_message_note_brings_it_once() {
+        let state = AppState::default();
+        let note = |request: &RunModelRequest| {
+            request
+                .prompt_profile
+                .text(crate::prompt_profile::PromptKey::SystemHostMessages)
+                .trim()
+                .to_owned()
+        };
+        let topics = |contexts: &[ContextItem]| {
+            contexts
+                .iter()
+                .filter_map(|context| crate::system_append::topic(context).map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let kinds = |contexts: &[ContextItem]| {
+            contexts
+                .iter()
+                .filter_map(|context| {
+                    crate::wire_history::host_notice_kind(context).map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // A model that takes a system message mid-conversation.
+        let mut request = run_request(ProviderFamily::OpenaiResponses);
+        request
+            .model
+            .capabilities
+            .insert(crate::model::ModelCapability::SystemAppend);
+        request.host_messages_in_prompt = false;
+        request.enabled_tools = vec!["read".into(), "edit".into()];
+        let (stable_before, dynamic_before) = crate::aisdk::step::system_prompt_parts(&request);
+        let mut generated = Vec::new();
+
+        // Nothing that starts a task: nothing to say.
+        deliver_host_messages_note(&mut request, &state, 1, &mut [], &mut generated);
+        assert!(generated.is_empty());
+
+        // `bash` joins: the note lands at the end of the transcript.
+        request.enabled_tools.push("bash".into());
+        deliver_host_messages_note(&mut request, &state, 2, &mut [], &mut generated);
+        assert_eq!(topics(&request.contexts), ["host-messages"]);
+        assert!(matches!(
+            request.contexts.last(),
+            Some(ContextItem::System { content, .. }) if *content == note(&request)
+        ));
+        assert_eq!(
+            crate::aisdk::step::system_prompt_parts(&request),
+            (stable_before, dynamic_before),
+            "an appended system prompt never enters the system prompt"
+        );
+
+        // Told once, whatever joins after it.
+        request.enabled_tools.push("agent_spawn".into());
+        deliver_host_messages_note(&mut request, &state, 3, &mut [], &mut generated);
+        assert_eq!(topics(&request.contexts), ["host-messages"]);
+
+        // A child starts from a transcript of its own under the same prompt,
+        // so it is owed the note at its own first boundary.
+        let mut child = agent_child_template(&request);
+        assert!(!child.host_messages_in_prompt);
+        child.enabled_tools.push("bash".into());
+        let mut child_generated = Vec::new();
+        deliver_host_messages_note(&mut child, &state, 1, &mut [], &mut child_generated);
+        assert_eq!(topics(&child.contexts), ["host-messages"]);
+
+        // Where no system message is taken: a `<system-reminder>`, told once.
+        let mut request = run_request(ProviderFamily::OpenaiCompatible);
+        request.host_messages_in_prompt = false;
+        request.enabled_tools = vec!["read".into(), "powershell".into()];
+        let mut generated = Vec::new();
+        deliver_host_messages_note(&mut request, &state, 1, &mut [], &mut generated);
+        assert_eq!(kinds(&request.contexts), ["host_messages"]);
+        assert!(!request.contexts.iter().any(|context| crate::system_append::is_appended(context)));
+        let message = crate::wire_history::host_delivery(request.contexts.last().unwrap())
+            .expect("a host delivery")
+            .message;
+        assert!(message.starts_with("<system-reminder>\n"), "{message}");
+        assert!(message.contains(&note(&request)), "{message}");
+        deliver_host_messages_note(&mut request, &state, 2, &mut [], &mut generated);
+        assert_eq!(kinds(&request.contexts), ["host_messages"]);
+
+        // A prompt that already says it, and a conversation whose host
+        // messages come in `box`, are owed nothing.
+        for (in_prompt, container) in [
+            (true, crate::model::HostMessageContainer::User),
+            (false, crate::model::HostMessageContainer::Box),
+        ] {
+            let mut request = run_request(ProviderFamily::OpenaiCompatible);
+            request.host_messages_in_prompt = in_prompt;
+            request.host_message_container = container;
+            request.enabled_tools = vec!["bash".into()];
+            let mut generated = Vec::new();
+            deliver_host_messages_note(&mut request, &state, 1, &mut [], &mut generated);
+            assert!(generated.is_empty(), "{in_prompt} {container:?}");
+        }
     }
 
     /// A run loop pointed at `address`, in plan mode as `trusted_run_request`
@@ -19994,6 +20442,7 @@ mod tests {
             environment: "# Environment of the turn".into(),
             prompt_profile_id: parent.prompt_profile.id.clone(),
             environment_facts: Default::default(),
+            environment_enabled: true,
             host_messages_in_user: false,
             skill_ids: Vec::new(),
             mcp_ids: Vec::new(),
@@ -25714,6 +26163,15 @@ mod tests {
         // The whole catalog, less what follows the run rather than a list:
         // `box` is declared only where host messages come in it.
         crate::agents::apply_task_runtime_tools(&mut request.enabled_tools, request.host_message_container);
+        crate::agents::apply_subagent_messaging_tool(&mut request.enabled_tools, request.subagent_messaging);
+        request
+    }
+
+    /// `request` as a conversation with subagent communication on would send it:
+    /// the main agent holds `send_message` and its children hold `subagent_update`.
+    fn with_subagent_messaging(mut request: RunModelRequest) -> RunModelRequest {
+        request.subagent_messaging = true;
+        crate::agents::apply_subagent_messaging_tool(&mut request.enabled_tools, true);
         request
     }
 
@@ -26735,7 +27193,9 @@ mod tests {
 
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("probe.txt"), "probe-content").unwrap();
-        let request = loop_request_for(address, workspace.path());
+        // The child reports progress through `subagent_update`, which a child holds
+        // only while the conversation's subagent communication is on.
+        let request = with_subagent_messaging(loop_request_for(address, workspace.path()));
         let conversation_id = request.conversation_id.clone();
         let events = Arc::new(Mutex::new(Vec::new()));
         let event_capture = Arc::clone(&events);
@@ -26892,14 +27352,18 @@ mod tests {
             serde_json::from_str(child_bodies[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         // AI SDK sends system prompts as input items rather than top-level instructions.
         // This verifies that the child instruction reaches the model, not its field location.
+        // The first paragraph, as this child — which holds the update tool —
+        // reads it: the key's markers resolved against its own tools.
+        let addendum_opening = crate::tool_mentions::resolve(
+            PromptKey::SubagentAddendum
+                .builtin_text()
+                .lines()
+                .next()
+                .unwrap(),
+            &crate::tool_mentions::OfferedTools::from_names([SUBAGENT_UPDATE_TOOL]),
+        );
         assert!(
-            child_bodies[0].contains(
-                PromptKey::SubagentAddendum
-                    .builtin_text()
-                    .lines()
-                    .next()
-                    .unwrap()
-            ),
+            child_bodies[0].contains(&*addendum_opening),
             "子代理系统提示词必须抵达模型：{}",
             child_bodies[0]
         );
@@ -27849,7 +28313,7 @@ mod tests {
         let (ok, output) = stop_with(&pool, &request, &state, "reviewer");
         assert!(ok, "{output}");
         assert!(output.starts_with("Stopping reviewer (review the diff)"), "{output}");
-        assert!(reviewer.cancel.load(Ordering::Acquire));
+        assert!(reviewer.is_cancelled());
         assert_eq!(
             reviewer.stop_attribution(),
             Some(agents::StopOrigin::Model),
@@ -27875,7 +28339,7 @@ mod tests {
         );
         assert!(stop_with(&pool, &request, &state, "workflow:audit").0);
         assert!(stop_with(&pool, &request, &state, "sweep").0);
-        assert!(audit.cancel.load(Ordering::Acquire) && sweep.cancel.load(Ordering::Acquire));
+        assert!(audit.is_cancelled() && sweep.is_cancelled());
         assert_eq!(audit.stop_attribution(), Some(agents::StopOrigin::Model));
         assert_eq!(sweep.stop_attribution(), Some(agents::StopOrigin::Model));
     }
@@ -27973,7 +28437,7 @@ mod tests {
         let (ok, output) = stop_with(&child_pool, &request, &state, "reviewer");
         assert!(!ok && output.contains("There is no subagent named reviewer"), "{output}");
         assert!(!command.stop_requested());
-        assert!(!reviewer.cancel.load(Ordering::Acquire));
+        assert!(!reviewer.is_cancelled());
 
         // Its own, it can stop.
         let own = state
@@ -33087,6 +33551,9 @@ mod tests {
         parent.tools = catalog::tool_catalog();
         parent.enabled_tools = parent.tools.iter().map(|tool| tool.name.clone()).collect();
         parent.reasoning_effort = ReasoningEffort::High;
+        // Subagent communication on: the child holds the update tool the
+        // allowlist below must leave alone.
+        parent.subagent_messaging = true;
         let base = agent_child_template(&parent);
         assert!(!base.enabled_tools.is_empty());
         assert!(
@@ -34840,6 +35307,7 @@ mod tests {
     fn subagent_update_follows_the_parent_english_tool_defaults() {
         let mut parent = run_request(ProviderFamily::OpenaiResponses);
         parent.tools = catalog::tool_catalog_for_language(crate::model::ResolvedLanguage::EnUs);
+        parent.subagent_messaging = true;
 
         let child = agent_child_template(&parent);
         let update = child
@@ -34869,6 +35337,186 @@ mod tests {
             update.parameters[0].help.as_deref(),
             Some("Describe current progress, important findings, or the next step.")
         );
+    }
+
+    /// A child holds `subagent_update` — descriptor and enabled name both — exactly
+    /// while its parent's agent tree talks (`subagent_messaging`, copied down from
+    /// the conversation's switch with `agent_spawn` enabled), and the answer is
+    /// the same whichever direction the template is derived from: a child
+    /// request used as a parent (an accounting template) keeps it, and one whose
+    /// switch has since gone off loses it. No child ever holds `send_message`.
+    #[test]
+    fn a_child_holds_the_update_tool_only_while_the_conversation_lets_its_agents_talk() {
+        let update_tool = |request: &RunModelRequest| {
+            (
+                request
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.name == SUBAGENT_UPDATE_TOOL)
+                    .count(),
+                request
+                    .enabled_tools
+                    .iter()
+                    .filter(|name| *name == SUBAGENT_UPDATE_TOOL)
+                    .count(),
+            )
+        };
+        let mut parent = run_request(ProviderFamily::OpenaiResponses);
+        parent.tools = catalog::tool_catalog();
+        parent.enabled_tools = parent.tools.iter().map(|tool| tool.name.clone()).collect();
+        parent.assembled_system_prompt = "Parent prompt.".into();
+
+        // Off, the default: neither the descriptor nor the name, and the
+        // child is not told to use a tool it cannot call.
+        assert!(!parent.subagent_messaging);
+        let silent = agent_child_template(&parent);
+        assert_eq!(update_tool(&silent), (0, 0));
+        assert!(!silent.subagent_messaging);
+        assert!(
+            !silent.assembled_system_prompt.contains("update tool"),
+            "{}",
+            silent.assembled_system_prompt
+        );
+        // The rest of the surface is untouched: the descriptor is simply absent
+        // and every other name a child inherits is still there.
+        assert!(silent.enabled_tools.iter().any(|name| name == "read"));
+
+        // On: one of each, and the addendum says to use it.
+        let mut talking_parent = with_subagent_messaging(parent.clone());
+        talking_parent.tools = catalog::tool_catalog();
+        let talking = agent_child_template(&talking_parent);
+        assert_eq!(update_tool(&talking), (1, 1));
+        assert!(talking.subagent_messaging);
+        assert!(
+            talking
+                .assembled_system_prompt
+                .contains("Report significant progress with the update tool."),
+            "{}",
+            talking.assembled_system_prompt
+        );
+        // The talking child is also told the main agent may message it, which
+        // the silent one is not; otherwise the two prompts are the same
+        // (`subagent_prompt` pins the passages themselves).
+        assert!(
+            talking
+                .assembled_system_prompt
+                .contains("any later messages the main agent sends you"),
+            "{}",
+            talking.assembled_system_prompt
+        );
+        assert!(
+            silent
+                .assembled_system_prompt
+                .contains("nothing more reaches you while you run"),
+            "{}",
+            silent.assembled_system_prompt
+        );
+        let base = |prompt: &str| {
+            prompt
+                .split_once("You are a child agent spawned by the main agent.")
+                .map(|(base, _)| base.to_owned())
+                .unwrap()
+        };
+        assert_eq!(
+            base(&talking.assembled_system_prompt),
+            base(&silent.assembled_system_prompt)
+        );
+
+        // Idempotent both ways: a child request as the parent of an accounting
+        // template, and a template derived twice, hold exactly one.
+        assert_eq!(update_tool(&agent_child_template(&talking)), (1, 1));
+        assert_eq!(update_tool(&agent_child_template(&silent)), (0, 0));
+        // A child request that carries the tool while its switch is off — a
+        // template rehydrated after the user turned the switch off — loses it.
+        let mut stale = talking.clone();
+        stale.subagent_messaging = false;
+        assert_eq!(update_tool(&agent_child_template(&stale)), (0, 0));
+        // And one that lacks it under a switch that is on gets it.
+        let mut late = silent.clone();
+        late.subagent_messaging = true;
+        assert_eq!(update_tool(&agent_child_template(&late)), (1, 1));
+
+        // The main agent's messaging tool never reaches a child, whatever the
+        // parent holds, though its descriptor stays known (like `agent_spawn`).
+        assert!(talking_parent
+            .enabled_tools
+            .iter()
+            .any(|name| name == SEND_MESSAGE_TOOL));
+        for child in [&silent, &talking] {
+            assert!(!child
+                .enabled_tools
+                .iter()
+                .any(|name| name == SEND_MESSAGE_TOOL));
+            assert!(!child.enabled_tools.iter().any(|name| name == "agent_spawn"));
+        }
+        assert!(talking
+            .tools
+            .iter()
+            .any(|tool| tool.name == SEND_MESSAGE_TOOL));
+        assert!(subagent_tool_is_disabled(SEND_MESSAGE_TOOL));
+        // A fork replays none of the main session's calls to it either.
+        assert!(!host_derived_child_tool(SEND_MESSAGE_TOOL));
+    }
+
+    /// A named role's child follows the switch the same way, whatever its
+    /// allowlist says: the update tool is host-derived (`host_derived_child_tool`),
+    /// so a role that never mentions it keeps it where the conversation talks and
+    /// cannot conjure it where it does not — at a spawn and at a resume alike.
+    #[test]
+    fn a_role_child_follows_the_switch_for_the_update_tool_whatever_its_allowlist() {
+        let (directory, state, parent, mut definition) =
+            named_agent_fixture(AgentDefinitionMemory::None);
+        definition.tools = Some(vec!["read".into(), SUBAGENT_UPDATE_TOOL.into()]);
+        select_test_roles(&state, directory.path(), &parent, vec![definition.clone()]);
+        let document = current_agent_document(&parent, &state).unwrap();
+        let (binding, _, _) =
+            initial_agent_definition_binding(&parent, &document, &definition).unwrap();
+        let record = sign_test_subagent_record(
+            &parent,
+            &state,
+            SubagentRunRecord {
+                kind: SubagentRunKind::General,
+                name: Some("a1".into()),
+                label: None,
+                inherits_model_memory: false,
+                fork_model_binding: None,
+                agent_definition: Some(binding),
+                execution_mode_receipt: String::new(),
+                task: "Review".into(),
+                status: SubagentRunStatus::Completed,
+                contexts: Vec::new(),
+                updates: Vec::new(),
+                structured_output: None,
+                output_schema: None,
+                usage: ModelUsage::default(),
+            },
+        );
+        for talks in [false, true] {
+            let mut parent = parent.clone();
+            parent.subagent_messaging = talks;
+            let mut spawned = agent_child_template(&parent);
+            apply_named_role_to_fresh_template(&parent, &state, &mut spawned, "reviewer").unwrap();
+            let resumed = build_rehydrated_agent_template(&parent, &state, "a1", &record).unwrap();
+            for (how, child) in [("spawned", &spawned), ("resumed", &resumed)] {
+                let named = child
+                    .enabled_tools
+                    .iter()
+                    .any(|name| name == SUBAGENT_UPDATE_TOOL);
+                let described = child
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == SUBAGENT_UPDATE_TOOL);
+                assert_eq!((named, described), (talks, talks), "{how}, switch {talks}");
+                assert_eq!(
+                    child.assembled_system_prompt.contains("update tool"),
+                    talks,
+                    "{how}, switch {talks}: {}",
+                    child.assembled_system_prompt
+                );
+                assert_eq!(child.subagent_messaging, talks, "{how}");
+            }
+        }
+        state.document_store.flush(Duration::from_secs(10)).unwrap();
     }
 
     /// A parent that can be forked AND restored. `restore_conversation_fork_binding`
@@ -35110,12 +35758,26 @@ mod tests {
             },
         );
         let resumed = build_rehydrated_agent_template(&parent, &state, "a1", &record).unwrap();
-        let addendum = profile.text(PromptKey::SubagentAddendum);
-        for prompt in [&child.assembled_system_prompt, &resumed.assembled_system_prompt] {
+        // The key's text with its markers resolved against the child's own tools:
+        // this parent does not talk to its children, so neither child holds the
+        // update tool and neither is told to use it.
+        let addendum = |tools: &[String]| {
+            crate::tool_mentions::resolve(
+                profile.text(PromptKey::SubagentAddendum),
+                &crate::tool_mentions::OfferedTools::from_names(tools.iter().map(String::as_str)),
+            )
+            .into_owned()
+        };
+        for template in [&child, &resumed] {
+            let prompt = &template.assembled_system_prompt;
             assert!(!prompt.contains(shell), "{prompt}");
             assert!(!prompt.contains("task_wait"), "{prompt}");
             assert!(!prompt.contains(browser), "{prompt}");
-            assert!(prompt.ends_with(addendum), "{prompt}");
+            assert!(!prompt.contains("update tool"), "{prompt}");
+            assert!(
+                prompt.ends_with(&addendum(&template.enabled_tools)),
+                "{prompt}"
+            );
         }
         state.document_store.flush(Duration::from_secs(10)).unwrap();
     }
@@ -35155,7 +35817,7 @@ mod tests {
             date: "2026-10-08".into(),
             ..Default::default()
         };
-        let environment = crate::run_environment_block(&profile, &facts, false);
+        let environment = crate::run_environment_block(&profile, &facts, true, false);
         parent.assembled_system_prompt = crate::assemble_system_prompt(&environment, "");
         parent.role_basis = Arc::new(crate::capabilities::RoleBasis {
             environment,
@@ -35195,6 +35857,8 @@ mod tests {
         use crate::prompt_profile::{BUILTIN_ID, RETIRED_GUIDED_ID};
         let (directory, state, mut parent, definition) =
             named_agent_fixture(AgentDefinitionMemory::None);
+        // The role's child holds the update tool this test checks the wording of.
+        parent.subagent_messaging = true;
         let facts = run_parent_on_marked_profile(&mut parent);
         for (chosen, expected) in [
             (BUILTIN_ID, PromptProfile::builtin()),
@@ -40774,6 +41438,976 @@ mod tests {
         );
     }
 
+    // ---- send_message ----------------------------------------------------
+
+    /// What a scripted model server has seen, and the child requests it is
+    /// holding back so the test decides when each child gets its answer.
+    struct ScriptedServer {
+        listener: TcpListener,
+        parent: Vec<String>,
+        child: Vec<String>,
+        held: std::collections::VecDeque<TcpStream>,
+    }
+
+    impl ScriptedServer {
+        /// Answers the oldest held child request.
+        fn release(&mut self, response: &Value) {
+            let mut stream = self.held.pop_front().expect("a held child request");
+            write_json_response(&mut stream, "200 OK", response);
+        }
+
+        /// Takes the next request, which must be a child's, and holds it. Only
+        /// for a step that blocks the parent on its own request: nothing else
+        /// can arrive meanwhile but the child.
+        fn await_child(&mut self) {
+            let mut stream = accept_within(&self.listener, FIXTURE_ACCEPT_BUDGET)
+                .expect("the child never made its request");
+            let body = read_http_request_with_body(&mut stream);
+            assert!(is_child_request(&body), "{body}");
+            self.child.push(body);
+            self.held.push_back(stream);
+        }
+    }
+
+    enum ScriptStep {
+        Respond(Value),
+        /// Keep the connection; a later step answers it with `release`.
+        Hold,
+        /// Answer and stop serving: the parent's final request.
+        Finish(Value),
+    }
+
+    /// One model server for a parent run and the child runs it starts, each
+    /// request answered by `script` from what the server has seen so far
+    /// (`is_child` says which side sent it; the body is already recorded).
+    /// Background children make the arrival order of parent and child requests
+    /// nondeterministic, so a script that cares holds a child's request until
+    /// the parent has got as far as it needs.
+    fn serve_scripted(
+        listener: TcpListener,
+        mut script: impl FnMut(&mut ScriptedServer, bool) -> ScriptStep + Send + 'static,
+    ) -> thread::JoinHandle<(Vec<String>, Vec<String>)> {
+        thread::spawn(move || {
+            let mut server = ScriptedServer {
+                listener,
+                parent: Vec::new(),
+                child: Vec::new(),
+                held: std::collections::VecDeque::new(),
+            };
+            loop {
+                let mut stream = accept_within(&server.listener, FIXTURE_ACCEPT_BUDGET)
+                    .expect("the run stopped making requests");
+                let body = read_http_request_with_body(&mut stream);
+                let is_child = is_child_request(&body);
+                if is_child {
+                    server.child.push(body);
+                } else {
+                    server.parent.push(body);
+                }
+                match script(&mut server, is_child) {
+                    ScriptStep::Respond(response) => {
+                        write_json_response(&mut stream, "200 OK", &response)
+                    }
+                    ScriptStep::Hold => server.held.push_back(stream),
+                    ScriptStep::Finish(response) => {
+                        write_json_response(&mut stream, "200 OK", &response);
+                        assert!(server.held.is_empty(), "a child request was never answered");
+                        return (server.parent, server.child);
+                    }
+                }
+            }
+        })
+    }
+
+    fn send_message_call(call_id: &str, to: &str, message: &str) -> Value {
+        json!({"type":"function_call","status":"completed","call_id":call_id,"name":SEND_MESSAGE_TOOL,
+            "arguments": json!({"to": to, "message": message}).to_string()})
+    }
+
+    fn calls_response(calls: Vec<Value>) -> Value {
+        json!({
+            "model": "model-test",
+            "status": "completed",
+            "output": calls,
+            "usage": {"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        })
+    }
+
+    /// The card a run minted for the call `call_id`.
+    fn card_of<'a>(contexts: &'a [ContextItem], call_id: &str) -> &'a ContextItem {
+        contexts
+            .iter()
+            .find(|context| {
+                matches!(
+                    context,
+                    ContextItem::Tool { provider_call_id: Some(call), id, .. }
+                        if call == call_id && !id.starts_with(AGENT_RESULT_CONTEXT_ID_PREFIX)
+                )
+            })
+            .unwrap_or_else(|| panic!("no card for {call_id}"))
+    }
+
+    fn card_result<'a>(contexts: &'a [ContextItem], call_id: &str) -> &'a ToolResult {
+        match card_of(contexts, call_id) {
+            ContextItem::Tool { result, .. } => result,
+            _ => unreachable!(),
+        }
+    }
+
+    fn card_record<'a>(
+        contexts: &'a [ContextItem],
+        call_id: &str,
+    ) -> Option<&'a SubagentRunRecord> {
+        match card_of(contexts, call_id) {
+            ContextItem::Tool { subagent, .. } => subagent.as_ref(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn child_input(body: &str) -> Vec<Value> {
+        request_body(body)["input"].as_array().unwrap().clone()
+    }
+
+    fn receipt(key: PromptKey, to: &str) -> String {
+        PromptProfile::builtin().render(key, &[("to", to)])
+    }
+
+    /// A message to a child that is still running is queued in its mailbox and
+    /// read before its next model request — here one the child would not have
+    /// made at all: it had just given its final answer, and the message found
+    /// waiting at the end of the run sends it round once more. The child stays
+    /// the incarnation it was, its record stays on the spawn's card, and its
+    /// live view shows the message as the user context it became.
+    #[test]
+    fn a_running_child_reads_a_queued_message_before_its_next_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_scripted(listener, |server, is_child| {
+            if is_child {
+                return match server.child.len() {
+                    // Answered only once the parent has queued the message.
+                    1 if server.parent.len() < 3 => ScriptStep::Hold,
+                    1 => ScriptStep::Respond(responses_text_output("first answer")),
+                    _ => ScriptStep::Respond(responses_text_output("answer after the message")),
+                };
+            }
+            match server.parent.len() {
+                1 => ScriptStep::Respond(function_call_response(
+                    "call-spawn",
+                    "agent_spawn",
+                    json!({"prompt": "review the parser", "name": "a1"}),
+                )),
+                2 => ScriptStep::Respond(calls_response(vec![send_message_call(
+                    "call-send",
+                    "a1",
+                    "also check the tests",
+                )])),
+                3 => {
+                    if !server.held.is_empty() {
+                        server.release(&responses_text_output("first answer"));
+                    }
+                    ScriptStep::Respond(function_call_response(
+                        "call-wait",
+                        "task_wait",
+                        json!({"tasks": ["a1"], "timeout_seconds": 60}),
+                    ))
+                }
+                _ => ScriptStep::Finish(responses_text_output("done")),
+            }
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let request = with_subagent_messaging(loop_request_for(address, workspace.path()));
+        let state = AppState::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        install_collecting_surface(&state, &request.conversation_id, Arc::clone(&events));
+
+        let response = run_model(request.clone(), &state, &discard_event, &approve_tool).unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let (_, child_bodies) = server.join().unwrap();
+
+        let sent = card_result(&response.contexts, "call-send");
+        assert!(sent.success, "{}", sent.output);
+        assert_eq!(sent.output, receipt(PromptKey::TaskSendQueued, "a1"));
+        // The child's last request carries the message as a user message, after
+        // its first answer when it got that far before the message arrived.
+        let last = child_input(child_bodies.last().unwrap());
+        assert!(
+            has_message(&last, "user", "also check the tests"),
+            "{last:?}"
+        );
+        assert!(has_message(&last, "user", "review the parser"), "{last:?}");
+        let wait = card_result(&response.contexts, "call-wait");
+        assert!(
+            wait.output.contains("answer after the message"),
+            "{}",
+            wait.output
+        );
+
+        let tasks = state.conversation_tasks(&request.conversation_id);
+        let child = tasks.pool.find("a1").unwrap();
+        assert_eq!(
+            child.identity().generation,
+            1,
+            "a queued message resumes nothing"
+        );
+        // The spawn's card keeps the record, which holds the message as the user
+        // context the child read; the queued call's card holds none.
+        assert!(card_record(&response.contexts, "call-send").is_none());
+        let record = card_record(&response.contexts, "call-spawn").expect("the spawn's record");
+        assert!(record.contexts.iter().any(|context| matches!(
+            context,
+            ContextItem::User { id, content, .. }
+                if id.starts_with("ctx_steer-message_") && content == "also check the tests"
+        )));
+        assert!(record.contexts.iter().any(|context| matches!(
+            context,
+            ContextItem::Assistant { content, .. } if content == "answer after the message"
+        )));
+        // The live view of the child shows it too.
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::SubagentEvent { call_id, event, .. }
+                if call_id == "call-spawn" && matches!(
+                    event.as_ref(),
+                    ModelStreamEvent::HostContextAdded { context, .. }
+                        if matches!(context.as_ref(), ContextItem::User { content, .. } if content == "also check the tests")
+                )
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::SubagentEvent { event, .. }
+                if matches!(event.as_ref(), ModelStreamEvent::UserInputReceived { .. })
+        )));
+        assert!(
+            tasks.shadow.divergences().is_empty(),
+            "{:?}",
+            tasks.shadow.divergences()
+        );
+    }
+
+    /// A message to a child whose run has ended but whose result has not
+    /// reached the model is refused, and nothing changes. Once the result is
+    /// delivered, the next message resumes the child in the background: the
+    /// next generation of the same task, running on its whole transcript plus
+    /// the message, streaming into the `send_message` card, whose record it
+    /// owns from then on. Its result arrives once, like any task result.
+    #[test]
+    fn a_finished_child_is_resumed_only_once_its_result_was_delivered() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let request = with_subagent_messaging(loop_request_for(address, workspace.path()));
+        let conversation_id = request.conversation_id.clone();
+        let state = AppState::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        install_collecting_surface(&state, &conversation_id, Arc::clone(&events));
+        let server_state = state.clone();
+        let server_conversation = conversation_id.clone();
+        let server = serve_scripted(listener, move |server, is_child| {
+            if is_child {
+                return match server.child.len() {
+                    1 if server.parent.len() < 2 => ScriptStep::Hold,
+                    1 => ScriptStep::Respond(responses_text_output("first answer")),
+                    // The resumed run: answered once the parent is waiting for it.
+                    _ if server.parent.len() < 4 => ScriptStep::Hold,
+                    _ => ScriptStep::Respond(responses_text_output("second answer")),
+                };
+            }
+            match server.parent.len() {
+                1 => ScriptStep::Respond(function_call_response(
+                    "call-spawn",
+                    "agent_spawn",
+                    json!({"prompt": "survey the repository", "name": "a1"}),
+                )),
+                2 => {
+                    // The child finishes after this round's boundary delivered
+                    // nothing, so its result is still on its way.
+                    if server.child.is_empty() {
+                        server.await_child();
+                    }
+                    server.release(&responses_text_output("first answer"));
+                    let pool = &server_state.conversation_tasks(&server_conversation).pool;
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while !pool.has_undrained_foldable_results() {
+                        assert!(Instant::now() < deadline, "the child never finished");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    ScriptStep::Respond(calls_response(vec![send_message_call(
+                        "call-send-early",
+                        "a1",
+                        "too early",
+                    )]))
+                }
+                3 => ScriptStep::Respond(calls_response(vec![send_message_call(
+                    "call-send",
+                    "a1",
+                    "now continue",
+                )])),
+                4 => {
+                    if !server.held.is_empty() {
+                        server.release(&responses_text_output("second answer"));
+                    }
+                    ScriptStep::Respond(function_call_response(
+                        "call-wait",
+                        "task_wait",
+                        json!({"tasks": ["a1"], "timeout_seconds": 60}),
+                    ))
+                }
+                _ => ScriptStep::Finish(responses_text_output("done")),
+            }
+        });
+
+        // Run events and the conversation surface feed the same collector.
+        let run_events = Arc::clone(&events);
+        let response = run_model(
+            request.clone(),
+            &state,
+            &move |event| {
+                run_events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+                Ok(())
+            },
+            &approve_tool,
+        )
+        .unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let (parent_bodies, child_bodies) = server.join().unwrap();
+
+        let early = card_result(&response.contexts, "call-send-early");
+        assert!(!early.success);
+        assert_eq!(
+            early.output,
+            receipt(PromptKey::TaskSendResultPending, "a1")
+        );
+        let resumed = card_result(&response.contexts, "call-send");
+        assert!(resumed.success, "{}", resumed.output);
+        assert_eq!(resumed.output, receipt(PromptKey::TaskSendResumed, "a1"));
+        // The model read the first result before it resumed the child.
+        assert!(parent_bodies[2].contains("first answer"));
+
+        // The resumed run starts from the whole transcript plus the message,
+        // and the refused message never reached it.
+        assert_eq!(child_bodies.len(), 2);
+        let resumed_input = child_input(&child_bodies[1]);
+        assert!(
+            has_message(&resumed_input, "user", "survey the repository"),
+            "{resumed_input:?}"
+        );
+        assert!(
+            has_message(&resumed_input, "assistant", "first answer"),
+            "{resumed_input:?}"
+        );
+        assert!(
+            has_message(&resumed_input, "user", "now continue"),
+            "{resumed_input:?}"
+        );
+        assert!(!child_bodies[1].contains("too early"));
+
+        // Its result came back once: in the wait, not folded as well.
+        let wait = card_result(&response.contexts, "call-wait");
+        assert!(wait.output.contains("second answer"), "{}", wait.output);
+        let deliveries = |text: &str| {
+            response
+                .contexts
+                .iter()
+                .filter(|context| matches!(
+                    context,
+                    ContextItem::Tool { id, result, .. }
+                        if id.starts_with(AGENT_RESULT_CONTEXT_ID_PREFIX) && result.output.contains(text)
+                ))
+                .count()
+        };
+        assert_eq!(deliveries("first answer"), 1);
+        assert_eq!(deliveries("second answer"), 0);
+
+        // The next generation of the same task, owned by the resuming call.
+        let tasks = state.conversation_tasks(&conversation_id);
+        let child = tasks.pool.find("a1").unwrap();
+        assert_eq!(child.identity().generation, 2);
+        assert_eq!(child.latest_call_id(), "call-send");
+        let record = card_record(&response.contexts, "call-send").expect("the resume's record");
+        assert_eq!(record.status, SubagentRunStatus::Completed);
+        for text in ["first answer", "second answer"] {
+            assert!(
+                record.contexts.iter().any(|context| matches!(
+                    context,
+                    ContextItem::Assistant { content, .. } if content == text
+                )),
+                "{text}"
+            );
+        }
+        assert!(record.contexts.iter().any(|context| matches!(
+            context,
+            ContextItem::User { content, .. } if content == "now continue"
+        )));
+        assert!(
+            card_record(&response.contexts, "call-spawn").is_none(),
+            "one card holds the record"
+        );
+        assert!(card_record(&response.contexts, "call-send-early").is_none());
+        // The delivered result settled the ledger the resume opened again.
+        assert!(!workspace
+            .path()
+            .join("subagents")
+            .join(&conversation_id)
+            .join("agent-a1.json")
+            .exists());
+
+        // The resumed run streams into the resuming call's card.
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let statuses = |call: &str| {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    ModelStreamEvent::SubagentDelta {
+                        call_id,
+                        channel: SubagentChannel::Status,
+                        delta,
+                        ..
+                    } if call_id == call && !delta.is_empty() => Some(delta.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            statuses("call-send").first().map(String::as_str),
+            Some("running")
+        );
+        assert!(statuses("call-send").iter().any(|status| status == "idle"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::SubagentEvent { call_id, .. } if call_id == "call-send"
+        )));
+        assert!(statuses("call-send-early").is_empty());
+        // The kernel saw a spawn into the slot the delivered result emptied.
+        assert!(
+            tasks.shadow.divergences().is_empty(),
+            "{:?}",
+            tasks.shadow.divergences()
+        );
+    }
+
+    /// Two messages to a finished child in one response: the first resumes it,
+    /// the second joins the resumed run's mailbox — one new incarnation, never
+    /// two — and the run reads both.
+    #[test]
+    fn two_messages_to_a_finished_child_resume_it_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_scripted(listener, |server, is_child| {
+            if is_child {
+                return match server.child.len() {
+                    1 => ScriptStep::Respond(responses_text_output("first answer")),
+                    _ if server.parent.len() < 3 => ScriptStep::Hold,
+                    n => ScriptStep::Respond(responses_text_output(&format!("answer {n}"))),
+                };
+            }
+            match server.parent.len() {
+                1 => ScriptStep::Respond(calls_response(vec![
+                    json!({"type":"function_call","status":"completed","call_id":"call-spawn","name":"agent_spawn",
+                        "arguments": json!({"prompt": "draft the plan", "name": "a1"}).to_string()}),
+                    json!({"type":"function_call","status":"completed","call_id":"call-wait-1","name":"task_wait",
+                        "arguments": json!({"tasks": ["a1"], "timeout_seconds": 60}).to_string()}),
+                ])),
+                2 => ScriptStep::Respond(calls_response(vec![
+                    send_message_call("call-send-1", "a1", "first follow-up"),
+                    send_message_call("call-send-2", "a1", "second follow-up"),
+                ])),
+                3 => {
+                    if !server.held.is_empty() {
+                        let n = server.child.len();
+                        server.release(&responses_text_output(&format!("answer {n}")));
+                    }
+                    ScriptStep::Respond(function_call_response(
+                        "call-wait-2",
+                        "task_wait",
+                        json!({"tasks": ["a1"], "timeout_seconds": 60}),
+                    ))
+                }
+                _ => ScriptStep::Finish(responses_text_output("done")),
+            }
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let request = with_subagent_messaging(loop_request_for(address, workspace.path()));
+        let state = AppState::default();
+        register_quiet_task_surface(&state, &request.conversation_id);
+
+        let response = run_model(request.clone(), &state, &discard_event, &approve_tool).unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let (_, child_bodies) = server.join().unwrap();
+
+        assert_eq!(
+            card_result(&response.contexts, "call-send-1").output,
+            receipt(PromptKey::TaskSendResumed, "a1")
+        );
+        assert_eq!(
+            card_result(&response.contexts, "call-send-2").output,
+            receipt(PromptKey::TaskSendQueued, "a1")
+        );
+        let tasks = state.conversation_tasks(&request.conversation_id);
+        let child = tasks.pool.find("a1").unwrap();
+        assert_eq!(child.identity().generation, 2, "resumed once");
+        assert_eq!(child.latest_call_id(), "call-send-1");
+        let last = child_input(child_bodies.last().unwrap());
+        for message in ["first follow-up", "second follow-up"] {
+            assert!(has_message(&last, "user", message), "{message}: {last:?}");
+        }
+        assert!(card_record(&response.contexts, "call-send-1").is_some());
+        assert!(card_record(&response.contexts, "call-send-2").is_none());
+        assert!(
+            tasks.shadow.divergences().is_empty(),
+            "{:?}",
+            tasks.shadow.divergences()
+        );
+    }
+
+    /// A child from an earlier turn of a conversation whose process has since
+    /// restarted is resumed from its persisted record, like one still in the
+    /// pool: rehydrated, then the next generation of the same task.
+    #[test]
+    fn a_child_restored_from_an_earlier_turn_is_resumed_from_its_record() {
+        let workspace = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let first_turn = serve_scripted(listener, |server, is_child| {
+            if is_child {
+                return ScriptStep::Respond(responses_text_output("first answer"));
+            }
+            match server.parent.len() {
+                1 => ScriptStep::Respond(calls_response(vec![
+                    json!({"type":"function_call","status":"completed","call_id":"call-spawn","name":"agent_spawn",
+                        "arguments": json!({"prompt": "map the modules", "name": "mapper"}).to_string()}),
+                    json!({"type":"function_call","status":"completed","call_id":"call-wait-1","name":"task_wait",
+                        "arguments": json!({"tasks": ["mapper"], "timeout_seconds": 60}).to_string()}),
+                ])),
+                _ => ScriptStep::Finish(responses_text_output("mapped")),
+            }
+        });
+        let request = with_subagent_messaging(loop_request_for(address, workspace.path()));
+        let state = AppState::default();
+        register_quiet_task_surface(&state, &request.conversation_id);
+        let first = run_model(request.clone(), &state, &discard_event, &approve_tool).unwrap();
+        assert!(first.error.is_none(), "{:?}", first.error);
+        first_turn.join().unwrap();
+        assert!(card_record(&first.contexts, "call-spawn").is_some());
+
+        // A new process: nothing in any pool, the record only in the timeline.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let second_turn = serve_scripted(listener, |server, is_child| {
+            if is_child {
+                return if server.parent.len() < 2 {
+                    ScriptStep::Hold
+                } else {
+                    ScriptStep::Respond(responses_text_output("second answer"))
+                };
+            }
+            match server.parent.len() {
+                1 => ScriptStep::Respond(calls_response(vec![send_message_call(
+                    "call-send",
+                    "mapper",
+                    "now map the tests",
+                )])),
+                2 => {
+                    if !server.held.is_empty() {
+                        server.release(&responses_text_output("second answer"));
+                    }
+                    ScriptStep::Respond(function_call_response(
+                        "call-wait-2",
+                        "task_wait",
+                        json!({"tasks": ["mapper"], "timeout_seconds": 60}),
+                    ))
+                }
+                _ => ScriptStep::Finish(responses_text_output("done")),
+            }
+        });
+        let mut second = with_subagent_messaging(loop_request_for(address, workspace.path()));
+        second.contexts = request.contexts.clone();
+        second.contexts.extend(first.contexts.clone());
+        let restarted = AppState::default();
+        register_quiet_task_surface(&restarted, &second.conversation_id);
+        let response =
+            run_model(second.clone(), &restarted, &discard_event, &approve_tool).unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let (_, child_bodies) = second_turn.join().unwrap();
+
+        assert_eq!(
+            card_result(&response.contexts, "call-send").output,
+            receipt(PromptKey::TaskSendResumed, "mapper")
+        );
+        let input = child_input(&child_bodies[0]);
+        assert!(has_message(&input, "user", "map the modules"), "{input:?}");
+        assert!(
+            has_message(&input, "assistant", "first answer"),
+            "{input:?}"
+        );
+        assert!(
+            has_message(&input, "user", "now map the tests"),
+            "{input:?}"
+        );
+        let wait = card_result(&response.contexts, "call-wait-2");
+        assert!(wait.output.contains("second answer"), "{}", wait.output);
+        let tasks = restarted.conversation_tasks(&second.conversation_id);
+        assert_eq!(tasks.pool.find("mapper").unwrap().identity().generation, 2);
+        let record = card_record(&response.contexts, "call-send").expect("the resume's record");
+        assert!(record.contexts.iter().any(|context| matches!(
+            context,
+            ContextItem::Assistant { content, .. } if content == "first answer"
+        )));
+        assert_eq!(record.status, SubagentRunStatus::Completed);
+        assert!(
+            tasks.shadow.divergences().is_empty(),
+            "{:?}",
+            tasks.shadow.divergences()
+        );
+    }
+
+    /// On a model that takes asynchronous calls, only a launch is owed its
+    /// task's result as its own output. A resumed child's result is the wait's
+    /// own result, and the launch's call is answered once.
+    #[test]
+    fn an_asynchronous_model_reads_a_resumed_childs_result_in_the_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_scripted(listener, |server, is_child| {
+            if is_child {
+                return match server.child.len() {
+                    1 => ScriptStep::Respond(responses_text_output("first answer")),
+                    _ if server.parent.len() < 3 => ScriptStep::Hold,
+                    _ => ScriptStep::Respond(responses_text_output("second answer")),
+                };
+            }
+            match server.parent.len() {
+                1 => ScriptStep::Respond(calls_response(vec![
+                    json!({"type":"function_call","status":"completed","call_id":"call-spawn","name":"agent_spawn",
+                        "arguments": json!({"prompt": "audit the API", "name": "a1"}).to_string()}),
+                    json!({"type":"function_call","status":"completed","call_id":"call-wait-1","name":"task_wait",
+                        "arguments": json!({"tasks": ["a1"], "timeout_seconds": 60}).to_string()}),
+                ])),
+                2 => ScriptStep::Respond(calls_response(vec![send_message_call(
+                    "call-send",
+                    "a1",
+                    "check the errors too",
+                )])),
+                3 => {
+                    if !server.held.is_empty() {
+                        server.release(&responses_text_output("second answer"));
+                    }
+                    ScriptStep::Respond(function_call_response(
+                        "call-wait-2",
+                        "task_wait",
+                        json!({"tasks": ["a1"], "timeout_seconds": 60}),
+                    ))
+                }
+                _ => ScriptStep::Finish(responses_text_output("done")),
+            }
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let request = with_subagent_messaging(with_async_tools(loop_request_for(
+            address,
+            workspace.path(),
+        )));
+        let state = AppState::default();
+        register_quiet_task_surface(&state, &request.conversation_id);
+
+        let response = run_model(request.clone(), &state, &discard_event, &approve_tool).unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let (parent_bodies, _) = server.join().unwrap();
+
+        let last = request_body(parent_bodies.last().unwrap());
+        assert!(declared_function(&last, SEND_MESSAGE_TOOL)
+            .unwrap()
+            .get("async")
+            .is_none());
+        let input = last["input"].as_array().unwrap();
+        let outputs_of = |call: &str| {
+            input
+                .iter()
+                .filter(|item| item["type"] == "function_call_output" && item["call_id"] == call)
+                .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        };
+        // The launch got the first result, once.
+        let launch = outputs_of("call-spawn");
+        assert_eq!(launch.len(), 1, "{input:?}");
+        assert!(launch[0].contains("first answer"));
+        assert!(!launch[0].contains("second answer"));
+        // The second result is the wait's own.
+        let wait = outputs_of("call-wait-2");
+        assert_eq!(wait.len(), 1, "{input:?}");
+        assert!(wait[0].contains("second answer"), "{}", wait[0]);
+        assert!(
+            !wait[0].contains(PromptKey::TaskWaitDeliveredOnCall.builtin_text()),
+            "{}",
+            wait[0]
+        );
+        assert!(
+            !last.to_string().matches("second answer").nth(1).is_some(),
+            "delivered once: {last}"
+        );
+        let tasks = state.conversation_tasks(&request.conversation_id);
+        assert!(
+            tasks.shadow.divergences().is_empty(),
+            "{:?}",
+            tasks.shadow.divergences()
+        );
+    }
+
+    /// Where the conversation's subagent communication is off there is no
+    /// `send_message`: the run never declares it, a call to it executes nothing
+    /// (the provider layer drops a call to a tool the request did not declare),
+    /// and the child — told that nothing more reaches it — reads nothing. The
+    /// runtime refuses the tool on its own as well.
+    #[test]
+    fn without_subagent_communication_nothing_reaches_a_child() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_scripted(listener, |server, is_child| {
+            if is_child {
+                return ScriptStep::Respond(responses_text_output("only answer"));
+            }
+            match server.parent.len() {
+                1 => ScriptStep::Respond(calls_response(vec![
+                    json!({"type":"function_call","status":"completed","call_id":"call-spawn","name":"agent_spawn",
+                        "arguments": json!({"prompt": "look around", "name": "a1"}).to_string()}),
+                    json!({"type":"function_call","status":"completed","call_id":"call-wait","name":"task_wait",
+                        "arguments": json!({"tasks": ["a1"], "timeout_seconds": 60}).to_string()}),
+                ])),
+                _ => ScriptStep::Finish(calls_response(vec![send_message_call(
+                    "call-send",
+                    "a1",
+                    "hello",
+                )])),
+            }
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let request = loop_request_for(address, workspace.path());
+        assert!(!request.subagent_messaging);
+        assert!(!request
+            .enabled_tools
+            .iter()
+            .any(|name| name == SEND_MESSAGE_TOOL));
+        let state = AppState::default();
+        register_quiet_task_surface(&state, &request.conversation_id);
+
+        let response = run_model(request.clone(), &state, &discard_event, &approve_tool).unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let (parent_bodies, child_bodies) = server.join().unwrap();
+        assert!(declared_function(&request_body(&parent_bodies[0]), SEND_MESSAGE_TOOL).is_none());
+        assert!(!response.contexts.iter().any(|context| matches!(
+            context,
+            ContextItem::Tool { tool_name, result, .. } if tool_name == SEND_MESSAGE_TOOL && result.success
+        )));
+        assert_eq!(child_bodies.len(), 1);
+        assert!(!child_bodies[0].contains("hello"));
+        // The child was not told anything may reach it either.
+        assert!(child_bodies[0].contains("nothing more reaches you while you run"));
+        assert!(!child_bodies[0].contains("main agent sends you"));
+
+        // The runtime's own gate, for any path that would get past the first.
+        let tasks = state.conversation_tasks(&request.conversation_id);
+        let refused = run_send_message(
+            &tasks.pool,
+            &tasks.shadow,
+            &request,
+            ToolCall {
+                id: "direct".into(),
+                name: SEND_MESSAGE_TOOL.into(),
+                input: json!({"to": "a1", "message": "hello"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            },
+            &state,
+            &discard_event,
+            1,
+        )
+        .unwrap();
+        assert!(!refused.result.success);
+        assert_eq!(tasks.pool.find("a1").unwrap().identity().generation, 1);
+        assert!(
+            tasks.shadow.divergences().is_empty(),
+            "{:?}",
+            tasks.shadow.divergences()
+        );
+    }
+
+    /// Every refusal names what the message could not reach, and changes
+    /// nothing: an unknown name, a name no child could have, a workflow run, a
+    /// background command (by address and by the pool name the host gave it),
+    /// a workflow run known only from the timeline, a child whose result is
+    /// still on its way, a child the user stopped — and any call from a child.
+    #[test]
+    fn send_message_refuses_what_it_cannot_reach() {
+        let state = AppState::default();
+        let mut parent = with_subagent_messaging(run_request(ProviderFamily::OpenaiResponses));
+        parent.tools = catalog::tool_catalog();
+        let pool = AgentPool::new();
+        let shadow = crate::kernel_shadow::KernelShadow::new();
+        let register = |name: &str, kind: SubagentRunKind, label: &str| {
+            pool.register(
+                name.into(),
+                label.into(),
+                "task".into(),
+                agent_child_template(&parent),
+                kind,
+                &state,
+                Vec::new(),
+                Vec::new(),
+                AgentLiveStatus::Running,
+                format!("call-{name}"),
+                None,
+            )
+            .unwrap()
+        };
+        let finish = |agent: &AgentShared, status: AgentLiveStatus| {
+            agent.complete_turn(
+                agent.identity(),
+                Vec::new(),
+                "partial".into(),
+                status,
+                &ModelUsage::default(),
+                1,
+                None,
+            );
+        };
+        register("a3", SubagentRunKind::ShellCommand, "shell:1");
+        register("wf", SubagentRunKind::WorkflowStep, "workflow:wf");
+        let busy = register("busy", SubagentRunKind::General, "busy");
+        let pending = register("pending", SubagentRunKind::General, "pending");
+        finish(&pending, AgentLiveStatus::Idle);
+        let stopped = register("stopped", SubagentRunKind::General, "stopped");
+        stopped.stop_task(agents::StopOrigin::User);
+        finish(&stopped, AgentLiveStatus::Interrupted);
+        stopped.take_undelivered_results();
+        parent.contexts.push(ContextItem::Tool {
+            id: "workflow-card".into(),
+            tool_name: workflow::WORKFLOW_TOOL.into(),
+            round: Some(1),
+            model_turn_id: Some("turn".into()),
+            provider_call_id: Some("call-flow".into()),
+            requested_input: None,
+            input: JsonObject::new(),
+            result: ToolResult {
+                success: true,
+                output: "ok".into(),
+                images: Vec::new(),
+                diff: None,
+                executed_at: "2026-10-16T00:00:00Z".into(),
+                duration_ms: 1,
+            },
+            subagent: Some(SubagentRunRecord {
+                kind: SubagentRunKind::WorkflowStep,
+                name: Some("flow".into()),
+                label: Some("workflow:flow".into()),
+                inherits_model_memory: false,
+                fork_model_binding: None,
+                agent_definition: None,
+                execution_mode_receipt: String::new(),
+                task: "flow".into(),
+                status: SubagentRunStatus::Completed,
+                contexts: Vec::new(),
+                updates: Vec::new(),
+                structured_output: None,
+                output_schema: None,
+                usage: ModelUsage::default(),
+            }),
+            notice: None,
+            attestation: String::new(),
+            created_at: "2026-10-16T00:00:00Z".into(),
+        });
+        let send = |parent: &RunModelRequest, to: &str| {
+            run_send_message(
+                &pool,
+                &shadow,
+                parent,
+                ToolCall {
+                    id: format!("send-{to}"),
+                    name: SEND_MESSAGE_TOOL.into(),
+                    input: json!({"to": to, "message": "hello", "summary": "say hello"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                },
+                &state,
+                &discard_event,
+                1,
+            )
+            .unwrap()
+            .result
+        };
+        for (to, key, named) in [
+            ("nobody", PromptKey::TaskSendUnknownTarget, "nobody"),
+            ("Not A Name", PromptKey::TaskSendUnknownTarget, "Not A Name"),
+            ("workflow:wf", PromptKey::TaskSendNotAnAgent, "workflow:wf"),
+            ("shell:1", PromptKey::TaskSendNotAnAgent, "shell:1"),
+            ("terminal:t1", PromptKey::TaskSendNotAnAgent, "terminal:t1"),
+            ("a3", PromptKey::TaskSendNotAnAgent, "a3"),
+            ("wf", PromptKey::TaskSendNotAnAgent, "wf"),
+            ("flow", PromptKey::TaskSendNotAnAgent, "flow"),
+            ("pending", PromptKey::TaskSendResultPending, "pending"),
+            ("stopped", PromptKey::TaskSendUserStopped, "stopped"),
+        ] {
+            let result = send(&parent, to);
+            assert!(!result.success, "{to}");
+            assert_eq!(result.output, receipt(key, named), "{to}");
+        }
+        assert_eq!(pending.identity().generation, 1);
+        assert_eq!(pending.status(), AgentLiveStatus::Idle);
+        assert_eq!(stopped.identity().generation, 1);
+        assert!(
+            pool.find("flow").is_none(),
+            "a workflow record is never rehydrated as a child"
+        );
+
+        // A malformed call is refused before anything is looked up.
+        let malformed = run_send_message(
+            &pool,
+            &shadow,
+            &parent,
+            ToolCall {
+                id: "send-empty".into(),
+                name: SEND_MESSAGE_TOOL.into(),
+                input: json!({"to": "busy", "message": "  "})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            },
+            &state,
+            &discard_event,
+            1,
+        )
+        .unwrap();
+        assert!(!malformed.result.success);
+        assert!(busy.mailbox().unwrap().is_empty());
+
+        // The one that is reachable: a running child gets it queued.
+        let queued = send(&parent, "busy");
+        assert!(queued.success);
+        assert_eq!(queued.output, receipt(PromptKey::TaskSendQueued, "busy"));
+        assert_eq!(busy.mailbox().unwrap().drain().len(), 1);
+
+        // A child never holds the tool; were a call to reach the runtime from
+        // one, it is refused there too.
+        let mut child = agent_child_template(&parent);
+        child.subagent_depth = 1;
+        let from_child = send(&child, "busy");
+        assert!(!from_child.success);
+        assert!(busy.mailbox().unwrap().is_empty());
+        assert!(
+            shadow.divergences().is_empty(),
+            "{:?}",
+            shadow.divergences()
+        );
+    }
+
     /// A child result that completes while the model is busy reaches the timeline
     /// once, is read at a later round boundary, and is never re-folded on replay.
     ///
@@ -41682,7 +43316,7 @@ mod tests {
         ];
         let fetch = web_fetch_request_template(&main, &urls);
         assert!(!fetch.native_search_call);
-        assert_eq!(fetch.native_fetch_call, Some(2));
+        assert_eq!(fetch.native_fetch_call.as_deref(), Some(urls.as_slice()));
         assert!(fetch.tools.is_empty());
         assert!(fetch.enabled_tools.is_empty());
         let fetch_step = native_step_json(&fetch);
@@ -41857,6 +43491,111 @@ mod tests {
         assert!(native_step_json(&fetch)["nativeFetch"]
             .get("maxContentTokens")
             .is_none());
+    }
+
+    /// Claude Agent searches with Claude Code's own `WebSearch`, which the
+    /// sidecar switches on for exactly this request: the call is dispatched
+    /// rather than refused, and its step carries the budget, no host tools and
+    /// no version (the CLI writes its own tool definition).
+    #[test]
+    fn a_claude_agent_search_call_carries_the_budget_and_nothing_else() {
+        let mut main = run_request(ProviderFamily::ClaudeAgent);
+        main.tools = catalog::tool_catalog();
+        main.enabled_tools = main.tools.iter().map(|tool| tool.name.clone()).collect();
+        main.web_search = crate::model::WebSearchSettings {
+            max_searches_per_call: 4,
+            backend: Some(SearchBackend::Native),
+            native_search_tool: crate::model::NativeSearchTool::WebSearch20260209,
+            ..Default::default()
+        };
+        let Ok(PreparedWebSearchBackend::Native { template }) =
+            prepare_web_search_backend(&main, "核对来源 A".into())
+        else {
+            panic!("Claude Agent 有原生搜索，不该被拒绝");
+        };
+        assert!(template.native_search_call);
+        assert!(template.tools.is_empty() && template.enabled_tools.is_empty());
+
+        let family = crate::aisdk::protocol::Family::for_format(template.provider.family);
+        let step = crate::aisdk::step::build_step_request(
+            &template,
+            &[],
+            wire_history::project_full(family, &template.contexts),
+            "",
+            None,
+            1,
+        )
+        .expect("the isolated native-search step should build");
+        let step = serde_json::to_value(step).unwrap();
+        assert_eq!(step["family"], json!("claude-agent"));
+        assert_eq!(step["nativeSearch"]["maxUses"], json!(4));
+        assert!(step["nativeSearch"].get("toolType").is_none());
+        assert!(step.get("nativeFetch").is_none());
+        assert!(step["tools"].as_array().map_or(true, Vec::is_empty));
+    }
+
+    /// Claude Agent fetches with Claude Code's own `WebFetch`, which the
+    /// sidecar switches on for exactly this request and admits call by call. So
+    /// the step carries the URLs themselves beside the budget — the sidecar
+    /// holds the CLI to them — and neither a version nor a content cap: the CLI
+    /// writes its own tool definition, and that tool takes no
+    /// `max_content_tokens`. The URLs still reach the request's own context,
+    /// where the executor reads which pages to fetch.
+    #[test]
+    fn a_claude_agent_fetch_call_carries_the_urls_and_nothing_else() {
+        let mut main = run_request(ProviderFamily::ClaudeAgent);
+        main.tools = catalog::tool_catalog();
+        main.enabled_tools = main.tools.iter().map(|tool| tool.name.clone()).collect();
+        main.web_search = crate::model::WebSearchSettings {
+            max_searches_per_call: 4,
+            backend: Some(SearchBackend::Native),
+            fetch: Some(crate::model::SearchFetchBackend::Native),
+            native_fetch_tool: crate::model::NativeFetchTool::WebFetch20260209,
+            ..Default::default()
+        };
+        // The conversation holds a non-zero fetch cap, which this family has
+        // nowhere to send.
+        assert!(main.web_search.execution.fetch_compression_cutoff > 0);
+        let urls = vec![
+            "https://example.com/a".to_owned(),
+            "https://example.com/b?x=1#part".to_owned(),
+        ];
+        let fetch = web_fetch_request_template(&main, &urls);
+        assert!(!fetch.native_search_call);
+        assert_eq!(fetch.native_fetch_call.as_deref(), Some(urls.as_slice()));
+        assert!(fetch.tools.is_empty() && fetch.enabled_tools.is_empty());
+
+        let family = crate::aisdk::protocol::Family::for_format(fetch.provider.family);
+        let step = crate::aisdk::step::build_step_request(
+            &fetch,
+            &[],
+            wire_history::project_full(family, &fetch.contexts),
+            "",
+            None,
+            1,
+        )
+        .expect("the isolated native-fetch step should build");
+        let step = serde_json::to_value(step).unwrap();
+        assert_eq!(step["family"], json!("claude-agent"));
+        // Exactly the budget and the list, the list exactly as the model named
+        // it: the sidecar does its own normalizing when it compares.
+        assert_eq!(
+            step["nativeFetch"],
+            json!({ "maxUses": 2, "urls": ["https://example.com/a", "https://example.com/b?x=1#part"] })
+        );
+        assert!(step.get("nativeSearch").is_none());
+        assert!(step["tools"].as_array().map_or(true, Vec::is_empty));
+        // The session block is the caller's to attach (`SessionLease`), never
+        // the step builder's.
+        assert!(step.get("agent").is_none());
+        let messages = serde_json::to_string(&step["messages"]).unwrap();
+        for url in &urls {
+            assert!(messages.contains(url.as_str()), "{url} must reach the fetch request's context");
+        }
+
+        // The family's own provider is what a `Native` fetch selection resolves
+        // against, so this conversation is offered `web_fetch` at all.
+        assert!(crate::web_search::family_supports_native_fetch(family));
     }
 
     /// Both unavailable-search cases must be actionable errors, never silent fallback
@@ -43836,6 +45575,7 @@ mod tests {
             web_search: Default::default(),
             native_search_call: false,
             web_search_enabled: false,
+            subagent_messaging: false,
             native_fetch_call: None,
             run_environment: Default::default(),
             workspaces: Default::default(),
@@ -43847,6 +45587,7 @@ mod tests {
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
             host_message_container: Default::default(),
+            host_messages_in_prompt: true,
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
             model,

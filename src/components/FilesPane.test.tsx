@@ -928,6 +928,8 @@ describe("FilesPane menus", () => {
     const menu = await screen.findByRole("menu", { name: "新建页面" });
     expect(within(menu).getByText("本机")).toBeInTheDocument();
     expect(within(menu).getByText("ubuntu")).toBeInTheDocument();
+    // The workspaces are listed by their paths, with no number at the right of each row.
+    expect(menu.querySelector(".popover-menu__hint")).toBeNull();
     await user.click(within(menu).getByRole("menuitem", { name: /srv/ }));
 
     expect(await screen.findByRole("treeitem", { name: rowName("app") })).toBeInTheDocument();

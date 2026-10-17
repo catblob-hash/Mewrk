@@ -387,7 +387,7 @@ describe("composer context chips", () => {
     const conversationId = document.workspaces[0].conversations[0].id;
     expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`))
       .toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "bash" }));
-    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["bash 1"]);
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["bash"]);
 
     // The same row now puts the pane away rather than adding a terminal.
     await user.click(within(toolbar).getByRole("button", { name: "终端" }));
@@ -435,7 +435,7 @@ describe("composer context chips", () => {
       const conversationId = document.workspaces[0].conversations[0].id;
       expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`))
         .toHaveAttribute("data-launch", JSON.stringify({ workspace: 1, shell: "powershell" }));
-      expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["PowerShell 1"]);
+      expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["PowerShell"]);
     } finally {
       platform.mockRestore();
     }
@@ -460,14 +460,14 @@ describe("composer context chips", () => {
       expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`))
         .toHaveAttribute("data-launch", JSON.stringify({ workspace: 1, shell: "zsh" }));
 
-      // A second choice opens a second terminal beside the first, numbered within its shell.
+      // A second choice opens a second terminal beside the first, named for its shell like the first.
       await user.click(within(toolbar).getByRole("button", { name: "终端" }));
       await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
         .getByRole("menuitem", { name: "bash" }));
       await user.click(within(toolbar).getByRole("button", { name: "终端" }));
       await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
         .getByRole("menuitem", { name: "zsh" }));
-      expect(screen.queryAllByRole("tab").map((tab) => tab.textContent)).toEqual(["zsh 1", "bash 1", "zsh 2"]);
+      expect(screen.queryAllByRole("tab").map((tab) => tab.textContent)).toEqual(["zsh", "bash", "zsh"]);
 
       // The pane's + offers the same shells, without the row that shows or hides the pane.
       await user.click(screen.getByRole("button", { name: "新建终端" }));
@@ -475,7 +475,7 @@ describe("composer context chips", () => {
       expect(menuTexts(paneMenu)).toEqual(["zsh", "bash"]);
       await user.click(within(paneMenu).getByRole("menuitem", { name: "bash" }));
       expect(screen.queryAllByRole("tab").map((tab) => tab.textContent))
-        .toEqual(["zsh 1", "bash 1", "zsh 2", "bash 2"]);
+        .toEqual(["zsh", "bash", "zsh", "bash"]);
     } finally {
       platform.mockRestore();
     }
@@ -499,7 +499,7 @@ describe("composer context chips", () => {
       const menu = await screen.findByRole("menu", { name: "新建终端" });
       const workspaces = within(menu).getAllByRole("menuitem")
         .filter((item) => item.getAttribute("aria-haspopup") === "menu");
-      expect(workspaces.map((item) => item.textContent)).toEqual(["C:\\test\\Mewrk1", "/home/dev/services2"]);
+      expect(workspaces.map((item) => item.textContent)).toEqual(["C:\\test\\Mewrk", "/home/dev/services"]);
 
       // The machine's shells open beside the workspace; nothing is opened until one is picked.
       await user.click(within(menu).getByRole("menuitem", { name: /^\/home\/dev\/services/ }));
@@ -511,7 +511,7 @@ describe("composer context chips", () => {
       const conversationId = document.workspaces[0].conversations[0].id;
       expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-1`))
         .toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "sh" }));
-      expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["sh 1"]);
+      expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["sh"]);
 
       // This machine's workspace offers this machine's shells, without the sh it cannot run.
       await user.click(within(toolbar).getByRole("button", { name: "终端" }));
@@ -523,13 +523,13 @@ describe("composer context chips", () => {
       // The pane's + asks the same two questions, without the row that shows or hides the pane.
       await user.click(screen.getByRole("button", { name: "新建终端" }));
       const paneMenu = await screen.findByRole("menu", { name: "新建终端" });
-      expect(menuTexts(paneMenu)).toEqual(["C:\\test\\Mewrk1", "/home/dev/services2"]);
+      expect(menuTexts(paneMenu)).toEqual(["C:\\test\\Mewrk", "/home/dev/services"]);
       await user.click(within(paneMenu).getByRole("menuitem", { name: /^\/home\/dev\/services/ }));
       await user.click(within(await screen.findByRole("menu", { name: "/home/dev/services" }))
         .getByRole("menuitem", { name: "bash" }));
       expect(window.document.getElementById(`conversation-terminal-${conversationId}-terminal-2`))
         .toHaveAttribute("data-launch", JSON.stringify({ workspace: 2, shell: "bash" }));
-      expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["sh 1", "bash 1"]);
+      expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["sh", "bash"]);
     } finally {
       platform.mockRestore();
     }
@@ -635,7 +635,7 @@ describe("composer context chips", () => {
     expect(screen.getByRole("checkbox", { name: /工作树/ })).not.toBeChecked();
   });
 
-  it("attaches a picked directory as its own numbered chip beside the other location chips", async () => {
+  it("attaches a picked directory as its own chip beside the other location chips", async () => {
     workspacePickerMocks.pickWorkspaceDirectory.mockResolvedValue("D:/shared/design-tokens");
     const user = userEvent.setup();
     render(<App />);
@@ -656,8 +656,9 @@ describe("composer context chips", () => {
 
     const chip = await screen.findByTitle("D:/shared/design-tokens");
     expect(chip).toHaveTextContent("design-tokens");
-    // Workspace 1 is the project's own, so the first attached one is 2.
-    expect(chip).toHaveTextContent("2");
+    // The chip names the directory alone; workspaces carry no number on screen.
+    expect(chip.querySelector(".composer-chip__index")).toBeNull();
+    expect(chip).not.toHaveTextContent("2");
     expect(chip.compareDocumentPosition(add) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
@@ -687,7 +688,7 @@ describe("composer context chips", () => {
     expect(await screen.findByTitle("/home/dev/services (SSH: devbox)")).toBeInTheDocument();
   });
 
-  it("numbers attached workspaces after every workspace of the project", async () => {
+  it("shows an attached workspace after every workspace of the project, without a number", async () => {
     const document = documentWithModel();
     document.workspaces[0].additionalWorkspaces = [{ path: "D:/shared/lib" }];
     runtimeMocks.loadDocument.mockResolvedValue(document);
@@ -700,7 +701,10 @@ describe("composer context chips", () => {
     const menu = await screen.findByRole("menu", { name: "在哪台机器上选目录" });
     await user.click(within(menu).getByRole("menuitem", { name: "本机" }));
 
-    expect(await screen.findByTitle("D:/shared/design-tokens")).toHaveTextContent("3");
+    const chip = await screen.findByTitle("D:/shared/design-tokens");
+    expect(chip).toHaveTextContent("design-tokens");
+    expect(chip.querySelector(".composer-chip__index")).toBeNull();
+    expect(chip).not.toHaveTextContent("3");
   });
 
   it("keeps the directory out of the conversation when the picker is cancelled", async () => {
@@ -769,11 +773,11 @@ describe("composer context chips", () => {
       .getByRole("menuitem", { name: "新建项目…" }));
 
     const dialog = await screen.findByRole("dialog", { name: "新建项目" });
-    await user.click(within(dialog).getByRole("button", { name: "工作区 1 的机器：本机" }));
+    await user.click(within(dialog).getByRole("button", { name: "工作区的机器：本机" }));
     const machines = await screen.findByRole("menu", { name: "选择机器" });
     await user.click(within(machines).getByRole("menuitem", { name: "SSH" }));
     await user.click(await screen.findByRole("menuitemradio", { name: "devbox" }));
-    await user.click(within(dialog).getByRole("button", { name: "为工作区 1 选择目录" }));
+    await user.click(within(dialog).getByRole("button", { name: "为工作区选择目录" }));
 
     const browser = await screen.findByRole("dialog", { name: "选择 devbox 上的工作区" });
     expect(workspacePickerMocks.pickWorkspaceDirectory).not.toHaveBeenCalled();
@@ -808,10 +812,10 @@ describe("composer context chips", () => {
       .getByRole("menuitem", { name: "新建项目…" }));
 
     const dialog = await screen.findByRole("dialog", { name: "新建项目" });
-    await user.click(within(dialog).getByRole("button", { name: "为工作区 1 选择目录" }));
+    await user.click(within(dialog).getByRole("button", { name: "为工作区选择目录" }));
     await user.click(within(dialog).getByRole("button", { name: "添加工作区" }));
-    await user.click(await within(dialog).findByRole("button", { name: "为工作区 2 选择目录" }));
-    await within(dialog).findByRole("button", { name: "工作区 2：D:/projects/tokens" });
+    await user.click(await within(dialog).findByRole("button", { name: "为工作区选择目录" }));
+    await within(dialog).findByRole("button", { name: "工作区：D:/projects/tokens" });
     await user.type(within(dialog).getByLabelText("显示名称"), "平台");
     await user.click(within(dialog).getByRole("button", { name: "创建项目" }));
 
@@ -855,8 +859,8 @@ describe("composer context chips", () => {
     await user.click(screen.getByRole("button", { name: "新建项目" }));
 
     const dialog = await screen.findByRole("dialog", { name: "新建项目" });
-    await user.click(within(dialog).getByRole("button", { name: "为工作区 1 选择目录" }));
-    await within(dialog).findByRole("button", { name: "工作区 1：D:/projects/fresh" });
+    await user.click(within(dialog).getByRole("button", { name: "为工作区选择目录" }));
+    await within(dialog).findByRole("button", { name: "工作区：D:/projects/fresh" });
     await user.click(within(dialog).getByRole("button", { name: "创建项目" }));
 
     // The draft it opens on shows the project's Git status at once, rather than a refusal and a
@@ -894,11 +898,11 @@ describe("composer context chips", () => {
       .getByRole("menuitem", { name: "新建项目…" }));
 
     const dialog = await screen.findByRole("dialog", { name: "新建项目" });
-    await user.click(within(dialog).getByRole("button", { name: "工作区 1 的机器：本机" }));
+    await user.click(within(dialog).getByRole("button", { name: "工作区的机器：本机" }));
     await user.click(within(await screen.findByRole("menu", { name: "选择机器" }))
       .getByRole("menuitem", { name: "SSH" }));
     await user.click(await screen.findByRole("menuitemradio", { name: "devbox" }));
-    await user.click(within(dialog).getByRole("button", { name: "为工作区 1 选择目录" }));
+    await user.click(within(dialog).getByRole("button", { name: "为工作区选择目录" }));
     const browser = await screen.findByRole("dialog", { name: "选择 devbox 上的工作区" });
     await user.click(within(browser).getByRole("button", { name: "选择" }));
     await user.click(within(dialog).getByRole("button", { name: "创建项目" }));
@@ -922,10 +926,10 @@ describe("composer context chips", () => {
     await user.click(await screen.findByRole("menuitem", { name: "编辑项目…" }));
     const dialog = await screen.findByRole("dialog", { name: "编辑项目" });
     // The project's first workspace is its identity; it cannot be swapped out here.
-    expect(within(dialog).getByRole("button", { name: `工作区 1：${document.workspaces[0].path}` })).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: `工作区：${document.workspaces[0].path}` })).toBeDisabled();
     await user.click(within(dialog).getByRole("button", { name: "添加工作区" }));
-    await user.click(await within(dialog).findByRole("button", { name: "为工作区 2 选择目录" }));
-    await within(dialog).findByRole("button", { name: "工作区 2：D:/shared/lib" });
+    await user.click(await within(dialog).findByRole("button", { name: "为工作区选择目录" }));
+    await within(dialog).findByRole("button", { name: "工作区：D:/shared/lib" });
     await user.click(within(dialog).getByRole("button", { name: "保存" }));
 
     expect(await screen.findByRole("button", { name: `工作区：${document.workspaces[0].path}` }))
@@ -954,10 +958,10 @@ describe("composer context chips", () => {
     await user.click(screen.getByRole("button", { name: `${project.name} 的更多选项` }));
     await user.click(await screen.findByRole("menuitem", { name: "编辑项目…" }));
     const dialog = await screen.findByRole("dialog", { name: "编辑项目" });
-    await user.click(within(dialog).getByRole("button", { name: "工作区 1 的机器：已删除的机器" }));
+    await user.click(within(dialog).getByRole("button", { name: "工作区的机器：已删除的机器" }));
     await user.click(await screen.findByRole("menuitemradio", { name: "本机" }));
-    await user.click(within(dialog).getByRole("button", { name: "为工作区 1 选择目录" }));
-    await within(dialog).findByRole("button", { name: "工作区 1：D:/work/shop" });
+    await user.click(within(dialog).getByRole("button", { name: "为工作区选择目录" }));
+    await within(dialog).findByRole("button", { name: "工作区：D:/work/shop" });
     await user.click(within(dialog).getByRole("button", { name: "保存" }));
 
     await waitFor(() => {
@@ -1156,9 +1160,9 @@ describe("workspace and machine settings from the composer", () => {
     render(<App />);
     await screen.findByLabelText("向 Agent 发送消息");
 
-    // With a second workspace the numbers are stated to the model, so the chip shows one.
+    // Even with a second workspace the chip names its workspace by path alone, with no number.
     expect(screen.getByRole("button", { name: /^工作区：/ }).querySelector(".composer-chip__index"))
-      .toHaveTextContent("1");
+      .toBeNull();
     await user.click(screen.getByRole("button", { name: "D:/shared/design-tokens 的设置" }));
     const dialog = await screen.findByRole("dialog", { name: "D:/shared/design-tokens" });
     await user.type(within(dialog).getByRole("textbox", { name: "环境变量" }), "TOKENS=1");

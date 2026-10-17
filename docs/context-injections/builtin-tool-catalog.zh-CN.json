@@ -3,7 +3,7 @@
   "language": "zh-CN",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
   "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
-  "toolCount": 51,
+  "toolCount": 52,
   "tools": [
     {
       "name": "ls",
@@ -966,6 +966,38 @@
           "required": true,
           "placeholder": "shell:1",
           "help": "要停止的任务地址：后台命令写 shell:<id>，子代理与工作流直接写名称（工作流也可写 workflow:<runId>）；终端会话不能用它停止，开发服务器用 preview_stop。被停任务的结果仍会照常交付"
+        }
+      ]
+    },
+    {
+      "name": "send_message",
+      "label": "发送消息",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "to",
+          "label": "子代理",
+          "type": "string",
+          "required": true,
+          "placeholder": "review-api",
+          "help": "agent_spawn 时起的名字"
+        },
+        {
+          "name": "message",
+          "label": "消息",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "改用 v2 接口再试一次，并报告结果"
+        },
+        {
+          "name": "summary",
+          "label": "摘要",
+          "type": "string",
+          "required": false,
+          "placeholder": "改用 v2 接口重试",
+          "help": "时间线上显示的 5–10 词预览"
         }
       ]
     },

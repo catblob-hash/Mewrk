@@ -9,7 +9,7 @@ import {
   SlidersHorizontal,
   Wrench
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
 import {
   MAX_AGENT_TYPE_CHARS,
@@ -712,57 +712,37 @@ export function AgentRoleEditor({
     hooks: t("钩子", "Hooks"),
     template: t("对话模板", "Conversation template")
   };
-  /* Chinese sentences run on; English ones are spaced. */
-  const sentenceGap = t("", " ");
-  /* Said on each capability page: which levels this role may pick from. */
-  const scopeNote = roleLevel === null
-    ? t(
-        "这个角色在全局，只能选全局（~/.mewrk）里的条目。",
-        "This role is global, so it can pick only global (~/.mewrk) entries."
-      )
-    : t(
-        "这个角色属于工作区 {path}，可以选全局与这个工作区里的条目。",
-        "This role belongs to the workspace {path}, so it can pick global entries and that workspace's own.",
-        { path: roleWorkspaces[0]?.path ?? roleLevel }
-      );
-  const pageBlurbs: Record<RoleEditorPage, string> = {
-    role: t(
-      "这个角色叫什么、主代理从描述里读到它是干什么的、它跑在哪个模型上，以及它的文件放在哪里。关掉窗口会保留草稿，点保存才会写入文件。",
-      "What this role is called, what the main agent reads about what it is for, which model it runs on, and where its file lives. Closing the window keeps the draft; nothing is written to the file until you save."
-    ),
+  /* Each page says in one line what it is for; how the role's settings meet the
+     calling conversation's is on the site, one link away. */
+  const roleWindowDocs = (text: string) => (
+    <>
+      {text}
+      <DocsLink inline page="agents" section="role-window" />
+    </>
+  );
+  const pageBlurbs: Record<RoleEditorPage, ReactNode> = {
+    role: roleWindowDocs(t("名称、描述、模型与位置。", "Name, description, model and location.")),
     tools: t("这个角色能调用的工具。", "The tools this role may call."),
     /* No lock on any of these: a role's settings are no part of the calling
        conversation's prompt cache, so a change simply reaches the next
        subagent this conversation calls. */
-    skills: [
-      t(
-        "这个角色的子代理能用的技能。改动对之后新调用的子代理生效；正文怎样送到模型面前由调用它的对话的「技能按需加载」决定。",
-        "The skills this role's subagents can use. A change applies to the next subagent called; how their bodies reach the model is decided by the calling conversation's Load skills on demand."
-      ),
-      scopeNote
-    ].join(sentenceGap),
-    mcp: [
-      t(
-        "这个角色的子代理接入的 MCP Server，选中的服务器的工具都交给它。改动对之后新调用的子代理生效；工具发现由调用它的对话决定。",
-        "The MCP servers this role's subagents attach, with all their tools. A change applies to the next subagent called; tool discovery is decided by the calling conversation."
-      ),
-      scopeNote
-    ].join(sentenceGap),
-    hooks: [
-      t(
-        "这个角色的子代理运行的钩子，只有这里选的这些：调用它的对话里的钩子不会带过来，要让对话的守卫也管到这个角色，就在这里一并选上。子代理只跑工具调用前后、权限请求与指令加载这几类；会话开始、提交提示词与停止属于主对话的回合。改动对之后新调用的子代理生效，但新选上的钩子要等下一轮开始时确认过才会运行（完全访问不需要确认）。",
-        "The hooks this role's subagents run — only the ones picked here: the calling conversation's hooks do not carry over, so to have the conversation's guards cover this role, pick them here too. A subagent runs only the hooks before and after a tool call, on a permission request and on instructions loaded; session start, prompt submitted and stop belong to the conversation's own turn. A change applies to the next subagent called, but a newly selected hook runs only once the next turn has confirmed it (Full access needs no confirmation)."
-      ),
-      scopeNote
-    ].join(sentenceGap),
+    skills: roleWindowDocs(t(
+      "这个角色的子代理能用的技能。",
+      "The skills this role's subagents can use."
+    )),
+    mcp: roleWindowDocs(t(
+      "这个角色的子代理可用的 MCP Server。",
+      "The MCP servers this role's subagents can use."
+    )),
+    hooks: roleWindowDocs(t(
+      "这个角色的子代理运行的钩子。",
+      "The hooks this role's subagents run."
+    )),
     advanced: t(
-      "这个角色自己的联网搜索与抓取：后端、原生工具版本、结果整形与域名过滤。联网开关、记忆、文件防误写保护与宿主消息的容器由调用它的对话决定，这里不出现；调用方对话没开联网时，这里怎么选都不会让子代理联网。",
-      "This role's own web search and fetch: the backends, the native tool versions, result shaping and the domain filter. Web access, memory, the file write guards and the host-message container are decided by the conversation that calls it, so they do not appear here; when that conversation is offline, nothing chosen here puts its subagent online."
+      "这个角色自己的联网搜索与抓取。",
+      "This role's own web search and fetch."
     ),
-    template: t(
-      "这个角色的开局历史。模板里的用户消息若恰好含一个 {input}，主代理给的输入会替换到那里；没有或有两个以上时，输入作为最后一条用户消息追加。右上角的「从预设覆盖」可以用一份预设的对话模板换掉这里。",
-      "This role's opening history. If the template's user messages contain exactly one {input}, the caller's input replaces it; with none or with two or more, the input is appended as a final user message. Copy from a preset, at the top right, replaces this one with a preset's template."
-    )
+    template: roleWindowDocs(t("这个角色的开局历史。", "This role's opening history."))
   };
 
   const nameErrorText = () => {
@@ -925,9 +905,13 @@ export function AgentRoleEditor({
                    an act on that page, read against the body it would replace. A
                    preset with no template has nothing to copy, so its row is
                    there but cannot be chosen. The two tool pages end the line
-                   with their documentation instead, as the conversation's do. */
-                action={page === "tools" || page === "advanced" ? (
+                   with their documentation instead, as the conversation's do:
+                   the tools page's is the conversation's, and the advanced page's
+                   is the role window's, where what the caller keeps is written. */
+                action={page === "tools" ? (
                   <DocsLink page="features" />
+                ) : page === "advanced" ? (
+                  <DocsLink page="agents" section="role-window" />
                 ) : page === "template" ? (
                   <div className="settings-page-heading__actions">
                     <PopoverMenu
@@ -1001,10 +985,10 @@ export function AgentRoleEditor({
                         * writes it through verbatim. */}
                       <Field
                         label={t("子代理描述", "Subagent description")}
-                        hint={t(
-                          "告诉主代理这个角色是干什么的。会拼进本对话「子代理」/「工作流」工具的描述里，每个角色一行；留空则这个角色不出现在那份说明里。",
-                          "Tells the main agent what this role is for. It is appended to this conversation's Subagent / Workflow tool description, one line per role; leave it empty and this role contributes no line."
-                        )}
+                        hint={roleWindowDocs(t(
+                          "告诉主代理何时选用这个角色。",
+                          "Tells the main agent when to pick this role."
+                        ))}
                       >
                         <textarea
                           className="input"
@@ -1046,8 +1030,8 @@ export function AgentRoleEditor({
                                   "This role has no model to run on right now (a broken binding an older build recorded). Choose the conversation's model or another available one."
                                 )
                             : t(
-                                "只列出已启用提供商中的模型；保存精确 provider/model ID。",
-                                "Only models from enabled providers are listed; exact provider/model IDs are saved."
+                                "只列出已启用提供商的模型。",
+                                "Only models from enabled providers."
                               )}
                         >
                           <select
@@ -1107,13 +1091,7 @@ export function AgentRoleEditor({
                           </select>
                         </Field>
 
-                        <Field
-                          label={t("思考程度", "Reasoning effort")}
-                          hint={t(
-                            "留空表示跟随对话的思考程度。",
-                            "Leave unset to follow the conversation's reasoning effort."
-                          )}
-                        >
+                        <Field label={t("思考程度", "Reasoning effort")}>
                           <select
                             className="input"
                             value={draft.effort ?? "inherit"}
@@ -1141,9 +1119,14 @@ export function AgentRoleEditor({
                           * following. */}
                         <Field
                           label={t("工具描述", "Tool descriptions")}
-                          hint={t(
-                            "选「跟随调用方」时，这个角色的子代理用调用它的对话所用的工具描述；选一份，则它的工具与提示词措辞改用这一份。调用方模型读到的子代理结果仍用调用方的措辞。",
-                            "Follow the caller to word this role's subagent with the calling conversation's tool descriptions; pick a file to word its tools and prompts with that one instead. What the caller's model reads about the subagent keeps the caller's wording."
+                          hint={(
+                            <>
+                              {t(
+                                "决定子代理的工具与提示词措辞。",
+                                "Sets the wording of the subagent's tools and prompts."
+                              )}
+                              <DocsLink inline page="prompt-profiles" section="apply" />
+                            </>
                           )}
                         >
                           <select
@@ -1176,8 +1159,8 @@ export function AgentRoleEditor({
                           hint={resource
                             ? undefined
                             : t(
-                                "全局角色每个对话都能选；工作区角色只有带着这个工作区的对话能选。保存后不能再改位置。",
-                                "A global role can be selected by every conversation; a workspace role only by conversations that have that workspace. The location cannot change after saving."
+                                "决定哪些对话能选它，保存后不可改。",
+                                "Decides which conversations can pick it; fixed once saved."
                               )}
                         >
                           {resource ? (
@@ -1208,9 +1191,9 @@ export function AgentRoleEditor({
                     switch (whether to reach the web at all is the caller's
                     decision, and stays the ceiling), the memory tiers (derived
                     from the caller's switches and the role's memory binding,
-                    never from a tool list), the file write guards (a run
-                    follows the conversation that called it) and the
-                    host-message container.
+                    never from a tool list), the file write guards and
+                    subagent communication (a run follows the conversation
+                    that called it) and the host-message container.
                     The tool-description file is a field of the role, on its
                     settings page. Nothing on either of these pages follows
                     the calling conversation: the list and the web answers are
@@ -1226,6 +1209,7 @@ export function AgentRoleEditor({
 
                 {page === "advanced" && (
                   <AdvancedToolsPage
+                    key={resource?.id ?? "new-role"}
                     web={{
                       value: draft.webSearch,
                       onChange: (patch) => replaceDraft((current) => ({
@@ -1235,6 +1219,7 @@ export function AgentRoleEditor({
                       // The native backends are the role's own model's, not the
                       // conversation's the hints otherwise speak of.
                       subject: "role",
+                      rememberKey: resource ? `role:${resource.id}` : undefined,
                       nativeFetchAvailable: familySupportsNativeFetch(runFamily),
                       nativeToolTypeSelectable: familySelectsNativeToolType(runFamily)
                     }}
@@ -1275,20 +1260,12 @@ export function AgentRoleEditor({
                       : page === "mcp"
                         ? t("尚未发现 MCP Server", "No MCP servers discovered")
                         : t("尚未发现钩子", "No hooks discovered")}
-                    emptyDescription={page === "skills"
-                      ? t(
-                          "把技能目录放在 ~/.mewrk/skills/ 或工作区的 .mewrk/skills/ 下，列表很快会自动刷新。",
-                          "Put skill folders under ~/.mewrk/skills/ or the workspace's .mewrk/skills/; the list refreshes by itself shortly after."
-                        )
-                      : page === "mcp"
-                        ? t(
-                            "把服务器写进 ~/.mewrk/mcp.json 或工作区的 .mewrk/mcp.json，保存后列表很快会自动刷新。",
-                            "Declare servers in ~/.mewrk/mcp.json or the workspace's .mewrk/mcp.json; the list refreshes by itself shortly after you save."
-                          )
-                        : t(
-                            "钩子写在 ~/.mewrk/hooks.json 或工作区的 .mewrk/hooks.json 里，保存后列表很快会自动刷新。",
-                            "Hooks live in ~/.mewrk/hooks.json or the workspace's .mewrk/hooks.json; the list refreshes by itself shortly after you save."
-                          )}
+                    emptyDescription={(
+                      <>
+                        {t("添加后会自动出现在这里。", "Anything you add shows up here automatically.")}
+                        <DocsLink inline page={page} section="location" />
+                      </>
+                    )}
                   />
                 )}
 

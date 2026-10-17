@@ -1164,6 +1164,45 @@ pub fn tool_catalog() -> Vec<ToolDescriptor> {
                 Some("要停止的任务地址：后台命令写 shell:<id>，子代理与工作流直接写名称（工作流也可写 workflow:<runId>）；终端会话不能用它停止，开发服务器用 preview_stop。被停任务的结果仍会照常交付"),
             )],
         ),
+        // Derived from the conversation's subagent-communication switch and
+        // `agent_spawn`, and absent from the picker: it exists only while the
+        // main agent can message the children it starts. A child never holds it.
+        descriptor(
+            "send_message",
+            "发送消息",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![
+                parameter(
+                    "to",
+                    "子代理",
+                    StringType,
+                    true,
+                    None,
+                    Some("review-api"),
+                    Some("agent_spawn 时起的名字"),
+                ),
+                parameter(
+                    "message",
+                    "消息",
+                    Multiline,
+                    true,
+                    None,
+                    Some("改用 v2 接口再试一次，并报告结果"),
+                    None,
+                ),
+                parameter(
+                    "summary",
+                    "摘要",
+                    StringType,
+                    false,
+                    None,
+                    Some("改用 v2 接口重试"),
+                    Some("时间线上显示的 5–10 词预览"),
+                ),
+            ],
+        ),
         descriptor(
             "box",
             "后台结果",
@@ -1785,6 +1824,7 @@ fn english_tool_label(name: &str) -> Option<&'static str> {
         "task_wait" => "Wait for tasks",
         "task_list" => "List tasks",
         "task_stop" => "Stop a task",
+        "send_message" => "Send message",
         "box" => "Background result",
         "read_global_memory" => "Read global memory",
         "read_project_memory" => "Read project memory",
@@ -1843,6 +1883,7 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
         "operation" => "Operation",
         "output_mode" => "Output mode",
         "max_results" => "Maximum results",
+        "message" => "Message",
         "name" => "Name",
         "new_text" => "New text",
         "none" => "Empty argument",
@@ -1867,10 +1908,12 @@ fn english_parameter_label(name: &str) -> Option<&'static str> {
         "serverId" => "Server ID",
         "start_line" => "Start line",
         "styles" => "CSS properties",
+        "summary" => "Summary",
         "task" => "Task address",
         "tasks" => "Tasks",
         "timeout" => "Timeout (ms)",
         "timeout_seconds" => "Timeout (seconds)",
+        "to" => "Child agent",
         "token_budget" => "Token budget",
         "uid" => "Element uid",
         "value" => "Value",
@@ -2047,6 +2090,8 @@ fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
         ("task_stop", "task") => {
             "Address of the task to stop: a background command as shell:<id>, a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>). Terminal sessions cannot be stopped with this tool, and dev servers are stopped with preview_stop. The stopped task's result is still delivered."
         }
+        ("send_message", "to") => "Name the child was spawned with.",
+        ("send_message", "summary") => "Optional 5–10 word preview shown on the timeline.",
         ("box", "none") => "Always an empty list.",
         ("read_global_memory", "name") | ("read_project_memory", "name") => {
             "A document name listed in the memory index. The .md suffix is optional."
@@ -2117,6 +2162,8 @@ fn english_parameter_placeholder(tool: &str, parameter: &str) -> Option<&'static
         ("web_search", "query") => "Anthropic Claude 4.5 release date",
         ("agent_spawn", "prompt") => "Inspect routing under src/ and summarize the key files",
         ("agent_spawn", "label") => "Inspect routing",
+        ("send_message", "message") => "Retry with the v2 endpoint and report the result",
+        ("send_message", "summary") => "Retry with the v2 endpoint",
         ("read_global_memory", "name")
         | ("create_global_memory", "name")
         | ("edit_global_memory", "name") => "user-preferences",
@@ -2240,12 +2287,6 @@ pub fn default_api_providers() -> Vec<ApiProvider> {
 /// preset of their own.
 pub(crate) const BUILTIN_PRESET_ID: &str = "preset_mewrk";
 
-/// The template the built-in preset opens with.
-///
-/// Fixed rather than minted: storage has to find its own row to rewrite it on
-/// every start, and the renderer seed has to name the same one.
-pub(crate) const BUILTIN_PRESET_TEMPLATE_ID: &str = "template_preset_mewrk";
-
 /// Presets earlier builds seeded into the document as ordinary user data, each
 /// with the template it opened with. The built-in preset replaces them, so
 /// storage removes both on load.
@@ -2254,36 +2295,10 @@ pub(crate) const RETIRED_SEEDED_PRESETS: &[(&str, &str)] = &[
     ("preset_claude_code", "template_preset_claude_code"),
 ];
 
-/// The system prompt the built-in preset opens with: the one `System` row of
-/// its template, which `aisdk::step::system_prompt_parts` lifts into the
-/// request's system half.
-///
-/// Engineering practice only. Where the model runs, with which tools and on
-/// which machines, is what the host's own sections say, so this says none of it
-/// — how to delegate included: that rides on `agent_spawn`'s own description,
-/// which reaches the model only when the conversation can spawn a child.
-pub(crate) const BUILTIN_PRESET_PROMPT: &str = "\
-    You are a software engineer working in the user's codebase. You help with engineering tasks: fixing bugs, building features, refactoring, explaining code and reviewing changes.\n\
-    \n\
-    # How to work\n\
-    - Read before you write. Look at the relevant code, its callers and the conventions around it before changing anything, and make new code read like its surroundings: the same naming, idioms and comment density.\n\
-    - Do what was asked, no less and no more. Don't quietly narrow the task, and don't add features, refactors, files or abstractions nobody requested. If you notice a real problem outside the task, mention it briefly instead of fixing it.\n\
-    - Prefer the smallest change that fully solves the problem, and fix causes rather than symptoms. Leave no dead code, debug output or commented-out blocks behind.\n\
-    - Check what you can check. Don't guess at an API, a path, a flag or a behaviour when the code, its documentation or a quick run can tell you.\n\
-    - Don't introduce security problems: validate untrusted input at the boundary, never assemble commands or queries from it by string concatenation, and keep credentials out of code and logs.\n\
-    \n\
-    # Verify before you claim\n\
-    - Saying something is done, fixed or passing needs evidence: build it, run the tests or the program, and read the output. If you could not verify something, say so and say why.\n\
-    - Report failures as they are, with their output. Never weaken, skip or delete a test to make it pass unless that is the task.\n\
-    \n\
-    # Actions with consequences\n\
-    - Confirm with the user before anything destructive or hard to reverse (deleting or overwriting files, discarding changes, rewriting history, force-pushing) and before anything others will see (pushing, publishing, sending messages). An approval covers the action it was given for, not later ones.\n\
-    - Look at what you are about to delete or overwrite before you do it. Don't commit or push unless asked.\n\
-    \n\
-    # Communicating\n\
-    - Lead with the answer or the outcome, then the evidence, then anything still open. Be concise and skip preamble and recaps.\n\
-    - Reply in the language the user writes in. Cite code as `path:line`.\n\
-    - When a request is ambiguous in a way that changes the result, ask. Otherwise make a sensible choice, say what it was, and proceed.";
+/// The template earlier builds wrote the built-in preset's system prompt
+/// behind. The preset now opens with no messages, so storage removes the row
+/// on load.
+pub(crate) const RETIRED_BUILTIN_PRESET_TEMPLATE_ID: &str = "template_preset_mewrk";
 
 /// The tools the built-in preset enables out of a document's catalog `tools`:
 /// every built-in tool except the names the host derives for itself, and of
@@ -2317,6 +2332,7 @@ pub(crate) fn builtin_preset_enabled_tools(
             built_in.contains(*name)
                 && !crate::mewrk_memory::is_memory_tool(name)
                 && !crate::agents::is_task_runtime_tool_name(name)
+                && !crate::agents::is_subagent_messaging_tool_name(name)
                 && !crate::plan_mode::is_plan_mode_tool_name(name)
                 && !crate::handoff::is_handoff_tool_name(name)
                 && *name != crate::capabilities::SKILL_TOOL
@@ -2334,9 +2350,9 @@ pub(crate) fn builtin_preset_enabled_tools(
 /// the document it goes into.
 ///
 /// The one shell is this machine's and is chosen by storage, which takes a
-/// probe. It selects no tool-description file, so it renders with the
-/// built-in one, and no role: none ships, so its children are anonymous ones
-/// on the conversation's model.
+/// probe. It opens with no messages, selects no tool-description file, so it
+/// renders with the built-in one, and no role: none ships, so its children are
+/// anonymous ones on the conversation's model.
 pub(crate) fn builtin_preset(
     tools: &[ToolDescriptor],
     shell: Option<crate::shell_backend::ShellBackend>,
@@ -2345,7 +2361,7 @@ pub(crate) fn builtin_preset(
         id: BUILTIN_PRESET_ID.into(),
         name: "mewrk".into(),
         description: String::new(),
-        template_id: BUILTIN_PRESET_TEMPLATE_ID.into(),
+        template_id: String::new(),
         settings: ConversationPresetSettings {
             enabled_tools: builtin_preset_enabled_tools(tools, shell),
             tool_description_file_id: None,
@@ -2380,6 +2396,9 @@ pub(crate) fn builtin_preset(
                 exclude_domains: Vec::new(),
             },
             web_search_enabled: true,
+            // Off: letting the main agent message its children, and handing
+            // them an update tool, is something a conversation turns on.
+            subagent_messaging_enabled: false,
             security_level: Default::default(),
             // The memory tools are switched by these two rather than named in
             // the list.
@@ -2393,6 +2412,7 @@ pub(crate) fn builtin_preset(
             // a choice of the conversation's.
             host_message_container: crate::model::HostMessageContainer::User,
             file_write_guards_enabled: true,
+            environment_prompt_enabled: true,
         },
     }
 }
@@ -2515,6 +2535,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
         settings: ConversationPresetSettings {
             enabled_tools: enabled_tools.to_vec(),
             web_search_enabled: true,
+            subagent_messaging_enabled: false,
             tool_description_file_id: None,
             agent_ids: Vec::new(),
             agent_definitions: Vec::new(),
@@ -2530,6 +2551,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
             mcp_tool_discovery_enabled: false,
             host_message_container: Default::default(),
             file_write_guards_enabled: true,
+            environment_prompt_enabled: true,
         },
     }];
     document.presets.default_conversation_preset_id = "conversation_default".into();
@@ -2559,6 +2581,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                 settings: ConversationSettings {
                     enabled_tools: enabled_tools.to_vec(),
                     web_search_enabled: true,
+                    subagent_messaging_enabled: false,
                     hook_ids: Vec::new(),
                     skill_ids: Vec::new(),
                     mcp_ids: Vec::new(),
@@ -2576,6 +2599,7 @@ fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
                     mcp_tool_discovery_enabled: false,
                     host_message_container: Default::default(),
                     file_write_guards_enabled: true,
+                    environment_prompt_enabled: true,
                     compaction_method: None,
                     legacy_sandbox: Default::default(),
                     tool_lock: None,
@@ -2679,7 +2703,7 @@ mod tests {
         let english = tool_catalog_for_language(ResolvedLanguage::EnUs);
         let chinese_after = tool_catalog_for_language(ResolvedLanguage::ZhCn);
 
-        assert_eq!(chinese.len(), 51);
+        assert_eq!(chinese.len(), 52);
         assert_eq!(english.len(), chinese.len());
         assert_eq!(chinese_after, chinese);
         for (localized, canonical) in english.iter().zip(&chinese) {
@@ -2742,6 +2766,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `send_message` is in the catalog so its cards render and the host can
+    /// classify it, but it is host-derived (the subagent-communication switch
+    /// grants it): the built-in preset never lists it, and the preset leaves
+    /// the switch off.
+    #[test]
+    fn send_message_is_cataloged_but_host_derived_and_off_in_the_builtin_preset() {
+        let catalog = tool_catalog();
+        let send = catalog
+            .iter()
+            .find(|tool| tool.name == "send_message")
+            .expect("send_message is in the catalog");
+        assert_eq!(send.category, ToolCategory::Orchestration);
+        assert!(!send.dangerous);
+        assert_eq!(
+            send.parameters
+                .iter()
+                .map(|parameter| (parameter.name.as_str(), parameter.required))
+                .collect::<Vec<_>>(),
+            [("to", true), ("message", true), ("summary", false)]
+        );
+        assert_eq!(
+            send.parameters[1].parameter_type,
+            crate::model::ToolParameterType::Multiline
+        );
+        let english = tool_catalog_for_language(ResolvedLanguage::EnUs);
+        let english_send = english
+            .iter()
+            .find(|tool| tool.name == "send_message")
+            .unwrap();
+        assert_eq!(english_send.label, "Send message");
+        assert_eq!(english_send.parameters[0].label, "Child agent");
+        assert_eq!(
+            english_send.parameters[0].help.as_deref(),
+            Some("Name the child was spawned with.")
+        );
+
+        let enabled = builtin_preset_enabled_tools(&catalog, None);
+        assert!(!enabled.iter().any(|name| name == "send_message"));
+        assert!(enabled.iter().any(|name| name == "agent_spawn"));
+        let preset = builtin_preset(&catalog, None);
+        assert!(!preset.settings.subagent_messaging_enabled);
+        assert!(!default_document().tools.is_empty());
     }
 
     #[test]

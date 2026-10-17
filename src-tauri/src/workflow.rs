@@ -49,7 +49,6 @@
 //! ([`resume_interrupted_run`]).
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1092,7 +1091,7 @@ fn drive_workflow_task(
     // fails and aborts the private pool.
     let cancel_shared = Arc::clone(&shared);
     let guarded_sink = move |event: ModelStreamEvent| -> Result<(), String> {
-        if cancel_shared.cancel.load(Ordering::Acquire) {
+        if cancel_shared.is_cancelled() {
             return Err("Workflow stopped".into());
         }
         event_sink(event)
@@ -1219,7 +1218,7 @@ fn drive_workflow_task(
         // cancellation body says the user closed the run when that is what happened, while a
         // channel failure is Failed so its recovery hint reads as a fault rather than a choice.
         Err(DriveAbort::SinkDead(detail)) => {
-            if shared.cancel.load(Ordering::Acquire) {
+            if shared.is_cancelled() {
                 let aborted = parent
                     .prompt_profile
                     .text(PromptKey::WorkflowAbortedCancelled)

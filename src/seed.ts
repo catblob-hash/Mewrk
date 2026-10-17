@@ -415,6 +415,18 @@ export const toolCatalog: ToolDescriptor[] = [
     ]
   },
   {
+    name: "send_message",
+    label: "发送消息",
+    description: "",
+    category: "orchestration",
+    dangerous: false,
+    parameters: [
+      { name: "to", label: "子代理", type: "string", required: true, placeholder: "review-api", help: "agent_spawn 时起的名字" },
+      { name: "message", label: "消息", type: "multiline", required: true, placeholder: "改用 v2 接口再试一次，并报告结果" },
+      { name: "summary", label: "摘要", type: "string", required: false, placeholder: "改用 v2 接口重试", help: "时间线上显示的 5–10 词预览" }
+    ]
+  },
+  {
     name: "box",
     label: "后台结果",
     description: "",
@@ -669,12 +681,6 @@ function freshToolCatalog(): ToolDescriptor[] {
  * deleted; this renderer copy only seeds the browser preview and vitest. */
 export const BUILTIN_PRESET_ID = "preset_mewrk";
 
-/** The template the built-in preset opens with. Keep in sync with
- * `catalog.rs::BUILTIN_PRESET_TEMPLATE_ID`. The body lives in the host's SQLite
- * store, written by `storage::install_builtin_preset`, so in the browser preview
- * and in vitest this id dangles — which every reader treats as "no template". */
-export const BUILTIN_PRESET_TEMPLATE_ID = "template_preset_mewrk";
-
 /** Keep in sync with `src-tauri/src/catalog.rs::product_default_api_providers`.
  * IDs stay random per installation because they key credential storage; the
  * renderer's `ensureCodexProvider` / `ensureClaudeAgentProvider` claim these
@@ -741,9 +747,10 @@ function seedPresetEnabledTools(tools: readonly ToolDescriptor[], shell: ShellBa
     });
 }
 
-/** Keep in sync with `src-tauri/src/catalog.rs::builtin_preset`. It selects no
- * tool-description file, so it renders with the built-in one, and no role: none
- * ships, so its children are anonymous ones on the conversation's model. */
+/** Keep in sync with `src-tauri/src/catalog.rs::builtin_preset`. It opens with
+ * no messages, selects no tool-description file, so it renders with the
+ * built-in one, and no role: none ships, so its children are anonymous ones on
+ * the conversation's model. */
 function builtinPreset(
   tools: readonly ToolDescriptor[],
   platform: string
@@ -752,9 +759,7 @@ function builtinPreset(
     id: BUILTIN_PRESET_ID,
     name: "mewrk",
     description: "",
-    // The body lives in the host store; this id dangles in the browser preview,
-    // which reads as "no template".
-    templateId: BUILTIN_PRESET_TEMPLATE_ID,
+    templateId: "",
     settings: {
       enabledTools: seedPresetEnabledTools(tools, seedShellBackend(platform)),
       toolDescriptionFileId: null,
@@ -788,6 +793,9 @@ function builtinPreset(
       },
       // Which of the two web tools this grants follows the resolved backend.
       webSearchEnabled: true,
+      // Off: letting the main agent message its children, and handing them an
+      // update tool, is something a conversation turns on.
+      subagentMessagingEnabled: false,
       securityLevel: "request_approval",
       // The memory tools are switched by these two rather than named in the list.
       globalMemoryEnabled: true,

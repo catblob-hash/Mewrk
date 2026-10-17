@@ -5,6 +5,7 @@ import { useI18n } from "../../i18n";
 import { CLAUDE_AGENT_LEGAL_URL } from "../../lib/claudeAgentProvider";
 import { claudeAgentLoginStatus, claudeAgentOpenLogin } from "../../lib/runtime";
 import type { ApiProvider, ClaudeAgentLoginStatus } from "../../types";
+import { DocsLink } from "../DocsLink";
 import { useSettingsSession } from "../settingsSession";
 import { useWindowRefocus } from "./useWindowRefocus";
 
@@ -312,10 +313,13 @@ export function ClaudeAgentLoginPanel({
         <CircleAlert size={16} aria-hidden="true" />
         <div>
           <div className="provider-field__title">{t("使用本机 Claude Code 的登录", "Uses the Claude Code login on this machine")}</div>
-          <p className="provider-field__help">{t(
-            "Mewrk 用的是上面安装的 Claude Code，不需要另外安装 claude 命令。打开终端登录，或把下面的命令复制到任意终端里运行（claude.ai 订阅或 Console 账号都可以）。已经在用 Claude Code 的话，在那边登录也一样，两者共用同一份登录。Mewrk 不读、不搬、也不转发任何凭据。",
-            "Mewrk uses the Claude Code installed above, so there is no separate claude command to install. Open a terminal to sign in, or copy the command below into any terminal (a claude.ai subscription or a Console account both work). If you already use Claude Code, signing in there works too: both share one login. Mewrk never reads, copies, or forwards any credential."
-          )}</p>
+          <p className="provider-field__help">
+            {t(
+              "在终端里登录，或复制命令到任意终端运行。",
+              "Sign in from a terminal, or copy the command and run it anywhere."
+            )}
+            <DocsLink inline page="providers" section="claude-agent" />
+          </p>
         </div>
       </div>
       <div className="provider-field__row">

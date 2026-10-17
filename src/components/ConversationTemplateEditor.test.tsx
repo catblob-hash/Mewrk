@@ -144,6 +144,7 @@ describe("ConversationTemplateEditor", () => {
     expect(onSave).not.toHaveBeenCalled();
 
     const dialog = screen.getByRole("dialog", { name: "模板里有未启用的工具" });
+    expect(within(dialog).getByText("这些工具当前是关闭的，套用后模型无法调用。")).toBeInTheDocument();
     expect(within(dialog).getByText("列出目录")).toBeInTheDocument();
     expect(within(dialog).getByText("ls")).toBeInTheDocument();
 

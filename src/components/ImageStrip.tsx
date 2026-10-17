@@ -182,11 +182,7 @@ function ImageThumbnail({
   }, [image.id, image.mime, loadVersion]);
 
   const dimensions = image.width && image.height ? `${image.width} × ${image.height}` : "";
-  const title = [
-    image.shortId !== undefined ? `[Image #${image.shortId}]` : "",
-    image.name,
-    dimensions
-  ].filter(Boolean).join(" · ");
+  const title = [image.name, dimensions].filter(Boolean).join(" · ");
   const status = source
     ? t("{name} 已加载", "{name} loaded", { name: image.name })
     : failed
@@ -264,14 +260,6 @@ function ImageThumbnail({
             : t("{name} 已重新加载", "{name} reloaded", { name: image.name })}
         </span>
       ) : null}
-      {image.shortId !== undefined ? (
-        <span className="image-strip__short-id">
-          <span aria-hidden="true">#{image.shortId}</span>
-          <span className="sr-only">
-            {t("对话编号 [Image #{id}]", "Conversation number [Image #{id}]", { id: image.shortId })}
-          </span>
-        </span>
-      ) : null}
       {onRemove ? (
         <button
           type="button"
@@ -286,7 +274,7 @@ function ImageThumbnail({
   );
 }
 
-/** The short type label a file tile carries, the way an image carries its number. */
+/** The short type label a file tile carries. */
 function fileTypeLabel(file: FileAttachment): string {
   if (file.format === "pdf") return "PDF";
   const extension = fileExtension(file.name);

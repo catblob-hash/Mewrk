@@ -189,10 +189,7 @@ export function UsageStatsCard({
                 )
                 : loading
                   ? t("正在读取统计…", "Loading statistics…")
-                  : t(
-                    "还没有记录到任何 token 用量——发出第一条消息就会开始记账。",
-                    "No token usage recorded yet — the first message starts the ledger."
-                  )}
+                  : t("还没有记录到 token 用量。", "No token usage recorded yet.")}
             </p>
           </>
         ) : (

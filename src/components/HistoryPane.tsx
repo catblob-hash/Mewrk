@@ -641,12 +641,12 @@ export function HistoryPane({ conversationId, contexts, streaming, owners }: His
       <p className="history-pane__empty">
         {historyOwners
           ? t(
-              "这个子代理还没有历史记录。记录从它发出的第一次请求开始。",
-              "Nothing has been recorded for this subagent yet. Recording starts with its first request."
+              "还没有历史记录，从它的第一次请求开始。",
+              "Nothing recorded yet. Recording starts at its first request."
             )
           : t(
-              "这个对话还没有历史记录。记录从下一次发送或编辑开始。",
-              "Nothing has been recorded for this conversation yet. Recording starts with the next send or edit."
+              "还没有历史记录，从下一次发送或编辑开始。",
+              "Nothing recorded yet. Recording starts at the next send or edit."
             )}
       </p>
     );
@@ -675,16 +675,9 @@ export function HistoryPane({ conversationId, contexts, streaming, owners }: His
       return t("还没有请求带出去的内容", "What no request has carried yet");
     }
     if (bar.kind === "interrupted") {
-      return t(
-        "第 {n} 轮 · 最后一次请求没有等到回复",
-        "Turn {n} · its last request never got an answer back",
-        { n: bar.index }
-      );
+      return t("最后一次请求没有等到回复", "The last request never got an answer back");
     }
-    return t("第 {n} 轮 · 发出 {count} 次请求", "Turn {n} · {count} requests", {
-      n: bar.index,
-      count: bar.requests.length
-    });
+    return t("发出 {count} 次请求", "{count} requests", { count: bar.requests.length });
   }
 
   function renderPrompt(bar: HistoryBar): ReactNode {

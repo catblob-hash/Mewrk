@@ -6,7 +6,8 @@
 //! - [`remote_agents`]: the agent builds for machines other than this computer
 //!   (SSH machines, WSL), fetched the first time such a machine needs one.
 //! - [`claude_agent`]: the Claude Agent SDK and the Claude Code CLI it drives,
-//!   from npm, installed and updated by the user on the provider page.
+//!   from npm at the version Mewrk's channel names, installed and updated by
+//!   the user on the provider page.
 //!
 //! # Mewrk's own channel
 //!
@@ -21,7 +22,12 @@
 //! components/aisdk/p<protocol>/<triple>/<sha256>/mewrk-aisdk.exe.gz
 //! components/remote-agent/<source id>/<triple>.json              pointer
 //! components/remote-agent/<source id>/<triple>/<sha256>/mewrk-remote.gz
+//! components/claude-agent/version.json                          {"schema": 1, "sdkVersion": "0.3.293"}
 //! ```
+//!
+//! `claude-agent/version.json` is not a pointer: it names, by hand, the one
+//! Claude Agent SDK release the provider page offers, whose packages come from
+//! npm ([`claude_agent`]). Like a pointer it is kept for a minute.
 //!
 //! A pointer's `files[].path` is relative to the directory the pointer is in.
 //! Trust is the app updater's: HTTPS to Mewrk's own host, every file checked

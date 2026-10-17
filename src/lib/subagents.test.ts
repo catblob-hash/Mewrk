@@ -10,6 +10,9 @@ import {
   findSubagentView,
   graftExternalStepBodies,
   hashSubagentId,
+  isChildMainMessageContext,
+  isQueuedMessageContext,
+  sendMessageRecipient,
   subagentAvatarTone
 } from "./subagents";
 
@@ -160,7 +163,7 @@ describe("deriveSubagentViews", () => {
 
     expect(view).toMatchObject({
       id: "stream-tool-run-call-live",
-      label: "子代理 1",
+      label: "子代理",
       status: "running",
       summary: "已经完成目录扫描",
       completedAt: null,
@@ -235,7 +238,7 @@ describe("deriveSubagentViews", () => {
 
   it("localizes generated labels, transcript placeholders, summaries, and supplemental updates", () => {
     const messages = {
-      fallbackLabel: (index: number) => `Subagent ${index}`,
+      fallbackLabel: "Subagent",
       workflowStepLabel: "Workflow step",
       missingTask: "No task description provided",
       updateReturned: "Status returned to the primary agent",
@@ -254,7 +257,7 @@ describe("deriveSubagentViews", () => {
       live: { contexts: [], updates: [], status: "running" }
     })], messages);
     expect(running).toMatchObject({
-      label: "Subagent 1",
+      label: "Subagent",
       task: "",
       summary: "Working"
     });
@@ -546,6 +549,168 @@ describe("background agent views", () => {
     expect(view.contexts.some(
       (context) => context.kind === "user" && context.content === "暂存这条要求"
     )).toBe(false);
+  });
+
+  describe("the main agent's send_message (`to`)", () => {
+    const record = (
+      status: SubagentRunRecord["status"],
+      contexts: ContextItem[]
+    ): SubagentRunRecord => ({ name: "helper", task: "审查 API", status, contexts, updates: [] });
+    const firstTurn: ContextItem[] = [
+      { id: "m-task", kind: "user", content: "审查 API", createdAt: "2026-07-14T01:00:01Z" },
+      { id: "m-answer", kind: "assistant", content: "初版结论", createdAt: "2026-07-14T01:01:00Z" }
+    ];
+    const sendMessage = (overrides: Partial<ToolContext> = {}): ToolContext => ({
+      id: "tool-message",
+      kind: "tool",
+      toolName: "send_message",
+      input: { to: "helper", message: "补充并发风险", summary: "并发风险" },
+      result: result("Message queued for helper; it reads it before its next model request.", true, "2026-07-14T02:00:01Z"),
+      createdAt: "2026-07-14T02:00:00Z",
+      ...overrides
+    });
+    const userTurns = (contexts: ContextItem[]) => contexts.flatMap(
+      (context) => (context.kind === "user" ? [context.content] : [])
+    );
+
+    it("tells the main agent's call from the retired child note by its recipient", () => {
+      expect(isChildMainMessageContext(sendMessage({ input: { message: "已定位到根因" } }))).toBe(true);
+      // Neither downward form is the child's note: the current tool names `to`,
+      // the retired queue-only call named `target`.
+      expect(isChildMainMessageContext(sendMessage())).toBe(false);
+      expect(isChildMainMessageContext(sendMessage({ input: { target: "helper", message: "补充" } }))).toBe(false);
+      expect(sendMessageRecipient(sendMessage())).toBe("helper");
+      expect(sendMessageRecipient(sendMessage({ input: { target: "helper", message: "补充" } }))).toBe("");
+      expect(sendMessageRecipient(sendMessage({ input: { message: "已定位" } }))).toBe("");
+      expect(sendMessageRecipient(sendMessage({ toolName: "agent_send", input: { to: "helper" } }))).toBe("");
+    });
+
+    it("merges a queued message into the child's one view without writing its user turn", () => {
+      const spawn = spawnContext({ subagent: record("completed", firstTurn) });
+      const queued = sendMessage();
+      expect(isQueuedMessageContext(queued)).toBe(true);
+
+      const views = deriveSubagentViews([spawn, queued]);
+      expect(views).toHaveLength(1);
+      expect(views[0]).toMatchObject({ id: "helper", name: "helper", status: "completed" });
+      expect(views[0].callIds).toEqual(["tool-spawn", "tool-message"]);
+      // The host's child transcript carries the message once the child drains
+      // it; the card must not stand in for it.
+      expect(userTurns(views[0].contexts)).toEqual(["审查 API"]);
+      // Nor does a message-call's `message`/`summary` become the view's task or label.
+      expect(views[0]).toMatchObject({ task: "审查 API", label: "审查" });
+    });
+
+    it("keeps a queued message from speaking for the child's status", () => {
+      // The child is running on its spawn card; the receipt card is settled and
+      // owns no run, so it must neither end nor extend the child.
+      const running = spawnContext({
+        streaming: true,
+        streamStatus: "completed",
+        live: { contexts: [], updates: [], status: "running" }
+      });
+      const streamingQueue = sendMessage({
+        streaming: true,
+        streamStatus: "completed",
+        live: { contexts: [], updates: [] }
+      });
+      expect(deriveSubagentViews([running, streamingQueue])[0].status).toBe("running");
+      expect(deriveSubagentViews([running, sendMessage()])[0].status).toBe("running");
+
+      // A spawn that was lost (no record anywhere) stays interrupted: the
+      // queued receipt's own success says nothing about the child.
+      expect(deriveSubagentViews([spawnContext(), sendMessage()])[0].status).toBe("interrupted");
+    });
+
+    it("does not open a phantom view for a queued or refused message with no child to join", () => {
+      expect(deriveSubagentViews([sendMessage()])).toEqual([]);
+      expect(deriveSubagentViews([
+        sendMessage({ result: result("There is no child agent named helper.", false) })
+      ])).toEqual([]);
+      // A message to some other name never joins the helper's view either.
+      const views = deriveSubagentViews([
+        spawnContext({ subagent: record("completed", firstTurn) }),
+        sendMessage({ input: { to: "other", message: "你好" } })
+      ]);
+      expect(views.map((view) => view.id)).toEqual(["helper"]);
+      expect(views[0].callIds).toEqual(["tool-spawn"]);
+    });
+
+    it("lets a resumed run's cumulative record supersede the spawn card's in the merged view", () => {
+      const spawn = spawnContext({ subagent: record("completed", firstTurn) });
+      const resumed = sendMessage({
+        result: result("helper had finished; it was resumed in the background with your message and its full context."),
+        subagent: record("stopped", [
+          ...firstTurn,
+          { id: "m-user-2", kind: "user", content: "补充并发风险", createdAt: "2026-07-14T02:00:02Z" },
+          { id: "m-answer-2", kind: "assistant", content: "补充后的结论", createdAt: "2026-07-14T02:01:00Z" }
+        ])
+      });
+      expect(isQueuedMessageContext(resumed)).toBe(false);
+
+      const views = deriveSubagentViews([spawn, resumed]);
+      expect(views).toHaveLength(1);
+      expect(views[0]).toMatchObject({
+        id: "helper",
+        name: "helper",
+        task: "审查 API",
+        // Status comes from the newest record, not the spawn's older one.
+        status: "stopped",
+        summary: "补充后的结论"
+      });
+      expect(views[0].callIds).toEqual(["tool-spawn", "tool-message"]);
+      // The transcript is the cumulative one, with the message the host put in
+      // the child's own record exactly once.
+      expect(userTurns(views[0].contexts)).toEqual(["审查 API", "补充并发风险"]);
+      expect(views[0].contexts.filter((context) => context.id === "m-task")).toHaveLength(1);
+    });
+
+    it("keys a resumed run that has only streamed so far by `to`, with its message already in the stream", () => {
+      const spawn = spawnContext({ subagent: record("completed", firstTurn) });
+      const resuming = sendMessage({
+        streaming: true,
+        streamStatus: "completed",
+        live: {
+          status: "running",
+          contexts: [
+            { id: "m-user-2", kind: "user", content: "补充并发风险", createdAt: "2026-07-14T02:00:02Z" },
+            { id: "m-live", kind: "assistant", content: "正在补充", streaming: true, createdAt: "2026-07-14T02:00:10Z" }
+          ],
+          updates: []
+        }
+      });
+      expect(isQueuedMessageContext(resuming)).toBe(false);
+
+      const views = deriveSubagentViews([spawn, resuming]);
+      expect(views).toHaveLength(1);
+      expect(views[0]).toMatchObject({ id: "helper", name: "helper", status: "running" });
+      expect(views[0].live?.contexts.map((context) => context.id)).toEqual(["m-user-2", "m-live"]);
+      expect(userTurns(views[0].contexts)).toEqual(["审查 API", "补充并发风险"]);
+      expect(views[0].contexts.some((context) => context.id === "m-answer")).toBe(true);
+      expect(views[0].contexts.some((context) => context.id === "m-live")).toBe(true);
+      expect(views[0].completedAt).toBeNull();
+    });
+
+    it("lets a resumed run stand without its spawn card in the timeline", () => {
+      // The run it carries is a child's, so it opens that child's view even
+      // when the spawn is out of this timeline; only a message that carries
+      // nothing is dropped.
+      const resumed = sendMessage({
+        subagent: record("completed", firstTurn)
+      });
+      const views = deriveSubagentViews([resumed]);
+      expect(views.map((view) => view.id)).toEqual(["helper"]);
+      expect(views[0].callIds).toEqual(["tool-message"]);
+    });
+
+    it("keeps every legacy `target` card reading as before beside the new form", () => {
+      const spawn = spawnContext({ subagent: record("completed", firstTurn) });
+      const legacy = sendMessage({ id: "tool-legacy", input: { target: "helper", message: "旧的排队" } });
+      const [view] = deriveSubagentViews([spawn, legacy, sendMessage()]);
+      expect(view.callIds).toEqual(["tool-spawn", "tool-legacy", "tool-message"]);
+      // The retired call still joins (and keys) by itself, even with no spawn card.
+      expect(deriveSubagentViews([legacy]).map((entry) => entry.id)).toEqual(["helper"]);
+    });
   });
 
   it("keeps the persisted conversation visible while an agent_send continuation streams", () => {
@@ -1596,12 +1761,31 @@ describe("agent timeline row status", () => {
       streaming: true,
       streamStatus: "completed"
     }))).toBe("running");
-    // A queued message (retired `send_message`) is not a run: it never owned a
-    // child of its own.
+    // A queued message (`send_message`, retired `target` form or current `to`)
+    // is not a run: it never owned a child of its own. A streaming card is
+    // announced with an empty live shell, which is not a run either.
     expect(agentTimelineRunStatus(agentTool("queue", "send_message", { target: "beta" }, {
       streaming: true,
       streamStatus: "completed"
     }))).toBe("completed");
+    expect(agentTimelineRunStatus(agentTool("queue-to", "send_message", { to: "beta", message: "m" }, {
+      streaming: true,
+      streamStatus: "completed",
+      live: { contexts: [], updates: [] }
+    }))).toBe("completed");
+    // The same call resumed a finished child once its stream or record rides on
+    // it, and then it speaks for that child like any continuation.
+    expect(agentTimelineRunStatus(agentTool("resume", "send_message", { to: "beta", message: "m" }, {
+      live: runningLive()
+    }))).toBe("running");
+    expect(agentTimelineRunStatus(agentTool("resume-stream", "send_message", { to: "beta", message: "m" }, {
+      streaming: true,
+      streamStatus: "completed",
+      live: { contexts: [{ id: "c", kind: "assistant", content: "…", createdAt: "2026-07-14T00:00:01Z" }], updates: [] }
+    }))).toBe("running");
+    expect(agentTimelineRunStatus(agentTool("resume-done", "send_message", { to: "beta", message: "m" }, {
+      subagent: { name: "beta", task: "t", status: "roundLimit", contexts: [], updates: [] }
+    }))).toBe("roundLimit");
     expect(agentTimelineRunStatus(agentTool("persisted", "agent_spawn", { name: "finished" }, {
       subagent: { name: "finished", task: "完成", status: "completed", contexts: [], updates: [] }
     }))).toBe("completed");
@@ -1633,6 +1817,13 @@ describe("agent timeline row status", () => {
     }))).toBe("recorded");
     expect(agentTimelineRouteId(agentTool("call", "agent_send", { agent: "addressed" }))).toBe("addressed");
     expect(agentTimelineRouteId(agentTool("call", "send_message", { target: "queued" }))).toBe("queued");
+    expect(agentTimelineRouteId(agentTool("call", "send_message", { to: "addressed-by-to", message: "m" })))
+      .toBe("addressed-by-to");
+    // The recorded name outranks the address, so a resumed run routes to the
+    // child's own view.
+    expect(agentTimelineRouteId(agentTool("call", "send_message", { to: "alias" }, {
+      subagent: { name: "recorded", task: "t", status: "completed", contexts: [], updates: [] }
+    }))).toBe("recorded");
     expect(agentTimelineRouteId(agentTool("call", "agent_spawn", { name: "declared" }))).toBe("declared");
     expect(agentTimelineRouteId(agentTool("anonymous", "workflow_step", {}))).toBe("anonymous");
   });

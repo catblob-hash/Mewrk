@@ -2,25 +2,18 @@ import { useId } from "react";
 import { useI18n } from "../i18n";
 import type { LockTone } from "../lib/toolLock";
 import type { HostMessageContainer } from "../types";
+import { DocsLink } from "./DocsLink";
 import { LockableSwitchRow, LockMark, lockToneClass, type LockHints } from "./LockTone";
 import { WebSearchBehaviorSettings } from "./WebSearchBehaviorSettings";
 import type { WebSearchBehaviorSettingsProps } from "./WebSearchBehaviorSettings";
 
 interface AdvancedToolsPageProps {
-  /** The search and fetch backends, with the shaping and filtering under them. */
-  web: WebSearchBehaviorSettingsProps;
   /**
-   * The switch deciding whether this surface reaches the web at all. Omitted
-   * where that decision belongs to someone else — a role's caller decides it,
-   * and stays the ceiling on whatever the role's own backends say — and the
-   * backend rows are then always drawn, since they are all that is left to
-   * answer.
+   * The web search and web fetch switches, each with its backend and the
+   * shaping and filtering under it. Where the surface decides web access at all
+   * it rides in here too (`webAccess`), written by the two switches.
    */
-  webAccess?: {
-    enabled: boolean;
-    tone?: LockTone | null;
-    onChange: (enabled: boolean) => void;
-  };
+  web: WebSearchBehaviorSettingsProps;
   /** The two memory tiers. Omitted where memory is not a switch of this surface. */
   memory?: {
     global: boolean;
@@ -36,6 +29,27 @@ interface AdvancedToolsPageProps {
    * spawns them.
    */
   fileWriteGuards?: {
+    enabled: boolean;
+    tone?: LockTone | null;
+    onChange: (enabled: boolean) => void;
+  };
+  /**
+   * Subagent communication, one switch for both directions (`send_message` for
+   * the main agent, `subagent_update` for its subagents). Omitted where the
+   * surface does not decide it: a role's runs follow the conversation that
+   * spawns them.
+   */
+  subagentMessaging?: {
+    enabled: boolean;
+    tone?: LockTone | null;
+    onChange: (enabled: boolean) => void;
+  };
+  /**
+   * Whether the system prompt opens with the environment section. Omitted where
+   * the surface does not decide it: a role's runs follow the conversation that
+   * spawns them.
+   */
+  environmentPrompt?: {
     enabled: boolean;
     tone?: LockTone | null;
     onChange: (enabled: boolean) => void;
@@ -65,9 +79,10 @@ interface AdvancedToolsPageProps {
  */
 export function AdvancedToolsPage({
   web,
-  webAccess,
   memory,
   fileWriteGuards,
+  subagentMessaging,
+  environmentPrompt,
   hostMessages,
   lockHints
 }: AdvancedToolsPageProps) {
@@ -75,44 +90,24 @@ export function AdvancedToolsPage({
 
   return (
     <>
-      {/* Web access is one switch, not two tool checkboxes. Upstreams do not
-          agree on how many web tools there are — Anthropic exposes search
+      {/* The two web tools are a switch each, not tool checkboxes. Upstreams do
+          not agree on how many web tools there are — Anthropic exposes search
           and fetch separately, DeepSeek and OpenAI expose search alone and
           keep page retrieval inside it — so the host derives the pair from
-          this switch and the resolved backend rather than letting the picker
-          promise a shape the upstream may not have. */}
+          these switches and the backend under each rather than letting the
+          tool list promise a shape the upstream may not have. */}
       <section className="conversation-settings__field">
-        {webAccess && (
-          <LockableSwitchRow
-            title={t("启用联网搜索", "Enable web search")}
-            description={t(
-              "这个对话能不能联网。具体拿到哪几个联网工具，由下面的搜索后端与抓取后端各自决定——两者可以分别指定，也可以分别关掉。",
-              "Whether this conversation can reach the web at all. Which web tools it actually gets is decided by the search and fetch backends below: each names its own, and each can be turned off on its own."
-            )}
-            checked={webAccess.enabled}
-            tone={webAccess.tone}
-            hints={lockHints}
-            onChange={webAccess.onChange}
-            label={webAccess.enabled
-              ? t("联网搜索已开启", "Web search enabled")
-              : t("联网搜索已关闭", "Web search disabled")}
-          />
-        )}
-        {!webAccess || webAccess.enabled ? (
-          <div className="web-search-provider-field">
-            <WebSearchBehaviorSettings {...web} />
-          </div>
-        ) : null}
+        <WebSearchBehaviorSettings lockHints={lockHints} {...web} />
       </section>
 
       {memory && (
         <section className="conversation-settings__field">
           <LockableSwitchRow
             title={t("启用全局记忆", "Enable global memory")}
-            description={t(
-              "开启后，~/.mewrk 的 MEWRK.md 常驻指令与 MEMORY.md 记忆索引拼进上下文，读取/创建/编辑全局记忆三个工具随之可用。",
-              "When enabled, ~/.mewrk's MEWRK.md instructions and MEMORY.md index join the context, and the read/create/edit global memory tools become available."
-            )}
+            description={<>
+              {t("接入全局记忆及其工具。", "Brings in global memory and its tools.")}
+              <DocsLink inline page="memory" section="memory-switches" />
+            </>}
             checked={memory.global}
             tone={memory.globalTone}
             hints={lockHints}
@@ -123,10 +118,10 @@ export function AdvancedToolsPage({
           />
           <LockableSwitchRow
             title={t("启用项目记忆", "Enable project memory")}
-            description={t(
-              "开启后，当前工作区 .mewrk 的 MEWRK.md 与 MEMORY.md 拼进上下文，读取/创建/编辑项目记忆三个工具随之可用。",
-              "When enabled, this workspace's .mewrk MEWRK.md and MEMORY.md join the context, and the read/create/edit project memory tools become available."
-            )}
+            description={<>
+              {t("接入项目记忆及其工具。", "Brings in project memory and its tools.")}
+              <DocsLink inline page="memory" section="memory-switches" />
+            </>}
             checked={memory.project}
             tone={memory.projectTone}
             hints={lockHints}
@@ -146,10 +141,13 @@ export function AdvancedToolsPage({
         <section className="conversation-settings__field">
           <LockableSwitchRow
             title={t("启用文件防误写保护", "Enable file write guards")}
-            description={t(
-              "开启后，修改或覆盖已有文件前必须先读过它；读过之后在磁盘上被改动的文件拒绝直接写入，并把改动告诉模型；钩子或格式化命令改写文件后也会提示重读。关闭后这些检查与通知全部停止，文件工具说明里的相关规则也一并去掉。子代理与工作流跟随本对话。",
-              "When enabled, an existing file must be read before it is edited or overwritten; a file that changed on disk since it was read is refused and the model is told what changed; a hook or formatter rewriting a file prompts a re-read. When disabled, every one of these checks and notices stops, and the file tools' descriptions drop the rules too. Subagents and workflows follow this conversation."
-            )}
+            description={<>
+              {t(
+                "写入前须先读过，并拦下过期写入。",
+                "Requires a read before a write and refuses stale writes."
+              )}
+              <DocsLink inline page="working" section="advanced-tools" />
+            </>}
             checked={fileWriteGuards.enabled}
             tone={fileWriteGuards.tone}
             hints={lockHints}
@@ -157,6 +155,56 @@ export function AdvancedToolsPage({
             label={fileWriteGuards.enabled
               ? t("文件防误写保护已开启", "File write guards enabled")
               : t("文件防误写保护已关闭", "File write guards disabled")}
+          />
+        </section>
+      )}
+
+      {/* One switch for both ends of the channel: the main agent's send_message
+          and the subagents' subagent_update exist together or not at all, and
+          only while the agent_spawn tool is on. */}
+      {subagentMessaging && (
+        <section className="conversation-settings__field">
+          <LockableSwitchRow
+            title={t("子代理通信", "Subagent communication")}
+            description={<>
+              {t(
+                "让主代理与子代理互相发消息。",
+                "Lets the main agent and subagents message each other."
+              )}
+              <DocsLink inline page="agents" section="subagents" />
+            </>}
+            checked={subagentMessaging.enabled}
+            tone={subagentMessaging.tone}
+            hints={lockHints}
+            onChange={subagentMessaging.onChange}
+            label={subagentMessaging.enabled
+              ? t("子代理通信已开启", "Subagent communication enabled")
+              : t("子代理通信已关闭", "Subagent communication disabled")}
+          />
+        </section>
+      )}
+
+      {/* The environment section heads the system prompt: facts a model would
+          otherwise spend a tool call on. Off drops the whole section, the
+          numbered workspace list included. */}
+      {environmentPrompt && (
+        <section className="conversation-settings__field">
+          <LockableSwitchRow
+            title={t("拼接环境信息", "Include environment info")}
+            description={<>
+              {t(
+                "提示词开头附上工作目录、系统与日期。",
+                "Adds the working directory, OS and date to the prompt."
+              )}
+              <DocsLink inline page="memory" section="injected" />
+            </>}
+            checked={environmentPrompt.enabled}
+            tone={environmentPrompt.tone}
+            hints={lockHints}
+            onChange={environmentPrompt.onChange}
+            label={environmentPrompt.enabled
+              ? t("环境信息已拼接", "Environment info included")
+              : t("环境信息未拼接", "Environment info left out")}
           />
         </section>
       )}
@@ -190,16 +238,16 @@ function HostMessageContainerRows({
       value: "user",
       title: t("user 消息", "User message"),
       description: t(
-        "照 Claude Code 的做法，包在 <system-reminder> 里作为一条 user 消息送达。缺点：与你说的话同在 user 角色里，只靠标签和「这不是用户输入」的抬头区分，模型偶尔会把它当成你的话，甚至当成确认；还可能与相邻的用户消息合并成一条。",
-        "Claude Code's way: a user message wrapped in <system-reminder>. Downside: it shares the user role with what you say and is told apart only by its tags and a “not user input” preamble, so a model sometimes takes it for you — even for an approval — and it may merge with an adjacent user message."
+        "Claude Code 的做法；可能被当成你说的话。",
+        "Claude Code's way; may be mistaken for something you said."
       )
     },
     {
       value: "box",
       title: t("box 工具结果", "box tool result"),
       description: t(
-        "Mewrk 替模型写下一次 box 调用，消息作为它的结果送达。缺点：这是模型从没发起过的伪造调用，模型可能当成自己调的；每次请求都要多声明一个 box 工具，模型偶尔会自己去调它（什么也不做）；每条消息都多占一对调用与结果。",
-        "Mewrk writes a box call for the model, and the message arrives as its result. Downside: it is a call the model never made, which it may take for its own; every request declares one more tool, box, which a model sometimes calls itself to no effect; and every message costs a call and a result."
+        "作为 box 调用的结果；模型可能当成自己调的。",
+        "Arrives as a box call result; the model may think it called it."
       )
     }
   ];
@@ -208,10 +256,10 @@ function HostMessageContainerRows({
       <div className={`tool-toggle-row${lockToneClass("tool-toggle-row", tone)}`}>
         <span>
           <strong>{title}</strong>
-          <small>{t(
-            "Mewrk 在两个回合之间交给模型的消息——没等到的后台结果、钩子补充的上下文、中途选中的技能、文件变动，以及模型不能中途追加系统提示词时的指令——装在哪里送达。子代理与工作流跟随本对话；模型支持异步工具调用时，子代理与工作流的结果改为作为启动它们的那次调用的输出。切换后，此前的宿主消息也按新容器重放。",
-            "What the messages Mewrk hands the model between rounds arrive in: background results nobody waited for, context a hook added, skills selected later, files that changed, and instructions on a model that takes no system prompt mid-conversation. Subagents and workflows follow this conversation; on a model with asynchronous tool calls, a subagent's or workflow's result is the output of the call that started it instead. After a switch, earlier host messages replay in the new container too."
-          )}</small>
+          <small>
+            {t("Mewrk 交给模型的消息用什么送达。", "What Mewrk's messages to the model arrive in.")}
+            <DocsLink inline page="context" section="host-messages" />
+          </small>
           {note && <small className={`lock-note${lockToneClass("lock-note", tone)}`}>{note}</small>}
         </span>
         <LockMark tone={tone} />

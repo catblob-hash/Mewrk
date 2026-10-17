@@ -37,6 +37,9 @@ pub(crate) fn tool_names(tool: &str) -> &'static [&'static str] {
         "web_search" => &["WebSearch"],
         "agent_spawn" => &["Task", "Agent"],
         "task_stop" => &["TaskStop"],
+        // Same three fields under the same names (`to`, `message`, `summary`), so
+        // there is no argument alias to add.
+        "send_message" => &["SendMessage"],
         "ask_user" => &["AskUserQuestion"],
         "exit_plan_mode" => &["ExitPlanMode"],
         "skill" => &["Skill"],
@@ -447,6 +450,25 @@ mod tests {
             object(json!({"task_id": "shell:4"})),
         );
         assert_eq!(Value::Object(call), json!({"task": "shell:4"}));
+    }
+
+    /// `SendMessage` is `send_message` under Claude Code's name; its fields are
+    /// spelled alike in both, so a hook reads and rewrites them as they are.
+    #[test]
+    fn a_send_message_answers_to_claude_codes_send_message() {
+        assert_eq!(tool_names("send_message"), ["SendMessage"]);
+        let input = object(json!({"to": "review-api", "message": "retry", "summary": "retry"}));
+        assert_eq!(
+            tool_input("send_message", &input),
+            Value::Object(input.clone())
+        );
+        let call = mewrk_input(
+            "send_message",
+            &input,
+            object(json!({"to": "review-api", "message": "retry with v2", "summary": "retry"})),
+        );
+        assert_eq!(call.get("message"), Some(&json!("retry with v2")));
+        assert_eq!(call.len(), 3);
     }
 
     #[test]

@@ -50,7 +50,13 @@ import { codeLanguage } from "../lib/fileViewers";
 import { backendOfTool, shellBackendLabel } from "../lib/machineShells";
 import { parseWaitOutput, questionsFromInput } from "../lib/orchestration";
 import { webSourceIcon as siteIcon } from "../lib/runtime";
-import { agentTimelineRunStatus, initialMessage, isChildMainMessageContext } from "../lib/subagents";
+import {
+  agentTimelineRunStatus,
+  carriesChildRun,
+  initialMessage,
+  isChildMainMessageContext,
+  sendMessageRecipient
+} from "../lib/subagents";
 import type { JsonValue, SubagentUpdate, ToolContext, ToolDescriptor } from "../types";
 import { CodeTokens } from "./CodeBlock";
 import { DiffOutput, parseUnifiedDiff } from "./DiffOutput";
@@ -556,13 +562,6 @@ function screenshotStat(item: ToolContext): string | undefined {
   return width !== undefined && height !== undefined ? `${width}×${height}` : browserDuration(item);
 }
 
-function uploadImageStat(item: ToolContext): string | undefined {
-  const raw = item.input.image_id;
-  const reference = typeof raw === "number" ? String(raw) : typeof raw === "string" ? raw.trim() : "";
-  const match = reference.match(/^(?:\[Image #|#)?([0-9]{1,9})\]?$/);
-  return match ? `#${match[1]}` : browserDuration(item);
-}
-
 /** `preview_resize` reports the size it was asked for; a preset carries no numbers. */
 function resizeStat(item: ToolContext): string | undefined {
   const width = inputNumber(item, "width");
@@ -572,7 +571,8 @@ function resizeStat(item: ToolContext): string | undefined {
 
 /**
  * What a host notice card says it is, by the kind its `notice` names. Mirrors
- * Rust `handoff::NOTICE_KIND` and `wire_history::notice_kind`; a delivered
+ * Rust `handoff::NOTICE_KIND`, `plan_mode`'s and `host_append`'s notice kinds
+ * and `wire_history::notice_kind`; a delivered
  * background result names no kind and keeps the default title.
  */
 const HOST_NOTICE_TITLES: Record<string, (t: Translate) => string> = {
@@ -580,6 +580,7 @@ const HOST_NOTICE_TITLES: Record<string, (t: Translate) => string> = {
   handoff_index: (t) => t("送达了交接文档索引", "Delivered the handoff notes index"),
   plan_mode: (t) => t("送达了计划模式引导", "Delivered the plan mode guidance"),
   plan_mode_exit: (t) => t("送达了计划模式结束说明", "Delivered the plan mode exit note"),
+  host_messages: (t) => t("送达了后台消息说明", "Delivered the note on background and host messages"),
   structured_output: (t) => t("提醒通过 structured_output 返回结果", "Reminded to return the result through structured_output"),
   hook_context: (t) => t("送达了钩子补充的上下文", "Delivered context from a hook"),
   skill_added: (t) => t("送达了新增的技能", "Delivered a newly added skill"),
@@ -762,7 +763,7 @@ export const TOOL_VIEW_REGISTRY = {
   preview_eval: { surface: "group", family: "browser-evaluate", icon: Code2, doneTitle: (t) => t("执行了页面脚本", "Ran page script"), runningTitle: (t) => t("正在执行页面脚本", "Running page script"), failedTitle: (t) => t("页面脚本执行失败", "Page script failed"), target: (item) => compact(inputString(item, "expression")), stat: browserDuration, summaryKind: "browser" },
   preview_network: { surface: "group", family: "browser-network", icon: Network, doneTitle: (t) => t("读取了网络请求", "Read network requests"), runningTitle: (t) => t("正在读取网络请求", "Reading network requests"), failedTitle: (t) => t("读取网络请求失败", "Failed to read network requests"), target: (item) => compact(inputString(item, "requestId") ?? inputString(item, "filter")), stat: previewEntryStat, summaryKind: "browser" },
   preview_resize: { surface: "group", family: "raw", icon: MonitorUp, doneTitle: (t) => t("调整了预览视口", "Resized preview viewport"), runningTitle: (t) => t("正在调整预览视口", "Resizing preview viewport"), failedTitle: (t) => t("调整预览视口失败", "Failed to resize preview viewport"), target: (item) => compact(inputString(item, "preset") ?? inputString(item, "colorScheme")), stat: resizeStat, keys: ["preset", "width", "height", "colorScheme"], summaryKind: "browser" },
-  preview_upload_image: { surface: "group", family: "browser-page", icon: Upload, doneTitle: (t) => t("上传了对话图片", "Uploaded conversation image"), runningTitle: (t) => t("正在上传对话图片", "Uploading conversation image"), failedTitle: (t) => t("上传对话图片失败", "Failed to upload conversation image"), target: targetSelector, stat: uploadImageStat, summaryKind: "browser" },
+  preview_upload_image: { surface: "group", family: "browser-page", icon: Upload, doneTitle: (t) => t("上传了对话图片", "Uploaded conversation image"), runningTitle: (t) => t("正在上传对话图片", "Uploading conversation image"), failedTitle: (t) => t("上传对话图片失败", "Failed to upload conversation image"), target: targetSelector, stat: browserDuration, summaryKind: "browser" },
   preview_dialog: { surface: "group", family: "browser-page", icon: CircleAlert, doneTitle: (t) => t("回答了页面对话框", "Answered page dialog"), runningTitle: (t) => t("正在回答页面对话框", "Answering page dialog"), failedTitle: (t) => t("回答页面对话框失败", "Failed to answer page dialog"), target: (item) => compact(inputString(item, "prompt_text")), stat: (item, t) => (
     item.input.accept === false ? t("取消", "Dismiss") : t("接受", "Accept")
   ), summaryKind: "browser" },
@@ -774,9 +775,12 @@ export const TOOL_VIEW_REGISTRY = {
   // splits the drained `[name · status]` envelopes; `agent-note` is a one-shot
   // message whose payload already sits in the row's target.
   agent_spawn: { surface: "group", family: "agent-run", icon: Bot, doneTitle: (t) => t("派生了子代理", "Spawned subagent"), runningTitle: (t) => t("正在派生子代理", "Spawning subagent"), failedTitle: (t) => t("派生子代理失败", "Failed to spawn subagent"), target: (item) => compact(inputString(item, "label") ?? inputString(item, "name")), summaryKind: "agents" },
-  // Retired names, kept so saved conversations still render their cards:
-  // `agent_send`, and the `send_message` / `followup_task` pair that replaced
-  // it. None of them is in the catalog any more; nothing issues them.
+  // `send_message` is the main agent's tool for messaging a child it started
+  // (`to`, `message`, optional `summary`); it is host-derived, never in the
+  // catalog. One wire name carries three shapes: that call, the retired
+  // queue-only call (`target`, `message`) and the retired child→main note
+  // (`message` alone). `agent_send` and `followup_task` are retired names kept
+  // so saved conversations still render their cards; nothing issues them.
   agent_send: { surface: "group", family: "agent-run", icon: MessageCircleMore, doneTitle: (t) => t("向子代理发送了消息", "Sent message to subagent"), runningTitle: (t) => t("正在向子代理发送消息", "Sending message to subagent"), failedTitle: (t) => t("发送子代理消息失败", "Failed to send subagent message"), target: (item) => compact(inputString(item, "agent")), summaryKind: "agents" },
   send_message: {
     surface: "group",
@@ -785,18 +789,37 @@ export const TOOL_VIEW_REGISTRY = {
     doneTitle: (t) => t("消息已加入子代理队列", "Queued message for subagent"),
     runningTitle: (t) => t("正在排队子代理消息", "Queueing message for subagent"),
     failedTitle: (t) => t("排队子代理消息失败", "Failed to queue subagent message"),
-    // The child form travels upward and opens nothing, so it is a note rather
-    // than an agent run: no target to name, no child transcript to disclose.
-    resolveFamily: (item) => (isChildMainMessageContext(item) ? "agent-note" : "agent-run"),
-    resolveTitle: (item, phase, t) => {
-      if (!isChildMainMessageContext(item)) return undefined;
-      if (phase === "running") return t("正在向主代理发送消息", "Sending message to main agent");
-      if (phase === "failed") return t("向主代理发送消息失败", "Failed to send message to main agent");
-      return t("向主代理发送了消息", "Sent message to main agent");
-    },
-    target: (item) => compact(
-      isChildMainMessageContext(item) ? inputString(item, "message") : inputString(item, "target")
+    // The retired child form travels upward and opens nothing, so it is a note
+    // rather than an agent run: no target to name, no child transcript to
+    // disclose. The main agent's call is the same note while it only queued a
+    // message (or was refused) — its receipt and message are the whole card —
+    // and becomes an agent run once it resumed a child and the child's stream
+    // or record rides on it, which the row then opens as the child's panel.
+    resolveFamily: (item) => (
+      isChildMainMessageContext(item) || (sendMessageRecipient(item) && !carriesChildRun(item))
+        ? "agent-note"
+        : "agent-run"
     ),
+    resolveTitle: (item, phase, t) => {
+      if (isChildMainMessageContext(item)) {
+        if (phase === "running") return t("正在向主代理发送消息", "Sending message to main agent");
+        if (phase === "failed") return t("向主代理发送消息失败", "Failed to send message to main agent");
+        return t("向主代理发送了消息", "Sent message to main agent");
+      }
+      if (sendMessageRecipient(item)) {
+        if (phase === "running") return t("正在发送消息", "Sending message");
+        if (phase === "failed") return t("发送消息失败", "Failed to send message");
+        return t("发送了消息", "Sent message");
+      }
+      return undefined;
+    },
+    target: (item) => {
+      if (isChildMainMessageContext(item)) return compact(inputString(item, "message"));
+      const to = sendMessageRecipient(item);
+      if (!to) return compact(inputString(item, "target"));
+      const summary = inputString(item, "summary");
+      return compact(summary ? `→ ${to} · ${summary}` : `→ ${to}`);
+    },
     summaryKind: "agents"
   },
   followup_task: { surface: "group", family: "agent-run", icon: MessageCircleMore, doneTitle: (t) => t("向子代理追加了任务", "Sent follow-up to subagent"), runningTitle: (t) => t("正在追加子代理任务", "Sending subagent follow-up"), failedTitle: (t) => t("追加子代理任务失败", "Failed to follow up with subagent"), target: (item) => compact(inputString(item, "target")), summaryKind: "agents" },
@@ -1901,14 +1924,20 @@ function runUpdates(item: ToolContext): SubagentUpdate[] {
 /** A call that owns a child run: what it was asked, what it said, what it returned. */
 function AgentRunView({ item }: { item: ToolContext }) {
   const { t } = useI18n();
+  // A `send_message` that resumed a child owns the run, but what it was asked
+  // is the message it sent, not an instruction that started the child.
+  const to = sendMessageRecipient(item);
   const instruction = initialMessage(item) || item.subagent?.task || "";
   const updates = runUpdates(item);
   return (
     <KeyValueCard
       rows={[
-        [t("子代理", "Subagent"), item.subagent?.label || item.subagent?.name || ""],
+        [t("子代理", "Subagent"), item.subagent?.label || item.subagent?.name || to],
         [t("状态", "Status"), runStatusLabel(agentTimelineRunStatus(item), t)],
-        [t("派发指令", "Instruction"), instruction],
+        to
+          ? [t("消息", "Message"), instruction]
+          : [t("派发指令", "Instruction"), instruction],
+        [t("摘要", "Summary"), to ? inputString(item, "summary") : undefined],
         [t("子代理更新", "Subagent updates"), updates.map((update) => update.content).join("\n")]
       ]}
       result={item.result.output}
@@ -1950,6 +1979,22 @@ function AgentWaitView({ item }: { item: ToolContext }) {
  */
 function AgentNoteView({ item }: { item: ToolContext }) {
   const { t } = useI18n();
+  // The main agent's `send_message` that only queued a message: who it went
+  // to and, when the model wrote one, the preview line, over the whole message
+  // and the host's receipt.
+  const to = sendMessageRecipient(item);
+  if (to) {
+    return (
+      <KeyValueCard
+        rows={[
+          [t("发给", "To"), to],
+          [t("摘要", "Summary"), inputString(item, "summary")],
+          [t("内容", "Message"), inputString(item, "message")]
+        ]}
+        result={item.result.output}
+      />
+    );
+  }
   const message = inputString(item, "message")
     ?? inputString(item, "content")
     ?? inputString(item, "status");

@@ -1,45 +1,82 @@
 import { BookOpen, ExternalLink } from "lucide-react";
 import { useI18n } from "../i18n";
+import type { ResolvedAppLanguage } from "../types";
 
 /**
- * A one-line link to the published configuration documentation.
+ * Links to the published documentation at mewrk.dev.
  *
- * The pages that carry it — features, skills, MCP, hooks — used to end their
- * toolbar with bulk enable/disable buttons. Those acted on everything the search
- * happened to be showing, which is not a decision a user makes about a tool
- * surface; what they actually need there is the page explaining what these
- * entries are and where they are configured. It is deliberately a bare `<a>`
- * with no wrapper: it sits in whatever row it is dropped into.
+ * The UI says what a control is for in a few words; how it works — paths,
+ * formats, caveats, what happens on each side of a switch — is on the site,
+ * one `{#id}` section per subject, and a short line that leaves something out
+ * ends with a link to the section that has it.
  */
 
 const DOCUMENTATION_ORIGIN = "https://mewrk.dev";
 
-/** The site page that documents each configuration surface. */
-const DOCUMENTATION_PAGES = {
-  features: "working",
-  skills: "skills",
-  mcp: "mcp",
-  hooks: "hooks",
-  toolDescriptions: "prompt-profiles",
-  /* The site has no page of its own for roles yet; subagents are explained on
-     the page about how a conversation works. */
-  agents: "working"
-} as const;
+/** The site's pages: `content/<locale>/<page>.md` in the Mewrk-site repository. */
+export type DocsPage =
+  | "index" | "providers" | "workspaces" | "working" | "context" | "security"
+  | "agents" | "preview" | "web" | "memory" | "prompt-profiles"
+  | "skills" | "mcp" | "hooks" | "lsp" | "tools" | "settings" | "privacy";
 
-function documentationLocale(resolvedLanguage: string): string {
+/** Configuration surfaces whose page the site names differently. */
+const SURFACE_PAGES = {
+  features: { page: "working", section: "conversation-settings" },
+  toolDescriptions: { page: "prompt-profiles", section: undefined },
+  agents: { page: "agents", section: "roles" }
+} as const satisfies Record<string, { page: DocsPage; section: string | undefined }>;
+
+export type DocsTarget = DocsPage | keyof typeof SURFACE_PAGES;
+
+function documentationLocale(resolvedLanguage: ResolvedAppLanguage | string): string {
   return resolvedLanguage === "zh-CN" ? "zh-CN" : "en";
 }
 
-export function DocsLink({ page }: { page: keyof typeof DOCUMENTATION_PAGES }) {
+/** The address of one page of the site, or of one section of it. */
+export function docsHref(
+  resolvedLanguage: ResolvedAppLanguage | string,
+  target: DocsTarget,
+  section?: string
+): string {
+  const surface = Object.hasOwn(SURFACE_PAGES, target)
+    ? SURFACE_PAGES[target as keyof typeof SURFACE_PAGES]
+    : undefined;
+  const page = surface?.page ?? (target as DocsPage);
+  const anchor = section ?? surface?.section;
+  return `${DOCUMENTATION_ORIGIN}/${documentationLocale(resolvedLanguage)}/${page}.html${anchor ? `#${anchor}` : ""}`;
+}
+
+/**
+ * A link to the documentation.
+ *
+ * By default it is the one-line "Configuration docs" link a page's heading row
+ * ends with. `inline` makes it the "Learn more" that trails a short
+ * description, in the description's own size. It is a bare `<a>` with no
+ * wrapper, so it sits in whatever line it is dropped into — never inside a
+ * `<button>`, where a link is neither valid nor operable.
+ */
+export function DocsLink({
+  page,
+  section,
+  inline = false
+}: {
+  page: DocsTarget;
+  /** A heading's `{#id}` on that page. */
+  section?: string;
+  inline?: boolean;
+}) {
   const { t, resolvedLanguage } = useI18n();
-  const locale = documentationLocale(resolvedLanguage);
+  const href = docsHref(resolvedLanguage, page, section);
+  if (inline) {
+    return (
+      <a className="docs-link docs-link--inline" href={href} target="_blank" rel="noreferrer noopener">
+        {t("详情", "Learn more")}
+        <ExternalLink size={9} aria-hidden="true" />
+      </a>
+    );
+  }
   return (
-    <a
-      className="docs-link"
-      href={`${DOCUMENTATION_ORIGIN}/${locale}/${DOCUMENTATION_PAGES[page]}.html`}
-      target="_blank"
-      rel="noreferrer noopener"
-    >
+    <a className="docs-link" href={href} target="_blank" rel="noreferrer noopener">
       <ExternalLink size={11} aria-hidden="true" />
       {t("配置说明文档", "Configuration docs")}
     </a>

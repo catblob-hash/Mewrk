@@ -8,10 +8,18 @@
 //! the user updates them; both packages are published together under one
 //! version, so they cannot disagree.
 //!
-//! Which releases are offered is the sidecar's to say. It is built against one
-//! SDK release (its pointer's `claudeAgentSdk`, else the pin this host was
-//! built with), and only that release's caret range — `^0.3.284` — keeps the
-//! interface the sidecar was written for. Prereleases are never offered.
+//! Which release is offered is Mewrk's to say, not npm's: one version, set by
+//! hand on Mewrk's own channel ([`RECOMMENDED_KEY`], published with
+//! `npm run publish:components -- --claude-agent-sdk <version>`), so a release
+//! reaches users only once someone has tried it. The provider page offers an
+//! update when what is installed is older than that version, and nothing
+//! when it is the same or newer.
+//!
+//! What runs is still the sidecar's to say. It is built against one SDK
+//! release (its pointer's `claudeAgentSdk`, else the pin this host was built
+//! with), and only that release's caret range — `^0.3.284` — keeps the
+//! interface the sidecar was written for: a version outside it is never
+//! installed, and one beyond it is shown as needing a newer Mewrk.
 //!
 //! # Where from
 //!
@@ -19,7 +27,9 @@
 //! mirror, serving the same tarballs) when the first cannot be reached or is
 //! failing: a refusal or a missing version is an answer, not a reason to ask
 //! the mirror. `MEWRK_NPM_REGISTRY` replaces both (a release build takes only
-//! an HTTPS registry, or one on this computer: [`super::override_base`]).
+//! an HTTPS registry, or one on this computer: [`super::override_base`]). The
+//! version itself comes from [`super::channel_base`], which
+//! `MEWRK_COMPONENTS_MIRROR` replaces.
 //!
 //! # Trust
 //!
@@ -63,7 +73,6 @@ use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
 use semver::{Comparator, Op, Prerelease, Version, VersionReq};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::host_platform::host_platform;
@@ -88,12 +97,13 @@ const CURRENT: &str = "current.json";
 const INSTALL_RECORD: &str = "install.json";
 const DOWNLOADS: &str = ".download";
 const STAGING_PREFIX: &str = ".staging-";
-/// The abbreviated packument: every version, without READMEs.
-const ABBREVIATED: &str = "application/vnd.npm.install-v1+json";
-const TAGS_LIMIT: usize = 64 * 1024;
+/// The release the provider page offers, under [`super::channel_base`]:
+/// `{"schema": 1, "sdkVersion": "0.3.293"}`, set by hand.
+const RECOMMENDED_KEY: &str = "claude-agent/version.json";
+/// The format of [`RECOMMENDED_KEY`] this host reads.
+const RECOMMENDED_SCHEMA: u32 = 1;
+const RECOMMENDED_LIMIT: usize = 4 * 1024;
 const VERSION_DOC_LIMIT: usize = 1 << 20;
-/// The SDK's abbreviated packument is ~400 KB with ~300 versions.
-const PACKUMENT_LIMIT: usize = 32 << 20;
 /// The CLI's tarball is ~80–100 MB.
 const TARBALL_LIMIT: u64 = 512 << 20;
 /// The SDK unpacks to ~5 MB.
@@ -232,17 +242,19 @@ pub struct ClaudeAgentComponentStatus {
     pub installed: Option<InstalledVersion>,
     /// The caret range the sidecar takes: `^0.3.284`.
     pub compatible: String,
-    /// The newest compatible release on npm. `None` when not checked (this
-    /// run has not asked yet) or when the check failed.
+    /// The release Mewrk's channel offers ([`RECOMMENDED_KEY`]), when it is in
+    /// [`Self::compatible`] and npm has it. `None` when not checked (this run
+    /// has not asked yet), when the check failed, or when the release offered
+    /// needs a newer Mewrk ([`Self::newer_incompatible`]).
     pub latest: Option<AvailableVersion>,
     /// Why the check failed, for people.
     pub latest_error: Option<String>,
-    /// The newest release outside [`Self::compatible`], when newer than
-    /// [`Self::latest`]: it needs a newer Mewrk.
+    /// The release Mewrk's channel offers, when it is beyond
+    /// [`Self::compatible`]: it needs a newer Mewrk.
     pub newer_incompatible: Option<String>,
     /// Installed, and [`Self::latest`] is newer — or the installed version is
     /// not compatible and `latest` is (the "update" may then be to an older
-    /// version: the newest this Mewrk takes).
+    /// version: the one this Mewrk takes).
     pub update_available: bool,
     pub task: Option<TaskStatus>,
     /// The last install's failure; cleared when another starts.
@@ -285,8 +297,8 @@ pub struct AvailableVersion {
 #[serde(rename_all = "camelCase")]
 pub struct TaskStatus {
     pub action: TaskAction,
-    /// Empty until the newest compatible release is known, when the install
-    /// was not asked for a version and nothing was checked before.
+    /// Empty until the release offered is known, when the install was not
+    /// asked for a version and nothing was checked before.
     pub sdk_version: String,
     pub phase: Phase,
     pub received_bytes: u64,
@@ -305,7 +317,7 @@ pub enum TaskAction {
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum Phase {
-    /// Asking npm which version, and for its tarballs.
+    /// Asking Mewrk's channel which version, and npm for its tarballs.
     Resolving,
     Downloading,
     /// Unpacking into staging, checking the CLI and the SDK's own version.
@@ -390,11 +402,12 @@ struct DistSignature {
     sig: String,
 }
 
-/// The abbreviated packument, as far as it is read.
+/// [`RECOMMENDED_KEY`].
 #[derive(Debug, Deserialize)]
-struct Packument {
-    #[serde(default)]
-    versions: BTreeMap<String, Value>,
+#[serde(rename_all = "camelCase")]
+struct RecommendedDoc {
+    schema: u32,
+    sdk_version: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -429,24 +442,56 @@ fn pinned_floor() -> Version {
     parse_release(env!("MEWRK_CLAUDE_AGENT_SDK_VERSION")).unwrap_or(Version::new(0, 0, 0))
 }
 
-/// What npm has for this host: the newest compatible release, and the newest
-/// release beyond it that this host cannot take.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Selection {
-    latest: Option<Version>,
-    newer_incompatible: Option<Version>,
+/// The release Mewrk's channel offers ([`RECOMMENDED_KEY`] under `channel`).
+fn recommended(client: &reqwest::blocking::Client, channel: &str) -> Result<Version, String> {
+    let url = format!("{channel}/{RECOMMENDED_KEY}");
+    let doc: RecommendedDoc = super::fetch_json(client, &url, None, RECOMMENDED_LIMIT)?.ok_or_else(|| {
+        ui_text!(
+            "Mewrk 的组件频道上还没有发布 Claude Agent SDK 的版本",
+            "Mewrk's component channel does not name a Claude Agent SDK release yet"
+        )
+    })?;
+    if doc.schema != RECOMMENDED_SCHEMA {
+        return Err(ui_text!(
+            "Mewrk 的组件频道用了这个版本的 Mewrk 读不懂的格式说明 Claude Agent SDK 的版本：请更新 Mewrk。",
+            "Mewrk's component channel names the Claude Agent SDK release in a format this Mewrk cannot read: update Mewrk."
+        ));
+    }
+    let text = doc.sdk_version.as_str();
+    parse_release(text).filter(|version| version.to_string() == text).ok_or_else(|| {
+        ui_text!(
+            "Mewrk 的组件频道给出的 Claude Agent SDK 版本 {text:?} 不是正式版本号",
+            "Mewrk's component channel names {text:?}, which is not a Claude Agent SDK release version"
+        )
+    })
 }
 
-fn select(versions: &[Version], floor: &Version) -> Selection {
-    let range = compatible_range(floor);
-    let releases = || versions.iter().filter(|version| version.pre.is_empty());
-    let latest = releases().filter(|version| range.matches(version)).max().cloned();
-    let newer_incompatible = releases()
-        .filter(|version| !range.matches(version))
-        .max()
-        .filter(|version| *version > latest.as_ref().unwrap_or(floor))
-        .cloned();
-    Selection { latest, newer_incompatible }
+/// What the release `channel` offers means for a sidecar built against `floor`,
+/// and its Claude Code version as npm lists it.
+fn check_with(
+    client: &reqwest::blocking::Client,
+    npm: &Npm,
+    channel: &str,
+    floor: &Version,
+) -> Result<LatestCheck, String> {
+    let version = recommended(client, channel)?;
+    if !compatible_range(floor).matches(&version) {
+        if version > *floor {
+            return Ok(LatestCheck { latest: None, newer_incompatible: Some(version.to_string()) });
+        }
+        let range = compatible_range(floor);
+        return Err(ui_text!(
+            "Mewrk 的组件频道给出的 Claude Agent SDK {version} 比这个版本的 Mewrk 需要的 {range} 旧",
+            "Mewrk's component channel names Claude Agent SDK {version}, older than the {range} this Mewrk needs"
+        ));
+    }
+    // Believed only as npm signed it: a version npm does not have, or did not
+    // sign, would only fail to install.
+    let doc = npm.first(|registry| registry.version_doc(client, SDK_PACKAGE, &version))?;
+    Ok(LatestCheck {
+        latest: Some(AvailableVersion { sdk_version: version.to_string(), claude_code_version: doc.claude_code_version }),
+        newer_incompatible: None,
+    })
 }
 
 /// Whether the installed `version` is one a sidecar built against `floor` takes.
@@ -549,30 +594,6 @@ impl Registry<'_> {
         format!("{}/{}", self.base, package.replace('/', "%2f"))
     }
 
-    fn latest_tag(&self, client: &reqwest::blocking::Client) -> Result<Option<Version>, Failure> {
-        let url = format!("{}/-/package/{}/dist-tags", self.base, SDK_PACKAGE.replace('/', "%2f"));
-        let tags: BTreeMap<String, Value> =
-            get_json(client, &url, None, TAGS_LIMIT)?.ok_or_else(|| not_on_npm(SDK_PACKAGE))?;
-        Ok(tags.get("latest").and_then(Value::as_str).and_then(parse_release))
-    }
-
-    /// Every release of the SDK that is not deprecated.
-    fn releases(&self, client: &reqwest::blocking::Client) -> Result<Vec<Version>, Failure> {
-        let url = self.package_url(SDK_PACKAGE);
-        let packument: Packument =
-            get_json(client, &url, Some(ABBREVIATED), PACKUMENT_LIMIT)?.ok_or_else(|| not_on_npm(SDK_PACKAGE))?;
-        Ok(packument
-            .versions
-            .iter()
-            // npm writes the reason; an empty one (or `false`) is a deprecation undone.
-            .filter(|(_, doc)| {
-                doc.get("deprecated")
-                    .is_none_or(|reason| reason.is_null() || reason == false || reason.as_str() == Some(""))
-            })
-            .filter_map(|(version, _)| parse_release(version))
-            .collect())
-    }
-
     fn version_doc(
         &self,
         client: &reqwest::blocking::Client,
@@ -597,31 +618,6 @@ impl Registry<'_> {
             )));
         }
         Ok(doc)
-    }
-
-    /// The newest compatible release and what is beyond it. `dist-tags.latest`
-    /// answers when it is compatible; the whole version list is read only when
-    /// it is not.
-    fn select(&self, client: &reqwest::blocking::Client, floor: &Version) -> Result<Selection, Failure> {
-        if let Some(latest) = self.latest_tag(client)? {
-            if compatible_range(floor).matches(&latest) {
-                return Ok(Selection { latest: Some(latest), newer_incompatible: None });
-            }
-        }
-        Ok(select(&self.releases(client)?, floor))
-    }
-
-    /// [`Self::select`] with the newest compatible release's Claude Code version.
-    fn check(&self, client: &reqwest::blocking::Client, floor: &Version) -> Result<LatestCheck, Failure> {
-        let selection = self.select(client, floor)?;
-        let latest = match &selection.latest {
-            Some(version) => Some(AvailableVersion {
-                sdk_version: version.to_string(),
-                claude_code_version: self.version_doc(client, SDK_PACKAGE, version)?.claude_code_version,
-            }),
-            None => None,
-        };
-        Ok(LatestCheck { latest, newer_incompatible: selection.newer_incompatible.map(|version| version.to_string()) })
     }
 }
 
@@ -1270,7 +1266,7 @@ fn installed_version(dir: Option<&Path>, floor: &Version) -> Option<InstalledVer
 // ---------------------------------------------------------------------------
 // Status
 
-/// What npm said last, for the floor it was asked about.
+/// What the last check found, for the floor it was asked about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LatestCheck {
     latest: Option<AvailableVersion>,
@@ -1285,18 +1281,25 @@ fn latest_cache() -> MutexGuard<'static, Option<(Version, LatestCheck)>> {
     LATEST.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The provider page's view. `check_latest` asks npm for the newest
-/// compatible release (blocking, a few seconds at most); without it the
-/// answer is what is on disk, the install in progress and the last check.
+/// The provider page's view. `check_latest` asks Mewrk's channel for the
+/// release it offers, and npm for that release (blocking, a few seconds at
+/// most); without it the answer is what is on disk, the install in progress
+/// and the last check.
 pub fn status(check_latest: bool) -> ClaudeAgentComponentStatus {
     let dir = super::root().map(|root| root.join(DIR));
-    status_with(dir.as_deref(), &Npm::from_env(), &floor(), check_latest)
+    status_with(dir.as_deref(), &Npm::from_env(), &super::channel_base(), &floor(), check_latest)
 }
 
-fn status_with(dir: Option<&Path>, npm: &Npm, floor: &Version, check_latest: bool) -> ClaudeAgentComponentStatus {
+fn status_with(
+    dir: Option<&Path>,
+    npm: &Npm,
+    channel: &str,
+    floor: &Version,
+    check_latest: bool,
+) -> ClaudeAgentComponentStatus {
     let compatible = compatible_range(floor).to_string();
     let (check, latest_error) = if check_latest {
-        match check(npm, floor) {
+        match check(npm, channel, floor) {
             Ok(check) => {
                 *latest_cache() = Some((floor.clone(), check.clone()));
                 (Some(check), None)
@@ -1311,11 +1314,6 @@ fn status_with(dir: Option<&Path>, npm: &Npm, floor: &Version, check_latest: boo
         (cached, None)
     };
     let (latest, newer_incompatible) = check.map_or((None, None), |check| (check.latest, check.newer_incompatible));
-    let latest_error = latest_error.or_else(|| {
-        (check_latest && latest.is_none()).then(|| {
-            ui_text!("npm 上没有与 {compatible} 兼容的版本", "npm has no release compatible with {compatible}")
-        })
-    });
     let installed = installed_version(dir, floor);
     let update_available = match (&installed, &latest) {
         // What is installed cannot run: the newest compatible release is the
@@ -1345,12 +1343,12 @@ fn status_with(dir: Option<&Path>, npm: &Npm, floor: &Version, check_latest: boo
     }
 }
 
-fn check(npm: &Npm, floor: &Version) -> Result<LatestCheck, String> {
+fn check(npm: &Npm, channel: &str, floor: &Version) -> Result<LatestCheck, String> {
     let client = super::small_client()?;
-    npm.first(|registry| registry.check(&client, floor)).map_err(|error| {
+    check_with(&client, npm, channel, floor).map_err(|error| {
         ui_text!(
-            "无法从 npm 检查 Claude Agent SDK 的版本: {error}",
-            "Could not check npm for Claude Agent SDK releases: {error}"
+            "无法检查 Claude Agent SDK 的版本: {error}",
+            "Could not check for Claude Agent SDK releases: {error}"
         )
     })
 }
@@ -1359,13 +1357,15 @@ fn check(npm: &Npm, floor: &Version) -> Result<LatestCheck, String> {
 // Installing
 
 /// Where and from what an install works. Everything an install reads from
-/// the process (the components root, the registry override, the sidecar's
-/// SDK release, the platform) is gathered here first, so tests can supply
-/// their own.
+/// the process (the components root, the channel and registry overrides, the
+/// sidecar's SDK release, the platform) is gathered here first, so tests can
+/// supply their own.
 struct Context {
     /// `<components>/claude-agent`.
     dir: PathBuf,
     npm: Npm,
+    /// [`super::channel_base`]: where the release offered is named.
+    channel: String,
     floor: Version,
     /// The CLI package's platform: [`platform_tag`].
     platform: String,
@@ -1375,7 +1375,13 @@ impl Context {
     fn current() -> Result<Self, String> {
         let root =
             super::root().ok_or_else(|| ui_text!("组件目录尚未就绪", "The components folder is not set up yet"))?;
-        Ok(Self { dir: root.join(DIR), npm: Npm::from_env(), floor: floor(), platform: platform_tag() })
+        Ok(Self {
+            dir: root.join(DIR),
+            npm: Npm::from_env(),
+            channel: super::channel_base(),
+            floor: floor(),
+            platform: platform_tag(),
+        })
     }
 }
 
@@ -1389,7 +1395,7 @@ enum Progress {
     Bytes(u64, Option<u64>),
 }
 
-/// Installs `requested` (else the newest compatible release) under
+/// Installs `requested` (else the release Mewrk's channel offers) under
 /// `ctx.dir` and makes it current. A version already installed there is
 /// switched to without downloading anything.
 fn install(
@@ -1400,25 +1406,20 @@ fn install(
 ) -> Result<(), String> {
     report(Progress::Phase(Phase::Resolving));
     let requested = requested.map(|text| compatible_version(text, &ctx.floor)).transpose()?;
+    let client = super::small_client()?;
+    let version = match requested {
+        Some(version) => version,
+        None => compatible_version(&recommended(&client, &ctx.channel)?.to_string(), &ctx.floor)?,
+    };
+    report(Progress::Version(version.to_string()));
     fs::create_dir_all(&ctx.dir).map_err(|error| folder_failed(&ctx.dir, error))?;
     // A staging directory left by an install that never finished.
     super::prune_dir(&ctx.dir, |name| !name.starts_with(STAGING_PREFIX));
     let downloads = ctx.dir.join(DOWNLOADS);
-    let client = super::small_client()?;
     let tarballs = download_client()?;
     let cli_package = cli_package(&ctx.platform);
     let fetched = ctx.npm.first(|registry| {
-        let version = match &requested {
-            Some(version) => version.clone(),
-            None => registry.select(&client, &ctx.floor)?.latest.ok_or_else(|| {
-                let range = compatible_range(&ctx.floor);
-                Failure::Fatal(ui_text!(
-                    "npm 上没有与 {range} 兼容的版本",
-                    "npm has no release compatible with {range}"
-                ))
-            })?,
-        };
-        report(Progress::Version(version.to_string()));
+        let version = version.clone();
         // Installed, and still the files that were: switching to it is all.
         // Anything else of it on disk is replaced.
         let installed = installed_at(&ctx.dir, &version.to_string());
@@ -1641,7 +1642,7 @@ fn task() -> MutexGuard<'static, Task> {
     TASK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Starts installing `version` (else the newest compatible release) on a
+/// Starts installing `version` (else the release Mewrk's channel offers) on a
 /// thread of its own; [`status`] follows it. Refused while another runs.
 pub fn start_install(version: Option<String>) -> Result<(), String> {
     start_install_with(Context::current()?, version)
@@ -1746,7 +1747,7 @@ mod tests {
 
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::*;
 
@@ -1891,6 +1892,7 @@ mod tests {
         Context {
             dir: root.join(DIR),
             npm: registries(&[fixture.base.as_str()]),
+            channel: channel(fixture),
             floor: Version::parse(FLOOR).unwrap(),
             platform: platform_tag(),
         }
@@ -2024,8 +2026,14 @@ mod tests {
         cli
     }
 
-    fn tag_latest(fixture: &Fixture, version: &str) {
-        fixture.json(&format!("/-/package/{SDK_PACKAGE}/dist-tags"), json!({ "latest": version }));
+    /// Where [`context`] reads the release offered: the fixture under `/channel`.
+    fn channel(fixture: &Fixture) -> String {
+        format!("{}/channel", fixture.base)
+    }
+
+    /// Names `version` as the release Mewrk offers, as `--claude-agent-sdk` publishes it.
+    fn recommend(fixture: &Fixture, version: &str) {
+        fixture.json(&format!("/channel/{RECOMMENDED_KEY}"), json!({ "schema": 1, "sdkVersion": version }));
     }
 
     fn no_leftovers(dir: &Path) {
@@ -2043,7 +2051,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let ctx = context(&fixture, root.path());
         let cli = release(&fixture, "0.3.290");
-        tag_latest(&fixture, "0.3.290");
+        recommend(&fixture, "0.3.290");
 
         let mut events = Vec::new();
         install(&ctx, None, &AtomicBool::new(false), &mut |progress| events.push(progress)).expect("installs");
@@ -2081,7 +2089,7 @@ mod tests {
         let (received, total) = last.expect("bytes were reported");
         assert_eq!(Some(received), total);
 
-        let status = status_with(Some(&ctx.dir), &ctx.npm, &ctx.floor, true);
+        let status = status_with(Some(&ctx.dir), &ctx.npm, &ctx.channel, &ctx.floor, true);
         let installed = status.installed.clone().expect("installed");
         assert_eq!((installed.sdk_version.as_str(), installed.source), ("0.3.290", InstalledSource::Installed));
         assert_eq!(status.latest.as_ref().map(|latest| latest.sdk_version.as_str()), Some("0.3.290"));
@@ -2115,8 +2123,8 @@ mod tests {
         assert_eq!(current_version(&ctx.dir).as_deref(), Some("0.3.292"));
         assert!(ctx.dir.join("0.3.291").is_dir());
         assert!(!ctx.dir.join("0.3.290").exists());
-        tag_latest(&fixture, "0.3.292");
-        assert!(!status_with(Some(&ctx.dir), &ctx.npm, &ctx.floor, true).update_available);
+        recommend(&fixture, "0.3.292");
+        assert!(!status_with(Some(&ctx.dir), &ctx.npm, &ctx.channel, &ctx.floor, true).update_available);
 
         // Going back to the version kept downloads nothing.
         let fetched = fixture.hits("/tarballs/");
@@ -2124,7 +2132,7 @@ mod tests {
         assert_eq!(current_version(&ctx.dir).as_deref(), Some("0.3.291"));
         assert_eq!(fixture.hits("/tarballs/"), fetched);
         assert!(ctx.dir.join("0.3.292").is_dir(), "the version it replaced stays");
-        assert!(status_with(Some(&ctx.dir), &ctx.npm, &ctx.floor, true).update_available);
+        assert!(status_with(Some(&ctx.dir), &ctx.npm, &ctx.channel, &ctx.floor, true).update_available);
     }
 
     #[test]
@@ -2226,23 +2234,8 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_compatible_release_is_offered_and_prereleases_never() {
+    fn only_a_compatible_release_can_be_asked_for() {
         let floor = Version::parse(FLOOR).unwrap();
-        let versions = |list: &[&str]| list.iter().map(|text| Version::parse(text).unwrap()).collect::<Vec<_>>();
-        let found = select(
-            &versions(&["0.2.99", "0.3.284", "0.3.290", "0.3.291-beta.1", "0.4.0", "0.4.1-rc.1", "1.0.0-alpha"]),
-            &floor,
-        );
-        assert_eq!(found.latest, Some(Version::new(0, 3, 290)));
-        assert_eq!(found.newer_incompatible, Some(Version::new(0, 4, 0)));
-        let found = select(&versions(&["0.3.284", "0.3.285"]), &floor);
-        assert_eq!((found.latest, found.newer_incompatible), (Some(Version::new(0, 3, 285)), None));
-        // A registry behind the sidecar: nothing to offer, nothing beyond.
-        let found = select(&versions(&["0.2.99", "0.3.100"]), &floor);
-        assert_eq!((found.latest, found.newer_incompatible), (None, None));
-        let found = select(&versions(&["0.2.99", "0.4.0"]), &floor);
-        assert_eq!((found.latest, found.newer_incompatible), (None, Some(Version::new(0, 4, 0))));
-
         assert_eq!(compatible_range(&floor).to_string(), "^0.3.284");
         assert!(compatible_version("0.3.300", &floor).is_ok());
         assert!(compatible_version("0.3.300-beta.1", &floor).is_err());
@@ -2252,42 +2245,87 @@ mod tests {
     }
 
     #[test]
-    fn the_version_list_is_read_only_when_latest_is_not_compatible() {
+    fn the_release_mewrk_names_is_offered_and_npms_own_newest_never() {
         let fixture = Fixture::start();
         let npm = registries(&[fixture.base.as_str()]);
+        let channel = channel(&fixture);
         let floor = Version::parse(FLOOR).unwrap();
-        release(&fixture, "0.3.289");
-        tag_latest(&fixture, "0.4.0");
-        fixture.json(
-            &format!("/{SDK_PACKAGE}"),
-            json!({ "name": SDK_PACKAGE, "versions": {
-                "0.2.1": {}, "0.3.284": {}, "0.3.289": {}, "0.3.290": { "deprecated": "broken" },
-                "0.3.291-beta.1": {}, "0.4.0": {}
-            }}),
-        );
-        let status = status_with(None, &npm, &floor, true);
+        for version in ["0.3.289", "0.3.290"] {
+            release(&fixture, version);
+        }
+        // npm's own word on what is newest is not asked for, whatever it says.
+        fixture.json(&format!("/-/package/{SDK_PACKAGE}/dist-tags"), json!({ "latest": "0.3.290" }));
+        recommend(&fixture, "0.3.289");
+        let status = status_with(None, &npm, &channel, &floor, true);
         assert_eq!(
             status.latest,
             Some(AvailableVersion { sdk_version: "0.3.289".into(), claude_code_version: Some("2.1.289".into()) })
         );
+        assert_eq!((status.newer_incompatible, status.latest_error), (None, None));
+        assert_eq!(fixture.hits("/-/"), 0);
+        let list = format!("/{SDK_PACKAGE}");
+        assert!(!fixture.hits.lock().unwrap().contains(&list), "the version list is never read");
+
+        // Newer than this Mewrk takes: shown as such, and nothing to install.
+        recommend(&fixture, "0.4.0");
+        let status = status_with(None, &npm, &channel, &floor, true);
+        assert!(status.latest.is_none());
         assert_eq!(status.newer_incompatible.as_deref(), Some("0.4.0"));
         assert_eq!(status.latest_error, None);
-        let list = format!("/{SDK_PACKAGE}");
-        let listed = || fixture.hits.lock().unwrap().iter().filter(|path| **path == list).count();
-        assert_eq!(listed(), 1);
+        let root = tempfile::tempdir().unwrap();
+        let ctx = context(&fixture, root.path());
+        let asked = fixture.hits(&format!("/{SDK_PACKAGE}"));
+        let error = install(&ctx, None, &AtomicBool::new(false), &mut quiet).unwrap_err();
+        assert!(error.contains("^0.3.284"), "{error}");
+        assert_eq!(fixture.hits(&format!("/{SDK_PACKAGE}")), asked, "npm is not asked");
 
-        tag_latest(&fixture, "0.3.289");
-        let status = status_with(None, &npm, &floor, true);
-        assert_eq!(status.latest.map(|latest| latest.sdk_version).as_deref(), Some("0.3.289"));
-        assert_eq!(status.newer_incompatible, None);
-        assert_eq!(listed(), 1, "a compatible latest tag answers without the list");
+        // Older than this Mewrk takes, a release npm does not have, a version that is not a
+        // release, a format this host cannot read: said, not left blank.
+        let cases = [
+            (json!({ "schema": 1, "sdkVersion": "0.2.1" }), "^0.3.284"),
+            (json!({ "schema": 1, "sdkVersion": "0.3.291" }), "0.3.291"),
+            (json!({ "schema": 1, "sdkVersion": "0.3.290-beta.1" }), "0.3.290-beta.1"),
+            (json!({ "schema": 1, "sdkVersion": " 0.3.289" }), "0.3.289"),
+            (json!({ "schema": 2, "sdkVersion": "0.3.289" }), "Mewrk"),
+        ];
+        for (doc, said) in cases {
+            fixture.json(&format!("/channel/{RECOMMENDED_KEY}"), doc.clone());
+            let status = status_with(None, &npm, &channel, &floor, true);
+            assert!(status.latest.is_none() && status.newer_incompatible.is_none(), "{doc}");
+            assert!(status.latest_error.as_deref().is_some_and(|error| error.contains(said)), "{doc}: {status:?}");
+        }
+        // Nothing published.
+        fixture.route(&format!("/channel/{RECOMMENDED_KEY}"), Reply::Status(404));
+        let status = status_with(None, &npm, &channel, &floor, true);
+        assert!(status.latest_error.is_some_and(|error| error.contains("Claude Agent SDK")));
+        assert!(install(&ctx, None, &AtomicBool::new(false), &mut quiet).is_err());
+        assert!(current_version(&ctx.dir).is_none());
+    }
 
-        // Nothing compatible: said, not left blank.
-        tag_latest(&fixture, "0.2.1");
-        fixture.json(&list, json!({ "versions": { "0.2.1": {} } }));
-        let status = status_with(None, &npm, &floor, true);
-        assert!(status.latest.is_none());
-        assert!(status.latest_error.is_some_and(|error| error.contains("^0.3.284")));
+    #[test]
+    fn an_older_install_is_offered_the_release_mewrk_names_and_a_newer_one_is_left_alone() {
+        let fixture = Fixture::start();
+        let root = tempfile::tempdir().unwrap();
+        let ctx = context(&fixture, root.path());
+        for version in ["0.3.290", "0.3.293", "0.3.295"] {
+            release(&fixture, version);
+        }
+        install(&ctx, Some("0.3.290"), &AtomicBool::new(false), &mut quiet).unwrap();
+        recommend(&fixture, "0.3.293");
+        let status = status_with(Some(&ctx.dir), &ctx.npm, &ctx.channel, &ctx.floor, true);
+        assert!(status.update_available);
+        assert_eq!(status.latest.map(|latest| latest.sdk_version).as_deref(), Some("0.3.293"));
+
+        // The update is to the release named, not to the newest on npm.
+        install(&ctx, None, &AtomicBool::new(false), &mut quiet).unwrap();
+        assert_eq!(current_version(&ctx.dir).as_deref(), Some("0.3.293"));
+        assert!(!status_with(Some(&ctx.dir), &ctx.npm, &ctx.channel, &ctx.floor, true).update_available);
+
+        // Ahead of what Mewrk names: nothing to update to.
+        install(&ctx, Some("0.3.295"), &AtomicBool::new(false), &mut quiet).unwrap();
+        let status = status_with(Some(&ctx.dir), &ctx.npm, &ctx.channel, &ctx.floor, true);
+        assert!(!status.update_available);
+        assert_eq!(status.latest.map(|latest| latest.sdk_version).as_deref(), Some("0.3.293"));
     }
 
     #[test]
@@ -2297,22 +2335,23 @@ mod tests {
             format!("http://{}", listener.local_addr().unwrap())
         };
         let failing = Fixture::start();
-        failing.route(&format!("/-/package/{SDK_PACKAGE}/dist-tags"), Reply::Status(503));
+        failing.route(&format!("/{SDK_PACKAGE}/0.3.290"), Reply::Status(503));
         let live = Fixture::start();
         release(&live, "0.3.290");
-        tag_latest(&live, "0.3.290");
+        let named = Fixture::start();
+        recommend(&named, "0.3.290");
         let floor = Version::parse(FLOOR).unwrap();
 
         let npm = registries(&[dead.as_str(), failing.base.as_str(), live.base.as_str()]);
-        let status = status_with(None, &npm, &floor, true);
+        let status = status_with(None, &npm, &channel(&named), &floor, true);
         assert_eq!(status.latest.map(|latest| latest.sdk_version).as_deref(), Some("0.3.290"));
         assert_eq!(failing.hits("/"), 1);
 
-        // "No such package" is an answer: the next registry is not asked.
+        // "No such version" is an answer: the next registry is not asked.
         let missing = Fixture::start();
         let npm = registries(&[missing.base.as_str(), live.base.as_str()]);
         let asked = live.hits("/");
-        let status = status_with(None, &npm, &floor, true);
+        let status = status_with(None, &npm, &channel(&named), &floor, true);
         assert!(status.latest.is_none());
         assert!(status.latest_error.is_some());
         assert_eq!(live.hits("/"), asked);
@@ -2321,6 +2360,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let ctx = Context {
             npm: registries(&[failing.base.as_str(), live.base.as_str()]),
+            channel: channel(&named),
             ..context(&live, root.path())
         };
         install(&ctx, None, &AtomicBool::new(false), &mut quiet).unwrap();
@@ -2496,7 +2536,7 @@ mod tests {
         }
 
         // The latest check believes the registry no more than an install does.
-        tag_latest(&fixture, "0.3.295");
+        recommend(&fixture, "0.3.295");
         let cli = cli_bytes("0.3.295", 1024);
         publish(&fixture, "0.3.295", &sdk_tarball("0.3.295", &cli, |_| {}), &cli_tarball(&cli));
         let path = format!("/{SDK_PACKAGE}/0.3.295");
@@ -2506,7 +2546,7 @@ mod tests {
         let mut doc: Value = serde_json::from_slice(&body).unwrap();
         doc["dist"].as_object_mut().unwrap().remove("signatures");
         fixture.json(&path, doc);
-        let status = status_with(None, &ctx.npm, &ctx.floor, true);
+        let status = status_with(None, &ctx.npm, &ctx.channel, &ctx.floor, true);
         assert!(status.latest.is_none());
         assert!(status.latest_error.is_some_and(|error| error.contains("签名") || error.contains("signature")));
     }
@@ -2525,8 +2565,8 @@ mod tests {
         let error = runtime_in(Some(&ctx.dir), &newer).unwrap_err();
         assert!(error.contains("0.3.290") && error.contains("^0.3.295"), "{error}");
         release(&fixture, "0.3.296");
-        tag_latest(&fixture, "0.3.296");
-        let status = status_with(Some(&ctx.dir), &ctx.npm, &newer, true);
+        recommend(&fixture, "0.3.296");
+        let status = status_with(Some(&ctx.dir), &ctx.npm, &ctx.channel, &newer, true);
         let installed = status.installed.clone().expect("still shown as installed");
         assert!(!installed.compatible);
         assert!(status.update_available);
@@ -2535,9 +2575,9 @@ mod tests {
         // Nor does one built against an older release take what is newer than its range: the
         // newest compatible release is the update, though it is older.
         let older = Version::parse("0.2.9").unwrap();
-        tag_latest(&fixture, "0.2.12");
+        recommend(&fixture, "0.2.12");
         release(&fixture, "0.2.12");
-        let status = status_with(Some(&ctx.dir), &ctx.npm, &older, true);
+        let status = status_with(Some(&ctx.dir), &ctx.npm, &ctx.channel, &older, true);
         assert_eq!(status.latest.map(|latest| latest.sdk_version).as_deref(), Some("0.2.12"));
         assert!(status.update_available);
         assert!(runtime_in(Some(&ctx.dir), &older).is_err());
@@ -2667,17 +2707,23 @@ mod tests {
         assert_eq!(build.checksum.as_deref(), Some(digest.as_str()));
     }
 
-    /// The whole install against the real registries (`MEWRK_NPM_REGISTRY`
-    /// honoured): ~100 MB, so only on request,
+    /// The whole install against Mewrk's channel and the real registries
+    /// (`MEWRK_COMPONENTS_MIRROR` and `MEWRK_NPM_REGISTRY` honoured): ~100 MB,
+    /// so only on request,
     /// `cargo test --lib components::claude_agent -- --ignored`.
     #[test]
     #[ignore = "downloads the Claude Agent SDK and its CLI from npm"]
-    fn installs_the_newest_compatible_release_from_npm() {
+    fn installs_the_release_mewrk_names_from_npm() {
         let root = tempfile::tempdir().unwrap();
-        let ctx =
-            Context { dir: root.path().join(DIR), npm: Npm::from_env(), floor: pinned_floor(), platform: platform_tag() };
-        let status = status_with(Some(&ctx.dir), &ctx.npm, &ctx.floor, true);
-        let latest = status.latest.expect("npm has a compatible release");
+        let ctx = Context {
+            dir: root.path().join(DIR),
+            npm: Npm::from_env(),
+            channel: super::super::channel_base(),
+            floor: pinned_floor(),
+            platform: platform_tag(),
+        };
+        let status = status_with(Some(&ctx.dir), &ctx.npm, &ctx.channel, &ctx.floor, true);
+        let latest = status.latest.expect("Mewrk's channel names a compatible release npm has");
         install(&ctx, None, &AtomicBool::new(false), &mut quiet).expect("installs from npm");
         let runtime = installed_runtime(&ctx.dir).expect("installed");
         assert_eq!(runtime.sdk_version, latest.sdk_version);

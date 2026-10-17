@@ -90,11 +90,13 @@ pub fn family_supports_native_search(family: crate::aisdk::protocol::Family) -> 
         | Family::Bedrock
         | Family::Google
         | Family::Vertex
-        | Family::Xai => true,
+        | Family::Xai
+        // Claude Code's own `WebSearch`, the one built-in tool the sidecar switches
+        // on, and only for the isolated search request (`claude-agent.ts`).
+        | Family::ClaudeAgent => true,
         // Chat Completions has no provider-executed tools; generic OpenAI-compatible providers
-        // discard them with an `unsupported` warning. Claude Code's built-in tools are all
-        // switched off for the agent family, its `WebSearch` included.
-        Family::OpenaiChat | Family::OpenaiCompatible | Family::ClaudeAgent => false,
+        // discard them with an `unsupported` warning.
+        Family::OpenaiChat | Family::OpenaiCompatible => false,
     }
 }
 
@@ -102,12 +104,17 @@ pub fn family_supports_native_search(family: crate::aisdk::protocol::Family) -> 
 /// read text out of.
 ///
 /// This is the asymmetry the whole fetch-provider setting exists for. Anthropic
-/// is the only family that both exposes fetching as its own server tool and
+/// is the only API family that both exposes fetching as its own server tool and
 /// returns the page as plain text: a `web_fetch_result` carries
 /// `content.source.{type:"text", media_type:"text/plain", data}`, so the host
-/// parses the page itself. Every other family either has no fetch tool at all
-/// (OpenAI Responses, xAI, Google) or keeps retrieval internal to its search
-/// tool, and those conversations have to borrow a catalog fetch provider.
+/// parses the page itself. The Claude Agent family borrows the same capability
+/// from Claude Code: its own `WebFetch`, the one built-in tool the sidecar
+/// switches on for the isolated fetch request (`claude-agent.ts`), held there
+/// to the URLs the request names, whose structured output carries the page as
+/// text — Claude Code's model's rendering of it, not the raw page. Every other
+/// family either has no fetch tool at all (OpenAI Responses, xAI, Google) or
+/// keeps retrieval internal to its search tool, and those conversations have to
+/// borrow a catalog fetch provider.
 ///
 /// Search is deliberately NOT symmetrical with this: no family's *search*
 /// results contain readable page text. Anthropic seals them in
@@ -117,6 +124,11 @@ pub fn family_supports_native_fetch(family: crate::aisdk::protocol::Family) -> b
     use crate::aisdk::protocol::Family;
     match family {
         Family::Anthropic | Family::Bedrock => true,
+        // Claude Code's own `WebFetch`, switched on only for the isolated fetch
+        // request and admitted URL by URL by the sidecar. It writes its own tool
+        // definition, so no version is picked for it
+        // ([`family_selects_native_tool_type`]).
+        Family::ClaudeAgent => true,
         Family::OpenaiResponses
         | Family::OpenaiCodex
         | Family::Azure
@@ -124,8 +136,7 @@ pub fn family_supports_native_fetch(family: crate::aisdk::protocol::Family) -> b
         | Family::Vertex
         | Family::Xai
         | Family::OpenaiChat
-        | Family::OpenaiCompatible
-        | Family::ClaudeAgent => false,
+        | Family::OpenaiCompatible => false,
     }
 }
 
@@ -457,6 +468,10 @@ mod tests {
         assert!(family_supports_native_fetch(Family::Anthropic));
         assert!(!family_supports_native_fetch(Family::OpenaiResponses));
         assert!(family_supports_native_search(Family::OpenaiResponses));
+        // Claude Agent fetches with Claude Code's own `WebFetch`, which writes
+        // its own tool definition: a fetch capability with no version to pick.
+        assert!(family_supports_native_fetch(Family::ClaudeAgent));
+        assert!(!family_selects_native_tool_type(Family::ClaudeAgent));
     }
 
     /// Every Messages tool version the host can name must be one the sidecar

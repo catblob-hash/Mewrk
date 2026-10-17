@@ -57,6 +57,21 @@ describe("QuestionDock", () => {
     });
   });
 
+  it("draws no number beside its rows, though the digit keys still pick them", () => {
+    const onRespond = vi.fn();
+    render(<QuestionDock prompt={card([choice("采用哪个方案？")])} onRespond={onRespond} />);
+
+    expect(document.querySelector(".question-dock__index")).toBeNull();
+    expect(screen.getByRole("option", { name: /方案 B/ })).not.toHaveTextContent(/^\s*2\./);
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "2" });
+    expect(onRespond).toHaveBeenCalledWith({
+      action: "submit",
+      answers: ["方案 B"],
+      previews: [null],
+      notes: [null]
+    });
+  });
+
   it("advances on each pick and submits what was answered from the review screen", async () => {
     const onRespond = vi.fn();
     render(

@@ -29,7 +29,7 @@ function preview(file: FileAttachment, readsDocuments: boolean) {
 describe("PDF attachment preview", () => {
   it("says the model reads the PDF itself where it does", () => {
     preview(pdf(3), true);
-    expect(screen.getByText(/模型读取的是这份 PDF 本身/)).toBeInTheDocument();
+    expect(screen.getByText(/模型直接读取这份 PDF/)).toBeInTheDocument();
   });
 
   it("says the model reads the extracted text past the page limit or without document support", () => {

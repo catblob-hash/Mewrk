@@ -10,6 +10,7 @@ import { fileAttachmentData } from "../lib/runtime";
 import type { FileAttachment } from "../types";
 import { MarkdownCodeBlock, NumberedCode } from "./CodeBlock";
 import { Dialog, IconButton } from "./Common";
+import { DocsLink } from "./DocsLink";
 import { CsvTable } from "./FilePreview/CsvTable";
 import { dataUrlBytes, formatBytes } from "./FilePreview/format";
 import { HtmlPreview, type HtmlPreviewResources } from "./FilePreview/HtmlPreview";
@@ -213,10 +214,10 @@ export function FileAttachmentPreview({ file, onClose }: { file: FileAttachment;
           {file.format === "pdf" ? (
             <span className="attachment-preview__hint">
               {readsDocuments && (file.pages ?? 0) <= MAX_NATIVE_PDF_PAGES
-                ? t(
-                  "模型读取的是这份 PDF 本身（一次请求放不下时改读上传时提取的文字）",
-                  "The model reads the PDF itself (the text extracted on upload when a request cannot carry it)"
-                )
+                ? <>
+                  {t("模型直接读取这份 PDF", "The model reads the PDF itself")}
+                  <DocsLink inline page="context" section="attachments" />
+                </>
                 : t("模型读取的是上传时提取出的文字", "The model reads the text extracted when it was uploaded")}
             </span>
           ) : null}

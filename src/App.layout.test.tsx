@@ -378,24 +378,25 @@ describe("App model run flow — layout", () => {
       window.document.getElementById(`conversation-terminal-${conversationId}-${terminalId}`)
     );
     const tabNames = () => screen.queryAllByRole("tab").map((element) => element.textContent);
-    const closeControl = (name: string) => within(
-      screen.getByRole("tab", { name }).closest(".page-tab") as HTMLElement
+    // Tabs are named for their shell alone, so two of one shell are told apart by place.
+    const closeControl = (index: number) => within(
+      screen.getAllByRole("tab")[index].closest(".page-tab") as HTMLElement
     ).getByRole("button", { name: "关闭终端" });
 
     // The pane opening with nothing in it starts the most preferred shell this machine has.
     await toggleTerminalPane(user, "显示终端面板");
-    expect(tabNames()).toEqual(["zsh 1"]);
+    expect(tabNames()).toEqual(["zsh"]);
     expect(panel("terminal-1")).toHaveAttribute("data-launch", JSON.stringify({ workspace: 1, shell: "zsh" }));
     await user.click(screen.getByRole("button", { name: "新建终端" }));
     await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
       .getByRole("menuitem", { name: "zsh" }));
-    expect(tabNames()).toEqual(["zsh 1", "zsh 2"]);
+    expect(tabNames()).toEqual(["zsh", "zsh"]);
 
     // Both shells stay mounted; only the tab in use is on screen, so switching back to the
     // other is a repaint rather than a new shell.
     expect(panel("terminal-2")).not.toBeNull();
     expect(panel("terminal-1")).toHaveAttribute("inert");
-    await user.click(screen.getByRole("tab", { name: "zsh 1" }));
+    await user.click(screen.getAllByRole("tab", { name: "zsh" })[0]);
     expect(panel("terminal-1")).not.toHaveAttribute("inert");
     expect(panel("terminal-2")).toHaveAttribute("inert");
 
@@ -406,25 +407,23 @@ describe("App model run flow — layout", () => {
     expect(panel("terminal-1")).not.toBeNull();
 
     await toggleTerminalPane(user, "显示终端面板");
-    expect(tabNames()).toEqual(["zsh 1", "zsh 2"]);
+    expect(tabNames()).toEqual(["zsh", "zsh"]);
 
-    // A tab's × ends that shell, and only that one. The survivor keeps its number: each shell
-    // counts the terminals it has had, not the ones still open.
-    await user.click(closeControl("zsh 2"));
+    // A tab's × ends that shell, and only that one; the survivor is the one before it.
+    await user.click(closeControl(1));
     await waitFor(() => expect(panel("terminal-2")).toBeNull());
     expect(terminalMocks.closeTerminal).toHaveBeenCalledExactlyOnceWith(conversationId, "terminal-2");
-    expect(tabNames()).toEqual(["zsh 1"]);
+    expect(tabNames()).toEqual(["zsh"]);
 
     // The last tab leaving takes the pane with it.
-    await user.click(closeControl("zsh 1"));
+    await user.click(closeControl(0));
     await waitFor(() => expect(panel("terminal-1")).toBeNull());
     expect(terminalMocks.closeTerminal).toHaveBeenLastCalledWith(conversationId, "terminal-1");
     expect(screen.queryByRole("button", { name: "关闭面板" })).not.toBeInTheDocument();
 
-    // Asking for the pane again asks for a terminal to put in it, on an id never used before,
-    // and the count goes on from where it was.
+    // Asking for the pane again asks for a terminal to put in it, on an id never used before.
     await toggleTerminalPane(user, "显示终端面板");
-    expect(tabNames()).toEqual(["zsh 3"]);
+    expect(tabNames()).toEqual(["zsh"]);
     expect(panel("terminal-3")).not.toBeNull();
   });
 
@@ -454,13 +453,13 @@ describe("App model run flow — layout", () => {
     await user.click(screen.getByRole("button", { name: "新建终端" }));
     await user.click(within(await screen.findByRole("menu", { name: "新建终端" }))
       .getByRole("menuitem", { name: "zsh" }));
-    expect(tabNames()).toEqual(["zsh 1", "zsh 2"]);
+    expect(tabNames()).toEqual(["zsh", "zsh"]);
 
     // A shell that ends behind the tab the user is looking at still takes its own tab with it,
     // and nothing else: the pane and the terminal in front of it stay put, under its own name.
     exitCleanly("terminal-1");
     await waitFor(() => expect(panel("terminal-1")).toBeNull());
-    expect(tabNames()).toEqual(["zsh 2"]);
+    expect(tabNames()).toEqual(["zsh"]);
     expect(screen.getByRole("button", { name: "关闭面板" })).toBeInTheDocument();
 
     // The last one ending takes the pane with it.

@@ -158,7 +158,6 @@ export function WorkspaceMemberSelector({
   workspaces,
   selected,
   sshMachines,
-  showIndex = true,
   onSelect,
   onConfigureMachine,
   onConfigureWorkspace
@@ -168,12 +167,6 @@ export function WorkspaceMemberSelector({
   /** 1-based. */
   selected: number;
   sshMachines: readonly SshMachineConfig[];
-  /**
-   * Whether the chip shows the selected workspace's number. Numbers are addresses the host
-   * states to the model only when the conversation has more than one workspace; a lone
-   * workspace's "1" would name something the model never sees.
-   */
-  showIndex?: boolean;
   onSelect: (member: number) => void;
   /** Opens the settings of a machine (`null` is this one). */
   onConfigureMachine: (machine: RunTarget | null) => void;
@@ -183,8 +176,8 @@ export function WorkspaceMemberSelector({
   const { t } = useI18n();
   const current = workspaces[selected - 1] ?? workspaces[0];
   if (!current) return null;
-  // One section per machine, in the order the machines first appear, so the numbers
-  // still read in ascending order within each group.
+  // One section per machine, in the order the machines first appear, so the workspaces
+  // still read in project order within each group.
   const groups = new Map<string, { machine: RunTarget | null; items: PopoverMenuItem[] }>();
   workspaces.forEach((workspace, index) => {
     const machine = workspace.machine ?? null;
@@ -195,7 +188,6 @@ export function WorkspaceMemberSelector({
       label: workspace.path,
       labelIsPath: true,
       title: workspaceLocationTitle(workspace.path, workspace.machine, sshMachines),
-      hint: String(index + 1),
       checked: index + 1 === selected,
       onSelect: () => onSelect(index + 1),
       action: {
@@ -226,7 +218,6 @@ export function WorkspaceMemberSelector({
       trigger={<>
         <GlassPlate />
         {machineIcon(current.machine, 13)}
-        {showIndex && <span className="composer-chip__index" aria-hidden="true">{selected}</span>}
         <PathText className="composer-chip__label" path={current.path} title={null} />
         <ChevronDown size={11} className="composer-chip__caret" />
       </>}
@@ -287,7 +278,6 @@ export function terminalWorkspaceMenuItems({
     labelIsPath: true,
     title: workspaceLocationTitle(workspace.path, workspace.machine, sshMachines),
     icon: machineIcon(workspace.machine, 14),
-    hint: String(index + 1),
     disabled,
     children: terminalShellMenuItems(
       shellsFor(workspace.machine ?? null),
@@ -320,7 +310,6 @@ export function previewWorkspaceMenuItems({
     labelIsPath: true,
     title: workspaceLocationTitle(workspace.path, workspace.machine, sshMachines),
     icon: machineIcon(workspace.machine, 14),
-    hint: String(index + 1),
     disabled,
     onSelect: () => onSelect(index + 1)
   }));

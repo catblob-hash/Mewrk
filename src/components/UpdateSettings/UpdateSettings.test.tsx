@@ -177,6 +177,18 @@ describe("UpdateSettings", () => {
     expect(backend.checkAppUpdate).toHaveBeenCalledTimes(1);
   });
 
+  it("describes how an installer edition updates in one line, with a link to the updates docs", async () => {
+    const backend = createBackend();
+    render(<UpdateSettings controller={createAppUpdateController(backend)} />);
+
+    await screen.findByText("已是最新版本");
+    expect(screen.getByText("检查并下载新版本。")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "详情" })).toHaveAttribute(
+      "href",
+      "https://mewrk.dev/zh-CN/settings.html#updates"
+    );
+  });
+
   it("leaves an MSIX install from the Store to the Microsoft Store and never checks GitHub", async () => {
     updateMocks.appVersionInfo.mockResolvedValue({
       ...versionInfo,
@@ -190,7 +202,8 @@ describe("UpdateSettings", () => {
     expect(screen.getByText("MSIX（Microsoft Store）")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "检查更新" })).not.toBeInTheDocument();
     expect(screen.queryByText("正在检查更新…")).not.toBeInTheDocument();
-    expect(screen.getByText("这个版本的更新由 Microsoft Store 提供。")).toBeInTheDocument();
+    expect(screen.getByText("更新由 Microsoft Store 提供。")).toBeInTheDocument();
+    expect(screen.getByText("Store 自动更新，应用内不检查、不下载。")).toBeInTheDocument();
     expect(screen.queryByText(/GitHub Releases/)).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "全部发布" })).not.toBeInTheDocument();
     expect(backend.checkAppUpdate).not.toHaveBeenCalled();
@@ -313,7 +326,8 @@ describe("UpdateSettings", () => {
 
     expect(await screen.findByText("发现新版本 v1.1.0")).toBeInTheDocument();
     expect(screen.getByText(/请到发布页下载新的 \.dmg。/)).toBeInTheDocument();
-    expect(screen.getByText(/但不负责下载/)).toBeInTheDocument();
+    expect(screen.getByText("只检查新版本，请到发布页下载 .dmg。")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "详情" })).not.toBeInTheDocument();
     expect(screen.queryByText(/dl\.mewrk\.dev/)).not.toBeInTheDocument();
     expect(screen.queryByText(/便携版/)).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "前往发布页" })).toHaveAttribute(
@@ -336,7 +350,7 @@ describe("UpdateSettings", () => {
     render(<UpdateSettings controller={createAppUpdateController(backend)} />);
 
     expect(await screen.findByText("发现新版本 v1.1.0")).toBeInTheDocument();
-    expect(screen.getByText(/没有任何渠道会自动更新它/)).toBeInTheDocument();
+    expect(screen.getByText("不会自动更新，请到发布页获取新的 .msix。")).toBeInTheDocument();
     expect(screen.getByText(/请到发布页下载并安装新的 \.msix。/)).toBeInTheDocument();
     expect(screen.queryByText("由 Microsoft Store 更新")).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "前往发布页" })).toBeInTheDocument();

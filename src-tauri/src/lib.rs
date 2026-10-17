@@ -426,18 +426,6 @@ fn preview_conversation_template(
     conversations::store(&path)?.template_contexts(&template_id)
 }
 
-/// The built-in preset's template ships with the build and is rewritten from
-/// it on every start (`storage::install_builtin_preset`), so an edit or a
-/// delete would be undone without a word. Refused instead, like every other
-/// change to that preset.
-#[cfg(not(test))]
-fn refuse_builtin_preset_template(template_id: &str) -> Result<(), String> {
-    if template_id == catalog::BUILTIN_PRESET_TEMPLATE_ID {
-        return Err("内置对话预设的模板随版本更新，不能修改或删除".into());
-    }
-    Ok(())
-}
-
 /// Writes a renderer-edited body onto a template, creating it if that id has no
 /// row yet.
 ///
@@ -481,7 +469,6 @@ fn update_conversation_template(
         .storage_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    refuse_builtin_preset_template(&template_id)?;
     let path = document_path(&app)?;
     let store = conversations::store(&path)?;
     // An unknown id reads as an empty body, and that empty read is what tells a
@@ -527,7 +514,6 @@ fn capture_conversation_template(
         .storage_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    refuse_builtin_preset_template(&template_id)?;
     if template_id.trim().is_empty() {
         return Err("对话模板的 ID 不能为空".into());
     }
@@ -567,7 +553,6 @@ fn delete_conversation_template(
     state: State<'_, AppState>,
     template_id: String,
 ) -> Result<(), String> {
-    refuse_builtin_preset_template(&template_id)?;
     let _guard = state
         .storage_lock
         .lock()
@@ -1318,8 +1303,7 @@ fn reset_document(app: AppHandle, state: State<'_, AppState>) -> Result<AppDocum
         .flush(std::time::Duration::from_secs(30))?;
     storage::purge_conversation_bodies(&path)?;
     let mut document = catalog::default_document();
-    // The purge took the built-in preset's template with it, and the default
-    // document has none of this machine's parts yet.
+    // The default document has none of this machine's parts yet.
     storage::install_builtin_preset(&path, &mut document)?;
     let started = agent_roles::scan_generation(&state.agent_roles);
     let discovered = capabilities::discover_document(&document);
@@ -1752,7 +1736,8 @@ async fn delete_skill(
     blocking_capability_task(move || capabilities::delete_skill(&document, &skill_id)).await
 }
 
-/// Removes a discovered MCP server from the `mcp.json` it was read from.
+/// Removes a discovered MCP server from the `mcp.json` it was read from, and
+/// ends the processes conversations still had of it.
 #[cfg(not(test))]
 #[tauri::command]
 async fn delete_mcp_server(
@@ -1761,7 +1746,13 @@ async fn delete_mcp_server(
     server_id: String,
 ) -> Result<(), String> {
     let (document, _) = capability_document(&app, &state)?;
-    blocking_capability_task(move || capabilities::delete_mcp_server(&document, &server_id)).await
+    let sessions = state.mcp_sessions.clone();
+    blocking_capability_task(move || {
+        capabilities::delete_mcp_server(&document, &server_id)?;
+        sessions.evict_servers([server_id.as_str()]);
+        Ok(())
+    })
+    .await
 }
 
 /// A folder on another machine for the renderer to show in the Files pane.
@@ -7112,26 +7103,55 @@ fn assemble_system_prompt(environment: &str, runtime_addendum: &str) -> String {
     prompt
 }
 
-/// A run's environment block: the `# Environment` section, and the section
-/// saying the host's own messages come as user messages when they do.
+/// A run's environment block: the `# Environment` section unless the
+/// conversation turned it off, and the section saying the host's own messages
+/// come as user messages when the run's prompt says it.
 ///
 /// What the host's own messages are travels with the environment, so every
-/// run's prompt says it — a child's and a role's included, which are built
-/// from this part. Only user messages need saying: in `box`, the tool's own
-/// description says what its results are.
+/// run's prompt that says it — a child's and a role's included, which are
+/// built from this part — says it in the same place. Only user messages need
+/// saying, and only to a prompt assembled for a tool that can start a
+/// background task ([`host_messages_in_prompt`]): in `box`, the tool's own
+/// description says what its results are, and a producer enabled later is
+/// told at the point it joins.
 fn run_environment_block(
     profile: &prompt_profile::PromptProfile,
     facts: &environment_prompt::EnvironmentFacts,
+    environment: bool,
     host_messages_in_user: bool,
 ) -> String {
-    let mut environment = environment_prompt::environment_section(profile, facts);
+    let mut block = if environment {
+        environment_prompt::environment_section(profile, facts)
+    } else {
+        String::new()
+    };
     if host_messages_in_user {
         append_system_prompt_section(
-            &mut environment,
+            &mut block,
             profile.text(prompt_profile::PromptKey::SystemHostMessages),
         );
     }
-    environment
+    block
+}
+
+/// Whether a run's system prompt says how the host's messages and background
+/// results arrive (`system.host_messages`): where they come as user messages,
+/// and the prompt was assembled for a tool that can start a background task.
+///
+/// The prompt is what every earlier round was answered against, so what it
+/// was assembled for is the conversation's tool-lock pin, set by its first run
+/// (`ConversationToolLock::prompt_task_tools`); a conversation with no pin
+/// reads the tools it enables now. A producer enabled after the prompt opened
+/// without one is told at the round it joins instead
+/// (`host_append::host_messages_owed`), so the prompt — and the cache behind
+/// it — stays as it was.
+fn host_messages_in_prompt(
+    container: model::HostMessageContainer,
+    pin: Option<bool>,
+    enabled_tools: &[String],
+) -> bool {
+    container == model::HostMessageContainer::User
+        && pin.unwrap_or_else(|| enabled_tools.iter().any(|name| agents::produces_tasks(name)))
 }
 
 fn append_system_prompt_section(prompt: &mut String, section: &str) {
@@ -7198,6 +7218,48 @@ mod prompt_tests {
         assert_eq!(assemble_system_prompt("", ""), "");
         assert_eq!(assemble_system_prompt(" ", "  \n "), "");
         assert_eq!(assemble_system_prompt("", "ADDENDUM"), "ADDENDUM");
+    }
+
+    /// The note on the host's messages belongs to a prompt assembled for a
+    /// tool that can start a background task, and only where host messages
+    /// come as user messages. The conversation's pin, once its first run set
+    /// it, decides over the tools enabled now.
+    #[test]
+    fn the_host_message_note_follows_the_tools_the_prompt_was_assembled_for() {
+        use crate::model::HostMessageContainer::{Box, User};
+        let tools = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        assert!(!super::host_messages_in_prompt(User, None, &tools(&["read", "edit", "web_search"])));
+        for producer in ["bash", "powershell", "pwsh", "agent_spawn", "workflow", "preview_start"] {
+            assert!(super::host_messages_in_prompt(User, None, &tools(&["read", producer])), "{producer}");
+        }
+        assert!(!super::host_messages_in_prompt(User, Some(false), &tools(&["bash"])));
+        assert!(super::host_messages_in_prompt(User, Some(true), &tools(&["read"])));
+        assert!(!super::host_messages_in_prompt(Box, None, &tools(&["bash"])));
+        assert!(!super::host_messages_in_prompt(Box, Some(true), &tools(&["bash"])));
+    }
+
+    /// The environment switch takes the whole `# Environment` section out and
+    /// nothing else: the note on the host's messages stays where it applies.
+    #[test]
+    fn the_environment_switch_drops_the_section_but_not_the_host_message_note() {
+        let profile = PromptProfile::builtin();
+        let facts = crate::environment_prompt::EnvironmentFacts {
+            working_directory: "/work/repo".into(),
+            platform: "linux".into(),
+            date: "2026-10-17".into(),
+            ..Default::default()
+        };
+        let section = crate::environment_prompt::environment_section(&profile, &facts);
+        let note = profile.text(crate::prompt_profile::PromptKey::SystemHostMessages);
+        assert!(section.starts_with("# Environment"), "{section}");
+
+        assert_eq!(super::run_environment_block(&profile, &facts, true, false), section);
+        assert_eq!(
+            super::run_environment_block(&profile, &facts, true, true),
+            format!("{section}\n\n---\n\n{note}")
+        );
+        assert_eq!(super::run_environment_block(&profile, &facts, false, false), "");
+        assert_eq!(super::run_environment_block(&profile, &facts, false, true), note);
     }
 
     /// The model-visible description of `name` under `profile`: the root of the
@@ -7685,9 +7747,25 @@ fn trusted_run_request(
     // Host-rendered sections are stable for the run; timeline system cards are
     // appended separately by the wire layer as dynamic context.
     let environment_facts = environment_facts(&request);
-    let host_messages_in_user =
-        conversation.settings.host_message_container == model::HostMessageContainer::User;
-    let environment = run_environment_block(&profile, &environment_facts, host_messages_in_user);
+    let environment_enabled = conversation.settings.environment_prompt_enabled;
+    // Read off the conversation's own list, before the host derives anything
+    // from it: no derived tool starts a task.
+    let host_messages_in_user = host_messages_in_prompt(
+        conversation.settings.host_message_container,
+        conversation
+            .settings
+            .tool_lock
+            .as_ref()
+            .and_then(|lock| lock.prompt_task_tools),
+        &request.enabled_tools,
+    );
+    request.host_messages_in_prompt = host_messages_in_user;
+    let environment = run_environment_block(
+        &profile,
+        &environment_facts,
+        environment_enabled,
+        host_messages_in_user,
+    );
     request.assembled_system_prompt = assemble_system_prompt(&environment, &runtime.addendum);
     // A role with skills, servers or hooks of its own is resolved when it is
     // spawned, against this run's half of them; one with a tool-description
@@ -7696,6 +7774,7 @@ fn trusted_run_request(
         environment,
         prompt_profile_id: profile.id.clone(),
         environment_facts,
+        environment_enabled,
         host_messages_in_user,
         skill_ids: conversation.settings.skill_ids.clone(),
         mcp_ids: conversation.settings.mcp_ids.clone(),
@@ -7781,6 +7860,19 @@ fn trusted_run_request(
     // conversation's setting, never a renderer-supplied request field.
     request.host_message_container = conversation.settings.host_message_container;
     agents::apply_task_runtime_tools(&mut request.enabled_tools, request.host_message_container);
+    // Same rule for `send_message`, driven by the conversation's
+    // subagent-communication switch and by `agent_spawn` being among the tools
+    // the conversation itself enables (`request.enabled_tools` holds nothing
+    // the host derived about `agent_spawn`, and a stale `send_message` in the
+    // persisted list cannot make the answer yes). The answer rides on the
+    // request: it is what the run's children copy
+    // (`api::agent_child_template`) to decide whether they hold
+    // `subagent_update`. Never taken from the request the renderer sent.
+    request.subagent_messaging = agents::subagent_messaging_granted(
+        conversation.settings.subagent_messaging_enabled,
+        &request.enabled_tools,
+    );
+    agents::apply_subagent_messaging_tool(&mut request.enabled_tools, request.subagent_messaging);
     // Same rule for the two web tools, driven by the conversation's single
     // web-access switch rather than by two checkboxes. Which of the pair this
     // grants depends on the backend that just resolved above, so it has to run

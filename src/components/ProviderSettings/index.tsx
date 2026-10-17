@@ -33,6 +33,7 @@ import type {
   ModelProfile
 } from "../../types";
 import { IconButton, Switch } from "../Common";
+import { DocsLink } from "../DocsLink";
 import { findReorderDropTarget, reorderItems, usePointerDrag } from "../usePointerDrag";
 import type { ReorderDropTarget } from "../usePointerDrag";
 import { AddProviderDialog } from "./AddProviderDialog";
@@ -882,10 +883,13 @@ export function ApiProviderSettings({
                   <p className="provider-field__error" id={keyErrorId} role="alert">{selectedKeyError}</p>
                 )}
                 <p className="provider-field__help">{desktopRuntime
-                  ? t(
-                    "输入后失去焦点会自动保存。明文存在系统凭据库里，不会写进对话文档。",
-                    "Saved when the field loses focus. The secret lives in the system credential store and is never written to conversation documents."
-                  )
+                  ? <>
+                    {t(
+                      "失去焦点时自动保存到系统凭据库。",
+                      "Saved to the system credential store when you leave the field."
+                    )}
+                    <DocsLink inline page="providers" section="add-provider" />
+                  </>
                   : t(
                     "浏览器预览不会发起真实请求，也不会保存 API Key 明文。",
                     "Browser preview does not send real requests or store API keys in plain text."
@@ -934,10 +938,13 @@ export function ApiProviderSettings({
                   </p>
                 )}
                 {selected.family === "azure" && (
-                  <p className="provider-field__help">{t(
-                    "填资源地址到 /openai 为止，例如 https://<resource>.openai.azure.com/openai，不要以 /v1 结尾：Mewrk 会自己补上 /v1/responses 和 api-version。",
-                    "Enter the resource address up to /openai, such as https://<resource>.openai.azure.com/openai, without a trailing /v1: Mewrk adds /v1/responses and the api-version itself."
-                  )}</p>
+                  <p className="provider-field__help">
+                    {t(
+                      "地址写到 /openai 为止，不要以 /v1 结尾。",
+                      "Stop the address at /openai; don't end it with /v1."
+                    )}
+                    <DocsLink inline page="providers" section="protocols" />
+                  </p>
                 )}
               </section>
               )}
@@ -969,7 +976,6 @@ export function ApiProviderSettings({
         <div className="provider-pane provider-pane--empty">
           <Cloud size={24} />
           <strong>{t("添加 API 提供商", "Add an API provider")}</strong>
-          <span>{t("配置一个用于对话模型的 API 提供商。", "Configure an API provider for chat models.")}</span>
           <button type="button" className="button button--secondary button--small" onClick={() => setAddingProvider(true)}>
             <Plus size={13} /> {t("添加提供商", "Add provider")}
           </button>

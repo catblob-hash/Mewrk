@@ -35,6 +35,7 @@ import { agentTimelineRouteId, agentTimelineRunStatus } from "../lib/subagents";
 import { isPreviewToolName } from "../lib/taskTools";
 import type { WorkflowRunView } from "../lib/workflowRuns";
 import { CopyButton, IconButton } from "./Common";
+import { DocsLink } from "./DocsLink";
 import { FileIcon } from "./FileIcon";
 import { InlineTextEditor } from "./InlineTextEditor";
 import { InlineToolEditor } from "./InlineToolEditor";
@@ -842,10 +843,10 @@ function ReasoningRow({
               {/* The provider's signed payload is what those protocols replay, so
                   what is typed here never reaches them; deleting is how to leave it out. */}
               {item.replay && (
-                <p className="timeline-row__note">{t(
-                  "这段思考带有提供方的签名。在 Anthropic、Amazon Bedrock、Claude Agent、OpenAI Responses 和 Azure 上，模型收到的始终是签名的原文，编辑只改变这里的显示；要让下一次请求不带这段思考，删除这张卡。在其他协议上，模型收到的就是编辑后的文字。",
-                  "This reasoning carries the provider's signature. On Anthropic, Amazon Bedrock, Claude Agent, OpenAI Responses and Azure the model always gets the signed original, so an edit only changes what is shown here; to leave it out of the next request, delete this card. On other protocols the model gets the edited text."
-                )}</p>
+                <p className="timeline-row__note">
+                  {t("带签名的思考：部分协议会忽略编辑。", "Signed reasoning: some protocols ignore edits.")}
+                  <DocsLink inline page="context" section="edit" />
+                </p>
               )}
               <InlineTextEditor
                 kind="reasoning"

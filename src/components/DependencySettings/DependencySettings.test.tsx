@@ -70,6 +70,17 @@ describe("DependencySettings", () => {
     expect(screen.queryByRole("button", { name: /安装/ })).not.toBeInTheDocument();
   });
 
+  it("says what the page checks in one line and links to the dependencies docs", async () => {
+    render(<DependencySettings tools={[customDefinition]} onChange={vi.fn()} />);
+    await screen.findByText("CustomCli");
+
+    expect(screen.getByText("检测这些命令行工具是否在 PATH 上。")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "详情" })).toHaveAttribute(
+      "href",
+      "https://mewrk.dev/zh-CN/settings.html#dependencies"
+    );
+  });
+
   it("only offers deletion for user-added tools", async () => {
     render(<DependencySettings tools={[customDefinition]} onChange={vi.fn()} />);
     await screen.findByText("CustomCli");

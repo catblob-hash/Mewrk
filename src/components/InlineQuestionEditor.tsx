@@ -291,8 +291,8 @@ export function InlineQuestionEditor({
         <span>{t("{count} 个问题", "{count} questions", { count: questions.length })}</span>
         <small>
           {t(
-            "不能增加或删除问题；选项可在每题 2 至 4 个之间调整。",
-            "Questions cannot be added or removed; each question can have 2 to 4 options."
+            "问题数固定，每题 2 至 4 个选项。",
+            "The question count is fixed; each has 2 to 4 options."
           )}
         </small>
       </div>
@@ -308,7 +308,7 @@ export function InlineQuestionEditor({
           >
             <header className="question-editor__question-heading">
               <h3 id={sectionId}>
-                {t("问题 {index}", "Question {index}", { index: questionIndex + 1 })}
+                {t("问题", "Question")}
               </h3>
               <span>{question.header || t("未填写标题", "Untitled")}</span>
             </header>
@@ -360,12 +360,6 @@ export function InlineQuestionEditor({
             <div className="question-editor__switch-row">
               <div>
                 <strong>{t("允许多选", "Allow multiple selections")}</strong>
-                <small>
-                  {t(
-                    "开启后，用户可以选择多个预设选项。",
-                    "When enabled, the user can choose multiple preset options."
-                  )}
-                </small>
               </div>
               <Switch
                 checked={question.multiSelect}
@@ -409,7 +403,7 @@ export function InlineQuestionEditor({
                 return (
                   <div className="question-editor__option" key={optionIndex}>
                     <span className="question-editor__option-index">
-                      {t("选项 {index}", "Option {index}", { index: optionIndex + 1 })}
+                      {t("选项", "Option")}
                     </span>
                     <IconButton
                       className="question-editor__option-remove"
@@ -496,8 +490,8 @@ export function InlineQuestionEditor({
                 <Field
                   label={t("对应回答", "Answer")}
                   hint={questionErrors?.answer ?? t(
-                    "保存时会使用修改后的问题内容重新建立对应关系。",
-                    "Saving rebuilds the answer mapping with the edited question text."
+                    "保存时按修改后的问题重新对应回答。",
+                    "Saving re-matches the answer to the edited question."
                   )}
                 >
                   <textarea

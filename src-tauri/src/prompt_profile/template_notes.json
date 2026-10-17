@@ -354,8 +354,8 @@
       "placeholders": {}
     },
     "system.host_messages": {
-      "en": "System prompt section saying Mewrk's reminder and task-notification user messages are not from the user.",
-      "zh": "系统提示词中的一节，说明 Mewrk 以用户消息形式发来的提醒和任务通知并非用户本人所说。",
+      "en": "System prompt section saying Mewrk's reminder and task-notification user messages are not from the user; included only when a tool that can start a background task is enabled, and appended later if one is enabled afterwards.",
+      "zh": "系统提示词中的一节，说明 Mewrk 以用户消息形式发来的提醒和任务通知并非用户本人所说；仅在启用了会创建后台任务的工具时拼接，之后才启用的会在启用处追加。",
       "placeholders": {}
     },
     "tool.ls.description": {
@@ -1012,6 +1012,26 @@
       "zh": "`task_stop` 的 `task` 参数说明。",
       "placeholders": {}
     },
+    "tool.send_message.description": {
+      "en": "Description of the `send_message` tool, which the model reads to decide when and how to use it. Offered only to the main agent, and only while the conversation has subagent communication on and `agent_spawn` enabled.",
+      "zh": "`send_message` 工具的描述，模型据此判断何时、如何调用它。仅提供给主代理，且仅在对话开启了子代理通信并启用了 `agent_spawn` 时提供。",
+      "placeholders": {}
+    },
+    "tool.send_message.param.to": {
+      "en": "Description of `send_message`'s `to` parameter: the name the child was spawned with.",
+      "zh": "`send_message` 的 `to` 参数说明：派生该子代理时起的名字。",
+      "placeholders": {}
+    },
+    "tool.send_message.param.message": {
+      "en": "Description of `send_message`'s `message` parameter.",
+      "zh": "`send_message` 的 `message` 参数说明。",
+      "placeholders": {}
+    },
+    "tool.send_message.param.summary": {
+      "en": "Description of `send_message`'s `summary` parameter, the short preview shown on the timeline.",
+      "zh": "`send_message` 的 `summary` 参数说明，即显示在时间线上的简短预览。",
+      "placeholders": {}
+    },
     "tool.box.description": {
       "en": "Description of the `box` tool, which carries Mewrk's host messages between rounds; used only where messages come in `box`.",
       "zh": "`box` 工具的描述，它在回合之间承载 Mewrk 的宿主消息；仅在宿主消息经由 `box` 送达时提供。",
@@ -1357,8 +1377,8 @@
       "placeholders": {}
     },
     "subagent.addendum": {
-      "en": "Text appended after a `---` separator to the system prompt of every spawned child agent and workflow step.",
-      "zh": "以 `---` 分隔，追加在每个子代理和工作流步骤的系统提示词末尾的说明。",
+      "en": "Text appended after a `---` separator to the system prompt of every spawned child agent and workflow step. A child holds the `subagent_update` tool only while the conversation has subagent communication on, which is also when the main agent can message it: {?subagent_update}…{/} wraps what only such a child is told (that the main agent's later messages reach it and carry instructions, and the sentence about reporting progress), {!subagent_update}…{/} what every other child is told instead.",
+      "zh": "以 `---` 分隔，追加在每个子代理和工作流步骤的系统提示词末尾的说明。子代理仅在对话开启子代理通信时持有 `subagent_update` 工具，这也正是主代理能给它发消息的时候：{?subagent_update}…{/} 包住只对这样的子代理说的话（主代理之后发来的消息会送达它、也算指令，以及汇报进展的那句），{!subagent_update}…{/} 包住对其他子代理说的对应文字。",
       "placeholders": {}
     },
     "subagent.addendum.browser_note": {
@@ -2091,6 +2111,66 @@
         "detail": {
           "en": "what the task was running",
           "zh": "任务正在运行的内容"
+        }
+      }
+    },
+    "task.send.queued": {
+      "en": "Result of a `send_message` call that put its message in front of a child still running; the child reads it before its next model request.",
+      "zh": "`send_message` 把消息递给仍在运行的子代理后的结果；子代理会在下一次模型请求前读到它。",
+      "placeholders": {
+        "to": {
+          "en": "the child agent's name",
+          "zh": "子代理的名字"
+        }
+      }
+    },
+    "task.send.resumed": {
+      "en": "Result of a `send_message` call to a child that had finished: the child resumes in the background with its full earlier context and the message.",
+      "zh": "`send_message` 发给已结束的子代理后的结果：子代理带着完整的先前上下文和这条消息在后台恢复运行。",
+      "placeholders": {
+        "to": {
+          "en": "the child agent's name",
+          "zh": "子代理的名字"
+        }
+      }
+    },
+    "task.send.result_pending": {
+      "en": "Refusal of a `send_message` call to a child that has just finished but whose result has not reached the model yet; nothing changed.",
+      "zh": "`send_message` 发给刚结束、结果尚未送达模型的子代理时的拒绝说明；没有任何改动。",
+      "placeholders": {
+        "to": {
+          "en": "the child agent's name",
+          "zh": "子代理的名字"
+        }
+      }
+    },
+    "task.send.user_stopped": {
+      "en": "Refusal of a `send_message` call to a child the user stopped, which is not resumed.",
+      "zh": "`send_message` 发给被用户停止的子代理时的拒绝说明；它不会被恢复。",
+      "placeholders": {
+        "to": {
+          "en": "the child agent's name",
+          "zh": "子代理的名字"
+        }
+      }
+    },
+    "task.send.unknown_target": {
+      "en": "Refusal of a `send_message` call that names no child agent of this conversation.",
+      "zh": "`send_message` 指定的名字不是本对话任何子代理时的拒绝说明。",
+      "placeholders": {
+        "to": {
+          "en": "the name the call gave",
+          "zh": "调用给出的名字"
+        }
+      }
+    },
+    "task.send.not_an_agent": {
+      "en": "Refusal of a `send_message` call that names a task which is not a child agent (a workflow run, a shell command, a dev server).",
+      "zh": "`send_message` 指定的任务不是子代理（工作流、shell 命令、开发服务器）时的拒绝说明。",
+      "placeholders": {
+        "to": {
+          "en": "the name or address the call gave",
+          "zh": "调用给出的名字或地址"
         }
       }
     },

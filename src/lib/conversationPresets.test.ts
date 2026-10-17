@@ -19,6 +19,7 @@ const PRESET_FIELDS = [
   "agentIds",
   "allowRolelessSubagents",
   "enabledTools",
+  "environmentPromptEnabled",
   "fileWriteGuardsEnabled",
   "globalMemoryEnabled",
   "hookIds",
@@ -29,6 +30,7 @@ const PRESET_FIELDS = [
   "securityLevel",
   "skillIds",
   "skillToolEnabled",
+  "subagentMessagingEnabled",
   "toolDescriptionFileId",
   "webSearch",
   "webSearchEnabled"
@@ -81,7 +83,9 @@ describe("conversation presets", () => {
       skillToolEnabled: false,
       mcpToolDiscoveryEnabled: false,
       hostMessageContainer: "user",
-      fileWriteGuardsEnabled: true
+      fileWriteGuardsEnabled: true,
+      environmentPromptEnabled: true,
+      subagentMessagingEnabled: false
     });
     expect(Object.keys(emptyConversationPresetSettings()).sort()).toEqual(PRESET_FIELDS);
   });
@@ -113,7 +117,11 @@ describe("conversation presets", () => {
       mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled,
       hostMessageContainer: "user",
       // The fixture's settings say nothing about the guards, which reads as on.
-      fileWriteGuardsEnabled: true
+      fileWriteGuardsEnabled: true,
+      // …nor about the environment section, which reads as on.
+      environmentPromptEnabled: true,
+      // …nor about subagent communication, which reads as off.
+      subagentMessagingEnabled: false
     });
     // Conversation-only fields — plan mode among them — do not enter presets;
     // web search, security, and memory tiers do.
@@ -152,7 +160,9 @@ describe("conversation presets", () => {
       skillToolEnabled: true,
       mcpToolDiscoveryEnabled: true,
       hostMessageContainer: "box",
-      fileWriteGuardsEnabled: false
+      fileWriteGuardsEnabled: false,
+      environmentPromptEnabled: false,
+      subagentMessagingEnabled: true
     };
 
     const applied: ConversationSettings = applyConversationPresetSettings(
@@ -193,6 +203,18 @@ describe("conversation presets", () => {
     // A preset that says nothing about them (one written before the switch) turns them on.
     const { fileWriteGuardsEnabled: _unsaid, ...silent } = preset;
     expect(applyConversationPresetSettings(applied, silent).fileWriteGuardsEnabled).toBe(true);
+    // And whether the prompt opens with the environment section.
+    expect(current.environmentPromptEnabled ?? true).toBe(true);
+    expect(applied.environmentPromptEnabled).toBe(false);
+    // A preset that says nothing about it (one written before the switch) turns it on.
+    const { environmentPromptEnabled: _silentEnvironment, ...unspoken } = preset;
+    expect(applyConversationPresetSettings(applied, unspoken).environmentPromptEnabled).toBe(true);
+    // And whether subagents can be talked to: off in the conversation, on in the preset.
+    expect(current.subagentMessagingEnabled ?? false).toBe(false);
+    expect(applied.subagentMessagingEnabled).toBe(true);
+    // A preset that says nothing about it (one written before the switch) turns it off.
+    const { subagentMessagingEnabled: _silentMessaging, ...quiet } = preset;
+    expect(applyConversationPresetSettings(applied, quiet).subagentMessagingEnabled).toBe(false);
   });
 
   it("applies a preset over a conversation that has run, moving everything but the pins", () => {
@@ -213,6 +235,7 @@ describe("conversation presets", () => {
         planMode: false,
         skillIds: ["skill_locked"],
         promptSkillIds: ["skill_locked"],
+        promptTaskTools: null,
         searchBackend: { kind: "native" },
         fetchBackend: { kind: "native" },
         webFetch: true,
@@ -223,7 +246,9 @@ describe("conversation presets", () => {
         hookIds: null,
         promptProfile: null,
         hostMessageContainer: null,
-        fileWriteGuards: null
+        fileWriteGuards: null,
+        environmentPrompt: null,
+        subagentMessaging: null
       }
     };
     const preset = {
@@ -321,6 +346,30 @@ describe("conversation presets", () => {
       .toBe(true);
   });
 
+  it("carries the environment prompt into a clone as an explicit boolean", () => {
+    const document = createSeedDocument();
+    const snapshot = document.workspaces[0].conversations[0].settings;
+    // Absent reads as on, and the clone says so outright.
+    expect(snapshot.environmentPromptEnabled).toBeUndefined();
+    expect(cloneConversationSettings(snapshot).environmentPromptEnabled).toBe(true);
+    expect(cloneConversationSettings({ ...snapshot, environmentPromptEnabled: false }).environmentPromptEnabled)
+      .toBe(false);
+    expect(cloneConversationSettings({ ...snapshot, environmentPromptEnabled: true }).environmentPromptEnabled)
+      .toBe(true);
+  });
+
+  it("carries subagent communication into a clone as an explicit boolean", () => {
+    const document = createSeedDocument();
+    const snapshot = document.workspaces[0].conversations[0].settings;
+    // Absent reads as off, and the clone says so outright.
+    expect(snapshot.subagentMessagingEnabled).toBeUndefined();
+    expect(cloneConversationSettings(snapshot).subagentMessagingEnabled).toBe(false);
+    expect(cloneConversationSettings({ ...snapshot, subagentMessagingEnabled: true }).subagentMessagingEnabled)
+      .toBe(true);
+    expect(cloneConversationSettings({ ...snapshot, subagentMessagingEnabled: false }).subagentMessagingEnabled)
+      .toBe(false);
+  });
+
   it("resolves a preset id leniently", () => {
     const document = createSeedDocument();
     document.globalSettings.conversationPresets = [
@@ -365,6 +414,16 @@ describe("conversation presets", () => {
     expect(sameConversationPresetSettings(base, unsaid)).toBe(true);
     expect(sameConversationPresetSettings(base, { ...base, fileWriteGuardsEnabled: false })).toBe(false);
     expect(sameConversationPresetSettings(unsaid, { ...base, fileWriteGuardsEnabled: false })).toBe(false);
+    // The environment section is too; an absent one is the same as on.
+    const { environmentPromptEnabled: _omittedEnvironment, ...unspoken } = base;
+    expect(sameConversationPresetSettings(base, unspoken)).toBe(true);
+    expect(sameConversationPresetSettings(base, { ...base, environmentPromptEnabled: false })).toBe(false);
+    expect(sameConversationPresetSettings(unspoken, { ...base, environmentPromptEnabled: false })).toBe(false);
+    // Subagent communication is too; an absent one is the same as off.
+    const { subagentMessagingEnabled: _unsaidMessaging, ...quiet } = base;
+    expect(sameConversationPresetSettings(base, quiet)).toBe(true);
+    expect(sameConversationPresetSettings(base, { ...base, subagentMessagingEnabled: true })).toBe(false);
+    expect(sameConversationPresetSettings(quiet, { ...base, subagentMessagingEnabled: true })).toBe(false);
     expect(sameConversationPresetSettings(base, {
       ...base,
       webSearch: { ...base.webSearch, maxSearchesPerCall: base.webSearch.maxSearchesPerCall + 1 }

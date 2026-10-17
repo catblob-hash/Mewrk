@@ -1068,6 +1068,148 @@ describe("document normalization", () => {
     expect(lockedGuards("false")).toBeNull();
   });
 
+  // Subagent communication defaults to off, the opposite of the guards: a
+  // document written before the switch existed, and any value that is not an
+  // outright `true`, both come back off.
+  it("reads subagent communication as off unless a conversation or preset says true", () => {
+    const loadedMessaging = (value: unknown) => {
+      const current = createSeedDocument() as unknown as {
+        workspaces: { conversations: { settings: Record<string, unknown> }[] }[]
+      };
+      const settings = current.workspaces[0].conversations[0].settings;
+      if (value === undefined) delete settings.subagentMessagingEnabled;
+      else settings.subagentMessagingEnabled = value;
+      return normalizeDocument(current as unknown as AppDocument)
+        .workspaces[0].conversations[0].settings.subagentMessagingEnabled;
+    };
+    expect(loadedMessaging(undefined)).toBe(false);
+    expect(loadedMessaging(true)).toBe(true);
+    expect(loadedMessaging(false)).toBe(false);
+    expect(loadedMessaging(null)).toBe(false);
+    expect(loadedMessaging("true")).toBe(false);
+
+    const loadedPreset = (value: unknown) => {
+      const current = createSeedDocument();
+      const settings = defaultPresetSettings(current) as unknown as Record<string, unknown>;
+      if (value === undefined) delete settings.subagentMessagingEnabled;
+      else settings.subagentMessagingEnabled = value;
+      return normalizeDocument(current).globalSettings.conversationPresets[0].settings.subagentMessagingEnabled;
+    };
+    expect(loadedPreset(undefined)).toBe(false);
+    expect(loadedPreset(true)).toBe(true);
+    expect(loadedPreset(false)).toBe(false);
+
+    // Every settings object a document carries goes through the one reading.
+    const document = createSeedDocument();
+    const workspace = document.workspaces[0];
+    const on = () => ({ ...structuredClone(workspace.conversations[0].settings), subagentMessagingEnabled: true });
+    (workspace as unknown as Record<string, unknown>).lastConversationSettings = on();
+    (workspace as unknown as Record<string, unknown>).draftConversation = { settings: on(), presetId: "" };
+    const normalized = normalizeDocument(document).workspaces[0];
+    expect(normalized.lastConversationSettings?.subagentMessagingEnabled).toBe(true);
+    expect(normalized.draftConversation?.settings.subagentMessagingEnabled).toBe(true);
+  });
+
+  it("keeps the tool lock's record of subagent communication, and reads an absent or foreign one as unknown", () => {
+    const lockedMessaging = (value: unknown) => {
+      const current = createSeedDocument() as unknown as {
+        workspaces: { conversations: { settings: Record<string, unknown> }[] }[]
+      };
+      const lock: Record<string, unknown> = { tools: [], mcpIds: [], skillIds: [] };
+      if (value !== undefined) lock.subagentMessaging = value;
+      current.workspaces[0].conversations[0].settings.toolLock = lock;
+      return normalizeDocument(current as unknown as AppDocument)
+        .workspaces[0].conversations[0].settings.toolLock?.subagentMessaging;
+    };
+    expect(lockedMessaging(true)).toBe(true);
+    expect(lockedMessaging(false)).toBe(false);
+    // A lock from before the switch knows nothing of it, so it tones nothing.
+    expect(lockedMessaging(undefined)).toBeNull();
+    expect(lockedMessaging(null)).toBeNull();
+    expect(lockedMessaging("true")).toBeNull();
+  });
+
+  // The environment section defaults to on, like the guards: a document written
+  // before the switch existed, and a value that is not an outright `false`, both
+  // come back on.
+  it("reads the environment prompt as on unless a conversation or preset says false", () => {
+    const loadedEnvironment = (value: unknown) => {
+      const current = createSeedDocument() as unknown as {
+        workspaces: { conversations: { settings: Record<string, unknown> }[] }[]
+      };
+      const settings = current.workspaces[0].conversations[0].settings;
+      if (value === undefined) delete settings.environmentPromptEnabled;
+      else settings.environmentPromptEnabled = value;
+      return normalizeDocument(current as unknown as AppDocument)
+        .workspaces[0].conversations[0].settings.environmentPromptEnabled;
+    };
+    expect(loadedEnvironment(undefined)).toBe(true);
+    expect(loadedEnvironment(true)).toBe(true);
+    expect(loadedEnvironment(false)).toBe(false);
+    expect(loadedEnvironment(null)).toBe(true);
+    expect(loadedEnvironment("false")).toBe(true);
+
+    const loadedPreset = (value: unknown) => {
+      const current = createSeedDocument();
+      const settings = defaultPresetSettings(current) as unknown as Record<string, unknown>;
+      if (value === undefined) delete settings.environmentPromptEnabled;
+      else settings.environmentPromptEnabled = value;
+      return normalizeDocument(current).globalSettings.conversationPresets[0].settings.environmentPromptEnabled;
+    };
+    expect(loadedPreset(undefined)).toBe(true);
+    expect(loadedPreset(false)).toBe(false);
+    expect(loadedPreset(true)).toBe(true);
+
+    // Every settings object a document carries goes through the one reading.
+    const document = createSeedDocument();
+    const workspace = document.workspaces[0];
+    const off = () => ({ ...structuredClone(workspace.conversations[0].settings), environmentPromptEnabled: false });
+    (workspace as unknown as Record<string, unknown>).lastConversationSettings = off();
+    (workspace as unknown as Record<string, unknown>).draftConversation = { settings: off(), presetId: "" };
+    const normalized = normalizeDocument(document).workspaces[0];
+    expect(normalized.lastConversationSettings?.environmentPromptEnabled).toBe(false);
+    expect(normalized.draftConversation?.settings.environmentPromptEnabled).toBe(false);
+  });
+
+  it("keeps the tool lock's record of the environment prompt, and reads an absent or foreign one as unknown", () => {
+    const lockedEnvironment = (value: unknown) => {
+      const current = createSeedDocument() as unknown as {
+        workspaces: { conversations: { settings: Record<string, unknown> }[] }[]
+      };
+      const lock: Record<string, unknown> = { tools: [], mcpIds: [], skillIds: [] };
+      if (value !== undefined) lock.environmentPrompt = value;
+      current.workspaces[0].conversations[0].settings.toolLock = lock;
+      return normalizeDocument(current as unknown as AppDocument)
+        .workspaces[0].conversations[0].settings.toolLock?.environmentPrompt;
+    };
+    expect(lockedEnvironment(true)).toBe(true);
+    expect(lockedEnvironment(false)).toBe(false);
+    // A lock from before the switch knows nothing of it, so it tones nothing.
+    expect(lockedEnvironment(undefined)).toBeNull();
+    expect(lockedEnvironment(null)).toBeNull();
+    expect(lockedEnvironment("false")).toBeNull();
+  });
+
+  it("keeps the tool lock's pin on whether the prompt was built for task tools, and reads an absent or foreign one as unpinned", () => {
+    const pinnedTaskTools = (value: unknown) => {
+      const current = createSeedDocument() as unknown as {
+        workspaces: { conversations: { settings: Record<string, unknown> }[] }[]
+      };
+      const lock: Record<string, unknown> = { tools: [], mcpIds: [], skillIds: [] };
+      if (value !== undefined) lock.promptTaskTools = value;
+      current.workspaces[0].conversations[0].settings.toolLock = lock;
+      return normalizeDocument(current as unknown as AppDocument)
+        .workspaces[0].conversations[0].settings.toolLock?.promptTaskTools;
+    };
+    expect(pinnedTaskTools(true)).toBe(true);
+    // `false` is an answer the first run gave, not an absence.
+    expect(pinnedTaskTools(false)).toBe(false);
+    // A lock from before the pin knows nothing of it: the next run sets it.
+    expect(pinnedTaskTools(undefined)).toBeNull();
+    expect(pinnedTaskTools(null)).toBeNull();
+    expect(pinnedTaskTools("true")).toBeNull();
+  });
+
   /* A fetch provider this build cannot resolve is a broken binding, as on the
      search leg: it reads "Repair fetch provider" and keeps `web_fetch`, rather
      than passing for the user's own "off". */

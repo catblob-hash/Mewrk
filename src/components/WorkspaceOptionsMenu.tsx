@@ -55,7 +55,7 @@ export function WorkspaceOptionsMenu({
             // No preset of its own: a new task starts from the settings the project last used.
             id: "last-used",
             label: t("上一次", "Last used"),
-            description: t("沿用这个项目最近一次用过的设置", "Reuse the settings this project last used"),
+            description: t("沿用项目上次用的设置", "Reuse the project's last settings"),
             checked: !selected,
             onSelect: () => onSelectPreset("")
           }, ...presets.map((preset) => ({

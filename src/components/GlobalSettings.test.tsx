@@ -277,12 +277,12 @@ describe("advanced settings", () => {
 
     const bedrock = renderProviders(providerWith("bedrock"));
     expect(screen.getByLabelText("API 地址")).toHaveAttribute("placeholder", "");
-    expect(screen.getByText("留空即可：Mewrk 会根据 AWS 区域推算端点。")).toBeInTheDocument();
+    expect(screen.getByText("留空即可，由 AWS 区域推算。")).toBeInTheDocument();
     expect(screen.queryByText(/尚未/u)).not.toBeInTheDocument();
     bedrock.unmount();
 
     renderProviders(providerWith("vertex"));
-    expect(screen.getByText("留空即可：Mewrk 会根据 GCP 项目和区域推算端点。")).toBeInTheDocument();
+    expect(screen.getByText("留空即可，由 GCP 项目和区域推算。")).toBeInTheDocument();
   });
 
   /* With a blank address Bedrock and Vertex have no catalog to read, so their
@@ -918,7 +918,7 @@ describe("model capabilities", () => {
 
   /* Responses-shaped requests always ask for `reasoning.encrypted_content`; the
      form only decides how the thinking that streams back is shown. */
-  it("says the encrypted reasoning field is always requested, whichever form is picked", async () => {
+  it("tells you when to choose Plaintext, and links to the model properties", async () => {
     const user = userEvent.setup();
     renderProviders((settings) => ({
       ...settings,
@@ -929,8 +929,11 @@ describe("model capabilities", () => {
 
     await user.click(screen.getByRole("button", { name: "模型 relay-model 的属性" }));
     const dialog = screen.getByRole("dialog", { name: "模型属性" });
-    expect(within(dialog).getByText(/Mewrk 总会向上游请求加密思考字段/u)).toBeInTheDocument();
-    expect(within(dialog).getByText(/许多中转站和 DeepSeek/u)).toBeInTheDocument();
+    const hint = within(dialog).getByText(/端点流式返回可读的思考文字时/u);
+    expect(within(hint).getByRole("link", { name: "详情" })).toHaveAttribute(
+      "href",
+      "https://mewrk.dev/zh-CN/providers.html#model-properties"
+    );
     expect(within(dialog).queryByText(/不向上游索取加密思考字段/u)).not.toBeInTheDocument();
   });
 

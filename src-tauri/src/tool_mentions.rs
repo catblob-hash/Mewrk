@@ -26,7 +26,9 @@
 //!
 //! Marked texts are resolved where a schema is assembled for the wire
 //! ([`crate::aisdk::tools::wire_tool_schema`]), against the tools the same
-//! request offers ([`OfferedTools::of`]).
+//! request offers ([`OfferedTools::of`]). The child agent addendum is resolved
+//! where it is rendered (`subagent_prompt`), against the child's final tool
+//! set, which is how its update sentence follows `subagent_update`.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -238,11 +240,14 @@ pub(crate) fn is_balanced(text: &str) -> bool {
     depth == 0
 }
 
-/// Whether `name` is something a marker may name: a catalog tool or the
-/// shell group.
+/// Whether `name` is something a marker may name: a catalog tool, the shell
+/// group, or `subagent_update` — the one child-only tool a text can be about
+/// (the child addendum's progress sentence), which no catalog lists.
 #[cfg(test)]
 pub(crate) fn is_known_name(name: &str) -> bool {
-    name == SHELL_GROUP || OfferedTools::everything().names.contains(name)
+    name == SHELL_GROUP
+        || name == "subagent_update"
+        || OfferedTools::everything().names.contains(name)
 }
 
 #[cfg(test)]

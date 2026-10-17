@@ -63,7 +63,12 @@ describe("SandboxSettings", () => {
     runtimeMocks.setupLocalSandbox.mockResolvedValue({ backend: "srt-win", available: true, detail: "", setup: false });
     render(<SandboxSettings machine={null} machineName="本机" path="/work/app" settings={undefined} onChange={vi.fn()} />);
 
-    await userEvent.click(await screen.findByRole("button", { name: /Set up|设置/ }));
+    const setUp = await screen.findByRole("button", { name: /Set up|设置/ });
+    // The short lines leave the details to the site: the account, the firewall rules, the allowlist format.
+    const hrefs = screen.getAllByRole("link", { name: /详情|Learn more/ }).map((link) => link.getAttribute("href"));
+    expect(hrefs).toHaveLength(3);
+    for (const href of hrefs) expect(href).toMatch(/\/security\.html#sandbox$/);
+    await userEvent.click(setUp);
 
     expect(runtimeMocks.machineSandboxSupport).toHaveBeenCalledWith(null);
     expect(runtimeMocks.setupLocalSandbox).toHaveBeenCalledTimes(1);

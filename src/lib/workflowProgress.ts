@@ -23,7 +23,7 @@ import type { WorkflowProgressEntry, WorkflowStepState } from "../types";
 
 export interface WorkflowProgressMessages {
   /** Step label when the plan declared none. */
-  fallbackStepLabel: (index: number) => string;
+  fallbackStepLabel: string;
   /** Phase heading for steps that declared no phase. */
   unphasedHeading: string;
   cachedBadge: string;
@@ -34,7 +34,7 @@ export interface WorkflowProgressMessages {
 }
 
 const defaultWorkflowProgressMessages: WorkflowProgressMessages = {
-  fallbackStepLabel: (index) => `步骤 ${index + 1}`,
+  fallbackStepLabel: "步骤",
   unphasedHeading: "未分组",
   cachedBadge: "已缓存",
   blockedBadge: "等待中",
@@ -115,7 +115,7 @@ export function deriveWorkflowProgress(
     if (entry.kind !== "agent") continue;
     steps.set(`${entry.kind}:${entry.index}`, {
       index: entry.index,
-      label: entry.label ?? messages.fallbackStepLabel(entry.index),
+      label: entry.label ?? messages.fallbackStepLabel,
       state: entry.state,
       preview: entry.preview ?? null,
       message: entry.message ?? null,

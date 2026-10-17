@@ -308,8 +308,9 @@ describe("buildContextRenderNodes", () => {
   });
 
   it("folds agent calls into blocks, leaving only the question outside", () => {
-    // Retired names (`agent_send`, `send_message`, `followup_task`, `subagent`,
-    // …) are listed too: saved conversations still hold their cards.
+    // `send_message` is the main agent's live tool; the retired names
+    // (`agent_send`, `followup_task`, `subagent`, …) are listed too: saved
+    // conversations still hold their cards.
     const agentNames = [
       "agent_spawn",
       "agent_send",
@@ -784,9 +785,9 @@ describe("TimelineBlock", () => {
     const { rerender } = render(
       <TimelineBlock {...props} entries={[reasoningEntry(signed, 0)]} editingContextId={signed.id} />
     );
-    expect(screen.getByText(/编辑只改变这里的显示/)).toBeInTheDocument();
+    expect(screen.getByText(/带签名的思考：部分协议会忽略编辑/)).toBeInTheDocument();
     rerender(<TimelineBlock {...props} entries={[reasoningEntry(plain, 0)]} editingContextId={plain.id} />);
-    expect(screen.queryByText(/编辑只改变这里的显示/)).toBeNull();
+    expect(screen.queryByText(/带签名的思考：部分协议会忽略编辑/)).toBeNull();
   });
 
   it("opens the in-place tool editor in the row's own body, with the list always reachable", async () => {
@@ -940,6 +941,59 @@ describe("TimelineBlock", () => {
     expect(ambientRow.querySelector(".timeline-row__chevron")).not.toBeNull();
     await user.click(getRowToggle(ambientRow));
     expect(ambientRow.querySelector(".timeline-row__details")).not.toBeNull();
+  });
+
+  it("keeps a queued or refused send_message a readable note and opens a resumed one as the child's panel", async () => {
+    const user = userEvent.setup();
+    const onOpenSubagent = vi.fn();
+    const queued = tool("msg-queued", "send_message", {
+      round: 9,
+      input: { to: "reviewer", message: "请再检查并发边界", summary: "再查并发" },
+      output: "Message queued for reviewer; it reads it before its next model request."
+    });
+    const refused = tool("msg-refused", "send_message", {
+      round: 9,
+      success: false,
+      input: { to: "ghost", message: "你好" },
+      output: "There is no child agent named ghost; task_list shows the existing ones."
+    });
+    const resumed = tool("msg-resumed", "send_message", {
+      round: 9,
+      input: { to: "reviewer", message: "补充并发风险" },
+      output: "reviewer had finished; it was resumed in the background with your message and its full context.",
+      subagent: { name: "reviewer", task: "审查接口", status: "stopped", contexts: [], updates: [] }
+    });
+    const { container } = render(
+      <TimelineBlock
+        entries={[entry(queued, 0), entry(refused, 1), entry(resumed, 2)]}
+        tools={[]}
+        insertionIndex={null}
+        onOpenSubagent={onOpenSubagent}
+      />
+    );
+
+    // A message that owns no run has no panel to go to, so even with panels
+    // available its row discloses the message and the host's receipt.
+    const queuedRow = getRow(container, queued.id);
+    expect(rowText(queuedRow, "name")).toBe("→ reviewer · 再查并发");
+    expect(queuedRow.querySelector(".timeline-row__chevron")).not.toBeNull();
+    await user.click(getRowToggle(queuedRow));
+    expect(within(queuedRow).getByText("请再检查并发边界")).toBeInTheDocument();
+    expect(within(queuedRow).getByText(queued.result.output)).toBeInTheDocument();
+
+    const refusedRow = getRow(container, refused.id);
+    expect(refusedRow).toHaveClass("timeline-row--error");
+    await user.click(getRowToggle(refusedRow));
+    expect(within(refusedRow).getByText(refused.result.output)).toBeInTheDocument();
+    expect(onOpenSubagent).not.toHaveBeenCalled();
+
+    // The one that resumed the child holds the child's run: its row is the way
+    // into that child, in the child's real state.
+    const resumedRow = getRow(container, resumed.id);
+    expect(resumedRow).toHaveClass("timeline-row--halted");
+    expect(resumedRow.querySelector(".timeline-row__chevron")).toBeNull();
+    await user.click(getRowToggle(resumedRow));
+    expect(onOpenSubagent).toHaveBeenCalledWith("reviewer");
   });
 
   it("summarizes a mixed block by what it actually contains", () => {

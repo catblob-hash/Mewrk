@@ -57,8 +57,9 @@ const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
 pub struct LostSubagent {
     pub conversation_id: String,
     pub name: String,
-    /// The provider call id of its `agent_spawn`, which finds the spawn card when the child
-    /// settled before any record of it was written. Absent in entries older than this field.
+    /// The provider call id of its `agent_spawn` — or of the `send_message` that resumed it —
+    /// which finds the owning card when the child settled before any record of it was written.
+    /// Absent in entries older than this field.
     pub spawn_call_id: Option<String>,
     /// Its run record as it stood at spawn, without the opening contexts: the execution-mode
     /// receipt, bindings and output schema a record written from nothing would lack.
@@ -92,8 +93,9 @@ fn entry_path(app_data_path: &Path, conversation_id: &str, name: &str) -> Option
 }
 
 /// Records that `name` is running in `conversation_id` and owes the model a result, with the call
-/// that spawned it and its record as it stands now. The record's contexts are dropped: a forked
-/// child opens with the whole parent conversation, and recovery never needs it.
+/// that spawned it (or the `send_message` that resumed it) and its record as it stands now. The
+/// record's contexts are dropped: a forked child opens with the whole parent conversation, and
+/// recovery never needs it.
 pub fn record_spawned(
     app_data_path: &Path,
     conversation_id: &str,

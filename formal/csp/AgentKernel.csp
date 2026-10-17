@@ -68,6 +68,15 @@
 -- The initial identity is 1, so the first task generation uses 2. Identity
 -- persists across turns.
 --
+-- A resumed task is a new run, not a continuation of the old one. When the
+-- model sends a message (send_message) to a task whose previous result has
+-- already been delivered (TaskWaitDeliver or AgentFold returned its slot to
+-- ANone), the host spawns a new run into that slot: AgentSpawn with a freshly
+-- minted identity, in-round, inside the send_message call's execution window,
+-- exactly as agent_spawn issues it. The resumed run then completes, waits, folds
+-- and wakes like any task, and owes exactly one delivery of its own.
+-- SCEN_RESUME_AFTER_DELIVER covers it.
+--
 -- Every host-embedded model or agent loop is a task and must use a task-slot
 -- pipeline. Spawn acknowledgement returns immediately; results are delivered by
 -- TaskWaitDeliver or AgentFold. Such loops must not nest a model loop inside a
@@ -113,6 +122,14 @@
 -- fold. A done task remains across cancellation and is folded in a later turn.
 -- TurnCancel cancels the model turn, its pending waits, and delivery
 -- obligations, but not tasks.
+--
+-- A resume of a slot whose result is still pending does not exist. While the
+-- previous run is still finishing, or its done result has not been delivered,
+-- the slot is not empty, and a spawn into it would overwrite a result that is
+-- still owed (BAD_SPAWN_OVERWRITE_RUNNING, BAD_SPAWN_OVERWRITE_DONE). The host
+-- refuses such a send_message instead: its receipt tells the model the result
+-- arrives at the next round, and it emits no task event. A message to a task
+-- the user stopped is refused the same way.
 --
 -- A turn the user ends by closing an `ask_user` card (`question_closed`) uses
 -- the cancellation-settlement projection. It does not interrupt background
@@ -357,6 +374,14 @@ AWakeDone(a, r) = AgentFold.a.r -> ANone(a, r)
 -- inside the host, until a running subagent ends. That wait is scheduling inside
 -- a running task, invisible to the model, so it is not an event here. Workflow
 -- runs and background commands have no limit at all.
+--
+-- A message to a running task is scheduling inside that task too. send_message
+-- queues it in the task's own mailbox, and it joins the task's own transcript
+-- at the task's next round boundary: the steer projection (SteerEnqueue, then
+-- SteerJoin) of the task's private kernel, not of this one, so the pending steer
+-- makes the task run one more round before it can end. For the parent it is an
+-- ordinary synchronous call (ToolRequest ... ToolSettle), like task_stop, and
+-- the slot stays running.
 
 -- -------------------------------------------------------------------------
 -- Composition. Turn events synchronize all processes. TurnEnd requires call
@@ -472,6 +497,22 @@ SCEN_TID_ROTATE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
                -> TaskWait.1.2 -> TaskWaitDeliver.1.2 -> AgentSpawn.1.1
                -> AgentComplete.1.1 -> TaskWait.1.1 -> TaskWaitDeliver.1.1 -> RoundEnd
                -> RoundStart -> RoundEnd -> TurnEnd -> STOP
+-- S10' x S11: send_message resumes a task only after its result is delivered.
+-- The first send_message comes when the run is done but its result is still
+-- owed, so the host refuses it: an ordinary call with no task event. The result
+-- folds in prep and empties the slot. In a later turn send_message resumes the
+-- task: a new run spawned into the same slot inside the call's execution window,
+-- with a fresh identity. It survives the turn, completes while idle, and the
+-- wake turn folds it before its first round: one delivery per run.
+SCEN_RESUME_AFTER_DELIVER = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
+                         -> ToolRequest.1.false -> ToolAllow.1 -> ToolExecStart.1
+                         -> ToolExecEnd.1 -> ToolSettle.1
+                         -> RoundEnd -> AgentFold.1.2 -> RoundStart -> RoundEnd
+                         -> TurnEnd -> TurnStart -> RoundStart -> ToolRequest.1.false
+                         -> ToolAllow.1 -> ToolExecStart.1 -> AgentSpawn.1.1
+                         -> ToolExecEnd.1 -> ToolSettle.1 -> RoundEnd -> RoundStart
+                         -> RoundEnd -> TurnEnd -> AgentComplete.1.1 -> TurnStart
+                         -> AgentFold.1.1 -> RoundStart -> RoundEnd -> TurnEnd -> STOP
 -- S11: a running task survives normal end. Idle completion wakes a new turn;
 -- prep folds the result and the first round delivers it.
 SCEN_TASK_SURVIVES_END = TurnStart -> RoundStart -> AgentSpawn.1.2 -> RoundEnd
@@ -657,6 +698,9 @@ BAD_APPROVE_EXECUTING = TurnStart -> RoundStart -> ToolRequest.1.true -> ToolApp
                      -> ToolExecStart.1 -> ToolApprove.1 -> STOP
 BAD_DENY_ALLOWED = TurnStart -> RoundStart -> ToolRequest.1.false -> ToolAllow.1
                 -> ToolDeny.1 -> STOP
+-- These two are also why send_message cannot resume a task whose result is
+-- still pending, whether the run is still finishing or done but undelivered.
+BAD_SPAWN_OVERWRITE_RUNNING = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentSpawn.1.1 -> STOP
 BAD_SPAWN_OVERWRITE_DONE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2
                         -> AgentSpawn.1.1 -> STOP
 BAD_DOUBLE_COMPLETE = TurnStart -> RoundStart -> AgentSpawn.1.2 -> AgentComplete.1.2

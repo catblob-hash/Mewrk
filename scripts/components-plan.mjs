@@ -10,6 +10,12 @@
 //   remote-agent/<SOURCE_ID>/<triple>.json                       pointer, kept 60 s
 //   remote-agent/<SOURCE_ID>/<triple>/<gz sha256>/<name>.gz      gzip, immutable
 //                                  (mewrk-remote[.exe], and srt-win.exe on Windows)
+//   claude-agent/version.json                                    the Claude Agent SDK release the provider
+//                                  page offers, set by hand, kept 60 s like a pointer
+//
+// `claude-agent/version.json` is not a pointer: it names one release,
+// `{ "schema": 1, "sdkVersion": "0.3.293" }`, and the app downloads the SDK and
+// the CLI from npm itself (src-tauri/src/components/claude_agent.rs reads it).
 //
 // A pointer describes one build and names its files relative to the pointer's
 // own directory. A blob is stored under the SHA-256 of its compressed bytes, so
@@ -529,6 +535,106 @@ export function publishDecision({ pointer, existing, force = false }) {
   }
   const unordered = existing.version && !comparable ? ` (its version ${JSON.stringify(existing.version)} cannot be ordered against ${pointer.version}, so whether this is a downgrade is unknown)` : "";
   return { publish: true, reason: `replaces ${replacing}${unordered}` };
+}
+
+// ---------------------------------------------------------------------------
+// The Claude Agent SDK release the provider page offers
+
+/** Where the release document is on the channel. */
+export const CLAUDE_AGENT_RELEASE_KEY = "claude-agent/version.json";
+/** The document format the app reads. */
+export const CLAUDE_AGENT_RELEASE_SCHEMA = 1;
+/** The npm registry the release is looked up on before it is named. */
+export const NPM_REGISTRY = "https://registry.npmjs.org";
+/** The CLI packages of the platforms the app is released for; npm must have the release of each before the page offers it. */
+export const CLAUDE_AGENT_PLATFORM_PACKAGES = Object.freeze([`${CLAUDE_AGENT_SDK}-win32-x64`, `${CLAUDE_AGENT_SDK}-darwin-arm64`]);
+
+const RELEASE_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/u;
+
+/** `MAJOR.MINOR.PATCH` and nothing else: no prerelease, no build metadata, no leading `v`, no spaces, no leading zeros. */
+export const isExactRelease = (text) => typeof text === "string" && RELEASE_PATTERN.test(text);
+
+/** The registry document of one version of a package: `https://registry.npmjs.org/@anthropic-ai%2fclaude-agent-sdk/0.3.293`. */
+export const npmVersionUrl = (name, version) => `${NPM_REGISTRY}/${name.replace("/", "%2f")}/${version}`;
+
+/**
+ * Checks the document at `claude-agent/version.json` the way the app does:
+ * schema 1 and an exact release as `sdkVersion`, nothing else. Returns the
+ * version; throws the reason otherwise.
+ */
+export function validateClaudeAgentRelease(doc) {
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) throw new Error("the Claude Agent SDK release document is not an object");
+  const extra = Object.keys(doc).filter((key) => key !== "schema" && key !== "sdkVersion");
+  if (extra.length) throw new Error(`the Claude Agent SDK release document has unknown ${extra.length === 1 ? "key" : "keys"} ${extra.map((key) => JSON.stringify(key)).join(", ")}`);
+  if (doc.schema !== CLAUDE_AGENT_RELEASE_SCHEMA) throw new Error(`the Claude Agent SDK release document has schema ${JSON.stringify(doc.schema)}, not ${CLAUDE_AGENT_RELEASE_SCHEMA}`);
+  if (!isExactRelease(doc.sdkVersion)) {
+    throw new Error(`the Claude Agent SDK release document's sdkVersion ${JSON.stringify(doc.sdkVersion)} is not an exact release such as 0.3.293 (MAJOR.MINOR.PATCH, no prerelease, build metadata, "v" or spaces)`);
+  }
+  return doc.sdkVersion;
+}
+
+/** The text of `claude-agent/version.json` naming `version`: two-space JSON and a final newline. Throws unless the app would accept it. */
+export function claudeAgentReleaseJson(version) {
+  const doc = { schema: CLAUDE_AGENT_RELEASE_SCHEMA, sdkVersion: version };
+  validateClaudeAgentRelease(doc);
+  return `${JSON.stringify(doc, null, 2)}\n`;
+}
+
+/**
+ * Whether `version` is inside `^pin`, the range of releases npm's caret allows
+ * (and the one hosts built from this tree take): at least `pin`, and for a
+ * 0.x pin the same major and minor, for 0.0.x exactly `pin`, from 1.0.0 on the
+ * same major. Both must be exact releases.
+ */
+export function withinCaretRange(version, pin) {
+  if (!isExactRelease(version) || !isExactRelease(pin)) throw new TypeError(`not exact releases: ${JSON.stringify(version)}, ${JSON.stringify(pin)}`);
+  const [major, minor, patch] = parseSemver(version).numbers;
+  const [pinMajor, pinMinor, pinPatch] = parseSemver(pin).numbers;
+  if (compareVersions(version, pin) < 0) return false;
+  if (pinMajor !== "0") return major === pinMajor;
+  if (pinMinor !== "0") return major === "0" && minor === pinMinor;
+  return major === "0" && minor === "0" && patch === pinPatch;
+}
+
+/**
+ * Whether to name `requested` on the channel, given the release `published`
+ * there now (null when there is none) and this tree's exact SDK `pin`
+ * (`claudeAgentSdkPin`). Returns `{ action: "publish" | "skip", reason }`, or
+ * throws why it refuses:
+ *
+ * - `requested` must be an exact release, `--force` or not;
+ * - one outside `^pin` is refused: hosts built from this tree only take that
+ *   range, so none of them could install it;
+ * - one older than `published` is refused: it would move every provider page
+ *   back;
+ * - the one already published is skipped.
+ *
+ * `force` publishes past the last three and says what it overrode.
+ */
+export function claudeAgentReleaseDecision({ requested, published = null, pin, force = false }) {
+  if (!isExactRelease(requested)) {
+    throw new Error(`Claude Agent SDK version ${JSON.stringify(requested)} is not an exact release such as 0.3.293 (MAJOR.MINOR.PATCH, no prerelease, build metadata, "v" or spaces)`);
+  }
+  if (!isExactRelease(pin)) throw new Error(`this tree's Claude Agent SDK pin ${JSON.stringify(pin)} is not an exact release`);
+  if (published !== null && !isExactRelease(published)) throw new Error(`the Claude Agent SDK release on the channel ${JSON.stringify(published)} is not an exact release`);
+
+  const forced = [];
+  if (!withinCaretRange(requested, pin)) {
+    const problem = `Claude Agent SDK ${requested} is outside ^${pin}: hosts built from this tree only take ^${pin}, so none of them could install it`;
+    if (!force) throw new Error(`${problem}; pass --force to publish it anyway`);
+    forced.push(`${requested} is outside ^${pin}, which hosts built from this tree take`);
+  }
+  const order = published === null ? 1 : compareVersions(requested, published);
+  if (order < 0) {
+    const problem = `the channel offers Claude Agent SDK ${published}, newer than ${requested}: publishing ${requested} would move every provider page back to the older release`;
+    if (!force) throw new Error(`${problem}; pass --force to downgrade on purpose`);
+    forced.push(`a downgrade from ${published}`);
+  }
+  if (order === 0 && !force) return { action: "skip", reason: `the channel already offers Claude Agent SDK ${requested} (--force publishes it again)` };
+
+  const replacing = published === null ? "" : order === 0 ? `publishing ${requested} again` : `replacing ${published} with ${requested}`;
+  if (force) return { action: "publish", reason: `--force: ${replacing || `naming ${requested}`}${forced.length ? `; ${forced.join("; ")}` : ""}` };
+  return { action: "publish", reason: published === null ? "the channel names no Claude Agent SDK release yet" : replacing };
 }
 
 // ---------------------------------------------------------------------------

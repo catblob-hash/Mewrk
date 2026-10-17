@@ -609,6 +609,7 @@ mod tests {
             web_search: Default::default(),
             native_search_call: false,
             web_search_enabled: false,
+            subagent_messaging: false,
             native_fetch_call: None,
             run_environment: Default::default(),
             prompt_profile: Default::default(),
@@ -619,6 +620,7 @@ mod tests {
             added_skills: Vec::new(),
             mcp_tool_discovery: false,
             host_message_container: Default::default(),
+            host_messages_in_prompt: true,
             file_guard: Default::default(),
             deferred_tools: Vec::new(),
             model: crate::model::ModelProfile {

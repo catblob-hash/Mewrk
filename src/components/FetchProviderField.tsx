@@ -30,6 +30,13 @@ interface FetchProviderFieldProps {
    * note says what moving it costs.
    */
   lock?: BackendLock | null;
+  /**
+   * Whether this model has a fetch tool of its own for the native row to name.
+   * Without one there is no native row: a family that reads pages inside its
+   * search tool grants no `web_fetch` for native, so offering it would offer a
+   * choice that turns fetching off.
+   */
+  nativeOffered: boolean;
   /** Opens the native row into a second step naming the wire tool version. */
   nativeToolChoice?: NativeFetchToolChoice;
   /**
@@ -46,8 +53,9 @@ interface FetchProviderFieldProps {
  * The twin of `SearchProviderField`, and deliberately its own component rather
  * than a second spelling inside the conversation's web settings: a role picks
  * its fetch backend on the same terms a conversation does, and one recipe is
- * what keeps the two from drifting. Lists only catalog entries that can fetch
- * and are switched on; a selection naming a provider that has since been
+ * what keeps the two from drifting. Drawn only while the fetch switch above it
+ * is on, so it has no "off" row of its own. Lists only catalog entries that can
+ * fetch and are switched on; a selection naming a provider that has since been
  * switched off or lost is said plainly rather than silently repaired, and
  * `web_fetch` stays offered meanwhile. One still waiting for its API key is an
  * ordinary choice: the fetch fails when it is made, and says so there.
@@ -58,6 +66,7 @@ export function FetchProviderField({
   webSearchAssets,
   hint,
   lock,
+  nativeOffered,
   nativeToolChoice,
   subject = "conversation"
 }: FetchProviderFieldProps) {
@@ -109,35 +118,40 @@ export function FetchProviderField({
   const sections: PopoverMenuSection[] = [{
     id: "backends",
     items: [
-      nativeRow,
+      ...(nativeOffered ? [nativeRow] : []),
       ...fetchProviders.map((provider) => ({
         id: provider.kind,
         label: provider.label,
         checked: value.kind === "explicit" && value.providerKind === provider.kind,
         onSelect: () => onChange({ kind: "explicit", providerKind: provider.kind })
-      })),
-      {
-        id: "disabled",
-        label: offLabel,
-        checked: value.kind === "disabled",
-        onSelect: () => onChange({ kind: "disabled" })
-      }
+      }))
     ]
   }];
 
   const disabled = lock?.kind === "settled";
   const tone = backendLockTone(lock);
-  return <Field
-    label={t("抓取提供商", "Fetch provider")}
-    hint={lockedFieldHint(lock, hint ?? (subject === "role"
+  const standingHint = !nativeOffered
+    ? subject === "role"
       ? t(
-        "原生用这个角色所跑模型自带的抓取，部分模型在搜索里一并完成。",
-        "Native uses the built-in fetch of the model this role runs on; some models do it inside search."
+        "这个角色所跑的模型没有自带的抓取，由所选提供商读取。",
+        "This role's model has no fetch of its own; the provider reads pages."
       )
       : t(
-        "原生用模型自带的抓取，部分模型在搜索里一并完成。",
-        "Native uses the model's own fetch; some models do it inside search."
-      )))}
+        "这个模型没有自带的抓取，由所选提供商读取。",
+        "This model has no fetch of its own; the provider reads pages."
+      )
+    : subject === "role"
+      ? t(
+        "原生用这个角色所跑模型自带的抓取。",
+        "Native uses the built-in fetch of the model this role runs on."
+      )
+      : t(
+        "原生用模型自带的抓取。",
+        "Native uses the model's own fetch."
+      );
+  return <Field
+    label={t("抓取提供商", "Fetch provider")}
+    hint={lockedFieldHint(lock, hint ?? standingHint)}
   >
     <PopoverMenu
       rootClassName="popover-select"

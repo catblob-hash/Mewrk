@@ -96,25 +96,6 @@
   font-size: 9px;
 }
 
-.image-strip__short-id {
-  position: absolute;
-  bottom: 3px;
-  left: 3px;
-  padding: 1px 5px;
-  border-radius: 6px;
-  color: var(--color-ffffff);
-  background: var(--color-20201f);
-  font-size: 10px;
-  font-weight: 650;
-  line-height: 1.5;
-  pointer-events: none;
-}
-
-.image-strip__item--compact .image-strip__short-id {
-  padding: 0 4px;
-  font-size: 9px;
-}
-
 .image-strip__remove {
   position: absolute;
   top: 4px;

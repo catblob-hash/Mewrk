@@ -14,6 +14,40 @@ const TASK_RUNTIME_TOOL_NAMES = ["task_wait", "task_list", "task_stop", "box"] a
 const TASK_RUNTIME_TOOL_NAME_SET: ReadonlySet<string> = new Set(TASK_RUNTIME_TOOL_NAMES);
 
 /**
+ * The tools that can put a row in the task list: subagents, workflows, shell
+ * commands (which can run in the background) and the dev server
+ * `preview_start` starts. Only a system prompt assembled for one of them says
+ * how background results and the host's messages arrive. Mirrors Rust
+ * `agents::TASK_PRODUCING_TOOL_NAMES`.
+ */
+const TASK_PRODUCING_TOOL_NAMES = [
+  "agent_spawn",
+  "workflow",
+  "bash",
+  "zsh",
+  "sh",
+  "pwsh",
+  "powershell",
+  "preview_start"
+] as const;
+
+const TASK_PRODUCING_TOOL_NAME_SET: ReadonlySet<string> = new Set(TASK_PRODUCING_TOOL_NAMES);
+
+export function producesTasks(name: string): boolean {
+  return TASK_PRODUCING_TOOL_NAME_SET.has(name);
+}
+
+/**
+ * Catalog name of the tool the conversation's subagent-communication switch
+ * grants (`subagentMessagingEnabled`). With the switch on and `agent_spawn`
+ * enabled the host gives the main agent `send_message` — a message into a
+ * running child, or the resumption of a finished one — and gives every child
+ * it starts `subagent_update`. Off, neither exists. Never a picker row and
+ * never in a persisted enabled list. Mirrors Rust `api::SEND_MESSAGE_TOOL`.
+ */
+const SUBAGENT_MESSAGING_TOOL_NAME = "send_message";
+
+/**
  * The preview tools that bring the conversation's page into existence.
  *
  * `preview_start` points the page at the server it just started; the page tools
@@ -153,8 +187,9 @@ export function isWebToolName(name: string): boolean {
  * Host-derived tools never enter persisted enabled lists. Memory follows memory
  * layer switches, runtime tools follow producers, `skill` follows its switch,
  * `tool_search` follows the MCP tool-discovery switch, the plan tools follow the
- * security level, the handoff tools follow the conversation's context, and the
- * two web tools follow the conversation's web-access switch.
+ * security level, the handoff tools follow the conversation's context, the
+ * two web tools follow the conversation's web-access switch, and
+ * `send_message` follows the subagent-communication switch.
  * Normalization and preset application share this rule.
  */
 export function isHostDerivedToolName(name: string): boolean {
@@ -163,6 +198,7 @@ export function isHostDerivedToolName(name: string): boolean {
     || PLAN_TOOL_NAME_SET.has(name)
     || HANDOFF_TOOL_NAME_SET.has(name)
     || WEB_TOOL_NAME_SET.has(name)
+    || name === SUBAGENT_MESSAGING_TOOL_NAME
     || name === SKILL_TOOL_NAME
     || name === TOOL_SEARCH_TOOL_NAME;
 }

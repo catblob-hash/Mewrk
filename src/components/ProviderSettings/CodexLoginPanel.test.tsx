@@ -61,6 +61,13 @@ describe("CodexLoginPanel", () => {
     expect(await screen.findByRole("button", { name: "Sign in with ChatGPT" })).toBeEnabled();
   });
 
+  it("says in one line what signing in does and links the rest to the docs", async () => {
+    renderPanel();
+    expect(await screen.findByText("Uses your ChatGPT subscription for Codex models.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Learn more" }))
+      .toHaveAttribute("href", "https://mewrk.dev/en/providers.html#codex");
+  });
+
   it("shows the signed-in account email and plan", async () => {
     runtimeMocks.codexOauthStatus.mockResolvedValue({
       signedIn: true,

@@ -43,6 +43,7 @@ import type { GitTarget } from "../lib/git";
 import type { SidePaneId } from "../lib/sidePanes";
 import { previewServerAddress, type PreviewTarget } from "../lib/preview";
 import { IconButton } from "./Common";
+import { DocsLink } from "./DocsLink";
 import { dataUrlBytes } from "./FilePreview/format";
 import { SidePane, type SidePaneBounds } from "./SidePane";
 import { SketchOverlay } from "./Sketch";
@@ -1222,10 +1223,10 @@ function BackendBrowserPanel({
             </button>
             {clearDataOpen && (
               <div className="browser-panel__clear-data" role="group" aria-label={t("清除浏览数据", "Clear browsing data")}>
-                <p>{t(
-                  "清除当前标签页临时 Profile 的 Cookie、历史记录、缓存和站点存储，相当于不关页面就退出登录。每个标签页的凭据本就互不共享，并会在标签页关闭时自动销毁。",
-                  "Clear cookies, history, cache, and site storage for this tab's single-use profile — signing this tab out without closing it. Each tab's credentials are never shared and are destroyed automatically when the tab closes."
-                )}</p>
+                <p>
+                  {t("清除此标签页的登录状态和浏览数据。", "Clears this tab's sign-ins and browsing data.")}
+                  <DocsLink inline page="preview" section="pages" />
+                </p>
                 <button
                   type="button"
                   role="menuitem"

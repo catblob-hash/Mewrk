@@ -400,6 +400,16 @@ describe("tool view registry", () => {
     expect(upward.family).toBe("agent-note");
     expect(upward.title).toBe("向主代理发送了消息");
     expect(upward.target).toBe("已定位到根因");
+    // The main agent's own tool names its recipient with `to`; it is neither of
+    // the retired shapes. While it only queued (or was refused) it is a note.
+    const sent = getToolPresentation(tool(
+      "send_message",
+      { to: "helper", message: "补充并发风险", summary: "并发风险" },
+      "Message queued for helper; it reads it before its next model request."
+    ));
+    expect(sent.family).toBe("agent-note");
+    expect(sent.title).toBe("发送了消息");
+    expect(sent.target).toBe("→ helper · 并发风险");
     expect(toolSurfaceForName("future_tool")).toBe("group");
   });
 
@@ -460,6 +470,7 @@ describe("tool view registry", () => {
       ["agent_spawn", { name: "reviewer", prompt: "审查" }, "agents"],
       // A retired child → main message, as saved conversations hold it.
       ["send_message", { message: "已定位" }, "agents"],
+      ["send_message", { to: "reviewer", message: "补充" }, "agents"],
       ["task_stop", { task: "shell:1" }, "agents"],
       // `fork` and `skill` each own a bucket rather than falling into `other`.
       ["fork", { prompt: "继续" }, "fork"],
@@ -1056,6 +1067,13 @@ describe("preview tool detail families", () => {
     expect(screen.queryByText("1280×720")).not.toBeInTheDocument();
   });
 
+  it("gives an uploaded conversation image the browser duration like any browser card, never its number", () => {
+    for (const image_id of [3, "#3", "[Image #3]"]) {
+      const upload = tool("preview_upload_image", { selector: "input[type=file]", image_id }, "Uploaded");
+      expect(getToolPresentation(upload).stat).toBe("12 ms");
+    }
+  });
+
   it("keeps console entries as the tool's own lines, tinted by level, with its footer as a note in the list", () => {
     const { rerender } = render(<ToolDetailRenderer item={tool(
       "preview_console_logs",
@@ -1395,6 +1413,71 @@ describe("agent detail views", () => {
     expect(getToolPresentation(tool("subagent_update", { message: "x" }, "ok")).family).toBe("agent-note");
     expect(screen.getByText("正在跑 e2e")).toBeInTheDocument();
     expect(screen.getByText("状态已返回给主智能体")).toBeInTheDocument();
+  });
+
+  it("shows who a send_message went to, its preview and its message in full beside the host's receipt", () => {
+    const message = "请再检查一次并发边界。\n特别是取消竞态。";
+    const receipt = "Message queued for reviewer; it reads it before its next model request.";
+    const queued = tool("send_message", { to: "reviewer", message, summary: "再查并发" }, receipt);
+
+    const { container, rerender } = render(<ToolDetailRenderer item={queued} />);
+    expect(kvRows(container)).toEqual(new Map([
+      ["发给", "reviewer"],
+      ["摘要", "再查并发"],
+      ["内容", message],
+      ["", receipt]
+    ]));
+
+    // The preview is optional; without one the card simply omits that row.
+    rerender(<ToolDetailRenderer item={tool("send_message", { to: "reviewer", message }, receipt)} />);
+    expect([...kvRows(container).keys()]).toEqual(["发给", "内容", ""]);
+    expect(getToolPresentation(tool("send_message", { to: "reviewer", message }, receipt)).target)
+      .toBe("→ reviewer");
+  });
+
+  it("titles a send_message row by phase and keeps a refusal's reason in the card", () => {
+    const input = { to: "ghost", message: "你好" };
+    const running = { ...tool("send_message", input, ""), streaming: true, streamStatus: "running" as const };
+    expect(getToolPresentation(running).title).toBe("正在发送消息");
+    const refusal = "There is no child agent named ghost; task_list shows the existing ones.";
+    const failed = tool("send_message", input, refusal, { success: false });
+    expect(getToolPresentation(failed).title).toBe(`发送消息失败：${refusal}`);
+
+    const { container } = render(<ToolDetailRenderer item={failed} />);
+    expect(kvRows(container).get("发给")).toBe("ghost");
+    expect(kvRows(container).get("")).toBe(refusal);
+  });
+
+  it("opens a resumed send_message as the child's run, under the message it sent", () => {
+    const resumed: ToolContext = {
+      ...tool(
+        "send_message",
+        { to: "reviewer", message: "补充并发风险", summary: "并发风险" },
+        "reviewer had finished; it was resumed in the background with your message and its full context."
+      ),
+      subagent: { ...runRecord, status: "stopped" }
+    };
+    // The run it carries makes it an agent run, which the timeline opens as a panel.
+    expect(getToolPresentation(resumed)).toMatchObject({
+      family: "agent-run",
+      title: "发送了消息",
+      target: "→ reviewer · 并发风险"
+    });
+    const live: ToolContext = {
+      ...tool("send_message", { to: "reviewer", message: "补充并发风险" }, "resumed"),
+      streaming: true,
+      streamStatus: "completed",
+      live: { contexts: [], updates: [], status: "running" }
+    };
+    expect(getToolPresentation(live).family).toBe("agent-run");
+
+    const { container } = render(<ToolDetailRenderer item={resumed} />);
+    const rows = kvRows(container);
+    expect(rows.get("子代理")).toBe("接口审查");
+    expect(rows.get("状态")).toBe("已停止");
+    expect(rows.get("消息")).toBe("补充并发风险");
+    expect(rows.get("摘要")).toBe("并发风险");
+    expect(rows.has("派发指令")).toBe(false);
   });
 
   it("titles a task_stop row by phase and shows the address it acted on beside the receipt", () => {

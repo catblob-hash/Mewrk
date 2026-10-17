@@ -3,7 +3,7 @@
   "language": "en-US",
   "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
   "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
-  "toolCount": 51,
+  "toolCount": 52,
   "tools": [
     {
       "name": "ls",
@@ -966,6 +966,38 @@
           "required": true,
           "placeholder": "shell:1",
           "help": "Address of the task to stop: a background command as shell:<id>, a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>). Terminal sessions cannot be stopped with this tool, and dev servers are stopped with preview_stop. The stopped task's result is still delivered."
+        }
+      ]
+    },
+    {
+      "name": "send_message",
+      "label": "Send message",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "to",
+          "label": "Child agent",
+          "type": "string",
+          "required": true,
+          "placeholder": "review-api",
+          "help": "Name the child was spawned with."
+        },
+        {
+          "name": "message",
+          "label": "Message",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "Retry with the v2 endpoint and report the result"
+        },
+        {
+          "name": "summary",
+          "label": "Summary",
+          "type": "string",
+          "required": false,
+          "placeholder": "Retry with the v2 endpoint",
+          "help": "Optional 5–10 word preview shown on the timeline."
         }
       ]
     },

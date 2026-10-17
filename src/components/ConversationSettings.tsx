@@ -39,20 +39,25 @@ import { isImeKeyEvent } from "../lib/shortcuts";
 import { selectedAgentRoleCount } from "../lib/agentRoles";
 import type { SaveAgentRoleTarget } from "../lib/runtime";
 import { isHostDerivedToolName, isPreviewLifecycleToolName } from "../lib/taskTools";
+import { environmentPromptEnabledOf } from "../lib/environmentPrompt";
 import { fileWriteGuardsEnabledOf } from "../lib/fileWriteGuards";
 import { hostMessageContainerOf } from "../lib/hostMessages";
-import { familySelectsNativeToolType, familySupportsNativeFetch } from "../lib/webSearch";
+import { subagentMessagingEnabledOf } from "../lib/subagentMessaging";
+import { familySelectsNativeToolType, familySupportsNativeFetch, webLegOn } from "../lib/webSearch";
 import {
   isBuiltinPromptProfileId,
   backendPinned,
   backendTone,
   lockTone,
+  environmentPromptTone,
   fileWriteGuardsTone,
   hostMessageContainerTone,
   lockTouch,
   promptProfileTone,
+  subagentMessagingTone,
   toolLockModelOf,
   toolLockState,
+  webLegTone,
   withoutDanglingSelection,
   type DanglingSelectionKind,
   type LockedSettingKind,
@@ -130,6 +135,18 @@ const PRESET_HIDDEN: ReadonlySet<ConversationSettingsView> = new Set(["presets"]
  * else.
  */
 const CONVERSATION_HIDDEN: ReadonlySet<ConversationSettingsView> = new Set(["template"]);
+
+/**
+ * The section of the site's working page that explains each page which has no
+ * documentation link of its own. The catalog pages (skills, MCP, hooks, tool
+ * descriptions, roles) already end their toolbar with one.
+ */
+const PAGE_DOCS_SECTIONS: Partial<Record<ConversationSettingsView, string>> = {
+  tools: "tools",
+  advanced: "advanced-tools",
+  template: "templates",
+  presets: "presets"
+};
 
 interface ConversationSettingsProps {
   conversation: Conversation;
@@ -301,8 +318,8 @@ export function ConversationSettings({
    * template is big enough that reading it on the chance the page is opened
    * would make opening a preset slower for everyone who never looks. */
   const [templateBody, setTemplateBody] = useState<ContextItem[] | null>(null);
-  /* The built-in preset's template as edited in its window. The host refuses
-   * every write to that template, so the edits are held here, outlive a trip to
+  /* The built-in preset's opening messages as edited in its window. The
+   * built-in cannot change, so the edits are held here, outlive a trip to
    * another page, and go with the copy that saving makes. */
   const [heldTemplate, setHeldTemplate] = useState<ContextItem[] | null>(null);
   /* "Save as preset" asks for a name, and whether the conversation's own
@@ -588,44 +605,45 @@ export function ConversationSettings({
       "The tools this conversation hands the model."
     ),
     advanced: t(
-      "不在工具列表里逐个挑、而由开关派生的那几件事：联网、记忆、文件防误写保护与宿主消息的容器。",
-      "What is derived from a switch rather than picked from the tool list: web access, memory, file write guards and the container for host messages."
+      "由开关控制、不在工具列表里的能力。",
+      "Capabilities set by switches, outside the tool list."
     ),
     skills: t(
-      "技能从 ~/.mewrk/skills/ 与工作区的 .mewrk/skills/ 扫描而来；这里挑给本对话用的，并决定正文怎么送到模型面前。",
-      "Skills are scanned from ~/.mewrk/skills/ and the workspace's .mewrk/skills/. Pick which ones this conversation uses, and how their bodies reach the model."
+      "本对话可用的技能。",
+      "The skills this conversation can use."
     ),
     mcp: t(
-      "MCP Server 写在 ~/.mewrk/mcp.json 或工作区的 .mewrk/mcp.json 里；选中的在本对话运行期间接入，它们的工具随之出现。",
-      "MCP servers are declared in ~/.mewrk/mcp.json or the workspace's .mewrk/mcp.json. Selected servers attach for this conversation's runs, and their tools appear with them."
+      "本对话接入的 MCP Server。",
+      "The MCP servers this conversation connects to."
     ),
     hooks: t(
-      "钩子写在 ~/.mewrk/hooks.json 或工作区的 .mewrk/hooks.json 里，在固定的事件点运行外部命令；这里只挑本对话要跑哪些。",
-      "Hooks live in ~/.mewrk/hooks.json or the workspace's .mewrk/hooks.json and run external commands at fixed events. Pick which ones apply to this conversation."
+      "本对话运行的钩子。",
+      "The hooks this conversation runs."
     ),
     toolDescriptions: t(
-      "工具描述文件放在 ~/.mewrk/tool-descriptions/ 下，改写模型看到的工具描述与 Mewrk 注入的提示词。本对话只用其中一份。",
-      "Tool-description files live in ~/.mewrk/tool-descriptions/ and reword the tool descriptions the model reads and the prompts Mewrk injects. A conversation uses one of them."
+      "改写模型所见工具描述与提示词的文件。",
+      "Files that reword the model's tool descriptions and prompts."
     ),
     roles: t(
-      "子代理可以点名的角色。角色是 ~/.mewrk/agents/ 或工作区 .mewrk/agents/ 下的 JSON 文件，各自绑模型、工具与开局历史；开关决定本对话把哪些交给模型。",
-      "The roles a subagent can be spawned as. Roles are JSON files in ~/.mewrk/agents/ or the workspace's .mewrk/agents/, each binding its own model, tools and opening history; the switch picks which ones this conversation offers the model."
+      "子代理可以点名使用的角色。",
+      "The roles a subagent can be spawned as."
     ),
     template: t(
-      "套用这份预设时铺进对话的开局消息。右键可以插入消息与工具调用；工具只列本预设启用的那些。",
-      "The opening messages laid into a conversation when this preset is applied. Right-click to insert messages and tool calls; only the tools this preset enables are offered."
+      "套用预设时铺进对话的开局消息。",
+      "The opening messages laid in when this preset is applied."
     ),
     presets: t(
-      "存好的这整页设置。套用一份会把它的内容复制到本对话。",
-      "Saved copies of this whole page. Applying one copies its contents into this conversation."
+      "存好的整页设置，套用即复制到本对话。",
+      "Saved copies of these settings; apply one to copy it here."
     )
   };
 
-  /* The two tool pages are explained by one page of the site. The link rides on
-   * the line that says what the page is for, at its far end, rather than taking
-   * a row of its own above the list. */
-  const pageDocs = view === "tools" || view === "advanced"
-    ? <DocsLink page="features" />
+  /* A page with no toolbar of its own is explained by one section of the site.
+   * The link rides on the line that says what the page is for, at its far end,
+   * rather than taking a row of its own above the list. */
+  const docsSection = PAGE_DOCS_SECTIONS[view];
+  const pageDocs = docsSection
+    ? <DocsLink page="working" section={docsSection} />
     : undefined;
 
   /* The page itself, the same in the side pane and in a window: only the frame
@@ -645,19 +663,31 @@ export function ConversationSettings({
 
       {view === "advanced" && (
         <AdvancedToolsPage
-          webAccess={{
-            enabled: Boolean(settings.webSearchEnabled),
-            tone: toneOf("webSearch", lock.webSearch, settings.webSearchEnabled),
-            onChange: (webSearchEnabled) => update({ webSearchEnabled })
-          }}
+          key={conversation.id}
           web={{
             value: settings.webSearch,
             onChange: updateWebSearch,
+            webAccess: {
+              enabled: Boolean(settings.webSearchEnabled),
+              onChange: (webSearchEnabled, patch) => guarded(
+                { webSearchEnabled, webSearch: { ...settings.webSearch, ...patch } },
+                true
+              )
+            },
             webSearchAssets: globalSettings.webSearch,
             nativeFetchAvailable,
             nativeToolTypeSelectable,
             searchLock: backendLock("search"),
-            fetchLock: backendLock("fetch")
+            fetchLock: backendLock("fetch"),
+            rememberKey: `conversation:${conversation.id}`,
+            switchTones: {
+              search: webLegTone(lockState, "search", webLegOn(
+                "search", Boolean(settings.webSearchEnabled), settings.webSearch, nativeFetchAvailable
+              )),
+              fetch: webLegTone(lockState, "fetch", webLegOn(
+                "fetch", Boolean(settings.webSearchEnabled), settings.webSearch, nativeFetchAvailable
+              ))
+            }
           }}
           memory={{
             global: Boolean(settings.globalMemoryEnabled),
@@ -671,6 +701,16 @@ export function ConversationSettings({
             enabled: fileWriteGuardsEnabledOf(settings),
             tone: fileWriteGuardsTone(lockState, settings),
             onChange: (fileWriteGuardsEnabled) => update({ fileWriteGuardsEnabled })
+          }}
+          subagentMessaging={{
+            enabled: subagentMessagingEnabledOf(settings),
+            tone: subagentMessagingTone(lockState, settings),
+            onChange: (subagentMessagingEnabled) => update({ subagentMessagingEnabled })
+          }}
+          environmentPrompt={{
+            enabled: environmentPromptEnabledOf(settings),
+            tone: environmentPromptTone(lockState, settings),
+            onChange: (environmentPromptEnabled) => update({ environmentPromptEnabled })
           }}
           hostMessages={{
             value: hostMessageContainerOf(settings),
@@ -700,10 +740,13 @@ export function ConversationSettings({
           onUntickDangling={(id) => untickDangling("skills", id)}
           searchLabel={t("搜索技能", "Search skills")}
           emptyTitle={t("尚未发现技能", "No skills discovered")}
-          emptyDescription={t(
-            "把技能目录放在 ~/.mewrk/skills/ 或工作区的 .mewrk/skills/ 下，列表很快会自动刷新。",
-            "Put skill folders under ~/.mewrk/skills/ or the workspace's .mewrk/skills/; the list refreshes by itself shortly after."
-          )}
+          emptyDescription={<>
+            {t(
+              "技能放进 skills 文件夹后自动列出。",
+              "Skills added to the skills folder are listed automatically."
+            )}
+            <DocsLink inline page="skills" section="location" />
+          </>}
           /* Delivery is a property of the page, not of any one row, so it
              is read after the list it qualifies and drawn even with an
              empty catalog: how skills would arrive is worth knowing
@@ -712,10 +755,13 @@ export function ConversationSettings({
           footer={(
             <LockableSwitchRow
               title={t("技能按需加载", "Load skills on demand")}
-              description={t(
-                "关闭时已选技能的正文开局就拼进系统提示词。开启后改为暴露一个 skill 工具：模型先看到每个技能的名字与触发条件，需要哪一个才把正文取出来。",
-                "When off, the selected skills' bodies are concatenated into the system prompt up front. When on, a skill tool is exposed instead: the model sees each skill's name and trigger, and pulls the body only for the one it needs."
-              )}
+              description={<>
+                {t(
+                  "只给模型技能清单，需要时再取正文。",
+                  "Shows the model a skill list; bodies load when needed."
+                )}
+                <DocsLink inline page="skills" section="delivery" />
+              </>}
               checked={Boolean(settings.skillToolEnabled)}
               tone={toneOf("skillTool", lock.skillTool, settings.skillToolEnabled)}
               hints={lockHints}
@@ -748,10 +794,13 @@ export function ConversationSettings({
           onUntickDangling={(id) => untickDangling("mcp", id)}
           searchLabel={t("搜索 MCP Server", "Search MCP servers")}
           emptyTitle={t("尚未发现 MCP Server", "No MCP servers discovered")}
-          emptyDescription={t(
-            "把服务器写进 ~/.mewrk/mcp.json 或工作区的 .mewrk/mcp.json（mcpServers 格式，与 Claude Code 的 .mcp.json 相同），保存后列表很快会自动刷新。",
-            "Declare servers in ~/.mewrk/mcp.json or the workspace's .mewrk/mcp.json (the mcpServers shape, same as Claude Code's .mcp.json); the list refreshes by itself shortly after you save."
-          )}
+          emptyDescription={<>
+            {t(
+              "在 mcp.json 里添加服务器后自动列出。",
+              "Servers added to mcp.json are listed automatically."
+            )}
+            <DocsLink inline page="mcp" section="location" />
+          </>}
           /* How the selected servers' tools arrive, read after the list
              it qualifies and drawn even with an empty catalog: a server
              with thirty tools costs a great deal of every request, and
@@ -761,10 +810,13 @@ export function ConversationSettings({
           footer={(
             <LockableSwitchRow
               title={t("工具发现", "Tool discovery")}
-              description={t(
-                "关闭时每个 MCP 工具的完整 schema 每一轮都随请求发出。开启后改为只报名字，并暴露一个 tool_search 工具：模型搜到需要的工具，才把它的 schema 取回来，取回之后就能直接调用。",
-                "When off, every MCP tool's full schema goes out with every request. When on, only the names are announced and a tool_search tool is exposed: the model searches for the tool it needs, pulls that one's schema, and can then call it directly."
-              )}
+              description={<>
+                {t(
+                  "只报工具名，需要时再取回 schema。",
+                  "Lists tool names only; schemas are fetched when needed."
+                )}
+                <DocsLink inline page="mcp" section="tool-discovery" />
+              </>}
               checked={discoveryAvailable && Boolean(settings.mcpToolDiscoveryEnabled)}
               tone={toneOf("discovery", lock.mcpToolDiscovery, settings.mcpToolDiscoveryEnabled)}
               hints={lockHints}
@@ -805,10 +857,13 @@ export function ConversationSettings({
           onUntickDangling={(id) => untickDangling("hooks", id)}
           searchLabel={t("搜索钩子", "Search hooks")}
           emptyTitle={t("尚未发现钩子", "No hooks discovered")}
-          emptyDescription={t(
-            "钩子写在 ~/.mewrk/hooks.json 或工作区的 .mewrk/hooks.json 里，保存后列表很快会自动刷新。",
-            "Hooks live in ~/.mewrk/hooks.json or the workspace's .mewrk/hooks.json; the list refreshes by itself shortly after you save."
-          )}
+          emptyDescription={<>
+            {t(
+              "在 hooks.json 里添加钩子后自动列出。",
+              "Hooks added to hooks.json are listed automatically."
+            )}
+            <DocsLink inline page="hooks" section="location" />
+          </>}
         />
       )}
 
@@ -846,14 +901,17 @@ export function ConversationSettings({
             : null)}
           searchLabel={t("搜索工具描述", "Search tool descriptions")}
           emptyTitle={t("尚未发现工具描述文件", "No tool-description files discovered")}
-          emptyDescription={t(
-            "把 JSON 文件（可带注释）放在 ~/.mewrk/tool-descriptions/ 下，列表很快会自动刷新。",
-            "Put JSON files (comments allowed) under ~/.mewrk/tool-descriptions/; the list refreshes by itself shortly after."
-          )}
+          emptyDescription={<>
+            {t(
+              "添加工具描述文件后自动列出。",
+              "Tool-description files you add are listed automatically."
+            )}
+            <DocsLink inline page="prompt-profiles" section="locations" />
+          </>}
           footer={(
             <p className="capability-page__hint">{t(
-              "一次只用一份：选另一份会替换当前这份。都不选时，用内置的 Mewrk concise。",
-              "One at a time: picking another replaces the current one. With none picked, the built-in Mewrk concise is used."
+              "选一份；不选则用内置的 Mewrk concise。",
+              "Pick one; with none, the built-in Mewrk concise is used."
             )}</p>
           )}
         />
@@ -901,8 +959,8 @@ export function ConversationSettings({
             enabledTools: [...new Set([...settings.enabledTools, ...names])]
           })}
           onSave={builtinPreset
-            /* Nothing can be written to the built-in's template, so an edit is
-               only ever kept for the copy. */
+            /* The built-in cannot change, so an edit is only ever kept for the
+               copy. */
             ? async (contexts) => setHeldTemplate(contexts)
             : async (contexts) => {
               const savedId = await onWriteTemplate(openTemplateId, contexts);
@@ -998,10 +1056,13 @@ export function ConversationSettings({
             </>
           )}
         >
-          <p className="confirm-copy">{t(
-            "橘色的设置是上一次请求带着的，它的提示缓存还没过期。改动其中任何一项，下一次请求就得把整段对话重新计费；在那之前改回原样，缓存仍然有效。",
-            "The orange settings are what the last request went out with, and its prompt cache has not expired yet. Changing any of them makes the next request pay for the whole conversation again; change it back before then and the cache still holds."
-          )}</p>
+          <p className="confirm-copy">
+            {t(
+              "改动橘色设置会让缓存失效，整段对话要重新计费。",
+              "Changing an orange setting breaks the cache and re-bills the conversation."
+            )}
+            <DocsLink inline page="working" section="tool-lock" />
+          </p>
           <label className="confirm-check">
             <input
               type="checkbox"
@@ -1168,8 +1229,8 @@ export function ConversationSettings({
                 it does in the side pane. */}
             <SettingsPageHeading description={pageBlurbs[view]} action={pageDocs} />
             {builtinPreset && <p className="settings-page__note">{t(
-              "内置预设随 Mewrk 版本更新，不能修改或删除。在这里做的改动，连同对话模板，可以另存为一份新预设。",
-              "The built-in preset updates with Mewrk and cannot be edited or deleted. What you change here, the conversation template included, can be saved as a new preset."
+              "内置预设不能修改，改动可另存为新预设。",
+              "The built-in preset is read-only; save changes as a new one."
             )}</p>}
             {pageStack}
           </section>

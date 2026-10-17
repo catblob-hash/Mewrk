@@ -21,7 +21,7 @@ use serde_json::Value;
 /// handle — a field the other side must understand, a new meaning for an old
 /// one, a frame it would reject — must bump this, or the channel pairs the two
 /// and they fail silently instead of at the handshake.
-pub(crate) const PROTOCOL_VERSION: u32 = 17;
+pub(crate) const PROTOCOL_VERSION: u32 = 18;
 
 /// Maximum line size (128 MiB). Both sides enforce it because neither side
 /// trusts the other.
@@ -103,8 +103,9 @@ pub(crate) struct NativeSearch {
 /// Attaches the family's server-side page-fetch tool to this request.
 ///
 /// Separate from [`NativeSearch`] because the two capabilities do not come
-/// together upstream: only Anthropic exposes fetching as its own server tool,
-/// and only its result carries the page as readable text.
+/// together upstream: only Anthropic exposes fetching as its own server tool
+/// whose result carries the page as readable text, and the Claude Agent family
+/// borrows the same capability through Claude Code's own `WebFetch`.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct NativeFetch {
     #[serde(rename = "maxUses")]
@@ -119,6 +120,14 @@ pub(crate) struct NativeFetch {
     /// than an invented number standing in for "unlimited".
     #[serde(rename = "maxContentTokens", skip_serializing_if = "Option::is_none")]
     pub(crate) max_content_tokens: Option<u32>,
+    /// The pages this request asks for, exactly as the model named them, for a
+    /// family whose fetch the sidecar admits call by call: Claude Agent, where
+    /// Claude Code's `WebFetch` may open these addresses and no other. Absent
+    /// everywhere else — a Messages upstream already refuses an address the
+    /// conversation never mentioned — and an agent-family request without it
+    /// fetches nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) urls: Vec<String>,
 }
 
 /// Claude Code session parameters for the `claude-agent` family.
@@ -584,7 +593,7 @@ mod tests {
         assert_eq!(parsed.native_search_call_ids, vec!["a", "b"]);
         assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":-1}"#).is_err());
         assert!(serde_json::from_str::<StepResult>(r#"{"nativeSearchUses":1.5}"#).is_err());
-        assert_eq!(PROTOCOL_VERSION, 17);
+        assert_eq!(PROTOCOL_VERSION, 18);
     }
 
     /// Provider-executed tool failures use cross-language field names, so pin each

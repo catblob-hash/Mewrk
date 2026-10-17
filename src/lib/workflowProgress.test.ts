@@ -107,7 +107,7 @@ describe("workflow progress projection", () => {
 
   it("takes localized labels from the options object", () => {
     const view = deriveWorkflowProgress([step(0), step(1, { phaseIndex: 0, phase: "A" })], {
-      fallbackStepLabel: (index) => `step ${index}`,
+      fallbackStepLabel: "step",
       unphasedHeading: "ungrouped",
       cachedBadge: "cached",
       blockedBadge: "blocked",
@@ -117,7 +117,7 @@ describe("workflow progress projection", () => {
 
     expect(view.progressLabel).toBe("0/2");
     expect(view.phases.map((phase) => phase.heading)).toEqual(["A", "ungrouped"]);
-    expect(view.phases[1].steps[0].label).toBe("step 0");
+    expect(view.phases[1].steps[0].label).toBe("step");
   });
 
   /**

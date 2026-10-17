@@ -728,7 +728,7 @@ describe("the first task in a new project", () => {
     await screen.findByLabelText("向 Agent 发送消息");
     await user.click(screen.getByRole("button", { name: "新建项目" }));
     const dialog = screen.getByRole("dialog", { name: "新建项目" });
-    await user.type(within(dialog).getByRole("textbox", { name: "工作区 1 的绝对路径" }), "C:\\Temp\\first-task");
+    await user.type(within(dialog).getByRole("textbox", { name: "工作区的绝对路径" }), "C:\\Temp\\first-task");
     await user.click(within(dialog).getByRole("button", { name: "创建项目" }));
 
     // The new project opens on the draft; sending it at once materializes the conversation while

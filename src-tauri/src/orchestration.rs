@@ -408,6 +408,31 @@ pub fn format_structured_output(value: &Value, profile: &PromptProfile) -> Strin
     profile.render(PromptKey::SubagentStructuredResultBlock, &[("body", &body)])
 }
 
+/// The main agent's `send_message`, as the host reads it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SendMessageSpec {
+    /// The recipient as the call named it, trimmed. Which task it names, if
+    /// any, is the runtime's to decide (`api::run_send_message`).
+    pub to: String,
+    /// What the child reads as its next user message.
+    pub message: String,
+    /// The timeline's preview. The host reads nothing from it; it is checked
+    /// so a malformed call is refused as a whole.
+    pub summary: Option<String>,
+}
+
+/// Bounds of `send_message`'s arguments, the schema's own.
+const SEND_MESSAGE_MAX_CHARS: usize = 32 * 1024;
+const SEND_MESSAGE_SUMMARY_MAX_CHARS: usize = 200;
+
+pub fn parse_send_message(input: &JsonObject) -> Result<SendMessageSpec, String> {
+    Ok(SendMessageSpec {
+        to: required_string(input, "to", MAX_TASK_REF_CHARS)?,
+        message: required_string(input, "message", SEND_MESSAGE_MAX_CHARS)?,
+        summary: optional_string(input, "summary", SEND_MESSAGE_SUMMARY_MAX_CHARS)?,
+    })
+}
+
 pub fn parse_task_wait(input: &JsonObject) -> Result<TaskWaitSpec, String> {
     let tasks_filter = match input.get("tasks") {
         None | Some(Value::Null) => Vec::new(),

@@ -9,6 +9,7 @@ import {
 import { rewindFiles } from "../lib/runtime";
 import type { RewindFileEntry, RewindFilesResponse } from "../types";
 import { Dialog } from "./Common";
+import { DocsLink } from "./DocsLink";
 import { FileIcon } from "./FileIcon";
 import "./RewindDialog.css";
 
@@ -193,9 +194,10 @@ export function RewindDialog({
       )}
       <p className="rewind-dialog__scope">
         {t(
-          "只包含 write / edit 工具做的改动；shell 命令和远端工作区里的改动不会被恢复。",
-          "Only changes made by the write and edit tools are included; changes made by shell commands or in remote workspaces are not restored."
+          "只恢复 write / edit 工具的改动。",
+          "Only write and edit tool changes are restored."
         )}
+        <DocsLink inline page="context" section="undo" />
       </p>
       {conversationBlockedReason && !blocked && (
         <p className="rewind-dialog__warning" role="status">{conversationBlockedReason}</p>

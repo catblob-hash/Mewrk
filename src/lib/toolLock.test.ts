@@ -7,6 +7,7 @@ import {
   BUILTIN_PROMPT_PROFILE_ID,
   DEFAULT_CACHE_TTL_MINUTES,
   EMPTY_TOOL_LOCK,
+  environmentPromptTone,
   fileWriteGuardsTone,
   hostMessageContainerTone,
   lockTone,
@@ -16,9 +17,11 @@ import {
   promptProfileTone,
   refreshedToolLock,
   restoreLockedSettings,
+  subagentMessagingTone,
   toolLockModelOf,
   toolLockOf,
   toolLockState,
+  webLegTone,
   withoutDanglingSelection,
   withRunToolLock,
   type ToolLockModel
@@ -85,6 +88,8 @@ describe("the lock a request leaves", () => {
     // Not the same as "opened its prompt with no skills": until a run says so,
     // every selected skill is still part of the prompt about to be built.
     expect(toolLockOf(current).promptSkillIds).toBeNull();
+    // Likewise the prompt's task-tool wording: no run has settled it yet.
+    expect(toolLockOf(current).promptTaskTools).toBeNull();
     expect(toolLockState(current, OPUS, SENT).engaged).toBe(false);
   });
 
@@ -235,6 +240,38 @@ describe("the lock a request leaves", () => {
     expect(toolLockOf(added).promptSkillIds).toEqual([]);
     expect(toolLockOf(added).skillIds).toEqual(["skill-a"]);
   });
+
+  it("records on the first run whether the opening prompt had a task-producing tool, and keeps that answer", () => {
+    expect(EMPTY_TOOL_LOCK.promptTaskTools).toBeNull();
+    // Read off the tools the request sent, not off the selection.
+    const producing = withRunToolLock(settings(), ["read", "bash"], request(OPUS));
+    expect(toolLockOf(producing).promptTaskTools).toBe(true);
+    const plain = withRunToolLock(settings(), ["read", "edit"], request(OPUS));
+    expect(toolLockOf(plain).promptTaskTools).toBe(false);
+    for (const tool of ["agent_spawn", "workflow", "bash", "zsh", "sh", "pwsh", "powershell", "preview_start"]) {
+      expect(toolLockOf(withRunToolLock(settings(), [tool], request(OPUS))).promptTaskTools).toBe(true);
+    }
+
+    // Dropped later, the opening prompt was still worded for it…
+    const dropped = withRunToolLock({ ...producing, enabledTools: ["read"] }, ["read"], request(OPUS));
+    expect(toolLockOf(dropped).promptTaskTools).toBe(true);
+    expect(toolLockOf(dropped).tools).toEqual(["read"]);
+    // …and added later, the prompt never was.
+    const added = withRunToolLock({ ...plain, enabledTools: ["read", "edit", "bash"] }, ["read", "edit", "bash"], request(OPUS));
+    expect(toolLockOf(added).promptTaskTools).toBe(false);
+    expect(toolLockOf(added).tools).toEqual(["read", "edit", "bash"]);
+    // Nothing moved: the same object, so the caller skips the write.
+    expect(withRunToolLock(added, ["read", "edit", "bash"], request(OPUS))).toBe(added);
+  });
+
+  it("reads a task-tool pin an older build never set, or a foreign one, as unset until the next run sets it", () => {
+    const older = settings({ toolLock: lock(OPUS) });
+    expect(toolLockOf(older).promptTaskTools).toBeNull();
+    const foreign = settings({ toolLock: lock(OPUS, { promptTaskTools: "yes" as unknown as boolean }) });
+    expect(toolLockOf(foreign).promptTaskTools).toBeNull();
+    expect(toolLockOf(withRunToolLock(older, ["bash"], request(OPUS))).promptTaskTools).toBe(true);
+    expect(toolLockOf(withRunToolLock(foreign, ["read"], request(OPUS))).promptTaskTools).toBe(false);
+  });
 });
 
 describe("where the lock stands for the selected model", () => {
@@ -302,7 +339,7 @@ describe("how a setting is drawn", () => {
   });
 
   it("draws the settings that rewrite the prefix either way orange whichever way they stand", () => {
-    for (const kind of ["mcp", "memory", "skillTool", "discovery", "hostMessages", "fileWriteGuards"] as const) {
+    for (const kind of ["mcp", "memory", "skillTool", "discovery", "hostMessages", "fileWriteGuards", "environment", "subagentMessaging"] as const) {
       expect(lockTone(warm, kind, false, false)).toBe("cache");
       expect(lockTone(warm, kind, true, true)).toBe("cache");
       expect(lockTone(warm, kind, false, true)).toBeNull();
@@ -328,7 +365,7 @@ describe("how a setting is drawn", () => {
     const current = settings({ toolLock: lock(HAIKU) });
     const cold = toolLockState(current, HAIKU, SENT + 31 * MINUTE);
     const elsewhere = toolLockState(current, OPUS, SENT);
-    const kinds = ["tool", "webSearch", "skill", "mcp", "memory", "skillTool", "discovery", "hook", "profile", "hostMessages", "fileWriteGuards"] as const;
+    const kinds = ["tool", "webSearch", "skill", "mcp", "memory", "skillTool", "discovery", "hook", "profile", "hostMessages", "fileWriteGuards", "environment", "subagentMessaging"] as const;
     for (const state of [cold, elsewhere]) {
       for (const kind of kinds) {
         expect(lockTone(state, kind, false, false)).toBeNull();
@@ -588,6 +625,75 @@ describe("the web backends", () => {
     // Backends already in place move nothing.
     const inPlace = hostRun(OPUS);
     expect(restoreLockedSettings(inPlace, toolLockState(inPlace, OPUS, SENT))).toBe(inPlace);
+  });
+
+  /* A leg's switch is toned like a tool's own row: orange while its tool went
+     out in the last request and the cache is warm, with the selector under it
+     toned on its own (`backendTone`). */
+  it("draws a leg's switch orange while its tool went out and the cache is warm, and plain once it has moved or gone cold", () => {
+    const current = hostRun(OPUS);
+    const warm = toolLockState(current, OPUS, SENT);
+    expect(webLegTone(warm, "search", true)).toBe("cache");
+    expect(webLegTone(warm, "fetch", true)).toBe("cache");
+    // Switched off since: the cache is already lost for that leg.
+    expect(webLegTone(warm, "search", false)).toBeNull();
+    expect(webLegTone(warm, "fetch", false)).toBeNull();
+    // Cold, or another model's cache: nothing to protect.
+    expect(webLegTone(toolLockState(current, OPUS, SENT + 31 * MINUTE), "search", true)).toBeNull();
+    expect(webLegTone(toolLockState(current, OPUS, SENT + 31 * MINUTE), "fetch", true)).toBeNull();
+    expect(webLegTone(toolLockState(current, GPT, SENT), "search", true)).toBeNull();
+    expect(webLegTone(toolLockState(current, GPT, SENT), "fetch", true)).toBeNull();
+  });
+
+  it("tones each leg by its own tool, and a conversation that never ran by neither", () => {
+    // Only search went out; there is no `web_fetch` to protect.
+    const searchOnly = settings({
+      toolLock: lock(OPUS, {
+        webSearch: true,
+        searchBackend: TAVILY,
+        fetchBackend: { kind: "disabled" },
+        webFetch: false
+      })
+    });
+    const warm = toolLockState(searchOnly, OPUS, SENT);
+    expect(webLegTone(warm, "search", true)).toBe("cache");
+    // Adding the missing tool appends it: plain on a model that can append.
+    expect(webLegTone(warm, "fetch", false)).toBeNull();
+    expect(webLegTone(warm, "fetch", true)).toBeNull();
+
+    // A search leg whose backend went out as Off sent no tool either.
+    const searchOff = settings({
+      toolLock: lock(OPUS, { webSearch: true, searchBackend: { kind: "disabled" }, webFetch: true })
+    });
+    const offWarm = toolLockState(searchOff, OPUS, SENT);
+    expect(webLegTone(offWarm, "search", false)).toBeNull();
+    expect(webLegTone(offWarm, "fetch", true)).toBe("cache");
+
+    expect(webLegTone(toolLockState(settings(), OPUS, SENT), "search", true)).toBeNull();
+    expect(webLegTone(toolLockState(settings(), OPUS, SENT), "fetch", false)).toBeNull();
+  });
+
+  /* Where turning a leg on folds its tool into the declared list, a leg that
+     sent nothing is orange too, while the cache is warm. */
+  it("tones a leg that sent nothing only on a model that cannot append tools, and only while it stays off", () => {
+    const none = (model: ToolLockModel) => settings({
+      toolLock: lock(model, {
+        webSearch: true,
+        searchBackend: { kind: "disabled" },
+        fetchBackend: { kind: "disabled" },
+        webFetch: false
+      })
+    });
+    expect(webLegTone(toolLockState(none(OPUS), OPUS, SENT), "search", false)).toBeNull();
+    expect(webLegTone(toolLockState(none(OPUS), OPUS, SENT), "fetch", false)).toBeNull();
+
+    const whole = toolLockState(none(HAIKU), HAIKU, SENT);
+    expect(webLegTone(whole, "search", false)).toBe("cache");
+    expect(webLegTone(whole, "fetch", false)).toBe("cache");
+    // Switched on since, it has moved away from what the cache holds.
+    expect(webLegTone(whole, "search", true)).toBeNull();
+    expect(webLegTone(whole, "fetch", true)).toBeNull();
+    expect(webLegTone(toolLockState(none(HAIKU), HAIKU, SENT + 31 * MINUTE), "search", false)).toBeNull();
   });
 });
 
@@ -849,6 +955,188 @@ describe("the file write guards", () => {
     expect(fileWriteGuardsTone(state, older)).toBeNull();
     expect(lockTouch(state, older, { ...older, fileWriteGuardsEnabled: true })).toBe(false);
     expect(restoreLockedSettings(older, state)).toBe(older);
+  });
+});
+
+describe("the environment prompt", () => {
+  const before = settings({
+    environmentPromptEnabled: false,
+    toolLock: lock(OPUS, { environmentPrompt: false })
+  });
+  const warm = toolLockState(before, OPUS, SENT);
+
+  it("records whether each request ran with the environment section, absent meaning on", () => {
+    expect(toolLockOf(withRunToolLock(before, [], request(OPUS))).environmentPrompt).toBe(false);
+    expect(toolLockOf(withRunToolLock(settings(), [], request(OPUS))).environmentPrompt).toBe(true);
+    expect(toolLockOf(withRunToolLock(settings({ environmentPromptEnabled: true }), [], request(OPUS))).environmentPrompt)
+      .toBe(true);
+    // A lock that holds the same answer is not a change to write.
+    const sent = withRunToolLock(before, [], request(OPUS));
+    expect(withRunToolLock(sent, [], request(OPUS))).toBe(sent);
+    // The switch moving is: the next request leaves the other answer behind.
+    const flipped = withRunToolLock({ ...sent, environmentPromptEnabled: true }, [], request(OPUS));
+    expect(flipped).not.toBe(sent);
+    expect(toolLockOf(flipped).environmentPrompt).toBe(true);
+  });
+
+  it("reads a lock written before the switch as knowing nothing", () => {
+    expect(EMPTY_TOOL_LOCK.environmentPrompt).toBeNull();
+    const { environmentPrompt: _gone, ...legacy } = lock(OPUS);
+    expect(toolLockOf(settings({ toolLock: legacy as ConversationToolLock })).environmentPrompt).toBeNull();
+    expect(toolLockOf(settings({ toolLock: lock(OPUS, { environmentPrompt: true }) })).environmentPrompt).toBe(true);
+  });
+
+  it("warns before it moves while the cache is warm, either way", () => {
+    expect(environmentPromptTone(warm, before)).toBe("cache");
+    expect(lockTouch(warm, before, { ...before, environmentPromptEnabled: true })).toBe(true);
+    // The other way too: the section on at the last request, switched off now.
+    const on = settings({ toolLock: lock(OPUS, { environmentPrompt: true }) });
+    const onWarm = toolLockState(on, OPUS, SENT);
+    expect(environmentPromptTone(onWarm, on)).toBe("cache");
+    expect(lockTouch(onWarm, on, { ...on, environmentPromptEnabled: false })).toBe(true);
+    // Writing the value it already has is no move.
+    expect(lockTouch(onWarm, on, { ...on, environmentPromptEnabled: true })).toBe(false);
+    // Moved away, the cache is already lost for it: plain again.
+    expect(environmentPromptTone(warm, { ...before, environmentPromptEnabled: true })).toBeNull();
+    const cold = toolLockState(before, OPUS, SENT + 31 * MINUTE);
+    expect(environmentPromptTone(cold, before)).toBeNull();
+    expect(lockTouch(cold, before, { ...before, environmentPromptEnabled: true })).toBe(false);
+  });
+
+  it("warns on a model that cannot append tools while the cache is warm, and holds nothing once it is cold", () => {
+    const wholeBefore = settings({ toolLock: lock(HAIKU, { environmentPrompt: true }) });
+    const whole = toolLockState(wholeBefore, HAIKU, SENT);
+    expect(environmentPromptTone(whole, wholeBefore)).toBe("cache");
+    expect(lockTouch(whole, wholeBefore, { ...wholeBefore, environmentPromptEnabled: false })).toBe(true);
+    const moved = { ...wholeBefore, environmentPromptEnabled: false };
+    expect(restoreLockedSettings(moved, toolLockState(moved, HAIKU, SENT)).environmentPromptEnabled).toBe(true);
+
+    const cold = toolLockState(wholeBefore, HAIKU, SENT + 60 * MINUTE);
+    expect(environmentPromptTone(cold, wholeBefore)).toBeNull();
+    expect(lockTouch(cold, wholeBefore, { ...wholeBefore, environmentPromptEnabled: false })).toBe(false);
+    expect(restoreLockedSettings(moved, toolLockState(moved, HAIKU, SENT + 60 * MINUTE))).toBe(moved);
+  });
+
+  it("puts it back when the warm model is picked again, and tones nothing an older lock never saw", () => {
+    const moved = { ...before, environmentPromptEnabled: true };
+    expect(restoreLockedSettings(moved, toolLockState(moved, OPUS, SENT)).environmentPromptEnabled).toBe(false);
+    // Absent is on, so a lock holding on puts back nothing against an absent field.
+    const absent = settings({ toolLock: lock(OPUS, { environmentPrompt: true }) });
+    expect(restoreLockedSettings(absent, toolLockState(absent, OPUS, SENT))).toBe(absent);
+
+    const older = settings({ environmentPromptEnabled: false, toolLock: lock(OPUS) });
+    const state = toolLockState(older, OPUS, SENT);
+    expect(environmentPromptTone(state, older)).toBeNull();
+    expect(lockTouch(state, older, { ...older, environmentPromptEnabled: true })).toBe(false);
+    expect(restoreLockedSettings(older, state)).toBe(older);
+  });
+});
+
+describe("subagent communication", () => {
+  /* The switch reaches the wire only with `agent_spawn` among the tools: it adds
+     `send_message` and rewrites the `agent_spawn` wording. */
+  const SPAWN = ["agent_spawn"];
+  const off = settings({
+    enabledTools: SPAWN,
+    toolLock: lock(OPUS, { tools: SPAWN, subagentMessaging: false })
+  });
+  const on = settings({
+    enabledTools: SPAWN,
+    subagentMessagingEnabled: true,
+    toolLock: lock(OPUS, { tools: SPAWN, subagentMessaging: true })
+  });
+  const warmOff = toolLockState(off, OPUS, SENT);
+  const warmOn = toolLockState(on, OPUS, SENT);
+
+  it("records the switch each request saw, absent meaning off", () => {
+    expect(toolLockOf(withRunToolLock(settings(), SPAWN, request(OPUS))).subagentMessaging).toBe(false);
+    expect(toolLockOf(withRunToolLock(settings({ subagentMessagingEnabled: false }), SPAWN, request(OPUS))).subagentMessaging)
+      .toBe(false);
+    expect(toolLockOf(withRunToolLock(on, SPAWN, request(OPUS))).subagentMessaging).toBe(true);
+    // A lock that holds the same answer is not a change to write.
+    const sent = withRunToolLock(on, SPAWN, request(OPUS));
+    expect(withRunToolLock(sent, SPAWN, request(OPUS))).toBe(sent);
+    // The switch moving is: the next request leaves the other answer behind.
+    const flipped = withRunToolLock({ ...sent, subagentMessagingEnabled: false }, SPAWN, request(OPUS));
+    expect(flipped).not.toBe(sent);
+    expect(toolLockOf(flipped).subagentMessaging).toBe(false);
+  });
+
+  it("reads a lock written before the switch as knowing nothing", () => {
+    expect(EMPTY_TOOL_LOCK.subagentMessaging).toBeNull();
+    const { subagentMessaging: _gone, ...legacy } = lock(OPUS);
+    expect(toolLockOf(settings({ toolLock: legacy as ConversationToolLock })).subagentMessaging).toBeNull();
+    expect(toolLockOf(settings({ toolLock: lock(OPUS, { subagentMessaging: true }) })).subagentMessaging).toBe(true);
+  });
+
+  it("warns before it moves while the cache is warm and agent_spawn is on, either way", () => {
+    expect(subagentMessagingTone(warmOff, off)).toBe("cache");
+    expect(lockTouch(warmOff, off, { ...off, subagentMessagingEnabled: true })).toBe(true);
+    expect(subagentMessagingTone(warmOn, on)).toBe("cache");
+    expect(lockTouch(warmOn, on, { ...on, subagentMessagingEnabled: false })).toBe(true);
+    // Writing the value it already has is no move.
+    expect(lockTouch(warmOn, on, { ...on, subagentMessagingEnabled: true })).toBe(false);
+    expect(lockTouch(warmOff, off, { ...off, subagentMessagingEnabled: false })).toBe(false);
+    // Moved away, the cache is already lost for it: plain again.
+    expect(subagentMessagingTone(warmOff, { ...off, subagentMessagingEnabled: true })).toBeNull();
+    const cold = toolLockState(off, OPUS, SENT + 31 * MINUTE);
+    expect(subagentMessagingTone(cold, off)).toBeNull();
+    expect(lockTouch(cold, off, { ...off, subagentMessagingEnabled: true })).toBe(false);
+  });
+
+  it("tones nothing without agent_spawn, in the last request or in these settings", () => {
+    // The settings no longer hold the tool: the tool's own row speaks.
+    const dropped = { ...off, enabledTools: [] };
+    expect(subagentMessagingTone(warmOff, dropped)).toBeNull();
+    expect(lockTouch(warmOff, dropped, { ...dropped, subagentMessagingEnabled: true })).toBe(false);
+    // The last request never carried it: giving it the tool is the tool's change.
+    const never = settings({
+      enabledTools: SPAWN,
+      toolLock: lock(OPUS, { tools: [], subagentMessaging: false })
+    });
+    const neverState = toolLockState(never, OPUS, SENT);
+    expect(subagentMessagingTone(neverState, never)).toBeNull();
+    expect(lockTouch(neverState, never, { ...never, subagentMessagingEnabled: true })).toBe(false);
+  });
+
+  it("warns on a model that cannot append tools, and holds nothing once the cache is cold", () => {
+    const wholeBefore = settings({
+      enabledTools: SPAWN,
+      toolLock: lock(HAIKU, { tools: SPAWN, subagentMessaging: false })
+    });
+    const whole = toolLockState(wholeBefore, HAIKU, SENT);
+    expect(subagentMessagingTone(whole, wholeBefore)).toBe("cache");
+    expect(lockTouch(whole, wholeBefore, { ...wholeBefore, subagentMessagingEnabled: true })).toBe(true);
+    const cold = toolLockState(wholeBefore, HAIKU, SENT + 60 * MINUTE);
+    expect(subagentMessagingTone(cold, wholeBefore)).toBeNull();
+    expect(lockTouch(cold, wholeBefore, { ...wholeBefore, subagentMessagingEnabled: true })).toBe(false);
+  });
+
+  it("puts it back when the warm model is picked again, only where agent_spawn went out", () => {
+    const moved = { ...off, subagentMessagingEnabled: true };
+    expect(restoreLockedSettings(moved, toolLockState(moved, OPUS, SENT)).subagentMessagingEnabled).toBe(false);
+    const movedOff = { ...on, subagentMessagingEnabled: false };
+    expect(restoreLockedSettings(movedOff, toolLockState(movedOff, OPUS, SENT)).subagentMessagingEnabled).toBe(true);
+    // Absent is off, so a lock holding off puts back nothing against an absent field.
+    const absent = settings({ enabledTools: SPAWN, toolLock: lock(OPUS, { tools: SPAWN, subagentMessaging: false }) });
+    expect(restoreLockedSettings(absent, toolLockState(absent, OPUS, SENT))).toBe(absent);
+    // A cold cache holds nothing.
+    expect(restoreLockedSettings(moved, toolLockState(moved, OPUS, SENT + 60 * MINUTE))).toBe(moved);
+
+    // The last request had no agent_spawn, so the switch was never on the wire: left alone.
+    const never = settings({
+      enabledTools: SPAWN,
+      subagentMessagingEnabled: true,
+      toolLock: lock(OPUS, { tools: [], subagentMessaging: false })
+    });
+    expect(restoreLockedSettings(never, toolLockState(never, OPUS, SENT)).subagentMessagingEnabled).toBe(true);
+
+    // An older lock knows nothing of it.
+    const older = settings({ enabledTools: SPAWN, subagentMessagingEnabled: true, toolLock: lock(OPUS, { tools: SPAWN }) });
+    const olderState = toolLockState(older, OPUS, SENT);
+    expect(subagentMessagingTone(olderState, older)).toBeNull();
+    expect(lockTouch(olderState, older, { ...older, subagentMessagingEnabled: false })).toBe(false);
+    expect(restoreLockedSettings(older, olderState)).toBe(older);
   });
 });
 

@@ -79,9 +79,9 @@ export function apiAddressExample(family: ProviderFamily): string {
 export function apiAddressDerivation(t: TranslationFunction, family: ProviderFamily): string | null {
   switch (family) {
     case "bedrock":
-      return t("留空即可：Mewrk 会根据 AWS 区域推算端点。", "Leave it blank: Mewrk derives the endpoint from the AWS region.");
+      return t("留空即可，由 AWS 区域推算。", "Leave blank; derived from the AWS region.");
     case "vertex":
-      return t("留空即可：Mewrk 会根据 GCP 项目和区域推算端点。", "Leave it blank: Mewrk derives the endpoint from the GCP project and location.");
+      return t("留空即可，由 GCP 项目和区域推算。", "Leave blank; derived from the GCP project and location.");
     default:
       return null;
   }
@@ -170,8 +170,8 @@ export function familySettingMeta(
         label: "api-version",
         placeholder: t("留空 = 用默认版本", "blank = provider default"),
         hint: t(
-          "Azure 把它放在查询串里。留空时用 AI SDK 自带的默认版本——写一个没验证过的版本号比不写更糟。",
-          "Azure passes this as a query parameter. Blank uses the AI SDK default; pinning an unverified version is worse than not pinning one."
+          "留空用默认版本，别随意指定。",
+          "Blank uses the default; don't pin an unverified version."
         ),
       };
   }

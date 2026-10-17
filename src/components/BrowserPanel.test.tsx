@@ -1366,7 +1366,7 @@ describe("BrowserPanel", () => {
       "clear_data",
       null
     );
-    expect(screen.getByText(/不关页面就退出登录/)).toBeInTheDocument();
+    expect(screen.getByText(/清除此标签页的登录状态和浏览数据/)).toBeInTheDocument();
     await user.click(screen.getByRole("menuitem", { name: "清除此标签页的全部浏览数据" }));
 
     await waitFor(() => expect(performAction).toHaveBeenCalledWith(

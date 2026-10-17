@@ -15,6 +15,7 @@ import { computeContextBreakdown, type ContextSegmentId } from "../lib/contextBr
 import { formatCompactTokenCount } from "../lib/contextTokens";
 import type { AutoCompactSettings, CompactionMethod, ContextItem, NativeCompaction } from "../types";
 import { Switch } from "./Common";
+import { DocsLink } from "./DocsLink";
 import { MenuFlyout, MenuSurfacesContext, createMenuSurfaces } from "./MenuFlyout";
 import { RollingNumber } from "./RollingNumber";
 import { usePopoverAnchor } from "./usePopoverAnchor";
@@ -356,11 +357,14 @@ function AutoCompactFlyout({
             disabled={!settings.enabled}
             onCommit={(thresholdPercent) => onChange({ ...settings, thresholdPercent })}
             hint={(percent) => hasWindow
-              ? t(
-                "上下文达到 {tokens} tokens 时，模型写好交接文档，在新的交接会话中继续",
-                "At {tokens} tokens of context, the model writes handoff notes and continues in a new handover conversation",
-                { tokens: formatCompactTokenCount(autoCompactThresholdTokens(contextWindow, percent)) }
-              )
+              ? <>
+                {t(
+                  "上下文达到 {tokens} tokens 时交接",
+                  "Hands off at {tokens} tokens",
+                  { tokens: formatCompactTokenCount(autoCompactThresholdTokens(contextWindow, percent)) }
+                )}
+                <DocsLink inline page="context" section="auto-compact" />
+              </>
               : noWindow}
           />
         </section>
@@ -374,11 +378,14 @@ function AutoCompactFlyout({
             disabled={!settings.enabled}
             onCommit={(thresholdPercent) => onChange({ ...settings, native: { ...native, thresholdPercent } })}
             hint={(percent) => hasWindow
-              ? t(
-                "上下文达到 {tokens} tokens 时，模型把上下文原生压缩成一个压缩项，在新会话中继续",
-                "At {tokens} tokens of context, the model compacts it natively into one item and continues in a new conversation",
-                { tokens: formatCompactTokenCount(autoCompactThresholdTokens(contextWindow, percent)) }
-              )
+              ? <>
+                {t(
+                  "上下文达到 {tokens} tokens 时压缩",
+                  "Compacts at {tokens} tokens",
+                  { tokens: formatCompactTokenCount(autoCompactThresholdTokens(contextWindow, percent)) }
+                )}
+                <DocsLink inline page="context" section="native-compaction" />
+              </>
               : noWindow}
           />
           <RetainedControl
@@ -400,8 +407,8 @@ function AutoCompactFlyout({
       )}
       <p className="context-usage-compact__note">
         {t(
-          "方式按对话各自记；开关、阈值和保留量对所有对话生效。",
-          "The method is this conversation's own; the switch, thresholds and budget apply to every conversation."
+          "方式按对话记，其余设置全局生效。",
+          "The method is per conversation; the rest is global."
         )}
       </p>
     </MenuFlyout>

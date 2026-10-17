@@ -24,6 +24,17 @@ export interface PastedText {
 /** Names a paste by its number and by how many lines follow its first. */
 export type PastedTextLabeler = (id: number, extraLines: number) => string;
 
+/** Word joiner and zero-width joiner: invisible, and neither lets a line break beside it. */
+const ID_MARK_BITS = ["\u2060", "\u200d"] as const;
+
+/**
+ * A paste's number spelled in invisible marks. Two tags that read the same on
+ * screen still differ in the text, which is how the draft tells them apart.
+ */
+export function pastedTextIdMark(id: number): string {
+  return Math.max(1, Math.trunc(id)).toString(2).split("").map((bit) => ID_MARK_BITS[Number(bit)]).join("");
+}
+
 export interface PastedTextRange {
   start: number;
   end: number;

@@ -6,11 +6,11 @@ import catalogSource from "../src-tauri/src/catalog.rs?raw";
 import promptProfileSource from "../src-tauri/src/prompt_profile.rs?raw";
 import {
   BUILTIN_PRESET_ID,
-  BUILTIN_PRESET_TEMPLATE_ID,
   createSeedDocument
 } from "./seed";
 import { defaultConversationWebSearchSettings, normalizeDocument } from "./lib/runtime";
 import { BUILTIN_PROMPT_PROFILE_ID, RETIRED_GUIDED_PROMPT_PROFILE_ID } from "./lib/toolLock";
+import { isHostDerivedToolName } from "./lib/taskTools";
 import type { ConversationPreset } from "./types";
 
 function builtinPresetOf(platform?: string): ConversationPreset {
@@ -90,7 +90,7 @@ describe("seed document", () => {
 
   it("ships workspace, web, and host-run orchestration tools", () => {
     const tools = createSeedDocument().tools;
-    expect(tools).toHaveLength(51);
+    expect(tools).toHaveLength(52);
     expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length);
     const webTools = tools.filter((tool) => tool.category === "web");
     expect(webTools.map((tool) => tool.name)).toEqual([
@@ -107,7 +107,7 @@ describe("seed document", () => {
     ]);
     const orchestrationTools = tools.filter((tool) => tool.category === "orchestration");
     expect(orchestrationTools.map((tool) => tool.name)).toEqual([
-      "agent_spawn", "task_wait", "task_list", "task_stop", "box",
+      "agent_spawn", "task_wait", "task_list", "task_stop", "send_message", "box",
       "skill", "tool_search", "workflow", "ask_user", "fork",
       "plan", "exit_plan_mode",
       "read_handoff_note", "create_handoff_note", "edit_handoff_note", "handoff"
@@ -132,9 +132,22 @@ describe("seed document", () => {
       }
     }
     // Retired agent tools: saved cards still render, but nothing offers them.
-    for (const retired of ["subagent", "agent_send", "send_message", "followup_task"]) {
+    for (const retired of ["subagent", "agent_send", "followup_task"]) {
       expect(tools.some((tool) => tool.name === retired)).toBe(false);
     }
+    // `send_message` is the live tool of the same family: the main agent's message to a
+    // child, granted by the subagent-communication switch. It is in the catalog so its
+    // cards render and the host can classify it, but it is host-derived, so no list the
+    // user can edit ever names it (`isHostDerivedToolName`).
+    const sendMessage = tools.find((tool) => tool.name === "send_message");
+    expect(sendMessage).toMatchObject({ category: "orchestration", dangerous: false });
+    expect(sendMessage?.parameters.map((parameter) => [parameter.name, parameter.type, parameter.required])).toEqual([
+      ["to", "string", true],
+      ["message", "multiline", true],
+      ["summary", "string", false]
+    ]);
+    expect(isHostDerivedToolName("send_message")).toBe(true);
+    expect(catalogSource).toContain('"send_message"');
   });
 
   it("does not ship demonstration timeline data or any built-in capability", () => {
@@ -176,9 +189,6 @@ describe("seed document", () => {
     );
 
     expect(catalogSource).toContain(`const BUILTIN_PRESET_ID: &str = "${BUILTIN_PRESET_ID}";`);
-    expect(catalogSource).toContain(
-      `const BUILTIN_PRESET_TEMPLATE_ID: &str = "${BUILTIN_PRESET_TEMPLATE_ID}";`
-    );
 
     // With no role selected, an anonymous child is the only kind `agent_spawn` and
     // `workflow` can start.
@@ -190,7 +200,7 @@ describe("seed document", () => {
     expect(preset.settings.enabledTools).toEqual(
       document.tools.map((tool) => tool.name).filter((name) => !(
         document.tools.find((tool) => tool.name === name)!.category === "memory"
-        || ["skill", "tool_search", "task_wait", "task_list", "task_stop", "box", "web_search", "web_fetch"].includes(name)
+        || ["skill", "tool_search", "task_wait", "task_list", "task_stop", "box", "web_search", "web_fetch", "send_message"].includes(name)
         || ["plan", "exit_plan_mode"].includes(name)
         || ["read_handoff_note", "create_handoff_note", "edit_handoff_note", "handoff"].includes(name)
         || ["bash", "sh", "pwsh", "powershell"].includes(name)
@@ -203,6 +213,13 @@ describe("seed document", () => {
     // Web access is on even though the two web tool names are host-derived
     // from this switch.
     expect(preset.settings.webSearchEnabled).toBe(true);
+    // Subagent communication is off, and `send_message`, which it grants, is host-derived
+    // like the other switched tools; the host's preset says the same on both counts.
+    expect(preset.settings.subagentMessagingEnabled).toBe(false);
+    expect(preset.settings.enabledTools).not.toContain("send_message");
+    expect(builtinPresetSource.slice(0, builtinPresetSource.indexOf("security_level:")))
+      .toContain("subagent_messaging_enabled: false,");
+    expect(catalogSource).toContain("&& !crate::agents::is_subagent_messaging_tool_name(name)");
     // Both capability surfaces load on demand rather than inlining every
     // selected body and every MCP schema into the system prompt.
     expect(preset.settings.skillToolEnabled).toBe(true);
@@ -213,8 +230,10 @@ describe("seed document", () => {
     expect(preset.settings.skillIds).toEqual([]);
     expect(preset.settings.mcpIds).toEqual([]);
     expect(preset.settings.hookIds).toEqual([]);
-    // It opens with the system prompt the host writes behind this id.
-    expect(preset.templateId).toBe(BUILTIN_PRESET_TEMPLATE_ID);
+    // It opens with no messages; the host's preset says the same.
+    expect(preset.templateId).toBe("");
+    expect(builtinPresetSource.slice(0, builtinPresetSource.indexOf("settings:")))
+      .toContain("template_id: String::new(),");
 
     // Retired preset collections must not reappear, even as empty arrays.
     for (const retired of [

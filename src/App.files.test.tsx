@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { configureI18n } from "./i18n";
+import { pastedTextIdMark } from "./lib/pastedText";
 import type { FileAttachment, ModelRunRequest } from "./types";
 import { resetAppMocks, documentWithModel, model, runtimeMocks } from "./test/appMocks";
 
@@ -94,8 +95,9 @@ describe("App — file attachments", () => {
       clipboardData: { files: [], getData: (type: string) => (type === "text/plain" ? long : "") }
     });
     expect(handled).toBe(false);
-    expect(composer).toHaveValue("看看这段：\u00a0粘贴文本\u00a0#1\u00a0");
-    expect(composerRegion.querySelector(".pasted-text-tag")).toHaveTextContent("粘贴文本 #1", { normalizeWhitespace: true });
+    expect(composer).toHaveValue(`看看这段：\u00a0粘贴文本${pastedTextIdMark(1)}\u00a0`);
+    expect(composerRegion.querySelector(".pasted-text-tag")).toHaveTextContent("粘贴文本", { normalizeWhitespace: true });
+    expect(composerRegion.querySelector(".pasted-text-tag")?.textContent).not.toContain("#");
     expect(runtimeMocks.prepareFileAttachment).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "发送" }));

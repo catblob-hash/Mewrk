@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { chatRequestPreview } from "./endpointMeta";
+import type { TranslationFunction } from "../../i18n";
+import { apiAddressDerivation, chatRequestPreview } from "./endpointMeta";
 
 describe("chatRequestPreview", () => {
   it("keeps a relay path segment the host also keeps", () => {
@@ -31,5 +32,19 @@ describe("chatRequestPreview", () => {
   it("appends no suffix for families whose path depends on the model or deployment", () => {
     expect(chatRequestPreview("https://relay.example.com/v1", "google"))
       .toBe("https://relay.example.com/v1");
+  });
+});
+
+describe("apiAddressDerivation", () => {
+  // Stands in for the zh-CN / en-US switch: it returns the Chinese line.
+  const zh = ((chinese: string) => chinese) as TranslationFunction;
+
+  it("tells Bedrock and Vertex a blank address is normal, in one short line", () => {
+    expect(apiAddressDerivation(zh, "bedrock")).toBe("留空即可，由 AWS 区域推算。");
+    expect(apiAddressDerivation(zh, "vertex")).toBe("留空即可，由 GCP 项目和区域推算。");
+  });
+
+  it("says nothing for a protocol whose blank address is simply missing", () => {
+    expect(apiAddressDerivation(zh, "openai_chat")).toBeNull();
   });
 });

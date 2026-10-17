@@ -4,7 +4,12 @@ import { describe, expect, it, vi } from "vitest";
 import { createTestDocument as createSeedDocument } from "../test/fixtures";
 import { TEMPORARY_WORKSPACE_ID } from "../lib/workspaces";
 import type { AttachedWorkspace, SshMachineConfig, Workspace } from "../types";
-import { ProjectSelector, WorkspaceMemberSelector } from "./ProjectChips";
+import {
+  previewWorkspaceMenuItems,
+  ProjectSelector,
+  terminalWorkspaceMenuItems,
+  WorkspaceMemberSelector
+} from "./ProjectChips";
 
 const devbox: SshMachineConfig = {
   id: "machine-devbox",
@@ -146,13 +151,15 @@ describe("WorkspaceMemberSelector", () => {
     return handlers;
   }
 
-  it("names the selected workspace by its absolute path and number, and switches between them", async () => {
+  it("names the selected workspace by its absolute path, and switches between them", async () => {
     const user = userEvent.setup();
     const { onSelect } = renderSelector();
 
     const trigger = screen.getByRole("button", { name: "工作区：/srv/api" });
     expect(trigger).toHaveAttribute("title", "/srv/api (SSH: devbox)");
-    expect(trigger).toHaveTextContent("2");
+    // No number: the chip and its rows name a workspace by its path alone.
+    expect(trigger.querySelector(".composer-chip__index")).toBeNull();
+    expect(trigger).not.toHaveTextContent("2");
     await user.click(trigger);
     const menu = screen.getByRole("menu", { name: "选择工作区" });
     expect(within(menu).getByRole("menuitemradio", { name: /^\/srv\/api/ })).toHaveAttribute("aria-checked", "true");
@@ -160,7 +167,7 @@ describe("WorkspaceMemberSelector", () => {
     expect(onSelect).toHaveBeenCalledWith(1);
   });
 
-  it("groups the workspaces under the machine each is on, keeping their numbers", async () => {
+  it("groups the workspaces under the machine each is on, in project order and without numbers", async () => {
     const user = userEvent.setup();
     renderSelector();
 
@@ -171,9 +178,10 @@ describe("WorkspaceMemberSelector", () => {
       items: Array.from(section.querySelectorAll(".popover-menu__item")).map((item) => item.textContent)
     }));
     expect(sections).toEqual([
-      { heading: "本机", items: ["C:\\platform1", "D:\\shared\\tokens3"] },
-      { heading: "SSH: devbox", items: ["/srv/api2"] }
+      { heading: "本机", items: ["C:\\platform", "D:\\shared\\tokens"] },
+      { heading: "SSH: devbox", items: ["/srv/api"] }
     ]);
+    expect(menu.querySelector(".popover-menu__hint")).toBeNull();
   });
 
   it("opens a machine's settings from its heading's gear and a workspace's variables from its own", async () => {
@@ -196,9 +204,38 @@ describe("WorkspaceMemberSelector", () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
-  it("leaves the number off a lone workspace, which the model is never told", () => {
-    renderSelector({ workspaces: [{ path: "C:\\platform" }], selected: 1, showIndex: false });
+  it("leaves the number off a lone workspace as it does off several", () => {
+    renderSelector({ workspaces: [{ path: "C:\\platform" }], selected: 1 });
     const trigger = screen.getByRole("button", { name: "工作区：C:\\platform" });
     expect(trigger.querySelector(".composer-chip__index")).toBeNull();
+  });
+});
+
+describe("workspace menus for the terminal and the preview", () => {
+  const places: AttachedWorkspace[] = [
+    { path: "C:\\platform" },
+    { machine: { kind: "ssh", machineId: devbox.id }, path: "/srv/api" }
+  ];
+
+  it("list each workspace by its path with no number beside it, and still address it by its place", () => {
+    const onSelectTerminal = vi.fn();
+    const onSelectPreview = vi.fn();
+    const terminal = terminalWorkspaceMenuItems({
+      workspaces: places,
+      sshMachines: [devbox],
+      shellsFor: () => ["powershell"],
+      emptyLabel: "没有可用的终端",
+      onSelect: onSelectTerminal
+    });
+    const preview = previewWorkspaceMenuItems({ workspaces: places, sshMachines: [devbox], onSelect: onSelectPreview });
+
+    expect(terminal.map((item) => item.label)).toEqual(["C:\\platform", "/srv/api"]);
+    expect(preview.map((item) => item.label)).toEqual(["C:\\platform", "/srv/api"]);
+    for (const item of [...terminal, ...preview]) expect(item.hint).toBeUndefined();
+
+    preview[1].onSelect?.();
+    expect(onSelectPreview).toHaveBeenCalledWith(2);
+    terminal[1].children?.[0].onSelect?.();
+    expect(onSelectTerminal).toHaveBeenCalledWith(2, "powershell");
   });
 });

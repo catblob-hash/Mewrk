@@ -713,7 +713,7 @@ describe("ConversationSettings", () => {
     await openPage(user, /^对话预设/);
     await user.click(screen.getByRole("button", { name: "打开预设 mewrk" }));
     const dialog = screen.getByRole("dialog");
-    expect(within(dialog).getByText(/内置预设随 Mewrk 版本更新/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/内置预设不能修改/)).toBeInTheDocument();
     const nestedNav = within(dialog).getByRole("navigation", { name: "对话设置分类" });
     expect(within(nestedNav).queryByRole("button", { name: "保存预设" })).toBeNull();
     await user.click(within(nestedNav).getByRole("button", { name: "另存为新预设" }));
@@ -847,7 +847,7 @@ describe("ConversationSettings", () => {
     expect(screen.queryByText("启用工具")).toBeNull();
     expect(screen.queryByText(/个已选/)).toBeNull();
     const docs = screen.getByRole("link", { name: "配置说明文档" });
-    expect(docs).toHaveAttribute("href", "https://mewrk.dev/zh-CN/working.html");
+    expect(docs).toHaveAttribute("href", "https://mewrk.dev/zh-CN/working.html#tools");
     expect(docs).toHaveAttribute("target", "_blank");
     expect(docs.parentElement).toHaveClass("conversation-settings__page-header-line");
     expect(docs.previousElementSibling).toHaveTextContent("本对话交给模型的工具。");
@@ -893,18 +893,21 @@ describe("ConversationSettings", () => {
     // And the advanced page is everything the list is not, under the same
     // documentation link.
     expect(document.querySelector('[data-tool-name="read"]')).toBeNull();
-    const blurb = screen.getByRole("link", { name: "配置说明文档" }).previousElementSibling;
-    expect(blurb).toHaveTextContent(/由开关派生/);
+    const advancedDocs = screen.getByRole("link", { name: "配置说明文档" });
+    expect(advancedDocs).toHaveAttribute("href", "https://mewrk.dev/zh-CN/working.html#advanced-tools");
+    const blurb = advancedDocs.previousElementSibling;
+    expect(blurb).toHaveTextContent(/由开关控制/);
     // The tool-description files have a page of their own now, so neither the
     // page's blurb nor its controls mention them.
     expect(blurb).not.toHaveTextContent(/工具描述/);
     expect(backendTrigger("搜索提供商")).toBeEnabled();
     expect(screen.getByRole("radiogroup", { name: "宿主消息容器" })).toBeInTheDocument();
-    // The five write guards are one switch, on when the settings say nothing,
-    // and the page's blurb names it.
-    expect(blurb).toHaveTextContent(/文件防误写保护/);
+    // The five write guards are one switch, on when the settings say nothing.
     expect(screen.getByRole("switch", { name: "文件防误写保护已开启" })).toBeChecked();
     expect(screen.getByText("启用文件防误写保护")).toBeInTheDocument();
+    // Subagent communication is a switch of the same page, off until it is turned on.
+    expect(screen.getByRole("switch", { name: "子代理通信已关闭" })).not.toBeChecked();
+    expect(screen.getByText("子代理通信")).toBeInTheDocument();
     expect(screen.queryByRole("combobox", { name: "工具描述" })).toBeNull();
     expect(screen.queryByRole("option", { name: "Mewrk 内置" })).toBeNull();
     // Executor limits and the web-search heading stay gone; the identically named tool row remains.
@@ -949,8 +952,8 @@ describe("ConversationSettings", () => {
     // Absent is Claude Code's way.
     expect(userMessage).toBeChecked();
     expect(box).not.toBeChecked();
-    expect(userMessage.closest("label")).toHaveTextContent(/缺点：与你说的话同在 user 角色里/);
-    expect(box.closest("label")).toHaveTextContent(/缺点：这是模型从没发起过的伪造调用/);
+    expect(userMessage.closest("label")).toHaveTextContent(/可能被当成你说的话/);
+    expect(box.closest("label")).toHaveTextContent(/模型可能当成自己调的/);
 
     // A preset component, like the switches beside it.
     await user.click(box);
@@ -982,8 +985,7 @@ describe("ConversationSettings", () => {
     expect(guards).toBeChecked();
     const row = guards.closest(".tool-toggle-row") as HTMLElement;
     expect(row).toHaveTextContent("启用文件防误写保护");
-    expect(row).toHaveTextContent(/修改或覆盖已有文件前必须先读过它/);
-    expect(row).toHaveTextContent(/子代理与工作流跟随本对话/);
+    expect(row).toHaveTextContent(/写入前须先读过/);
     // Its own section, apart from the memory tiers and the host-message container.
     expect(row.closest("section")).not.toBe(
       screen.getByRole("switch", { name: "全局记忆已关闭" }).closest("section")
@@ -1051,6 +1053,10 @@ describe("ConversationSettings", () => {
     await user.click(guards);
     const warning = screen.getByRole("dialog", { name: "这样改会让缓存失效" });
     expect(onSettingsChange).not.toHaveBeenCalled();
+    // One line says what happens; the lock page of the docs says the rest.
+    expect(within(warning).getByText("改动橘色设置会让缓存失效，整段对话要重新计费。")).toBeInTheDocument();
+    expect(within(warning).getByRole("link", { name: "详情" }))
+      .toHaveAttribute("href", "https://mewrk.dev/zh-CN/working.html#tool-lock");
     await user.click(within(warning).getByRole("button", { name: "仍然更改" }));
     expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ fileWriteGuardsEnabled: false }));
     // Moved away from what the last request had, the cache is already lost for it.
@@ -1079,6 +1085,319 @@ describe("ConversationSettings", () => {
     await user.click(older);
     expect(screen.queryByRole("dialog", { name: "这样改会让缓存失效" })).toBeNull();
     expect(onOlderChange).toHaveBeenLastCalledWith(expect.objectContaining({ fileWriteGuardsEnabled: false }));
+  });
+
+  it("switches the environment section on the advanced tools page, on until it is told otherwise", async () => {
+    const seed = createSeedDocument();
+    const onSettingsChange = vi.fn();
+    const onConversationOnlyChange = vi.fn();
+    const user = userEvent.setup();
+    const conversation = seed.workspaces[0].conversations[0];
+    // A conversation from before the switch says nothing about it.
+    expect(conversation.settings.environmentPromptEnabled).toBeUndefined();
+    render(
+      <SettingsHarness
+        initialConversation={conversation}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+        onConversationOnlyChange={onConversationOnlyChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+
+    const environment = screen.getByRole("switch", { name: "环境信息已拼接" });
+    expect(environment).toBeChecked();
+    const row = environment.closest(".tool-toggle-row") as HTMLElement;
+    expect(row).toHaveTextContent("拼接环境信息");
+    expect(row).toHaveTextContent(/工作目录/);
+    // Its own section, apart from the guards and the host-message container.
+    expect(row.closest("section")).not.toBe(
+      screen.getByRole("switch", { name: "文件防误写保护已开启" }).closest("section")
+    );
+    expect(row.closest("section")).not.toBe(
+      screen.getByRole("radiogroup", { name: "宿主消息容器" }).closest("section")
+    );
+
+    // A preset component, so it goes through `onChange` rather than a conversation-only patch.
+    await user.click(environment);
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ environmentPromptEnabled: false }));
+    expect(onConversationOnlyChange).not.toHaveBeenCalled();
+    const off = screen.getByRole("switch", { name: "环境信息未拼接" });
+    expect(off).not.toBeChecked();
+    await user.click(off);
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ environmentPromptEnabled: true }));
+    expect(screen.getByRole("switch", { name: "环境信息已拼接" })).toBeChecked();
+  });
+
+  it("draws the environment switch orange while the cache is warm, and asks before either way of switching it", async () => {
+    const seed = createSeedDocument();
+    const warm = withWarmModel(seed.globalSettings);
+    const conversation = seed.workspaces[0].conversations[0];
+    const onSettingsChange = vi.fn();
+    const user = userEvent.setup();
+    const { unmount } = render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: {
+            ...conversation.settings,
+            environmentPromptEnabled: false,
+            toolLock: lockFor(warm, { environmentPrompt: false })
+          }
+        }}
+        globalSettings={warm}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    // The section heads the system prompt, so turning it back on rewrites the
+    // cached prefix just as turning it off does.
+    const environment = screen.getByRole("switch", { name: "环境信息未拼接" });
+    const row = environment.closest(".tool-toggle-row") as HTMLElement;
+    expect(row).toHaveClass("tool-toggle-row--cache");
+    expect(row).toHaveTextContent("缓存还热");
+
+    await user.click(environment);
+    const warning = screen.getByRole("dialog", { name: "这样改会让缓存失效" });
+    expect(onSettingsChange).not.toHaveBeenCalled();
+    await user.click(within(warning).getByRole("button", { name: "仍然更改" }));
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ environmentPromptEnabled: true }));
+    const moved = screen.getByRole("switch", { name: "环境信息已拼接" });
+    expect(moved.closest(".tool-toggle-row")).not.toHaveClass("tool-toggle-row--cache");
+    unmount();
+
+    // A lock from before the switch knows nothing of it: plain, and no question.
+    resetCacheBreakWarnings();
+    const onOlderChange = vi.fn();
+    render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: { ...conversation.settings, toolLock: lockFor(warm) }
+        }}
+        globalSettings={warm}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onOlderChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    const older = screen.getByRole("switch", { name: "环境信息已拼接" });
+    expect(older.closest(".tool-toggle-row")).not.toHaveClass("tool-toggle-row--cache");
+    await user.click(older);
+    expect(screen.queryByRole("dialog", { name: "这样改会让缓存失效" })).toBeNull();
+    expect(onOlderChange).toHaveBeenLastCalledWith(expect.objectContaining({ environmentPromptEnabled: false }));
+  });
+
+  it("switches subagent communication on the advanced tools page, off until it is turned on", async () => {
+    const seed = createSeedDocument();
+    const onSettingsChange = vi.fn();
+    const onConversationOnlyChange = vi.fn();
+    const user = userEvent.setup();
+    const conversation = seed.workspaces[0].conversations[0];
+    // A conversation from before the switch says nothing about it.
+    expect(conversation.settings.subagentMessagingEnabled).toBeUndefined();
+    render(
+      <SettingsHarness
+        initialConversation={conversation}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+        onConversationOnlyChange={onConversationOnlyChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+
+    const messaging = screen.getByRole("switch", { name: "子代理通信已关闭" });
+    expect(messaging).not.toBeChecked();
+    const row = messaging.closest(".tool-toggle-row") as HTMLElement;
+    expect(row).toHaveTextContent("子代理通信");
+    expect(row).toHaveTextContent(/互相发消息/);
+    // Its own section, apart from the guards, the memory tiers and the host-message container.
+    expect(row.closest("section")).not.toBe(
+      screen.getByRole("switch", { name: "文件防误写保护已开启" }).closest("section")
+    );
+    expect(row.closest("section")).not.toBe(
+      screen.getByRole("switch", { name: "全局记忆已关闭" }).closest("section")
+    );
+    expect(row.closest("section")).not.toBe(
+      screen.getByRole("radiogroup", { name: "宿主消息容器" }).closest("section")
+    );
+
+    // A preset component, so it goes through `onChange` rather than a conversation-only patch.
+    await user.click(messaging);
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ subagentMessagingEnabled: true }));
+    expect(onConversationOnlyChange).not.toHaveBeenCalled();
+    const on = screen.getByRole("switch", { name: "子代理通信已开启" });
+    expect(on).toBeChecked();
+    await user.click(on);
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ subagentMessagingEnabled: false }));
+    expect(screen.getByRole("switch", { name: "子代理通信已关闭" })).not.toBeChecked();
+  });
+
+  it("reads a conversation that saved subagent communication on as on", async () => {
+    const seed = createSeedDocument();
+    const conversation = seed.workspaces[0].conversations[0];
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={{ ...conversation, settings: { ...conversation.settings, subagentMessagingEnabled: true } }}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    expect(screen.getByRole("switch", { name: "子代理通信已开启" })).toBeChecked();
+    expect(screen.queryByRole("switch", { name: "子代理通信已关闭" })).toBeNull();
+  });
+
+  it("draws subagent communication orange only while the cache is warm and agent_spawn is on, and asks before either way of switching it", async () => {
+    const seed = createSeedDocument();
+    const warm = withWarmModel(seed.globalSettings);
+    const conversation = seed.workspaces[0].conversations[0];
+    const withSpawn = [...new Set([...conversation.settings.enabledTools, "agent_spawn"])];
+    const user = userEvent.setup();
+    const settingsWith = (patch: Partial<ConversationSettingsType>): ConversationSettingsType => ({
+      ...conversation.settings,
+      enabledTools: withSpawn,
+      ...patch
+    });
+    const messagingRow = (name: string) => screen.getByRole("switch", { name }).closest(".tool-toggle-row") as HTMLElement;
+
+    // The last request went out with agent_spawn and the switch off: turning it
+    // on adds send_message and rewrites the agent_spawn wording.
+    const onSettingsChange = vi.fn();
+    const { unmount } = render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: settingsWith({
+            toolLock: lockFor(warm, { tools: withSpawn, subagentMessaging: false })
+          })
+        }}
+        globalSettings={warm}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    const row = messagingRow("子代理通信已关闭");
+    expect(row).toHaveClass("tool-toggle-row--cache");
+    expect(row.querySelector(".lock-mark--cache")).not.toBeNull();
+    expect(row).toHaveTextContent("缓存还热");
+
+    await user.click(screen.getByRole("switch", { name: "子代理通信已关闭" }));
+    const warning = screen.getByRole("dialog", { name: "这样改会让缓存失效" });
+    expect(onSettingsChange).not.toHaveBeenCalled();
+    await user.click(within(warning).getByRole("button", { name: "仍然更改" }));
+    expect(onSettingsChange).toHaveBeenLastCalledWith(expect.objectContaining({ subagentMessagingEnabled: true }));
+    // Moved away from what the last request had, the cache is already lost for it.
+    expect(messagingRow("子代理通信已开启")).not.toHaveClass("tool-toggle-row--cache");
+    unmount();
+
+    // Off again from on: the other way rewrites the prefix just as surely.
+    resetCacheBreakWarnings();
+    const onOffChange = vi.fn();
+    const offRender = render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: settingsWith({
+            subagentMessagingEnabled: true,
+            toolLock: lockFor(warm, { tools: withSpawn, subagentMessaging: true })
+          })
+        }}
+        globalSettings={warm}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onOffChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    expect(messagingRow("子代理通信已开启")).toHaveClass("tool-toggle-row--cache");
+    await user.click(screen.getByRole("switch", { name: "子代理通信已开启" }));
+    await user.click(within(screen.getByRole("dialog", { name: "这样改会让缓存失效" })).getByRole("button", { name: "仍然更改" }));
+    expect(onOffChange).toHaveBeenLastCalledWith(expect.objectContaining({ subagentMessagingEnabled: false }));
+    offRender.unmount();
+
+    // A lock from before the switch knows nothing of it: plain, and no question.
+    resetCacheBreakWarnings();
+    const onOlderChange = vi.fn();
+    const olderRender = render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: settingsWith({ toolLock: lockFor(warm, { tools: withSpawn }) })
+        }}
+        globalSettings={warm}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onOlderChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    expect(messagingRow("子代理通信已关闭")).not.toHaveClass("tool-toggle-row--cache");
+    await user.click(screen.getByRole("switch", { name: "子代理通信已关闭" }));
+    expect(screen.queryByRole("dialog", { name: "这样改会让缓存失效" })).toBeNull();
+    expect(onOlderChange).toHaveBeenLastCalledWith(expect.objectContaining({ subagentMessagingEnabled: true }));
+    olderRender.unmount();
+
+    // Without agent_spawn in the settings the switch changes nothing on the wire.
+    resetCacheBreakWarnings();
+    const onNoSpawnChange = vi.fn();
+    const noSpawnRender = render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: settingsWith({
+            enabledTools: withSpawn.filter((name) => name !== "agent_spawn"),
+            toolLock: lockFor(warm, { tools: withSpawn, subagentMessaging: false })
+          })
+        }}
+        globalSettings={warm}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onNoSpawnChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    expect(messagingRow("子代理通信已关闭")).not.toHaveClass("tool-toggle-row--cache");
+    await user.click(screen.getByRole("switch", { name: "子代理通信已关闭" }));
+    expect(screen.queryByRole("dialog", { name: "这样改会让缓存失效" })).toBeNull();
+    expect(onNoSpawnChange).toHaveBeenLastCalledWith(expect.objectContaining({ subagentMessagingEnabled: true }));
+    noSpawnRender.unmount();
+
+    // …nor when the last request went out without it: giving agent_spawn to a
+    // request that never had it is the tool's own change, not the switch's.
+    resetCacheBreakWarnings();
+    const onNeverSpawnedChange = vi.fn();
+    render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: settingsWith({
+            toolLock: lockFor(warm, { tools: [], subagentMessaging: false })
+          })
+        }}
+        globalSettings={warm}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onNeverSpawnedChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    expect(messagingRow("子代理通信已关闭")).not.toHaveClass("tool-toggle-row--cache");
+    await user.click(screen.getByRole("switch", { name: "子代理通信已关闭" }));
+    expect(screen.queryByRole("dialog", { name: "这样改会让缓存失效" })).toBeNull();
+    expect(onNeverSpawnedChange).toHaveBeenLastCalledWith(expect.objectContaining({ subagentMessagingEnabled: true }));
   });
 
   it("draws the host-message container orange while the cache is warm on a model that cannot append tools, and asks before it switches", async () => {
@@ -1311,15 +1630,20 @@ describe("ConversationSettings", () => {
     expect(backendTrigger("搜索提供商")).toHaveTextContent("web_search_20260209");
   });
 
-  it("offers the model's own provider as a fetch backend and pins both native backends once they have been used", async () => {    const seed = createSeedDocument();
+  it("offers the model's own provider as a fetch backend and pins both native backends once they have been used", async () => {
+    const seed = createSeedDocument();
     const defaults = defaultConversationWebSearchSettings();
     const onConversationOnlyChange = vi.fn();
     const user = userEvent.setup();
     const conversation = seed.workspaces[0].conversations[0];
+    /* The model's own provider is a fetch backend only on a model that has a
+       fetch tool of its own: Anthropic grants a second web tool for it, OpenAI
+       none. */
+    const messages = { ...seed.globalSettings, activeProviderId: "anthropic_messages" };
     const { unmount } = render(
       <SettingsHarness
         initialConversation={conversation}
-        globalSettings={seed.globalSettings}
+        globalSettings={messages}
         tools={seed.tools}
         capabilities={seed.capabilities}
         onSettingsChange={vi.fn()}
@@ -1329,51 +1653,58 @@ describe("ConversationSettings", () => {
     await openPage(user, /^高级工具/);
 
     /* Drawn whatever the search backend is: fetching and searching are separate
-       capabilities, so "the model's own provider" is an answer here too — one
-       that grants a second web tool on Anthropic and none on OpenAI. */
-    await chooseBackend(user, "抓取提供商", /^原生/);
+       capabilities, so "the model's own provider" is an answer here too. It is
+       a row beside the catalog's, and the way off is the leg's switch. */
+    await user.click(backendTrigger("抓取提供商"));
+    const fetchMenu = screen.getByRole("menu", { name: "抓取提供商" });
+    expect(within(fetchMenu).getByRole("menuitemradio", { name: /^原生/ })).toBeChecked();
+    expect(within(fetchMenu).queryByRole("menuitemradio", { name: /^不启用/ })).toBeNull();
+    await user.click(within(fetchMenu).getByRole("menuitemradio", { name: /^Jina/ }));
     expect(onConversationOnlyChange).toHaveBeenLastCalledWith({
-      webSearch: { ...defaults, fetchProvider: { kind: "native" } }
+      webSearch: { ...defaults, fetchProvider: { kind: "explicit", providerKind: "jina" } }
     });
 
     unmount();
-    render(
-      <SettingsHarness
-        initialConversation={{
-          ...conversation,
-          settings: {
-            ...conversation.settings,
-            toolLock: {
-              tools: [],
-              mcpIds: [],
-              globalMemory: false,
-              projectMemory: false,
-              skillTool: false,
-              mcpToolDiscovery: false,
-              webSearch: true,
-              planMode: false,
-              skillIds: [],
-              promptSkillIds: [],
-              searchBackend: { kind: "native" },
-              fetchBackend: { kind: "native" },
-              webFetch: true,
-              searchProvider: { kind: "native" },
-              fetchProvider: { kind: "native" },
-              lastRequest: null,
-              modelRequests: [],
-              hookIds: null,
-              promptProfile: null,
-              hostMessageContainer: null,
-              fileWriteGuards: null
-            }
-          }
-        }}
-        globalSettings={seed.globalSettings}
-        tools={seed.tools}
-        capabilities={seed.capabilities}
-        onSettingsChange={vi.fn()}
-        onConversationOnlyChange={vi.fn()}
-      />
+    const common = {
+      tools: seed.tools,
+      capabilities: seed.capabilities,
+      onSettingsChange: vi.fn(),
+      onConversationOnlyChange: vi.fn()
+    };
+    const pinnedConversation = {
+      ...conversation,
+      settings: {
+        ...conversation.settings,
+        toolLock: {
+          tools: [],
+          mcpIds: [],
+          globalMemory: false,
+          projectMemory: false,
+          skillTool: false,
+          mcpToolDiscovery: false,
+          webSearch: true,
+          planMode: false,
+          skillIds: [],
+          promptSkillIds: [],
+          promptTaskTools: null,
+          searchBackend: { kind: "native" as const },
+          fetchBackend: { kind: "native" as const },
+          webFetch: true,
+          searchProvider: { kind: "native" as const },
+          fetchProvider: { kind: "native" as const },
+          lastRequest: null,
+          modelRequests: [],
+          hookIds: null,
+          promptProfile: null,
+          hostMessageContainer: null,
+          fileWriteGuards: null,
+          environmentPrompt: null,
+          subagentMessaging: null
+        }
+      }
+    };
+    const { rerender } = render(
+      <SettingsHarness initialConversation={pinnedConversation} globalSettings={messages} {...common} />
     );
     await openPage(user, /^高级工具/);
 
@@ -1381,7 +1712,27 @@ describe("ConversationSettings", () => {
     // selector moves once its tool has gone out — whatever model is selected.
     expect(backendTrigger("搜索提供商")).toBeDisabled();
     expect(backendTrigger("抓取提供商")).toBeDisabled();
-    expect(screen.getAllByText(/已经用原生后端跑过了/)).toHaveLength(2);
+    // Each leg's switch is held with its selector, and says why in its own row
+    // as the selector's field does.
+    for (const name of ["网页搜索已开启", "网页抓取已开启"]) {
+      const control = screen.getByRole("switch", { name });
+      expect(control).toBeDisabled();
+      expect(control).not.toHaveClass("switch--cache");
+      const row = control.closest<HTMLElement>(".tool-toggle-row")!;
+      expect(row).toHaveClass("tool-toggle-row--disabled");
+      expect(within(row).getByText(/已经用原生后端跑过了/)).toBeInTheDocument();
+    }
+    expect(screen.getAllByText(/已经用原生后端跑过了/)).toHaveLength(4);
+
+    // On a model with no native fetch the fetch leg reads off, and is held all
+    // the same: the note is the one thing left to say about it.
+    rerender(
+      <SettingsHarness initialConversation={pinnedConversation} globalSettings={seed.globalSettings} {...common} />
+    );
+    expect(backendTrigger("搜索提供商")).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "网页抓取已关闭" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: /^抓取提供商：/ })).toBeNull();
+    expect(screen.getAllByText(/已经用原生后端跑过了/)).toHaveLength(3);
   });
 
   it("draws a host-run backend orange while its cache is warm, and warns once before it moves", async () => {
@@ -1426,21 +1777,193 @@ describe("ConversationSettings", () => {
     );
     await openPage(user, /^高级工具/);
 
-    // Orange, not settled: the choice is still the user's.
+    // Orange, not settled: the choice is still the user's. Each leg's switch
+    // wears the tone of its own tool, like the selector under it.
     expect(backendTrigger("搜索提供商")).toBeEnabled();
     expect(backendTrigger("搜索提供商")).toHaveClass("popover-select__trigger--cache");
     expect(backendTrigger("抓取提供商")).toHaveClass("popover-select__trigger--cache");
+    for (const name of ["网页搜索已开启", "网页抓取已开启"]) {
+      const control = screen.getByRole("switch", { name });
+      expect(control).toBeEnabled();
+      expect(control).toHaveClass("switch--cache");
+      expect(control.closest(".tool-toggle-row")).toHaveClass("tool-toggle-row--cache");
+    }
 
-    // Moving it asks first, and nothing moves until the answer.
-    await chooseBackend(user, "搜索提供商", /^不启用/);
+    // Picking another backend asks first, and declining leaves everything where it was.
+    await chooseBackend(user, "搜索提供商", /^Jina/);
+    await user.click(within(screen.getByRole("dialog", { name: "这样改会让缓存失效" }))
+      .getByRole("button", { name: "取消" }));
+    expect(onConversationOnlyChange).not.toHaveBeenCalled();
+    expect(backendTrigger("搜索提供商")).toHaveTextContent("Tavily");
+
+    // Turning a leg off is its switch. It asks too, nothing moves until the
+    // answer, and the access switch and the backend go out as one patch.
+    await user.click(screen.getByRole("switch", { name: "网页搜索已开启" }));
     const warning = screen.getByRole("dialog", { name: "这样改会让缓存失效" });
     expect(onConversationOnlyChange).not.toHaveBeenCalled();
     await user.click(within(warning).getByRole("button", { name: "仍然更改" }));
+    expect(onConversationOnlyChange).toHaveBeenCalledTimes(1);
     expect(onConversationOnlyChange).toHaveBeenLastCalledWith({
+      webSearchEnabled: true,
       webSearch: { ...webSearch, provider: { kind: "disabled" } }
     });
-    // Moved away, it is plain again: the cache is already lost for it.
-    expect(backendTrigger("搜索提供商")).not.toHaveClass("popover-select__trigger--cache");
+    // Moved away, it is plain again: the cache is already lost for it, and its
+    // selector went with the leg. The other leg stays where it was.
+    expect(screen.getByRole("switch", { name: "网页搜索已关闭" })).not.toHaveClass("switch--cache");
+    expect(screen.queryByRole("button", { name: /^搜索提供商：/ })).toBeNull();
+    expect(screen.getByRole("switch", { name: "网页抓取已开启" })).toHaveClass("switch--cache");
+    expect(backendTrigger("抓取提供商")).toHaveClass("popover-select__trigger--cache");
+  });
+
+  /* The page used to have one switch for the web as a whole. Its state is the
+     union of the two legs now, written in the same patch as the backends. */
+  it("flips web access with the legs, writing the access switch and the backends in one conversation-only patch", async () => {
+    const seed = createSeedDocument();
+    const defaults = defaultConversationWebSearchSettings();
+    const onSettingsChange = vi.fn();
+    const onConversationOnlyChange = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={seed.workspaces[0].conversations[0]}
+        globalSettings={{ ...seed.globalSettings, activeProviderId: "anthropic_messages" }}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={onSettingsChange}
+        onConversationOnlyChange={onConversationOnlyChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    expect(screen.getByRole("switch", { name: "网页搜索已开启" })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "网页抓取已开启" })).toBeChecked();
+
+    // One leg off while the other still names a backend: access stays on.
+    await user.click(screen.getByRole("switch", { name: "网页抓取已开启" }));
+    expect(onConversationOnlyChange).toHaveBeenLastCalledWith({
+      webSearchEnabled: true,
+      webSearch: { ...defaults, fetchProvider: { kind: "disabled" } }
+    });
+
+    // The last leg off takes access with it, and leaves its backend in place.
+    await user.click(screen.getByRole("switch", { name: "网页搜索已开启" }));
+    expect(onConversationOnlyChange).toHaveBeenLastCalledWith({
+      webSearchEnabled: false,
+      webSearch: { ...defaults, fetchProvider: { kind: "disabled" } }
+    });
+    expect(screen.getByRole("switch", { name: "网页搜索已关闭" })).not.toBeChecked();
+    expect(screen.getByRole("switch", { name: "网页抓取已关闭" })).not.toBeChecked();
+    expect(screen.queryByRole("button", { name: /^搜索提供商：/ })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "域名过滤" })).toBeNull();
+
+    // The first leg back on brings access back, and the backend it had with it.
+    await user.click(screen.getByRole("switch", { name: "网页抓取已关闭" }));
+    expect(onConversationOnlyChange).toHaveBeenLastCalledWith({
+      webSearchEnabled: true,
+      webSearch: { ...defaults, provider: { kind: "disabled" }, fetchProvider: { kind: "native" } }
+    });
+    expect(screen.getByRole("switch", { name: "网页抓取已开启" })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "网页搜索已关闭" })).not.toBeChecked();
+    expect(backendTrigger("抓取提供商")).toHaveTextContent("原生");
+    // Nothing went through the whole-body writer.
+    expect(onSettingsChange).not.toHaveBeenCalled();
+  });
+
+  /* A native fetch stored from a model that had one is not rewritten by a model
+     that does not: the leg reads off there, and is found on again where the
+     model has a fetch tool of its own. */
+  it("reads a native fetch as off on a model without one and as on again where there is one, without rewriting it", async () => {
+    const seed = createSeedDocument();
+    const onSettingsChange = vi.fn();
+    const onConversationOnlyChange = vi.fn();
+    const user = userEvent.setup();
+    const common = {
+      initialConversation: seed.workspaces[0].conversations[0],
+      tools: seed.tools,
+      capabilities: seed.capabilities,
+      onSettingsChange,
+      onConversationOnlyChange
+    };
+    const messages = { ...seed.globalSettings, activeProviderId: "anthropic_messages" };
+    const responses = { ...seed.globalSettings, activeProviderId: "openai_responses" };
+    const { rerender } = render(<SettingsHarness {...common} globalSettings={messages} />);
+    await openPage(user, /^高级工具/);
+
+    // Web access is on, search and fetch are native, and this model has both.
+    expect(seed.workspaces[0].conversations[0].settings.webSearchEnabled).toBe(true);
+    expect(screen.getByRole("switch", { name: "网页搜索已开启" })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "网页抓取已开启" })).toBeChecked();
+    expect(backendTrigger("抓取提供商")).toHaveTextContent("原生");
+
+    // Another model, with no fetch tool of its own.
+    rerender(<SettingsHarness {...common} globalSettings={responses} />);
+    expect(screen.getByRole("switch", { name: "网页搜索已开启" })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "网页抓取已关闭" })).not.toBeChecked();
+    expect(screen.queryByRole("button", { name: /^抓取提供商：/ })).toBeNull();
+    expect(screen.queryByRole("spinbutton", { name: "抓取结果压缩" })).toBeNull();
+    // The domain filter still has the search leg to filter.
+    expect(screen.getByRole("combobox", { name: "域名过滤" })).toBeInTheDocument();
+    // The standing description says what the switch is doing.
+    expect(screen.getByText(/让模型读取指定网址的页面/)).toBeInTheDocument();
+    // Looking at it wrote nothing.
+    expect(onConversationOnlyChange).not.toHaveBeenCalled();
+    expect(onSettingsChange).not.toHaveBeenCalled();
+
+    // Back on a model with a fetch tool of its own, the leg is on as it was left.
+    rerender(<SettingsHarness {...common} globalSettings={messages} />);
+    expect(screen.getByRole("switch", { name: "网页抓取已开启" })).toBeChecked();
+    expect(backendTrigger("抓取提供商")).toHaveTextContent("原生");
+    expect(onConversationOnlyChange).not.toHaveBeenCalled();
+    expect(onSettingsChange).not.toHaveBeenCalled();
+
+    // Away again, a switch flip works from what is stored: search off keeps
+    // access on for the fetch leg that only reads off here ...
+    rerender(<SettingsHarness {...common} globalSettings={responses} />);
+    await user.click(screen.getByRole("switch", { name: "网页搜索已开启" }));
+    expect(onConversationOnlyChange).toHaveBeenLastCalledWith({
+      webSearchEnabled: true,
+      webSearch: { ...defaultConversationWebSearchSettings(), provider: { kind: "disabled" } }
+    });
+    // ... so it is found on again by the model that has a fetch tool.
+    rerender(<SettingsHarness {...common} globalSettings={messages} />);
+    expect(screen.getByRole("switch", { name: "网页搜索已关闭" })).not.toBeChecked();
+    expect(screen.getByRole("switch", { name: "网页抓取已开启" })).toBeChecked();
+    expect(backendTrigger("抓取提供商")).toHaveTextContent("原生");
+  });
+
+  /* On a model without a native fetch, turning the leg on picks a provider
+     that fetches, since native has nothing to offer there. */
+  it("turns fetch on with a catalog provider on a model without a native fetch", async () => {
+    const seed = createSeedDocument();
+    const onConversationOnlyChange = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={seed.workspaces[0].conversations[0]}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+        onConversationOnlyChange={onConversationOnlyChange}
+      />
+    );
+    await openPage(user, /^高级工具/);
+    expect(screen.getByRole("switch", { name: "网页抓取已关闭" })).not.toBeChecked();
+
+    await user.click(screen.getByRole("switch", { name: "网页抓取已关闭" }));
+    // Jina is the switched-on provider that fetches in the seed's settings.
+    expect(onConversationOnlyChange).toHaveBeenLastCalledWith({
+      webSearchEnabled: true,
+      webSearch: {
+        ...defaultConversationWebSearchSettings(),
+        fetchProvider: { kind: "explicit", providerKind: "jina" }
+      }
+    });
+    expect(screen.getByRole("switch", { name: "网页抓取已开启" })).toBeChecked();
+    // This model has no native fetch to list beside it.
+    await user.click(backendTrigger("抓取提供商"));
+    const menu = screen.getByRole("menu", { name: "抓取提供商" });
+    expect(within(menu).queryByRole("menuitemradio", { name: /^原生/ })).toBeNull();
+    expect(within(menu).getByRole("menuitemradio", { name: /^Jina/ })).toBeChecked();
   });
 
   it("picks one discovered tool-description file rather than editing entries", async () => {
@@ -1977,7 +2500,7 @@ describe("ConversationSettings", () => {
 
     expect(screen.getByRole("link", { name: "配置说明文档" }))
       .toHaveAttribute("href", "https://mewrk.dev/zh-CN/prompt-profiles.html");
-    expect(screen.getByText("一次只用一份：选另一份会替换当前这份。都不选时，用内置的 Mewrk concise。"))
+    expect(screen.getByText("选一份；不选则用内置的 Mewrk concise。"))
       .toBeInTheDocument();
 
     const search = screen.getByRole("textbox", { name: "搜索工具描述" });
@@ -2008,14 +2531,14 @@ describe("ConversationSettings", () => {
     // The built-in Mewrk concise is not a row, so a catalog of nothing but it is an empty one.
     expect(seed.capabilities.toolDescriptionFiles.map((file) => file.id)).toEqual([BUILTIN_PROFILE]);
     expect(screen.getByText("尚未发现工具描述文件")).toBeInTheDocument();
-    expect(screen.getByText("把 JSON 文件（可带注释）放在 ~/.mewrk/tool-descriptions/ 下，列表很快会自动刷新。"))
+    expect(screen.getByText("添加工具描述文件后自动列出。"))
       .toBeInTheDocument();
     expect(screen.getByText("0 / 0 个已选")).toBeInTheDocument();
     expect(screen.queryByText("Mewrk concise")).toBeNull();
     expect(document.querySelectorAll(".catalog-row")).toHaveLength(0);
     // The rule is drawn with or without rows: how nothing selected behaves is
     // worth knowing before the first file is written.
-    expect(screen.getByText(/都不选时，用内置的 Mewrk concise。/)).toBeInTheDocument();
+    expect(screen.getByText(/不选则用内置的 Mewrk concise。/)).toBeInTheDocument();
   });
 
   it("words the tool-descriptions page in English", async () => {
@@ -2037,7 +2560,7 @@ describe("ConversationSettings", () => {
     expect(screen.getByRole("region", { name: "Global" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "main" })).toBeInTheDocument();
     expect(screen.getByText(
-      "One at a time: picking another replaces the current one. With none picked, the built-in Mewrk concise is used."
+      "Pick one; with none, the built-in Mewrk concise is used."
     )).toBeInTheDocument();
     // The built-in is no row of the list.
     expect(screen.queryByRole("button", { name: "Mewrk concise" })).toBeNull();
@@ -2592,10 +3115,10 @@ describe("ConversationSettings", () => {
     expect(read).toHaveAttribute("aria-pressed", "true");
     expect(write).toHaveAttribute("aria-pressed", "false");
 
-    // The switches on the advanced page are orange with the list — web access
-    // and each memory tier, off as they are — and none is held.
+    // The switches on the advanced page are orange with the list — both web
+    // legs and each memory tier, off as they are — and none is held.
     await openPage(user, /^高级工具/);
-    for (const name of [/^联网搜索已/, "全局记忆已关闭", "项目记忆已关闭"]) {
+    for (const name of [/^网页搜索已/, /^网页抓取已/, "全局记忆已关闭", "项目记忆已关闭"]) {
       const control = screen.getByRole("switch", { name });
       expect(control).toBeEnabled();
       expect(control).toHaveClass("switch--cache");
@@ -2666,7 +3189,8 @@ describe("ConversationSettings", () => {
       expect(row.querySelector(".lock-mark")).toBeNull();
     }
     await openPage(user, /^高级工具/);
-    expect(screen.getByRole("switch", { name: /^联网搜索已/ })).not.toHaveClass("switch--cache");
+    expect(screen.getByRole("switch", { name: /^网页搜索已/ })).not.toHaveClass("switch--cache");
+    expect(screen.getByRole("switch", { name: /^网页抓取已/ })).not.toHaveClass("switch--cache");
     expect(screen.getByRole("switch", { name: "全局记忆已关闭" })).not.toHaveClass("switch--cache");
     await openPage(user, /^MCP/);
     expect(screen.getByRole("button", { name: "Workspace Files" }).closest(".catalog-row"))
@@ -3505,9 +4029,19 @@ describe("ConversationSettings", () => {
       .toEqual(["工具", "高级工具", "技能", "MCP", "钩子", "工具描述", "代理角色", "对话模板", "保存预设"]);
     expect(within(nestedNav).queryByRole("button", { name: /对话预设/ })).toBeNull();
     await user.click(within(nestedNav).getByRole("button", { name: /^高级工具/ }));
-    expect(within(dialog).getByRole("switch", { name: /^联网搜索已/ })).toBeInTheDocument();
+    // A preset's web access is the two legs, as a conversation's is.
+    expect(within(dialog).getByRole("switch", { name: /^网页搜索已/ })).toBeInTheDocument();
+    expect(within(dialog).getByRole("switch", { name: /^网页抓取已/ })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("switch", { name: /^联网搜索已/ })).toBeNull();
     // The file write guards are part of a preset, on in a fresh one.
     expect(within(dialog).getByRole("switch", { name: "文件防误写保护已开启" })).toBeChecked();
+    // So is the environment section.
+    expect(within(dialog).getByRole("switch", { name: "环境信息已拼接" })).toBeChecked();
+    // So is subagent communication, off in a fresh one — and a preset has run
+    // nothing, so it is never toned.
+    const messaging = within(dialog).getByRole("switch", { name: "子代理通信已关闭" });
+    expect(messaging).not.toBeChecked();
+    expect(messaging.closest(".tool-toggle-row")).not.toHaveClass("tool-toggle-row--cache");
     // Plan mode is not part of a preset.
     expect(within(dialog).queryByRole("switch", { name: /^计划模式已/ })).toBeNull();
     expect(within(dialog).getByRole("link", { name: "配置说明文档" }).parentElement)
@@ -3528,11 +4062,11 @@ describe("ConversationSettings", () => {
     // Saving narrows the pane's whole body back down to exactly what a preset owns.
     expect(Object.keys(onSavePreset.mock.calls.at(-1)![1]).sort()).toEqual([
       "agentIds", "allowRolelessSubagents",
-      "enabledTools", "fileWriteGuardsEnabled",
+      "enabledTools", "environmentPromptEnabled", "fileWriteGuardsEnabled",
       "globalMemoryEnabled",
       "hookIds", "hostMessageContainer", "mcpIds", "mcpToolDiscoveryEnabled", "projectMemoryEnabled",
       "securityLevel", "skillIds",
-      "skillToolEnabled", "toolDescriptionFileId", "webSearch", "webSearchEnabled"
+      "skillToolEnabled", "subagentMessagingEnabled", "toolDescriptionFileId", "webSearch", "webSearchEnabled"
     ]);
   });
 
@@ -3732,6 +4266,9 @@ describe("ConversationSettings", () => {
     const second = screen.getByRole("region", { name: /^\/srv\/b/ });
     expect(within(second).getByRole("button", { name: "第二工作区技能" })).toBeInTheDocument();
     expect(within(second).getByText("/srv/b")).toBeInTheDocument();
+    // A section is headed by its path alone: no workspace number precedes the heading.
+    expect(screen.queryAllByRole("region").flatMap((section) => [...section.querySelectorAll(".capability-section__number")]))
+      .toEqual([]);
     expect(screen.queryByRole("button", { name: "别处技能" })).toBeNull();
     // The counter divides the population it is drawn over, so it counts the
     // filtered catalog rather than everything the scan found.
@@ -4051,5 +4588,111 @@ describe("ConversationSettings", () => {
     const written = onSettingsChange.mock.lastCall?.[0] as ConversationSettingsType;
     expect(written.mcpIds).toEqual([]);
     expect(written.toolLock?.mcpIds).toEqual([]);
+  });
+
+  it("keeps each page's description to one line and sends the detail to the docs", async () => {
+    const seed = createSeedDocument();
+    // Empty catalogs, so each page draws the empty-state line as well as its footer.
+    seed.capabilities.skills = [];
+    seed.capabilities.mcps = [];
+    seed.capabilities.hooks = [];
+    seed.capabilities.agents = [];
+    seed.capabilities.toolDescriptionFiles = [];
+    const conversation = seed.workspaces[0].conversations[0];
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          // Nothing selected either, or a selection the catalog lacks would draw a row.
+          settings: {
+            ...conversation.settings,
+            skillIds: [],
+            mcpIds: [],
+            hookIds: [],
+            agentIds: [],
+            toolDescriptionFileId: null
+          }
+        }}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+      />
+    );
+    const learnMore = () => screen.queryAllByRole("link", { name: "详情" })
+      .map((link) => link.getAttribute("href"));
+    const docs = "https://mewrk.dev/zh-CN";
+    // The catalog pages end their toolbar with the docs link, so the blurb is plain.
+    const blurbOf = () => document.querySelector(".conversation-settings__page-header-line p");
+
+    await openPage(user, /^技能/);
+    expect(blurbOf()).toHaveTextContent("本对话可用的技能。");
+    expect(screen.getByText("技能放进 skills 文件夹后自动列出。")).toBeInTheDocument();
+    expect(learnMore()).toEqual([`${docs}/skills.html#location`, `${docs}/skills.html#delivery`]);
+
+    await openPage(user, /^MCP/);
+    expect(blurbOf()).toHaveTextContent("本对话接入的 MCP Server。");
+    expect(learnMore()).toEqual([`${docs}/mcp.html#location`, `${docs}/mcp.html#tool-discovery`]);
+
+    await openPage(user, /^钩子/);
+    expect(blurbOf()).toHaveTextContent("本对话运行的钩子。");
+    expect(learnMore()).toEqual([`${docs}/hooks.html#location`]);
+
+    await openPage(user, TOOL_DESCRIPTIONS_PAGE);
+    expect(learnMore()).toEqual([`${docs}/prompt-profiles.html#locations`]);
+
+    // Roles: the empty-state line and the role-less switch each point at the roles section.
+    await openPage(user, /^代理角色/);
+    expect(blurbOf()).toHaveTextContent("子代理可以点名使用的角色。");
+    expect(learnMore()).toEqual([`${docs}/agents.html#roles`, `${docs}/agents.html#roles`]);
+
+    // The pages with no toolbar of their own end the description's line with the link.
+    await openPage(user, /^对话预设/);
+    expect(screen.getByRole("link", { name: "配置说明文档" }))
+      .toHaveAttribute("href", `${docs}/working.html#presets`);
+    expect(screen.getByRole("link", { name: "配置说明文档" }).previousElementSibling)
+      .toHaveTextContent("存好的整页设置，套用即复制到本对话。");
+
+    // The template page exists only in a preset's window, and links the templates section.
+    await user.click(screen.getByRole("button", { name: "打开预设 默认" }));
+    const dialog = screen.getByRole("dialog", { name: "默认" });
+    const nestedNav = within(dialog).getByRole("navigation", { name: "对话设置分类" });
+    await user.click(within(nestedNav).getByRole("button", { name: /^对话模板/ }));
+    expect(within(dialog).getByRole("link", { name: "配置说明文档" }))
+      .toHaveAttribute("href", `${docs}/working.html#templates`);
+    expect(dialog.querySelector(".settings-page-heading")).toHaveTextContent("套用预设时铺进对话的开局消息。");
+  });
+
+  it("words the pane's one-line descriptions in English", async () => {
+    configureI18n("en-US");
+    const seed = createSeedDocument();
+    seed.capabilities.skills = [];
+    const conversation = seed.workspaces[0].conversations[0];
+    const user = userEvent.setup();
+    render(
+      <SettingsHarness
+        initialConversation={{
+          ...conversation,
+          settings: { ...conversation.settings, skillIds: [] }
+        }}
+        globalSettings={seed.globalSettings}
+        tools={seed.tools}
+        capabilities={seed.capabilities}
+        onSettingsChange={vi.fn()}
+      />
+    );
+
+    await openPage(user, /^Skills/);
+    expect(screen.getByText("The skills this conversation can use.")).toBeInTheDocument();
+    expect(screen.getByText("Skills added to the skills folder are listed automatically."))
+      .toBeInTheDocument();
+    expect(screen.getByText("Shows the model a skill list; bodies load when needed."))
+      .toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: "Learn more" }).map((link) => link.getAttribute("href")))
+      .toEqual([
+        "https://mewrk.dev/en/skills.html#location",
+        "https://mewrk.dev/en/skills.html#delivery"
+      ]);
   });
 });

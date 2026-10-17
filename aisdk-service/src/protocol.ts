@@ -19,7 +19,7 @@
  * this constant, or the two end up paired through the same channel and fail
  * silently instead of at the handshake.
  */
-export const PROTOCOL_VERSION = 17;
+export const PROTOCOL_VERSION = 18;
 
 /** Maximum line size (128 MiB); mirrors the host constant `MAX_LINE_BYTES`. */
 const MAX_LINE_BYTES = 128 * 1024 * 1024;
@@ -179,9 +179,13 @@ export interface StepRequest {
    * search server-side can also fetch server-side, and because a fetch request
    * asks for named pages rather than a query. `maxContentTokens` is the
    * per-page token cap the host's fetch leg carries, written to the tool as its
-   * own `max_content_tokens`; absent means no cap was asked for.
+   * own `max_content_tokens`; absent means no cap was asked for. `urls` are the
+   * pages the request asks for, sent only to `claude-agent`, where the sidecar
+   * admits each of Claude Code's `WebFetch` calls itself and lets it open these
+   * addresses and no other (absent: nothing is fetched); a Messages upstream
+   * already refuses an address the conversation never mentioned.
    */
-  nativeFetch?: { maxUses: number; toolType?: string; maxContentTokens?: number };
+  nativeFetch?: { maxUses: number; toolType?: string; maxContentTokens?: number; urls?: string[] };
   /** Present only for the `claude-agent` family; see [`AgentSession`]. */
   agent?: AgentSession;
   /**
@@ -328,6 +332,8 @@ export interface StepResult {
    * equivalent field for them and why the host still needs a model to turn a
    * search into prose. Binary payloads (PDF) are dropped rather than
    * base64-forwarded: the host has no decoder and the model cannot read base64.
+   * On `claude-agent` the text is the `result` of Claude Code's own `WebFetch`
+   * (its structured `tool_use_result`), with no title: see `NativeFetchLedger`.
    */
   webDocuments?: Array<{ url: string; title?: string; text: string }>;
   /**

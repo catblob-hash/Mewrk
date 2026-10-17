@@ -305,18 +305,6 @@
   color: var(--muted);
 }
 .capability-section__heading > svg { flex: 0 0 auto; }
-.capability-section__number {
-  flex: 0 0 auto;
-  min-width: 13px;
-  padding: 0 3px;
-  border-radius: 4px;
-  background: var(--subtle);
-  color: var(--muted);
-  font-size: 9px;
-  font-weight: 650;
-  font-variant-numeric: tabular-nums;
-  text-align: center;
-}
 .capability-section__label {
   flex: 0 1 auto;
   min-width: 0;

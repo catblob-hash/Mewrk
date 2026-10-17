@@ -188,7 +188,7 @@ prompt_keys! {
     SystemPlanModeExit => ("system.plan_mode_exit", [],
         "System prompt appended at the point the user turns plan mode off before approving a plan, carried like `system.plan_mode`. An approved plan needs no such note: the `exit_plan_mode` result says so."),
     SystemHostMessages => ("system.host_messages", [],
-        "Section of the system prompt of every run whose host messages come as user messages (the conversation's host-message container is `user`) saying what the user-role messages the host writes are: `<system-reminder>` notices, and background task results as `<task-notification>` behind Claude Code's `[SYSTEM NOTIFICATION - NOT USER INPUT]` preamble. None of them is the user speaking. Where they come in `box`, `tool.box.description` says it instead."),
+        "Section of the system prompt of every run whose host messages come as user messages (the conversation's host-message container is `user`) and whose prompt was assembled with a tool that can start a background task (`agent_spawn`, `workflow`, a shell, `preview_start`), saying what the user-role messages the host writes are: `<system-reminder>` notices, and background task results as `<task-notification>` behind Claude Code's `[SYSTEM NOTIFICATION - NOT USER INPUT]` preamble. None of them is the user speaking. Such a tool enabled after the prompt was assembled without one brings the same text with it, as a system prompt appended where it joins (a `<system-reminder>` on a model that takes no system message mid-conversation). Where host messages come in `box`, `tool.box.description` says it instead."),
 
 
     // ---- Built-in tool descriptions -------------------------------------
@@ -467,6 +467,14 @@ prompt_keys! {
         "Root description of the `task_stop` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `task_stop` overrides this key."),
     ToolTaskStopParamTask => ("tool.task_stop.param.task", [],
         "Description of `task_stop`'s `task` parameter."),
+    ToolSendMessageDescription => ("tool.send_message.description", [],
+        "Root description of the `send_message` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `send_message` overrides this key. Declared only to a top-level run whose conversation has subagent communication on and `agent_spawn` enabled."),
+    ToolSendMessageParamTo => ("tool.send_message.param.to", [],
+        "Description of `send_message`'s `to` parameter: the name the child was spawned with."),
+    ToolSendMessageParamMessage => ("tool.send_message.param.message", [],
+        "Description of `send_message`'s `message` parameter."),
+    ToolSendMessageParamSummary => ("tool.send_message.param.summary", [],
+        "Description of `send_message`'s `summary` parameter: the short preview the timeline shows."),
     ToolBoxDescription => ("tool.box.description", [],
         "Root description of the `box` schema — what the model reads to decide what the tool is. A profile's `tools[].description` for `box` overrides this key. Declared only where the conversation's host messages come in `box`."),
     ToolBoxParamNone => ("tool.box.param.none", [],
@@ -600,7 +608,7 @@ prompt_keys! {
 
     // ---- Child agents --------------------------------------------------
     SubagentAddendum => ("subagent.addendum", [],
-        "Addendum appended (after a `---` separator) to the system prompt of every spawned subagent and workflow step."),
+        "Addendum appended (after a `---` separator) to the system prompt of every spawned subagent and workflow step. What depends on the conversation's subagent communication is marked with the child's update tool, which a child holds only while that is on: `{?subagent_update}…{/}` wraps what only such a child is told (that the main agent's later messages reach it and carry instructions, and the sentence telling it to report progress with the update tool), `{!subagent_update}…{/}` what every other child is told instead."),
     SubagentAddendumBrowserNote => ("subagent.addendum.browser_note", [],
         "Item added to the end of `subagent.addendum`'s notes list when the child holds a `preview_*` tool, which acts on the browser session it shares with the conversation."),
     SubagentAddendumShellNote => ("subagent.addendum.shell_note", [],
@@ -759,6 +767,18 @@ prompt_keys! {
         "Last line of a command's output file once it has reached its size limit."),
     TaskStopStopped => ("task.stop_stopped", ["task", "detail"],
         "Result of a `task_stop` call that stopped a task: the task's address and what it was running."),
+    TaskSendQueued => ("task.send.queued", ["to"],
+        "Result of a `send_message` call that put its message in front of a child still running: `{to}` is the child's name. Nothing starts; the child reads the message before its next model request."),
+    TaskSendResumed => ("task.send.resumed", ["to"],
+        "Result of a `send_message` call to a child that had finished and was delivered: the child is resumed in the background with its full earlier context and the message. `{to}` is the child's name. Its new result arrives like any task result."),
+    TaskSendResultPending => ("task.send.result_pending", ["to"],
+        "Refusal of a `send_message` call to a child that has just finished but whose result has not reached the model yet. Nothing changed. `{to}` is the child's name."),
+    TaskSendUserStopped => ("task.send.user_stopped", ["to"],
+        "Refusal of a `send_message` call to a child the user stopped, which is not resumed. `{to}` is the child's name."),
+    TaskSendUnknownTarget => ("task.send.unknown_target", ["to"],
+        "Refusal of a `send_message` call naming no child agent of this conversation. `{to}` is the name the call gave."),
+    TaskSendNotAnAgent => ("task.send.not_an_agent", ["to"],
+        "Refusal of a `send_message` call naming a task that is not a child agent (a workflow run, a shell command, a dev server). `{to}` is the name or address the call gave."),
     TaskOutputTruncated => ("task.output_truncated", [],
         "Suffix appended when a task result was cut to the output limit."),
     TaskStoppedByUser => ("task.stopped_by_user", [],
@@ -1103,6 +1123,7 @@ impl PromptKey {
             "task_wait" => Some(PromptKey::ToolTaskWaitDescription),
             "task_list" => Some(PromptKey::ToolTaskListDescription),
             "task_stop" => Some(PromptKey::ToolTaskStopDescription),
+            "send_message" => Some(PromptKey::ToolSendMessageDescription),
             "box" => Some(PromptKey::ToolBoxDescription),
             "read_global_memory" => Some(PromptKey::ToolReadGlobalMemoryDescription),
             "read_project_memory" => Some(PromptKey::ToolReadProjectMemoryDescription),
@@ -1751,6 +1772,107 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Without `send_message` the `agent_spawn` texts are what they were before the
+    /// tool existed, byte for byte: the sentence about messaging is a marked
+    /// alternative, and a run that does not offer the tool reads the old one.
+    /// The expected texts are literals, never derived from the registry.
+    #[test]
+    fn without_send_message_the_agent_spawn_texts_are_unchanged() {
+        const SPAWN: &str = r#"Start a background child agent; the call returns once it is dispatched. Delegate self-contained, checkable work and run independent children in parallel; keep judgement that spans the whole task here. The child sees only what you give it and has this conversation's tools (or its role's), except spawning agents and asking the user. Nothing can be sent to it after dispatch, so the prompt must be complete: the goal, relevant paths and constraints, and what to return. Children outlive the turn: one finishing while the conversation is idle starts a new turn to deliver its result. Collect progress and results with task_wait; until a result arrives you know nothing of what the child found, and what it reports is a claim to check."#;
+        const SPAWN_ASYNC: &str = r#"Start a background child agent. Asynchronous: the call returns nothing at first and the child's result arrives later as this call's own output; call task_wait when your next step needs it. Delegate self-contained, checkable work and run independent children in parallel; keep judgement that spans the whole task here. The child sees only what you give it and has this conversation's tools (or its role's), except spawning agents and asking the user. Nothing can be sent to it after dispatch, so the prompt must be complete: the goal, relevant paths and constraints, and what to return. Children outlive the turn: one finishing while the conversation is idle starts a new turn to deliver its result. Until a result arrives you know nothing of what the child found; never invent one, and treat what it reports as a claim to check."#;
+        const NAME: &str = r#"The child's address for task_wait and its task title. Reserved across this conversation's branch tree, workflow runs included: a name already used is rejected."#;
+        // Every tool a conversation that can spawn offers except the new one,
+        // and the bare minimum a text could be resolved against.
+        let without_catalog = crate::tool_mentions::OfferedTools::from_names(
+            crate::catalog::tool_catalog()
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .filter(|name| *name != "send_message"),
+        );
+        let without_any = crate::tool_mentions::OfferedTools::from_names(["agent_spawn"]);
+        for offered in [&without_catalog, &without_any] {
+            for (key, expected) in [
+                (PromptKey::ToolAgentSpawnDescription, SPAWN),
+                (PromptKey::ToolAgentSpawnAsyncDescription, SPAWN_ASYNC),
+                (PromptKey::ToolAgentSpawnParamName, NAME),
+            ] {
+                assert_eq!(
+                    crate::tool_mentions::resolve(key.builtin_text(), offered),
+                    expected,
+                    "{}",
+                    key.id()
+                );
+            }
+        }
+
+        // With it, the three say the messaging wording instead and nothing else changes.
+        let with = crate::tool_mentions::OfferedTools::from_names(["agent_spawn", "send_message"]);
+        for (key, old) in [
+            (PromptKey::ToolAgentSpawnDescription, SPAWN),
+            (PromptKey::ToolAgentSpawnAsyncDescription, SPAWN_ASYNC),
+        ] {
+            let said = crate::tool_mentions::resolve(key.builtin_text(), &with).into_owned();
+            assert!(
+                !said.contains("Nothing can be sent to it after dispatch"),
+                "{said}"
+            );
+            assert!(
+                said.contains("send_message reaches the child later by its name"),
+                "{said}"
+            );
+            assert!(
+                said.contains("A new agent_spawn always starts a fresh child with no memory"),
+                "{said}"
+            );
+            // Everything around the one sentence is still there.
+            let head = old
+                .split("Nothing can be sent to it after dispatch")
+                .next()
+                .unwrap();
+            let tail = old.split("what to return.").nth(1).unwrap();
+            assert!(said.starts_with(head) && said.ends_with(tail), "{said}");
+        }
+        assert_eq!(
+            crate::tool_mentions::resolve(PromptKey::ToolAgentSpawnParamName.builtin_text(), &with),
+            NAME.replace("task_wait and its", "task_wait, send_message and its")
+        );
+    }
+
+    /// The model-facing wording of `send_message` and its six receipts: the tool
+    /// is the main agent's, a receipt names the child it is about, and none
+    /// of them promises more than the host does.
+    #[test]
+    fn the_send_message_texts_and_receipts_name_the_child_they_are_about() {
+        let profile = PromptProfile::builtin();
+        for key in [
+            PromptKey::TaskSendQueued,
+            PromptKey::TaskSendResumed,
+            PromptKey::TaskSendResultPending,
+            PromptKey::TaskSendUserStopped,
+            PromptKey::TaskSendUnknownTarget,
+            PromptKey::TaskSendNotAnAgent,
+        ] {
+            assert_eq!(key.placeholders(), ["to"], "{}", key.id());
+            assert!(key.id().starts_with("task.send."), "{}", key.id());
+            let said = profile.render(key, &[("to", "review-api")]);
+            assert!(
+                said.contains("review-api") && !said.contains("{to}"),
+                "{said}"
+            );
+            assert!(!has_cjk(&said), "{said}");
+        }
+        assert_eq!(
+            profile.render(PromptKey::TaskSendQueued, &[("to", "a1")]),
+            "Message queued for a1; it reads it before its next model request."
+        );
+        assert_eq!(
+            PromptKey::for_tool_description("send_message", ToolVariant::Standard),
+            Some(PromptKey::ToolSendMessageDescription)
+        );
+        // One variant only: the tool is the same call under every axis.
+        assert_eq!(crate::tool_surface::variants_of("send_message").len(), 1);
     }
 
     /// Each PowerShell edition describes its own language: 7's operators are

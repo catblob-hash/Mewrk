@@ -1776,7 +1776,6 @@ export function FilesPane({
         id: `workspace-${workspace.number}`,
         label: formatAddress(workspace.machine, workspace.root, addressContext),
         labelIsPath: true,
-        hint: `${workspace.number}`,
         icon: <FolderOpen size={13} aria-hidden="true" />,
         onSelect: () => pick({ machine: workspace.machine, path: workspace.root })
       }))

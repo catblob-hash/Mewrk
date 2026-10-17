@@ -16,6 +16,7 @@ import type {
   LocalModelVariantStatus
 } from "../../types";
 import { Dialog, IconButton, Switch } from "../Common";
+import { DocsLink } from "../DocsLink";
 import { formatBytes } from "../FilePreview/format";
 import { SettingRow, SettingsCard } from "./rows";
 
@@ -49,18 +50,18 @@ function variantDescription(id: LocalModelVariantId, t: Translate): string {
   switch (id) {
     case "ane":
       return t(
-        "在神经网络引擎上运行：省电，不占用显卡。第一次加载要为这台 Mac 编译，约两分钟，之后一秒内加载；应用更新后，或磁盘空间不足、系统清掉了编译缓存时，会再编译一次。",
-        "Runs on the Neural Engine: low power, leaves the GPU alone. The first load compiles it for this Mac, about two minutes; after that it loads in a second. It compiles again after an app update, or when the disk runs low and the system clears its compiled copy."
+        "省电，不占显卡；首次加载约需两分钟。",
+        "Low power, leaves the GPU free; first load takes about 2 minutes."
       );
     case "mlx":
       return t(
-        "用 MLX 在显卡上运行：加载快，但生成时会占用显卡。本机已有同版本的 MLX 时直接用它的显卡内核库，否则一并下载。",
-        "Runs on the GPU with MLX: loads fast, but uses the GPU while it writes. Uses the GPU kernels of this Mac's own copy of the same MLX release if there is one, otherwise downloads them too."
+        "加载快，但生成时占用显卡。",
+        "Loads fast, but uses the GPU while generating."
       );
     case "llama":
       return t(
-        "用 llama.cpp 运行 GGUF 版；有显卡时放在显卡上。",
-        "Runs the GGUF build with llama.cpp, on the GPU when there is one."
+        "运行 GGUF 版，有显卡时用显卡。",
+        "Runs the GGUF build, on the GPU when there is one."
       );
   }
 }
@@ -224,9 +225,11 @@ export function LocalModelSettings({ preferences, onChange }: LocalModelSettings
     <SettingsCard title={t("本地小模型", "Local model")}>
       <SettingRow
         title={t("自动生成会话标题", "Name conversations automatically")}
-        description={t(
-          "会话第一次发出请求时，用本机运行的 Qwen3.5-0.8B 起一个标题。它和主模型一样读整条消息：文字、附带的文件和图片，合计超过 4096 个 token 的部分截掉。启动子代理时，也用模型交给它的任务起一个标题，作为任务面板里那一行的副标题。",
-          "When a conversation sends its first request, Qwen3.5-0.8B running on this computer names it. Like the main model, it reads the whole message: its text, attached files and images, cut beyond 4,096 tokens in all. A subagent's task, as the model gave it, is named the same way and becomes the subtitle of its row in the task panel."
+        description={(
+          <>
+            {t("用本地模型为新会话起标题。", "Names new conversations with the local model.")}
+            <DocsLink inline page="settings" section="local-model" />
+          </>
         )}
       >
         <Switch
@@ -239,8 +242,8 @@ export function LocalModelSettings({ preferences, onChange }: LocalModelSettings
       <SettingRow
         title={t("解释 Shell 命令", "Explain shell commands")}
         description={t(
-          "为每条 shell 命令写一行说明，显示在工具卡片的标题上。",
-          "Write a one-line description of each shell command and show it as the tool card's title."
+          "用一句话说明 shell 命令，作为卡片标题。",
+          "Explains each shell command in one line, as the card title."
         )}
       >
         <Switch
@@ -252,9 +255,11 @@ export function LocalModelSettings({ preferences, onChange }: LocalModelSettings
       </SettingRow>
       <SettingRow
         title={t("解释错误", "Explain errors")}
-        description={t(
-          "工具调用或 shell 命令失败时，把错误消息交给本地模型，用一句话说明原因，显示在工具卡片的标题上（超过 15 个 token 的部分截掉）。说明出来之前标题先显示错误原文；关闭时一直显示原文。",
-          "When a tool call or shell command fails, the local model reads its error message and says why in a few words, shown as the tool card's title (cut at 15 tokens). Until it answers the title shows the error itself; with this off it always does."
+        description={(
+          <>
+            {t("用几个词说明失败原因，作为卡片标题。", "Says why a call failed in a few words, as the card title.")}
+            <DocsLink inline page="settings" section="local-model" />
+          </>
         )}
       >
         <Switch
@@ -266,9 +271,11 @@ export function LocalModelSettings({ preferences, onChange }: LocalModelSettings
       </SettingRow>
       <SettingRow
         title={t("也用于子代理", "Also for subagents")}
-        description={t(
-          "上面几项也用在子代理和工作流步骤上：它们的 shell 命令和失败也会得到说明，工作流的每一步也会起标题，作为任务面板里那一行的副标题。这些请求排在主对话之后：模型同时跑的请求数有上限、一起合批生成，等待的请求太多时先让出子代理的。",
-          "The uses above reach subagents and workflow steps too: their shell commands and failures are explained as well, and each workflow step is named, as the subtitle of its row in the task panel. These requests wait behind the conversation's own: the model runs a bounded number of requests at once, batched together, and when too many are waiting a subagent's give way first."
+        description={(
+          <>
+            {t("上面几项也用在子代理和工作流上。", "Extends the uses above to subagents and workflows.")}
+            <DocsLink inline page="settings" section="local-model" />
+          </>
         )}
       >
         <Switch
@@ -322,9 +329,11 @@ function ChooseVariantDialog({
   return (
     <Dialog
       title={t("下载本地模型？", "Download the local model?")}
-      description={t(
-        "Qwen3.5-0.8B 官方指令版（非 Base），由官方 BF16 权重预先转换好，从 Hugging Face 下载。模型在本机运行，不会把会话内容发给任何服务；每个文件都会校验 SHA-256，下载中断后从断点继续。",
-        "Qwen3.5-0.8B, the official instruct model (not Base), converted ahead of time from the official BF16 weights and downloaded from Hugging Face. It runs on this computer and sends nothing anywhere; every file is checked against its SHA-256, and an interrupted download picks up where it stopped."
+      description={(
+        <>
+          {t("Qwen3.5-0.8B 在本机运行，不发送任何内容。", "Qwen3.5-0.8B runs on this computer and sends nothing out.")}
+          <DocsLink inline page="settings" section="local-model" />
+        </>
       )}
       onClose={onCancel}
       width="520px"
@@ -423,8 +432,8 @@ function ChinaMirrorDialog({
     <Dialog
       title={t("使用国内镜像下载？", "Download from the mirror in mainland China?")}
       description={t(
-        "在中国大陆访问 Hugging Face 可能很慢或连不上。国内镜像 hf-mirror.com 提供同样的文件，每个文件都会校验 SHA-256。",
-        "Hugging Face can be slow or unreachable from mainland China. The mirror hf-mirror.com serves the same files; every file is checked against its SHA-256."
+        "hf-mirror.com 文件相同，逐个校验。",
+        "hf-mirror.com serves the same files; each one is checked."
       )}
       onClose={onCancel}
       width="480px"
@@ -500,8 +509,8 @@ function LocalModelDialog({
           <strong>Qwen3.5-0.8B</strong>
           <small>
             {t(
-              "官方指令版（非 Base），由官方 BF16 权重转换而来。每个版本对应一种推理后端，可以都下载，同一时间只用其中一个。",
-              "The official instruct model (not Base), converted from the official BF16 weights. Each build runs on one inference backend; download any of them and pick the one in use."
+              "可下载多个版本，同一时间只用其中一个。",
+              "Download any of the builds; only one is used at a time."
             )}
           </small>
           {machine && <small className="local-model-dialog__status">{t("本机：{machine}", "This Mac: {machine}", { machine })}</small>}

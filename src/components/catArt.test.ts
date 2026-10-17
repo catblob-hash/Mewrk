@@ -2,21 +2,36 @@ import { describe, expect, it } from "vitest";
 import {
   CAT_BODY,
   CAT_BODY_WITHOUT_PAWS,
+  CAT_COMPOSER_BODY,
+  CAT_COMPOSER_VIEWBOX,
   CAT_EYES,
   CAT_EYE_WHITES,
   CAT_FACE,
   CAT_FAR_PAW,
+  CAT_HIND_LEG_SLIT,
+  CAT_LAPTOP,
+  CAT_LEDGE_Y,
   CAT_LID_LIFT,
   CAT_LIDS,
   CAT_MUZZLE,
   CAT_NEAR_PAW,
   CAT_NEAR_PAW_OVERLAP,
+  CAT_ON_LEDGE,
   CAT_PUPILS,
+  CAT_TAIL_RAISED,
+  CAT_TAIL_RAISED_ROOT,
   CAT_WHISKERS,
   CAT_WRIST
 } from "./catArt";
 
 type Point = [number, number];
+
+/** How far `CAT_ON_LEDGE` lowers the drawing, and so where the desk is in the drawing's own coordinates. */
+const LIFT = Number(CAT_ON_LEDGE.match(/^translate\(0 ([\d.]+)\)$/)?.[1]);
+const DESK = CAT_LEDGE_Y - LIFT;
+
+/** How far either way the raised tail is checked to swing; `ComposerCat.test.tsx` keeps the stylesheet inside it. */
+const TAIL_SWING_CHECKED = 12;
 
 /** A path string, split back into the subpaths it was concatenated from. */
 function subpaths(path: string): string[] {
@@ -225,19 +240,80 @@ describe("catArt", () => {
     expect(subpaths(CAT_MUZZLE)).toHaveLength(1);
   });
 
-  it("keeps every face mark inside the body the composer cat punches it from", () => {
+  it("keeps every face mark inside the bodies it is punched from", () => {
     // Even-odd punches a hole only where a subpath lies *inside* the outer contour. One that
     // reached past the cheek would be filled instead of cleared and would render as a spike
     // growing out of the silhouette.
-    const { escaped, clearance } = containment(CAT_BODY, CAT_FACE);
-    expect(escaped).toBe(0);
-    expect(clearance).toBeGreaterThan(10);
+    for (const body of [CAT_BODY, CAT_COMPOSER_BODY]) {
+      const { escaped, clearance } = containment(body, CAT_FACE);
+      expect(escaped).toBe(0);
+      expect(clearance).toBeGreaterThan(10);
+    }
 
     // The scan has to be able to fail: push the near whiskers out through the body's
     // underside (y≈658 below them) and it must report them. Without this, a scanner that
     // silently matched nothing would pass.
     const breached = containment(CAT_BODY, movePoints(CAT_WHISKERS, ([x, y]) => [x, y + 120]));
     expect(breached.escaped).toBeGreaterThan(100);
+  });
+
+  it("lays the composer cat's underside on the desk rather than above it", () => {
+    // Just above the desk, everything from the rump to the chin is cat, but for the slits that
+    // open onto it: the hind leg's, the near paw's, and the notch between its toes.
+    const widestDaylight = (path: string) => {
+      const body = rings(path);
+      let widest = 0;
+      let run = 0;
+      for (let x = 310; x <= 630; x += 0.5) {
+        run = contains(body, [x, DESK - 1.2]) ? 0 : run + 0.5;
+        widest = Math.max(widest, run);
+      }
+      return widest;
+    };
+    expect(widestDaylight(CAT_COMPOSER_BODY)).toBeLessThan(20);
+    // The drawing's own underside runs 11 units above the desk from the haunch to the near paw,
+    // which is the gap the composer body closes: the same scan must find it there.
+    expect(widestDaylight(CAT_BODY)).toBeGreaterThan(100);
+  });
+
+  it("keeps the raised tail's root buried in the rump and off the hind leg however it swings", () => {
+    // The root is closed off by a straight line inside the rump. Out past the back, it shows as
+    // a corner on the tail; over the hind leg's slit or a face mark, the tail plugs the hole.
+    const body = rings(CAT_COMPOSER_BODY);
+    const root: Point = [CAT_TAIL_RAISED_ROOT.x, CAT_TAIL_RAISED_ROOT.y];
+    const exposure = (tail: string) => {
+      const ring = rings(tail)[0] as Point[];
+      const [from, to] = [ring.at(-1) as Point, ring[0] as Point];
+      let exposed = 0;
+      for (let step = 0; step <= 40; step += 1) {
+        const t = step / 40;
+        if (!contains(body, [from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t])) exposed += 1;
+      }
+      return exposed;
+    };
+    const holes = `${CAT_HIND_LEG_SLIT}${CAT_FACE}`;
+    for (let degrees = -TAIL_SWING_CHECKED; degrees <= TAIL_SWING_CHECKED; degrees += 2) {
+      const swung = turn(CAT_TAIL_RAISED, root, degrees);
+      expect(exposure(swung), `${degrees}deg`).toBe(0);
+      expect(pointsInHoles(swung, holes), `${degrees}deg`).toEqual([]);
+    }
+    // Both scans have to be able to fail: swung much further the root comes out of the back,
+    // and dropped onto the thigh the tail lands in the slit.
+    expect(exposure(turn(CAT_TAIL_RAISED, root, 40))).toBeGreaterThan(0);
+    expect(pointsInHoles(shift(CAT_TAIL_RAISED, 30, 50), holes).length).toBeGreaterThan(0);
+  });
+
+  it("fits the composer cat in its scene through a breath and the tail's whole swing", () => {
+    const [left, top, width, height] = CAT_COMPOSER_VIEWBOX.split(" ").map(Number) as [number, number, number, number];
+    const inScene = ([x, y]: Point) => x >= left && x <= left + width && y >= top && y <= top + height;
+    const lowered = (path: string) => rings(path).flat().map(([x, y]): Point => [x, y + LIFT]);
+    // The breath scales the figure by up to 1.035 about the ledge, which lifts the ears.
+    const breathing = lowered(`${CAT_COMPOSER_BODY}${CAT_LAPTOP}`).map(([x, y]): Point => [x, CAT_LEDGE_Y + (y - CAT_LEDGE_Y) * 1.035]);
+    expect(breathing.filter((point) => !inScene(point))).toEqual([]);
+    const root: Point = [CAT_TAIL_RAISED_ROOT.x, CAT_TAIL_RAISED_ROOT.y];
+    for (let degrees = -TAIL_SWING_CHECKED; degrees <= TAIL_SWING_CHECKED; degrees += 2) {
+      expect(lowered(turn(CAT_TAIL_RAISED, root, degrees)).filter((point) => !inScene(point)), `${degrees}deg`).toEqual([]);
+    }
   });
 
   it("puts the body back together exactly from the pieces the streaming cat cuts it into", () => {

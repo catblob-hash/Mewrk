@@ -260,9 +260,10 @@ export interface ForkModelBinding {
 
 /**
  * A cumulative child run snapshot persisted with the agent tool context that
- * started the child (`agent_spawn`). Older saved conversations may carry it on
- * a retired `send_message` or `followup_task` context instead, and legacy
- * `subagent` contexts carry one too.
+ * last started the child: its `agent_spawn`, or the `send_message` that resumed
+ * it. Older saved conversations may carry it on a retired `followup_task` or
+ * queue-only `send_message` context instead, and legacy `subagent` contexts
+ * carry one too.
  */
 export interface SubagentRunRecord {
   /** Addressable agent name `task_wait` takes; absent on legacy records. */
@@ -487,6 +488,24 @@ export interface ConversationSettings {
    */
   fileWriteGuardsEnabled?: boolean;
   /**
+   * Whether this conversation's system prompt opens with the environment
+   * section: the working directory, the numbered workspaces, the platform and
+   * today's date. Subagents and workflows follow the conversation. Absent means
+   * on; only an explicit `false` leaves it out. Mirrors Rust
+   * `ConversationSettings::environment_prompt_enabled`.
+   */
+  environmentPromptEnabled?: boolean;
+  /**
+   * Whether subagents can be talked to. On, and with `agent_spawn` enabled, the
+   * main agent gets `send_message` (message a running subagent, or resume a
+   * finished one with its full context) and every subagent it starts gets
+   * `subagent_update` (report progress while running). Off, or without
+   * `agent_spawn`, neither tool exists. Absent means off; only an explicit
+   * `true` turns it on — the opposite default from the file write guards.
+   * Mirrors Rust `ConversationSettings::subagent_messaging_enabled`.
+   */
+  subagentMessagingEnabled?: boolean;
+  /**
    * What this conversation's last request put in front of the model, and which
    * model sent it when. Absent until the first run. Per-conversation runtime
    * state, not a preset component: it records history and must never be copied
@@ -541,6 +560,15 @@ export interface ConversationToolLock {
    */
   promptSkillIds: string[] | null;
   /**
+   * Whether the tools the system prompt was assembled for could start a
+   * background task (`TASK_PRODUCING_TOOL_NAMES`), fixed by this
+   * conversation's first run and `null` before it. Only such a prompt says how
+   * background results and the host's messages arrive; a producer enabled
+   * afterwards is told at the point it joins, so the prompt never changes
+   * under the earlier rounds. Mirrors Rust `ConversationToolLock::prompt_task_tools`.
+   */
+  promptTaskTools: boolean | null;
+  /**
    * The search backend the last request's settings named, or `null` when that
    * request had no web access. Part of the surface: a host-run search leaves
    * ordinary tool results any backend can follow, so another one may take over
@@ -589,6 +617,18 @@ export interface ConversationToolLock {
    * `write` descriptions carry their rules only then), or `null` on an older lock.
    */
   fileWriteGuards: boolean | null;
+  /**
+   * Whether the last request's system prompt opened with the environment
+   * section, or `null` on an older lock.
+   */
+  environmentPrompt: boolean | null;
+  /**
+   * The subagent-communication switch as the last request saw it, or `null` on
+   * an older lock. It changes the wire only while `tools` holds `agent_spawn`
+   * (the switch adds `send_message` and rewrites the `agent_spawn` wording), so
+   * the lock's tone and restore consult both.
+   */
+  subagentMessaging: boolean | null;
 }
 
 /** Which model a conversation's last request used, and when. */
@@ -632,6 +672,10 @@ export interface ConversationPresetSettings {
   hostMessageContainer?: HostMessageContainer;
   /** File-write-guards template copied into conversations; absent means on. */
   fileWriteGuardsEnabled?: boolean;
+  /** Environment-section template copied into conversations; absent means on. */
+  environmentPromptEnabled?: boolean;
+  /** Subagent-communication template copied into conversations; absent means off. */
+  subagentMessagingEnabled?: boolean;
 }
 
 /**

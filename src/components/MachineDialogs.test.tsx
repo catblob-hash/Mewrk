@@ -151,7 +151,7 @@ describe("a machine's shells in its settings", () => {
   it("says a machine has not been probed and shows why a probe failed", async () => {
     const shells = control({ probe: vi.fn(() => Promise.reject(new Error("ssh: connect to host winbox: timed out"))) });
     renderDialog({ kind: "ssh", machineId: "winbox" }, shells);
-    expect(screen.getByText(/还没有探测过这台机器/)).toBeInTheDocument();
+    expect(screen.getByText(/还没有探测结果/)).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "代理 shell" })).toBeDisabled();
     await userEvent.click(screen.getByRole("button", { name: "重新探测 shell" }));
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("timed out"));

@@ -6,9 +6,11 @@ import type {
   GlobalSettings
 } from "../types";
 import { BUILTIN_PRESET_ID } from "../seed";
+import { environmentPromptEnabledOf } from "./environmentPrompt";
 import { fileWriteGuardsEnabledOf } from "./fileWriteGuards";
 import { hostMessageContainerOf } from "./hostMessages";
 import { defaultConversationWebSearchSettings } from "./runtime";
+import { subagentMessagingEnabledOf } from "./subagentMessaging";
 import { isHostDerivedToolName } from "./taskTools";
 import { toolLockOf } from "./toolLock";
 
@@ -39,7 +41,9 @@ export function emptyConversationPresetSettings(): ConversationPresetSettings {
     skillToolEnabled: false,
     mcpToolDiscoveryEnabled: false,
     hostMessageContainer: "user",
-    fileWriteGuardsEnabled: true
+    fileWriteGuardsEnabled: true,
+    environmentPromptEnabled: true,
+    subagentMessagingEnabled: false
   };
 }
 
@@ -76,7 +80,9 @@ export function captureConversationPresetSettings(
     skillToolEnabled: settings.skillToolEnabled === true,
     mcpToolDiscoveryEnabled: settings.mcpToolDiscoveryEnabled === true,
     hostMessageContainer: hostMessageContainerOf(settings),
-    fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(settings)
+    fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(settings),
+    environmentPromptEnabled: environmentPromptEnabledOf(settings),
+    subagentMessagingEnabled: subagentMessagingEnabledOf(settings)
   };
 }
 
@@ -120,6 +126,8 @@ export function sameConversationPresetSettings(
     && a.mcpToolDiscoveryEnabled === b.mcpToolDiscoveryEnabled
     && hostMessageContainerOf(a) === hostMessageContainerOf(b)
     && fileWriteGuardsEnabledOf(a) === fileWriteGuardsEnabledOf(b)
+    && environmentPromptEnabledOf(a) === environmentPromptEnabledOf(b)
+    && subagentMessagingEnabledOf(a) === subagentMessagingEnabledOf(b)
     && a.webSearchEnabled === b.webSearchEnabled
     && sameIdSet(a.enabledTools, b.enabledTools)
     && sameIdSet(a.hookIds, b.hookIds)
@@ -183,6 +191,8 @@ export function cloneConversationSettings(
     mcpToolDiscoveryEnabled: snapshot.mcpToolDiscoveryEnabled === true,
     hostMessageContainer: hostMessageContainerOf(snapshot),
     fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(snapshot),
+    environmentPromptEnabled: environmentPromptEnabledOf(snapshot),
+    subagentMessagingEnabled: subagentMessagingEnabledOf(snapshot),
     // The conversation's own choice, which a branch keeps. Not a preset's: a
     // preset carries none, so a new conversation chooses by its model.
     ...(snapshot.compactionMethod ? { compactionMethod: snapshot.compactionMethod } : {})
@@ -230,6 +240,8 @@ export function applyConversationPresetSettings(
     skillToolEnabled: preset.skillToolEnabled === true,
     mcpToolDiscoveryEnabled: preset.mcpToolDiscoveryEnabled === true,
     hostMessageContainer: hostMessageContainerOf(preset),
-    fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(preset)
+    fileWriteGuardsEnabled: fileWriteGuardsEnabledOf(preset),
+    environmentPromptEnabled: environmentPromptEnabledOf(preset),
+    subagentMessagingEnabled: subagentMessagingEnabledOf(preset)
   };
 }

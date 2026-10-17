@@ -944,16 +944,23 @@ describe("AgentRoleEditor", () => {
 
     // What belongs to the calling conversation is not on this page.
     expect(within(dialog).queryByRole("switch", { name: /联网搜索已/ })).toBeNull();
+    expect(within(dialog).getAllByRole("switch").map((control) => control.getAttribute("aria-label")))
+      .toEqual(["网页搜索已开启", "网页抓取已关闭"]);
     expect(within(dialog).queryByRole("switch", { name: /记忆/ })).toBeNull();
     expect(within(dialog).queryByRole("combobox", { name: "工具描述" })).toBeNull();
     expect(within(dialog).queryByRole("radiogroup", { name: "宿主消息容器" })).toBeNull();
     // The file write guards are the calling conversation's too: a role's runs follow it.
     expect(within(dialog).queryByRole("switch", { name: /文件防误写保护/ })).toBeNull();
     expect(within(dialog).queryByText("启用文件防误写保护")).toBeNull();
-    // The role's own answers — native on both legs, its own shaping and no
-    // filter — not the conversation's Tavily, Jina, 9 results and allowlist.
+    // Whether to reach the web at all is the caller's decision. The role has
+    // only its two legs: native search is on, and the native fetch stored for
+    // it reads off on this role's model, which has no fetch tool of its own.
+    expect(within(dialog).getByRole("switch", { name: "网页搜索已开启" })).toBeChecked();
+    expect(within(dialog).getByRole("switch", { name: "网页抓取已关闭" })).not.toBeChecked();
+    // The role's own answers — native search, its own shaping and no filter —
+    // not the conversation's Tavily, Jina, 9 results and allowlist.
     expect(within(dialog).getByRole("button", { name: "搜索提供商：原生" })).toBeInTheDocument();
-    expect(within(dialog).getByRole("button", { name: "抓取提供商：原生" })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: /^抓取提供商：/ })).toBeNull();
     // A native search has no count of its own to send, so no row asks for one.
     expect(within(dialog).queryByRole("spinbutton", { name: "结果数" })).toBeNull();
     const filter = within(dialog).getByRole("combobox", { name: "域名过滤" });
@@ -963,14 +970,21 @@ describe("AgentRoleEditor", () => {
 
     await user.click(within(dialog).getByRole("button", { name: /^搜索提供商：/ }));
     const search = screen.getByRole("menu", { name: "搜索提供商" });
+    // A leg is off by its switch, so there is no row for it in the menu.
     expect(within(search).getAllByRole("menuitemradio").map((row) => row.textContent))
-      .toEqual(["原生", "Tavily", "Jina", "不启用"]);
+      .toEqual(["原生", "Tavily", "Jina"]);
     await user.click(within(search).getByRole("menuitemradio", { name: "Tavily" }));
     // Tavily takes a result count: the role's own, under the search selector.
     expect(within(dialog).getByRole("spinbutton", { name: "结果数" })).toHaveValue(5);
-    await user.click(within(dialog).getByRole("button", { name: /^抓取提供商：/ }));
+
+    // Switching fetch on, on a model with no fetch tool of its own, names a
+    // provider that fetches rather than the native it cannot use.
+    await user.click(within(dialog).getByRole("switch", { name: "网页抓取已关闭" }));
+    expect(within(dialog).getByRole("switch", { name: "网页抓取已开启" })).toBeChecked();
+    await user.click(within(dialog).getByRole("button", { name: "抓取提供商：Jina" }));
     const fetch = screen.getByRole("menu", { name: "抓取提供商" });
     expect(within(fetch).queryByRole("menuitemradio", { name: /跟随/ })).toBeNull();
+    expect(within(fetch).getAllByRole("menuitemradio").map((row) => row.textContent)).toEqual(["Jina"]);
     await user.click(within(fetch).getByRole("menuitemradio", { name: "Jina" }));
     // Jina Reader takes a per-page token cap, which is the role's own fetch cap.
     const fetchCompression = within(dialog).getByRole("spinbutton", { name: "抓取结果压缩" });
@@ -989,9 +1003,73 @@ describe("AgentRoleEditor", () => {
     });
   });
 
+  /* The role's native fetch is its own model's: stored as the author left it,
+     read off where the model has none, and left alone by being looked at. */
+  it("reads a role's stored native fetch off on a model without one, and saves it as it was", async () => {
+    const user = userEvent.setup();
+    const onSaveRole = saveRoleMock("agent_user_reviewer");
+    renderRoles({ onSaveRole });
+    const dialog = await openRole(user, "reviewer");
+    await openPage(user, dialog, /^高级工具/);
+
+    expect(within(dialog).getByRole("switch", { name: "网页抓取已关闭" })).not.toBeChecked();
+    expect(within(dialog).queryByRole("spinbutton", { name: "抓取结果压缩" })).toBeNull();
+    // Switching search off beside it writes the leg alone: the role has no
+    // access switch of its own to take with it.
+    await user.click(within(dialog).getByRole("switch", { name: "网页搜索已开启" }));
+    await user.click(within(dialog).getByRole("switch", { name: "网页搜索已关闭" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
+
+    expect(onSaveRole.mock.calls.at(-1)![1].webSearch).toEqual(defaultAgentRoleWebSearch());
+  });
+
+  it("offers a role bound to a Messages model its native fetch, with the number it sends", async () => {
+    const user = userEvent.setup();
+    const onSaveRole = saveRoleMock("agent_user_reviewer");
+    renderRoles({
+      onSaveRole,
+      catalog: catalogWith([roleResource("agent_user_reviewer", roleBody({
+        modelSelection: { kind: "explicit", providerId: "messages-provider", modelId: "messages-model" }
+      }))])
+    });
+    const dialog = await openRole(user, "reviewer");
+    await openPage(user, dialog, /^高级工具/);
+
+    // Native on both legs: this model has a fetch tool of its own.
+    expect(within(dialog).getByRole("switch", { name: "网页搜索已开启" })).toBeChecked();
+    expect(within(dialog).getByRole("switch", { name: "网页抓取已开启" })).toBeChecked();
+    expect(within(dialog).getByRole("button", { name: "搜索提供商：原生" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "抓取提供商：原生" })).toBeInTheDocument();
+    // The number is the Messages tool's, and says it is only sent for this family.
+    const compression = within(dialog).getByRole("spinbutton", { name: "抓取结果压缩" });
+    expect(compression.closest("label.field")!.querySelector(".field__hint")!.textContent)
+      .toBe("每页上限，仅 Anthropic 家族模型会发送。");
+
+    await user.click(within(dialog).getByRole("button", { name: /^抓取提供商：/ }));
+    const menu = screen.getByRole("menu", { name: "抓取提供商" });
+    expect(within(menu).queryByText(/不启用/)).toBeNull();
+    const native = within(menu).getByRole("menuitemradio", { name: /^原生/ });
+    expect(native).toHaveAttribute("aria-haspopup", "menu");
+    await user.keyboard("{Escape}");
+
+    // Off keeps the native choice to come back to.
+    await user.click(within(dialog).getByRole("switch", { name: "网页抓取已开启" }));
+    expect(within(dialog).queryByRole("button", { name: /^抓取提供商：/ })).toBeNull();
+    expect(within(dialog).queryByRole("spinbutton", { name: "抓取结果压缩" })).toBeNull();
+    await user.click(within(dialog).getByRole("switch", { name: "网页抓取已关闭" }));
+    expect(within(dialog).getByRole("button", { name: "抓取提供商：原生" })).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
+    expect(onSaveRole.mock.calls.at(-1)![1].webSearch).toEqual(defaultAgentRoleWebSearch());
+  });
+
   it("speaks of the role's own model on the web page, not of the conversation's", async () => {
     const user = userEvent.setup();
-    renderRoles();
+    // Bound to a model with a fetch tool of its own, so both native rows have advice to give.
+    renderRoles({
+      catalog: catalogWith([roleResource("agent_user_reviewer", roleBody({
+        modelSelection: { kind: "explicit", providerId: "messages-provider", modelId: "messages-model" }
+      }))])
+    });
     const dialog = await openRole(user, "reviewer");
     await openPage(user, dialog, /^高级工具/);
 
@@ -999,6 +1077,24 @@ describe("AgentRoleEditor", () => {
     expect(within(dialog).getByText(/^原生用这个角色所跑模型自带的抓取/)).toBeInTheDocument();
     // The conversation's wording is what a conversation's own page says.
     expect(within(dialog).queryByText(/^原生用模型自带的/)).toBeNull();
+    expect(within(dialog).queryByText(/^这个模型没有自带的抓取/)).toBeNull();
+  });
+
+  it("says which provider reads pages for a role whose model has no fetch of its own", async () => {
+    const user = userEvent.setup();
+    renderRoles({
+      catalog: catalogWith([roleResource("agent_user_reviewer", roleBody({
+        webSearch: { ...defaultAgentRoleWebSearch(), fetchProvider: { kind: "explicit", providerKind: "jina" } }
+      }))])
+    });
+    const dialog = await openRole(user, "reviewer");
+    await openPage(user, dialog, /^高级工具/);
+
+    expect(within(dialog).getByText(/^这个角色所跑的模型没有自带的抓取，由所选提供商读取/)).toBeInTheDocument();
+    expect(within(dialog).queryByText(/^这个模型没有自带的抓取/)).toBeNull();
+    await user.click(within(dialog).getByRole("button", { name: /^抓取提供商：/ }));
+    expect(within(screen.getByRole("menu", { name: "抓取提供商" }))
+      .queryByRole("menuitemradio", { name: /^原生/ })).toBeNull();
   });
 
   it("offers the native tool versions when the role's own model speaks Messages", async () => {
@@ -1051,7 +1147,9 @@ describe("AgentRoleEditor", () => {
     const dialog = await openRole(user, "reviewer");
     await openPage(user, dialog, /^技能/);
 
-    expect(dialog.querySelector(".settings-page-heading")).toHaveTextContent(/只能选全局/);
+    expect(dialog.querySelector(".settings-page-heading")).toHaveTextContent("这个角色的子代理能用的技能。");
+    // The list itself shows the scope: the global level alone, no workspace section.
+    expect(within(dialog).getByRole("region", { name: "全局" })).toBeInTheDocument();
     // The role's own selection: nothing, although the conversation selects 技能甲.
     expect(within(dialog).getByRole("button", { name: "技能甲" })).toHaveAttribute("aria-pressed", "false");
     // A workspace's skill could not reach every conversation this role is
@@ -1281,5 +1379,114 @@ describe("AgentRoleEditor", () => {
 
     await user.click(within(dialog).getByRole("button", { name: "保存角色" }));
     expect(onSaveRole.mock.calls.at(-1)![1].templateId).toBe("template_minted");
+  });
+});
+
+describe("AgentRoleEditor subtitles", () => {
+  const headingOf = (dialog: HTMLElement) => dialog.querySelector(".settings-page-heading") as HTMLElement;
+  const inlineLink = (root: Element | null) => root?.querySelector("a.docs-link--inline") ?? null;
+  const fieldOf = (dialog: HTMLElement, name: string) => (
+    within(dialog).getByRole("combobox", { name }).closest(".field")
+  );
+
+  it("says what each page is for in one line, and links the role window where the caller matters", async () => {
+    const user = userEvent.setup();
+    renderRoles();
+    const dialog = await openRole(user, "reviewer");
+    const roleWindow = "https://mewrk.dev/zh-CN/agents.html#role-window";
+
+    expect(headingOf(dialog)).toHaveTextContent("名称、描述、模型与位置。");
+    expect(inlineLink(headingOf(dialog))).toHaveAttribute("href", roleWindow);
+
+    for (const [page, blurb] of [
+      [/^技能/, "这个角色的子代理能用的技能。"],
+      [/^MCP/, "这个角色的子代理可用的 MCP Server。"],
+      [/^钩子/, "这个角色的子代理运行的钩子。"],
+      [/^对话模板/, "这个角色的开局历史。"]
+    ] as const) {
+      await openPage(user, dialog, page);
+      expect(headingOf(dialog)).toHaveTextContent(blurb);
+      expect(inlineLink(headingOf(dialog))).toHaveAttribute("href", roleWindow);
+    }
+
+    // The two tool pages keep their documentation link in the heading's own slot.
+    await openPage(user, dialog, /^工具/);
+    expect(headingOf(dialog)).toHaveTextContent("这个角色能调用的工具。");
+    expect(inlineLink(headingOf(dialog))).toBeNull();
+    expect(headingOf(dialog).querySelector("a.docs-link")).toHaveAttribute(
+      "href",
+      "https://mewrk.dev/zh-CN/working.html#conversation-settings"
+    );
+    await openPage(user, dialog, /^高级工具/);
+    expect(headingOf(dialog)).toHaveTextContent("这个角色自己的联网搜索与抓取。");
+    expect(inlineLink(headingOf(dialog))).toBeNull();
+    expect(headingOf(dialog).querySelector("a.docs-link")).toHaveAttribute("href", roleWindow);
+  });
+
+  it("words the page lines in English", async () => {
+    configureI18n("en-US");
+    const user = userEvent.setup();
+    renderRoles();
+    await user.click(screen.getByRole("button", { name: "Configure role reviewer" }));
+    const dialog = screen.getByRole("dialog", { name: "reviewer" });
+    expect(headingOf(dialog)).toHaveTextContent("Name, description, model and location.");
+    expect(inlineLink(headingOf(dialog))).toHaveAttribute(
+      "href",
+      "https://mewrk.dev/en/agents.html#role-window"
+    );
+    const rail = within(dialog).getByRole("navigation", { name: "Role settings categories" });
+    await user.click(within(rail).getByRole("button", { name: /^Hooks/ }));
+    expect(headingOf(dialog)).toHaveTextContent("The hooks this role's subagents run.");
+    await user.click(within(rail).getByRole("button", { name: /^Conversation template/ }));
+    expect(headingOf(dialog)).toHaveTextContent("This role's opening history.");
+  });
+
+  it("keeps the role page's field lines to one clause each", async () => {
+    const user = userEvent.setup();
+    renderRoles();
+    const dialog = await openRole(user, "reviewer");
+
+    const description = within(dialog).getByRole("textbox", { name: "子代理描述" }).closest(".field");
+    expect(description?.querySelector(".field__hint")).toHaveTextContent("告诉主代理何时选用这个角色。");
+    expect(inlineLink(description)).toHaveAttribute("href", "https://mewrk.dev/zh-CN/agents.html#role-window");
+
+    const model = fieldOf(dialog, "执行模型");
+    expect(model?.querySelector(".field__hint")).toHaveTextContent("只列出已启用提供商的模型。");
+    expect(inlineLink(model)).toBeNull();
+
+    // "Follow the conversation" is already the select's first option.
+    expect(fieldOf(dialog, "思考程度")?.querySelector(".field__hint")).toBeNull();
+
+    const descriptions = fieldOf(dialog, "工具描述");
+    expect(descriptions?.querySelector(".field__hint")).toHaveTextContent("决定子代理的工具与提示词措辞。");
+    expect(inlineLink(descriptions)).toHaveAttribute(
+      "href",
+      "https://mewrk.dev/zh-CN/prompt-profiles.html#apply"
+    );
+
+    // An existing role's location is its file; there is nothing left to explain.
+    expect(within(dialog).getByText(globalReviewer.location).closest(".field")?.querySelector(".field__hint")).toBeNull();
+  });
+
+  it("explains a new role's location in one clause", async () => {
+    const user = userEvent.setup();
+    renderRoles();
+    const dialog = await openCreate(user);
+    expect(fieldOf(dialog, "位置")?.querySelector(".field__hint")).toHaveTextContent("决定哪些对话能选它，保存后不可改。");
+  });
+
+  it.each([
+    ["技能", /^技能/, "skills", "尚未发现技能"],
+    ["MCP", /^MCP/, "mcp", "尚未发现 MCP Server"],
+    ["钩子", /^钩子/, "hooks", "尚未发现钩子"]
+  ] as const)("points an empty %s list at where entries are written", async (_label, page, slug, title) => {
+    const user = userEvent.setup();
+    renderRoles({ catalog: { ...catalogWith(), skills: [], mcps: [], hooks: [] } });
+    const dialog = await openRole(user, "reviewer");
+    await openPage(user, dialog, page);
+
+    const empty = within(dialog).getByText(title).parentElement as HTMLElement;
+    expect(empty).toHaveTextContent("添加后会自动出现在这里。");
+    expect(inlineLink(empty)).toHaveAttribute("href", `https://mewrk.dev/zh-CN/${slug}.html#location`);
   });
 });

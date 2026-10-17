@@ -59,7 +59,8 @@ interface SearchProviderFieldProps {
 /**
  * Shared search-provider picker for conversations, presets and subagent roles.
  *
- * Lists only catalog entries that both do keyword search and are switched on:
+ * Drawn only while the search switch above it is on, so it has no "off" row of
+ * its own. Lists only catalog entries that both do keyword search and are switched on:
  * a fetch-only provider cannot satisfy this selection, and a disabled one is
  * not a choice — offering it greyed out would make the menu a list of things
  * that do not work. A selection naming a provider that has since been switched
@@ -129,13 +130,7 @@ export function SearchProviderField({
         label: provider.label,
         checked: value.kind === "explicit" && value.providerKind === provider.kind,
         onSelect: () => onChange({ kind: "explicit", providerKind: provider.kind })
-      })),
-      {
-        id: "disabled",
-        label: offLabel,
-        checked: value.kind === "disabled",
-        onSelect: () => onChange({ kind: "disabled" })
-      }
+      }))
     ]
   }];
 
@@ -145,12 +140,12 @@ export function SearchProviderField({
     label={t("搜索提供商", "Search provider")}
     hint={lockedFieldHint(lock, hint ?? (subject === "role"
       ? t(
-        "原生用这个角色所跑模型自带的搜索；选提供商则由 Mewrk 代为检索。",
-        "Native uses the built-in search of the model this role runs on; with a provider, Mewrk searches instead."
+        "原生用这个角色所跑模型自带的搜索。",
+        "Native uses the built-in search of the model this role runs on."
       )
       : t(
-        "原生用模型自带的搜索；选提供商则由 Mewrk 代为检索。",
-        "Native uses the model's own search; with a provider, Mewrk searches instead."
+        "原生用模型自带的搜索。",
+        "Native uses the model's own search."
       )))}
   >
     <PopoverMenu

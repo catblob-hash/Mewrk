@@ -19,6 +19,7 @@ import {
   normalizePastedText,
   parseDraftClipboard,
   pastedTextExtraLines,
+  pastedTextIdMark,
   pastedTextRangeAround,
   pastedTextRanges,
   type DraftClipboard,
@@ -184,10 +185,11 @@ export function usePastedTextTags({
 
   const labelFor = useCallback<PastedTextLabeler>((id, extraLines) => {
     const name = extraLines > 0
-      ? t("粘贴文本 #{id} +{lines} 行", "Pasted text #{id} +{lines} lines", { id, lines: extraLines })
-      : t("粘贴文本 #{id}", "Pasted text #{id}", { id });
-    // No-break spaces pad the tag and keep a label from wrapping partway through.
-    return `${NBSP}${name.replace(/ /g, NBSP)}${NBSP}`;
+      ? t("粘贴文本 +{lines} 行", "Pasted text +{lines} lines", { lines: extraLines })
+      : t("粘贴文本", "Pasted text");
+    // No-break spaces pad the tag and keep a label from wrapping partway through; the
+    // number is carried invisibly, so tags that read alike stay distinct.
+    return `${NBSP}${name.replace(/ /g, NBSP)}${pastedTextIdMark(id)}${NBSP}`;
   }, [t]);
 
   useEffect(() => {
