@@ -756,6 +756,22 @@ impl Terminal {
                 self.select_all();
                 continue;
             }
+            // Control is the shell's on Windows, so its terminals paste and copy with Shift held too, as Windows Terminal does.
+            if cfg!(windows) && press.ctrl && press.shift && !press.alt {
+                match press.key {
+                    Key::Char(c) if c.eq_ignore_ascii_case(&'v') => {
+                        if let Some(text) = ui.clipboard.get() {
+                            self.paste(&text);
+                        }
+                        continue;
+                    }
+                    Key::Char(c) if c.eq_ignore_ascii_case(&'c') => {
+                        self.copy(ui);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             if press.cmd && !press.ctrl {
                 match press.key {
                     Key::Char(c) if c.eq_ignore_ascii_case(&'v') => {

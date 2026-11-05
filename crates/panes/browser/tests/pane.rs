@@ -49,6 +49,8 @@ fn start() -> Rig {
     // SAFETY: serialized by `SERIAL`, before this test's threads read the environment.
     unsafe {
         std::env::set_var("HOME", &home);
+        // Where `std::env::home_dir` looks on Windows.
+        std::env::set_var("USERPROFILE", &home);
         std::env::set_var("LANG", "en_US.UTF-8");
     }
     set_theme(Theme::dark());

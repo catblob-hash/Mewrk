@@ -74,6 +74,40 @@ pub fn shell_nav(app: &mut App, sidebar_open: bool, sidebar_width: f32) -> E {
     drag_region(row().key("shell-nav").absolute().top(0.0).left(inset).w(width).h(TOPBAR_HEIGHT).items_center().gap(NAV_GAP).child(drawer).child(back).child(forward).child(search))
 }
 
+const CAPTION_BUTTON: f32 = 32.0;
+const CAPTION_GAP: f32 = 2.0;
+const CAPTION_INSET: f32 = 12.0;
+
+/// `--window-caption-width`: what the Windows caption buttons take of the top row's right end.
+pub fn window_caption_width() -> f32 {
+    if cfg!(windows) { 3.0 * CAPTION_BUTTON + 2.0 * CAPTION_GAP + CAPTION_INSET } else { 0.0 }
+}
+
+/// `WindowCaptionControls`: minimize, maximize and close for the frameless Windows window, the top bar's own size of button,
+/// with a red close. Over the window's top right corner, above the dialogs' dimming as the system's own would be.
+pub fn window_caption(app: &mut App) -> Option<E> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let t_ = theme();
+    let button = |key: &'static str, name: &'static str, size: f32, label: &'static str| row().key(key).center().size(CAPTION_BUTTON, CAPTION_BUTTON).radius(6.0).hover_bg(t_.subtle_hover).press_bg(t_.subtle_pressed).shrink0().tooltip(label).child(icon(name, size).color(t_.text_secondary));
+    let minimize = button("window-caption-minimize", "Minus", 16.0, t("最小化", "Minimize")).on_click(|app: &mut App| {
+        app.window.minimize = true;
+        repaint();
+    });
+    let (name, size, label) = if app.window_maximized { ("Copy", 13.0, t("向下还原", "Restore")) } else { ("Square", 12.0, t("最大化", "Maximize")) };
+    let maximize = button("window-caption-maximize", name, size, label).on_click(|app: &mut App| {
+        app.window.zoom = true;
+        repaint();
+    });
+    let close = row().key("window-caption-close").center().size(CAPTION_BUTTON, CAPTION_BUTTON).radius(6.0).hover_bg(t_.critical).press_bg(t_.critical).shrink0().tooltip(t("关闭", "Close")).child(icon("X", 16.0).color(t_.text_secondary)).on_click(|app: &mut App| {
+        app.window.close = true;
+        repaint();
+    });
+    // The gaps around the buttons belong to the title bar, so they move the window.
+    Some(drag_region(row().key("window-caption").absolute().top(0.0).right(0.0).w(window_caption_width()).h(TOPBAR_HEIGHT).pr(CAPTION_INSET).items_center().justify_end().gap(CAPTION_GAP).child(minimize).child(maximize).child(close)))
+}
+
 pub use mewrk_ui_common::brand::{BRAND_ORANGE, MARK_HEIGHT, MARK_PATH, MARK_WIDTH};
 
 fn hex_of(c: Color) -> String {

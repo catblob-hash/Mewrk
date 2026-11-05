@@ -1,6 +1,6 @@
 # Mewrk 原生版
 
-[Mewrk 1.0](https://github.com/catblob-hash/Mewrk-previous)（已废弃的 Tauri 版）的纯 Rust 重写，界面和功能与原版对齐，样式保持 Fluent。目前只在 macOS 上运行过。
+[Mewrk 1.0](https://github.com/catblob-hash/Mewrk-previous)（已废弃的 Tauri 版）的纯 Rust 重写，界面和功能与原版对齐，样式保持 Fluent。在 macOS 和 Windows 上运行过。
 
 ## 运行
 
@@ -14,7 +14,9 @@
 open target/release/Mewrk.app
 ```
 
-第一次打开后，到 **设置 → 模型供应商** 添加一个供应商。数据放在 `~/Library/Application Support/dev.mewrk.native`，格式和原版相同（`document.v1.json` 加 `conversations.v1.sqlite3`）。
+Windows 上，在 Git Bash 里运行 `./scripts/package-windows.sh` 生成安装包，或者 `cargo run -p mewrk` 直接运行。不需要下载 Chromium：预览面板用系统的 WebView2 运行时。
+
+第一次打开后，到 **设置 → 模型供应商** 添加一个供应商。数据放在 `~/Library/Application Support/dev.mewrk.native`（Windows 上是 `%APPDATA%\dev.mewrk.native`），格式和原版相同（`document.v1.json` 加 `conversations.v1.sqlite3`）。
 
 调试时用 `MEWRK_DATA_DIR` 把数据放到别处。`--headless --shot x.png` 不开窗口渲染一帧，`--scene NAME` 选一个界面场景，场景列表见 `src/scenes.rs`，`--right-click XxY` 在截图前按一次右键。`MEWRK_TRACE=1` 把每一帧的开销打到 stderr，`MEWRK_ANIMATE=1` 让窗口不停地画，`--fullscreen-test` 每 4 秒切一次全屏。
 
@@ -45,6 +47,18 @@ open target/release/Mewrk.app
 - **PDF 附件。** 用系统的 PDFKit 取文字，所以只有 macOS 能用，其他平台会拒收。
 - **版本更新。** 这个版本从 1.0.0 开始有发布，但还没有自己的更新清单：GitHub 连不上时，退回的 `dl.mewrk.dev/latest.json` 写的是原版的 1.0.3，比它高，还指向原版的安装包。所以这一页把检查关了（`UpdatesPage::release_channel`），等有自己的清单再打开。这一页也没有原版的 AI SDK 组件卡片：模型层在进程内，没有要安装的组件。
 - **公式。** 自写的 TeX 排版，不是 MathJax，字形也来自系统的数学字体。原版加载的 29 个宏包定义的 1564 个名字，`crates/ui/common/tests/suite/math_packages.rs` 逐条核对过都有含义，`\ce` 和 `\pu` 是 `mhchemParser` 的移植；`textmacros` 里的 `\href`、`\style`、`\class`、`\data`、`\cssId` 和原版一样标红。还差：`flalign`、`xalignat` 不撑满整列；`p{...}` 列和 `\parbox` 只占宽度，不会自动折行；`\hfill` 和 `\breakAlign` 不起作用；`\shortvdotswithin` 不收紧行距；`\Newextarrow` 的箭头不拉伸字形，只画一条线加箭头。
+
+**Windows。** 窗口没有系统边框，顶栏就是标题栏，按钮是自己画的（和原版一样）；关闭窗口后留在通知区域，从图标菜单退出。和 macOS 比，下面这些还没有：
+
+- **PDF。** 预览和附件都依赖 PDFKit：文件面板只显示文件卡片，附件会被拒收。
+- **HTML 预览。** 不跑网页引擎，画的是原生的简化版。
+- **音频预览的播放。** 能解码和显示波形，但没有播放控件。
+- **动态背景。** 只支持图片，选择器里不列视频。解码视频用的是 AVFoundation。
+- **HEIC、AVIF 图片。** 依赖系统的 ImageIO，这两种格式打不开。
+- **Android 屏幕的 H.264 流。** 依赖 VideoToolbox，回退到 `screencap`。
+- **拼写检查。** 见上文。
+
+安装包没有 Authenticode 签名，第一次运行时 SmartScreen 会提示。
 
 **Vertex。** 外部账号的 `certificate` 凭据来源不支持，它需要双向 TLS。其余凭据类型都支持，但只对过假服务器。
 
@@ -86,6 +100,12 @@ HTML 查看页和它的 HTTP 服务还在，直接打开那个地址时仍然能
 
 对照原版的机械检查：原版 2826 条界面文案，这里缺 60 条，都是已经不存在的东西：Claude Agent 的下载面板、AI SDK 更新卡片、自定义 CSS、浏览器预览专用的提示、Windows 标题栏按钮。前端调用的 161 个宿主命令只缺 3 个，就是 Claude Agent 的安装、更新和取消，换成了 `claude_agent_cli_status`。
 
+**Windows（Windows 11，x64）。** 真实窗口里用真实鼠标和按键走过：窗口的最小化、最大化、关闭到通知区域和从图标菜单退出；重复启动时唤起已有窗口；模型工具（读、写，写入要批准）和窗口隐藏时跑完一轮；PowerShell 终端里输入中文、`Ctrl+C` 中断程序；系统文件夹选择框、新建项目、审阅面板看差异（含 CRLF 文件）、文件面板打开文件；预览面板打开本地页面、在页面里点击和输入、菜单盖在页面上、面板缩放和应用缩放时页面跟着走。`crates/panes/browser/examples/win_engine.rs` 单独走一遍 WebView2 引擎的每个调用，有截图为证。
+
+Windows 上的 `cargo test --workspace`（不含没进应用的 `mewrk-core`、`chaos`、`stress`，以及测试只写了 Unix 版的 `mewrk-term`）：7482 个通过，27 个失败，74 个忽略。失败的都是测试本身写死了 Unix：硬编码 `zsh`、`/tmp`、把 `\\?\` 路径交给 Git Bash。
+
+安装包在非管理员下装到临时目录、运行、卸载过，界面和语言看过；**以管理员身份实际装到 `Program Files`、写注册表和快捷方式、卸载旧版这一路没有跑过**。
+
 **没有验证过的：**
 
 - **真实模型。** 只对过本地模拟服务器和差分测试，没有连过真实服务。Claude Agent 用的是真实 CLI，但上游是本地的，没有用过真实登录。
@@ -94,7 +114,9 @@ HTML 查看页和它的 HTTP 服务还在，直接打开那个地址时仍然能
 - **拼写检查的波浪线和右键菜单，还有烘好的玻璃。** 都只看过无窗口截图，没有在真实窗口里看过。截图和 `spell.rs` 的测试问的是真的 `NSSpellChecker`；菜单是脚本按的右键；忽略和学习只对假的检查器跑过，没有写过真实词典。
 - **系统文件对话框和拖放。** 代码路径用脚本测过，没有经过真实系统界面。
 - **SSH 和 WSL。** 没有连过真实机器。
-- **Windows 和 Linux。** 没有运行过。
+- **Windows 上的高 DPI 和多显示器。** 只在 100% 缩放的单显示器上跑过。预览页面的位置在应用自身缩放下验证过，按系统 DPI 换算的路径是同一段代码，但没有实机验证。
+- **Windows 上的真实输入法和屏幕阅读器。** 中文只用 `SendInput` 的 Unicode 字符输入过，没有经过输入法的组字；讲述人没有跑过。
+- **Linux。** 没有运行过。
 - **真实手机和真实 VNC 服务器。** 本机没有 adb、设备和 WebDriverAgent。Android 流、iOS 流和设备上的输入都没有连过真机。旋转手机时流会重开，这段逻辑也只靠推理。
 
 ## 许可证

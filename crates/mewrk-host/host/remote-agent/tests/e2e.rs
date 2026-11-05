@@ -1202,6 +1202,9 @@ fn a_loopback_connection_is_relayed_and_survives_a_dropped_link() {
             writer.write_all(line.to_uppercase().as_bytes()).unwrap();
             line.clear();
         }
+        // Said outright: on Windows `try_clone` makes an inheritable socket, and the proxy this process started for the new link holds a
+        // copy of it, so closing ours would not end the connection until that proxy exits.
+        let _ = writer.shutdown(std::net::Shutdown::Both);
     });
     let mut connect = spec_of(
         "net1",

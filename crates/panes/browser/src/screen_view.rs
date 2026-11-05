@@ -149,7 +149,7 @@ fn key_event(key: &str, code: &str, down: bool) -> ViewerEvent {
 /// One whole press, modifiers around it. There are no key-up events to forward here, so a press goes
 /// down and comes up at once.
 fn press_events(press: &KeyPress, key: &str, code: &str) -> Vec<ViewerEvent> {
-    let modifiers: Vec<(&str, &str)> = [(press.ctrl, "Control", "ControlLeft"), (press.cmd, "Meta", "MetaLeft"), (press.alt, "Alt", "AltLeft"), (press.shift, "Shift", "ShiftLeft")].into_iter().filter(|(on, ..)| *on).map(|(_, name, code)| (name, code)).collect();
+    let modifiers: Vec<(&str, &str)> = [(press.ctrl, "Control", "ControlLeft"), (press.cmd && !cfg!(windows), "Meta", "MetaLeft"), (press.alt, "Alt", "AltLeft"), (press.shift, "Shift", "ShiftLeft")].into_iter().filter(|(on, ..)| *on).map(|(_, name, code)| (name, code)).collect();
     let mut events = Vec::with_capacity(modifiers.len() * 2 + 2);
     events.extend(modifiers.iter().map(|(name, code)| key_event(name, code, true)));
     events.push(key_event(key, code, true));

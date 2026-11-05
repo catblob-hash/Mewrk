@@ -124,6 +124,9 @@ fn is_mainland_china_locale() -> bool {
         if !env.is_empty() && !env.starts_with('C') {
             return env;
         }
+        #[cfg(windows)]
+        return mewrk_client::i18n::windows_locale_name();
+        #[cfg(not(windows))]
         std::process::Command::new("defaults").args(["read", "-g", "AppleLocale"]).output().ok().map_or_else(String::new, |o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
     });
     let lowered = locale.to_lowercase().replace('-', "_");

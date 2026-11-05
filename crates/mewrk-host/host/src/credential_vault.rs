@@ -364,7 +364,7 @@ fn shared_vault() -> keyring::Result<&'static Vault> {
     static VAULT: OnceLock<Option<Vault>> = OnceLock::new();
     VAULT
         .get_or_init(|| {
-            let directory = dirs::home_dir()?.join(".mewrk").join("credential-vault");
+            let directory = std::env::home_dir()?.join(".mewrk").join("credential-vault");
             Some(Vault::at(&directory))
         })
         .as_ref()

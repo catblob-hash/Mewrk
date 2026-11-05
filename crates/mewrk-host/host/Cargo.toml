@@ -92,8 +92,8 @@ num-bigint = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
-webview2-com = "0.38.2"
-windows-core = "0.61.2"
+webview2-com = "0.39.1"
+windows-core = "0.62"
 # Deliberately minimal. Mewrk has no desktop-automation line at all, so the
 # shipped binary must not even be able to reach the APIs one would need: no
 # Graphics_Capture / WinRT Direct3D (Windows Graphics Capture), no

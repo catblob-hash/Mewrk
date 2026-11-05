@@ -788,7 +788,8 @@ pub fn diff(workspace: &Path, request: GitDiffRequest) -> Result<GitDiffResponse
         args.push(OsString::from("--no-index"));
         args.push(OsString::from("--"));
         args.push(OsString::from("/dev/null"));
-        args.push(absolute.into_os_string());
+        // Git for Windows can't open a path spelled the way `canonicalize` spells it there.
+        args.push(git_cli_environment_path(&absolute));
     } else {
         match &request {
             GitDiffRequest::Working { .. } => {
@@ -6356,11 +6357,14 @@ mod tests {
         assert!(!write_changes_repository(&outside.path().join("scratch.txt")));
     }
 
+    // Every one of these drops GIT_CONFIG_NOSYSTEM, as `configure_cli_environment` does for the code under test: if only this side saw it,
+    // a system config with `core.autocrlf` would have the code check files out with CRLF, and this side call those local changes.
     fn run_test_git(root: &Path, args: &[&str]) {
         let git = find_program("git").expect("Git is available");
         let output = Command::new(git)
             .current_dir(root)
             .args(args)
+            .env_remove("GIT_CONFIG_NOSYSTEM")
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .unwrap();
@@ -6377,6 +6381,7 @@ mod tests {
         let output = Command::new(git)
             .current_dir(root)
             .args(args)
+            .env_remove("GIT_CONFIG_NOSYSTEM")
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .unwrap();
@@ -6395,6 +6400,7 @@ mod tests {
             .current_dir(root)
             .args(args)
             .env("GIT_INDEX_FILE", git_cli_environment_path(index))
+            .env_remove("GIT_CONFIG_NOSYSTEM")
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .unwrap();
@@ -6458,6 +6464,25 @@ mod tests {
         (repository, base)
     }
 
+    #[test]
+    fn an_untracked_file_is_diffed_against_nothing() {
+        if !git_available() {
+            return;
+        }
+        let repository = initialized_repository();
+        fs::write(repository.path().join("new.txt"), "one\ntwo\n").unwrap();
+        let response = diff(
+            repository.path(),
+            GitDiffRequest::Working {
+                path: Some("new.txt".into()),
+                context: None,
+            },
+        )
+        .unwrap();
+        assert_eq!((response.additions, response.deletions), (2, 0), "{}", response.patch);
+        assert!(response.patch.contains("+one"), "{}", response.patch);
+    }
+
     /// Merges `feature/conflict` into the checked-out branch of a
     /// `repository_with_merge_conflict`, which stops on the conflict.
     fn start_conflicted_merge(root: &Path) {
@@ -6465,6 +6490,7 @@ mod tests {
         let output = Command::new(git)
             .current_dir(root)
             .args(["merge", "--no-edit", "feature/conflict"])
+            .env_remove("GIT_CONFIG_NOSYSTEM")
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .unwrap();

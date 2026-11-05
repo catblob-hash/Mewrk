@@ -263,7 +263,7 @@ impl AnsiView {
         }
         if ui.mem.focus == id {
             for press in &input.keys {
-                if press.cmd && !press.ctrl && !press.alt && !press.shift {
+                if press.cmd && !press.alt && !press.shift {
                     match press.key {
                         Key::Char(c) if c.eq_ignore_ascii_case(&'c') => {
                             if let Some(text) = self.selection_text() {

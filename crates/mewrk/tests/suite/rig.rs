@@ -108,6 +108,8 @@ impl Rig {
         // SAFETY: tests here run one at a time, under `SERIAL`.
         unsafe {
             std::env::set_var("HOME", &home);
+            // Where `std::env::home_dir` looks on Windows.
+            std::env::set_var("USERPROFILE", &home);
         }
         set_theme(Theme::dark());
         let mut app = App::start(StartOptions { identifier: "mewrk.test".into(), version: "0.0.0".into(), data_dir: dir.clone(), resource_dir: None, wake: Arc::new(|| {}), exit: Arc::new(|_| {}), show_window: Arc::new(|| {}) }).map_err(|e| format!("{e:?}")).unwrap();

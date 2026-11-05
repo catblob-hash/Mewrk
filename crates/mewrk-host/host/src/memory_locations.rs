@@ -14,7 +14,7 @@ impl MemoryLocationRoots {
     pub(crate) fn for_host() -> Self {
         Self {
             managed_mewrk: managed_instruction_path(),
-            home: dirs::home_dir(),
+            home: std::env::home_dir(),
         }
     }
 

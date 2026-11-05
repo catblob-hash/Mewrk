@@ -39,7 +39,7 @@ fn install_cli_session(provider_id: &str) {
     let path = std::env::var(AUTH_ENV)
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            dirs::home_dir()
+            std::env::home_dir()
                 .expect("home directory")
                 .join(".codex")
                 .join("auth.json")

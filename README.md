@@ -8,13 +8,13 @@ Mewrk is a desktop coding agent that lets you steer what the model sees and does
 
 This repository is the rewrite in Rust. The interface, the host and the model layer run in one native process, with no web renderer and no Node sidecar. It matches the features and structure of Mewrk 1.0, and its styling is Fluent.
 
-**Status: 1.0.0, the rewrite's first release.** [Download the DMG](https://github.com/catblob-hash/Mewrk/releases/tag/v1.0.0) for Apple silicon and macOS 13 or later; it is signed and notarized. There is no update channel yet, so the app won't tell you about newer versions. It has only been run on macOS on Apple silicon, and only against local mock providers. It has not been tested against real model APIs, Windows or Linux. [crates/mewrk/README.md](crates/mewrk/README.md) (in Chinese) lists what has been verified and what hasn't.
+**Status: 1.0.0, the rewrite's first release.** [Download the installer](https://github.com/catblob-hash/Mewrk/releases/tag/v1.0.0) for 64-bit Windows 10 or 11. It is not signed, so SmartScreen warns before it runs. On macOS, build from source for now. There is no update channel yet, so the app won't tell you about newer versions. It has been run on macOS on Apple silicon and on Windows 11, and only against local mock providers. It has not been tested against real model APIs or on Linux. [crates/mewrk/README.md](crates/mewrk/README.md) (in Chinese) lists what has been verified and what hasn't, and what the Windows version doesn't have yet.
 
 ![The Mewrk window with a finished task, a terminal, the file browser and the review pane open](docs/img/mewrk-window.png)
 
 ## Build from source
 
-You need macOS on Apple silicon, stable Rust, the Xcode Command Line Tools, `cmake` and `ninja`.
+On macOS you need Apple silicon, stable Rust, the Xcode Command Line Tools, `cmake` and `ninja`.
 
 ```bash
 ./scripts/bundle-macos.sh
@@ -23,7 +23,15 @@ open target/release/Mewrk.app
 
 The first build downloads the Chromium Embedded Framework (about 460 MB unpacked) into `.cef`. The script signs with `$APPLE_SIGNING_IDENTITY` if it is set, and ad hoc if not. `./scripts/release-macos.sh` builds the notarized DMG in `target/dist`, for any Apple silicon Mac rather than only the one building it.
 
-Add a provider under **Settings → Providers → Model providers**. Data is kept in `~/Library/Application Support/dev.mewrk.native`, in the same format as Mewrk 1.0.
+On Windows you need stable Rust with the MSVC toolchain, the Windows SDK, Python and [NSIS](https://nsis.sourceforge.io) 3. From Git Bash:
+
+```bash
+./scripts/package-windows.sh
+```
+
+That builds the installer in `target/dist`. `cargo run -p mewrk` runs the app without one. The preview pane uses the WebView2 Runtime that comes with Windows, so nothing is downloaded for it.
+
+Add a provider under **Settings → Providers → Model providers**. Data is kept in `~/Library/Application Support/dev.mewrk.native` on macOS and `%APPDATA%\dev.mewrk.native` on Windows, in the same format as Mewrk 1.0.
 
 ## Layout
 

@@ -242,8 +242,14 @@ pub fn publish_bounds(app: &mut App, session_id: &str, body: Rect, reserved_bott
     let Some(intent) = controller(app).current_intent(session_id).filter(|intent| intent.desired == BrowserIntentDesired::Open) else {
         return;
     };
+    // The page is the window's child, and the window's units know nothing of the app's zoom.
+    let zoom = app.window_zoom;
     let runtime = app.local::<PageRuntime>();
-    let bounds = page_bounds(body, reserved_bottom, bottom_corner_radius);
+    let mut bounds = page_bounds(body, reserved_bottom, bottom_corner_radius);
+    bounds.x *= f64::from(zoom);
+    bounds.y *= f64::from(zoom);
+    bounds.width *= f64::from(zoom);
+    bounds.height *= f64::from(zoom);
     let queue = runtime.bounds.entry(session_id.to_owned()).or_default();
     if queue.last == Some(bounds) {
         return;

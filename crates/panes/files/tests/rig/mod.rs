@@ -101,8 +101,9 @@ impl Rig {
         std::fs::write(path, content).unwrap();
     }
 
+    /// A path as the pane spells it, which is not how `canonicalize` spells it on Windows.
     pub fn path(&self, relative: &str) -> String {
-        self.root.join(relative).to_string_lossy().into_owned()
+        browser::browse_path(&self.root.join(relative).to_string_lossy())
     }
 
     pub fn frame(&mut self) {

@@ -133,7 +133,7 @@ pub fn workspace_key(location: &AttachedWorkspace) -> String {
 impl ConfigLevel {
     /// The global level, `~`; `None` when the platform has no home directory.
     pub fn user() -> Option<Self> {
-        dirs::home_dir().map(|home| Self {
+        std::env::home_dir().map(|home| Self {
             source: ResourceSource::User,
             base: home,
             workspace: None,
@@ -1450,7 +1450,7 @@ impl WorkspacePlaces {
 /// one declared `"workspace": true` gets an instance in each workspace here
 /// that a call names. Hooks are placed when they run ([`place_hooks`]).
 pub(crate) fn place_in_workspace(request: &mut crate::model::RunModelRequest, has_workspace: bool) {
-    let home = dirs::home_dir().map(|home| home.to_string_lossy().into_owned());
+    let home = std::env::home_dir().map(|home| home.to_string_lossy().into_owned());
     let mut local_folders = request
         .workspaces
         .entries()
@@ -2367,7 +2367,7 @@ pub(crate) fn mcp_probe_server(
                 .find(|level| level.is_local() && level.workspace_key().as_deref() == Some(key))
         })
         .map(|level| level.base.to_string_lossy().into_owned());
-    let home = dirs::home_dir().map(|home| home.to_string_lossy().into_owned());
+    let home = std::env::home_dir().map(|home| home.to_string_lossy().into_owned());
     let mut server = RuntimeMcpServer::from_config(&config);
     server.default_working_directory(workspace_dir.or(home).as_deref(), None);
     Ok(server)

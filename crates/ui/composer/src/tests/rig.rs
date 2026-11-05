@@ -164,6 +164,8 @@ impl Rig {
         // SAFETY: the first thing any rig does, before a host thread exists to read the environment.
         ENVIRONMENT.call_once(|| unsafe {
             std::env::set_var("HOME", &home.0);
+            // Where `std::env::home_dir` looks on Windows.
+            std::env::set_var("USERPROFILE", &home.0);
             std::env::set_var("MEWRK_LANG", "en");
         });
         std::mem::forget(home);

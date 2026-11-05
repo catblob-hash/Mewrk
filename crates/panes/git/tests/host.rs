@@ -30,7 +30,9 @@ fn fresh_dir(tag: &str) -> PathBuf {
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git").args(args).current_dir(repo).env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").output().unwrap();
+    // The host's git never sees this variable, so this one mustn't either: with a system config that sets `core.autocrlf`, as Git for
+    // Windows' does, the host would check files out with CRLF and this one would commit that as a change.
+    let out = Command::new("git").args(args).current_dir(repo).env_remove("GIT_CONFIG_NOSYSTEM").env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").output().unwrap();
     assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -77,7 +79,11 @@ fn start(seed: impl FnOnce(&Path)) -> (Rig, App) {
         "capabilities": { "skills": [], "mcps": [] },
     });
     std::fs::write(dir.join("document.v1.json"), serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-    unsafe { std::env::set_var("HOME", &home) };
+    unsafe {
+        std::env::set_var("HOME", &home);
+        // Where `std::env::home_dir` looks on Windows.
+        std::env::set_var("USERPROFILE", &home);
+    }
     set_theme(Theme::dark());
     set_window_size(WIN.0, WIN.1);
     let app = App::start(StartOptions { identifier: "mewrk.test".into(), version: "0.0.0".into(), data_dir: dir, resource_dir: None, wake: Arc::new(|| {}), exit: Arc::new(|_| {}), show_window: Arc::new(|| {}) }).map_err(|e| format!("{e:?}")).unwrap();
@@ -253,7 +259,8 @@ fn stage_unstage_and_discard_change_the_repository_and_the_listing_follows() {
     assert_eq!(c.file_actions("src/app.ts").iter().find(|a| a.id == "discard").unwrap().label, "确认丢弃未暂存更改");
     act(&mut rig, &mut app, &mut view, "src/app.ts", "discard");
     until(&mut rig, &mut app, &mut view, "the file to go from the list", &mut |app| listed(app) == ["README.md"]);
-    assert_eq!(read(&rig.repo, "src/app.ts"), "const keep = 1;\nconst old = 2;\nconst tail = 3;\n");
+    // Under `core.autocrlf`, git writes it back with CRLF.
+    assert_eq!(read(&rig.repo, "src/app.ts").replace("\r\n", "\n"), "const keep = 1;\nconst old = 2;\nconst tail = 3;\n");
     assert!(read(&rig.repo, "draft.txt").contains("untracked"), "and it touched nothing else");
 }
 
@@ -493,7 +500,10 @@ fn branches_are_listed_and_a_checkout_moves_head_through_the_same_write() {
         frame(&mut rig, &mut app, &mut view);
         std::thread::sleep(Duration::from_millis(5));
     }
-    for _ in 0..50 {
+    // HEAD moves before the host has read the snapshot and answered, which takes a while where starting a process is slow.
+    let start = Instant::now();
+    while refreshed.get() == 0 {
+        assert!(start.elapsed() < Duration::from_secs(20), "the checkout's snapshot is read again either way");
         frame(&mut rig, &mut app, &mut view);
         std::thread::sleep(Duration::from_millis(2));
     }

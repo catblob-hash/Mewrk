@@ -28,3 +28,11 @@ accesskit.workspace = true
 objc2.workspace = true
 objc2-foundation = { workspace = true, features = ["NSRunLoop", "NSDate", "NSObjCRuntime", "NSString"] }
 objc2-app-kit.workspace = true
+
+# `examples/win_engine`: a real window with a real GPU surface, and what it takes to read back what the engine did.
+[target.'cfg(windows)'.dev-dependencies]
+pollster.workspace = true
+webview2-com = "0.39.1"
+wgpu.workspace = true
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+winit.workspace = true

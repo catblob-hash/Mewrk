@@ -353,7 +353,8 @@ fn discard_asks_inside_the_pane_first() {
     let confirm_y = PANE.bottom() - 42.0 - 68.0 + 32.0 + 14.0;
     click(&mut rig, &mut pane, PANE.right() - 10.0 - 42.0, confirm_y);
     until(&mut rig, &mut pane, "the discard", |p| p.settled() && p.file_count() == 0);
-    assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "fn main() {\n    let a = 1;\n}\n");
+    // Under `core.autocrlf`, git writes it back with CRLF.
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap().replace("\r\n", "\n"), "fn main() {\n    let a = 1;\n}\n");
     assert_eq!(pane.error(), None);
 }
 
@@ -915,6 +916,7 @@ fn the_breadcrumb_walks_up_and_a_missing_directory_is_said_quietly() {
     assert!(pane.tree().is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn clicking_a_breadcrumb_goes_there() {
     // A short path, so that all of it fits: "/" then "usr" then "bin".

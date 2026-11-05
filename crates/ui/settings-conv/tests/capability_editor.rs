@@ -36,8 +36,7 @@ fn open(tag: &str, page: Page) -> (Rig, App) {
 fn save_and_wait(rig: &mut Rig, app: &mut App, kind: CatalogKind, scope: &str) {
     let window = ("capability-editor-frame", kind.wire(), scope);
     rig.click(app, &view, button_key(kind, scope, "save"));
-    let frame = hash_key(window);
-    rig.until(app, &view, "the window to close", move |_| fluent::el::rect_of(frame).is_none());
+    rig.until(app, &view, "the window to close", move |_| fluent::el::rect_of(window).is_none());
 }
 
 /// A window reads its file through the host, so what it holds arrives a few frames later.

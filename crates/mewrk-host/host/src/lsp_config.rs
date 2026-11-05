@@ -317,7 +317,7 @@ pub fn servers_for_workspace(
             None,
         ));
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = std::env::home_dir() {
         levels.push(read_file(
             &crate::capabilities::config_path_for(&home, crate::capabilities::CapabilityKind::Lsp),
             ResourceSource::User,

@@ -169,7 +169,7 @@ fn disk_access() -> DiskAccess {
     if !cfg!(target_os = "macos") {
         return DiskAccess::NotApplicable;
     }
-    disk_access_from(&protected_files(dirs::home_dir().as_deref()))
+    disk_access_from(&protected_files(std::env::home_dir().as_deref()))
 }
 
 /// `Mewrk.app` when the executable is the one inside `Mewrk.app/Contents/MacOS`.

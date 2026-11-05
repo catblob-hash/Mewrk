@@ -11,6 +11,9 @@ pub mod glass;
 pub mod menu;
 #[cfg(target_os = "macos")]
 pub mod native;
+#[cfg(windows)]
+#[path = "native_win.rs"]
+pub mod native;
 pub mod pane_tiles;
 pub mod panes;
 pub mod root;

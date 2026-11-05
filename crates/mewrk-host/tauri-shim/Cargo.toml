@@ -3,7 +3,7 @@ name = "mewrk-tauri-shim"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "The narrow part of Tauri's API the Mewrk host uses, with WKWebView as the page engine on macOS, so the host's code stays unchanged."
+description = "The narrow part of Tauri's API the Mewrk host uses, with WKWebView on macOS and WebView2 on Windows as the page engine, so the host's code stays unchanged."
 
 [lib]
 name = "tauri"
@@ -27,3 +27,9 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry", "NSHTTPCookie", "NSJSONSerialization", "NSKeyValueCoding", "NSKeyValueObserving", "NSObject", "NSProcessInfo", "NSSet", "NSString", "NSThread", "NSURL", "NSURLRequest", "NSURLResponse", "NSValue", "block2"] }
 objc2-app-kit = { version = "0.3", features = ["NSAppearance", "NSBitmapImageRep", "NSEvent", "NSGraphics", "NSGraphicsContext", "NSImage", "NSImageRep", "NSPDFImageRep", "NSResponder", "NSView", "NSWindow", "objc2-core-foundation", "objc2-quartz-core"] }
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKBackForwardList", "WKBackForwardListItem", "WKContentWorld", "WKError", "WKFrameInfo", "WKHTTPCookieStore", "WKNavigation", "WKNavigationAction", "WKNavigationDelegate", "WKNavigationResponse", "WKOpenPanelParameters", "WKPDFConfiguration", "WKPreferences", "WKScriptMessage", "WKScriptMessageHandler", "WKSnapshotConfiguration", "WKUIDelegate", "WKURLSchemeHandler", "WKURLSchemeTask", "WKUserContentController", "WKUserScript", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataRecord", "WKWebsiteDataStore", "WKWindowFeatures"] }
+
+# The page engine: the installed WebView2 Runtime, reached through bindings. `windows` is the copy `webview2-com` is built on,
+# so their types are the same types; wgpu's 0.62 is another copy that never meets them.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39.1"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

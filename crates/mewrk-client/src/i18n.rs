@@ -36,10 +36,35 @@ pub fn system_prefers_chinese() -> bool {
         if !primary.is_empty() && primary != "c" {
             return matches!(primary.as_str(), "zh" | "cmn" | "yue" | "wuu" | "hak" | "nan" | "gan" | "hsn" | "cdo" | "cjy" | "cpx" | "czh" | "czo" | "lzh" | "ltc" | "mnp" | "och");
         }
+        #[cfg(windows)]
+        return windows_ui_language_is_chinese();
+        #[cfg(not(windows))]
         apple_languages_first().is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"))
     })
 }
 
+/// The user's locale, `zh-CN` and the like.
+#[cfg(windows)]
+pub fn windows_locale_name() -> String {
+    unsafe extern "system" {
+        fn GetUserDefaultLocaleName(name: *mut u16, length: i32) -> i32;
+    }
+    let mut name = [0u16; 85];
+    // SAFETY: the buffer's length is what's declared, and a return above 1 counts what was written, with its terminating NUL.
+    let written = unsafe { GetUserDefaultLocaleName(name.as_mut_ptr(), name.len() as i32) };
+    if written > 1 { String::from_utf16_lossy(&name[..written as usize - 1]) } else { String::new() }
+}
+
+#[cfg(windows)]
+fn windows_ui_language_is_chinese() -> bool {
+    unsafe extern "system" {
+        fn GetUserDefaultUILanguage() -> u16;
+    }
+    // SAFETY: takes nothing and returns a LANGID, whose low ten bits are the primary language; 0x04 is LANG_CHINESE.
+    unsafe { GetUserDefaultUILanguage() & 0x3ff == 0x04 }
+}
+
+#[cfg(not(windows))]
 fn apple_languages_first() -> Option<String> {
     let out = std::process::Command::new("defaults").args(["read", "-g", "AppleLanguages"]).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);

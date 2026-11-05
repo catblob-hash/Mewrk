@@ -146,6 +146,8 @@ impl Rig {
         #[allow(unused_unsafe)]
         unsafe {
             std::env::set_var("HOME", &home);
+            // Where `std::env::home_dir` looks on Windows.
+            std::env::set_var("USERPROFILE", &home);
         }
         probe::enable();
         set_theme(Theme::dark());

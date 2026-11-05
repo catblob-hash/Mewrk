@@ -59,6 +59,9 @@ pub struct WindowRequests {
     /// Bring the window to the front.
     pub show: bool,
     pub hide: bool,
+    pub minimize: bool,
+    /// What the system's close button would do.
+    pub close: bool,
 }
 
 pub struct StartOptions {
@@ -80,6 +83,11 @@ pub struct App {
     /// Conversations whose contexts have not been loaded yet.
     pub unloaded: HashSet<String>,
     pub window: WindowRequests,
+    /// Maximizing is also a snap, a double click on the title bar or a keyboard shortcut, so the driver says it after every resize.
+    pub window_maximized: bool,
+    /// The app's own zoom, which scales everything drawn. A view that places something native in the window needs it: the window
+    /// knows nothing of it.
+    pub window_zoom: f32,
     pub system_dark: bool,
     /// The window's content view, for native child views. Null when headless.
     pub native_view: *mut std::ffi::c_void,
@@ -190,6 +198,8 @@ impl App {
             unloaded,
             window: WindowRequests::default(),
             system_dark: true,
+            window_maximized: false,
+            window_zoom: 1.0,
             native_view: std::ptr::null_mut(),
             frame_no: 0,
             mailbox,

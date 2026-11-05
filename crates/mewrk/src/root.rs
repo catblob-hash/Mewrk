@@ -94,6 +94,7 @@ pub fn root(app: &mut App) -> E {
     frame = frame.child(fork_tray_view(app));
     frame = frame.child(crate::dialogs::path_choice::path_choice_menu(app));
     frame = frame.children(crate::dialogs::windows(app));
+    frame = frame.child(crate::chrome::window_caption(app));
     // `is-resizing` on the body: a drag keeps its cursor wherever the pointer strays. The handle holds the capture, so this
     // covering the window takes nothing from it.
     let dragging = if shell(app).sidebar_resizing {

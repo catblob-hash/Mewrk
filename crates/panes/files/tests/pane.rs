@@ -298,7 +298,7 @@ fn opens_with_arrow_right_collapses_with_arrow_left_and_climbs_to_the_parent() {
 #[test]
 fn opens_a_workspace_recorded_under_home_where_its_machine_says_it_is() {
     let mut rig = sample();
-    let home = std::env::var("HOME").unwrap();
+    let home = browse_path(&std::env::home_dir().unwrap().to_string_lossy());
     rig.props.workspaces[0].path = "~".to_owned();
     rig.until("the page to take the machine's spelling", |x| x.state().active().and_then(|p| p.directory.as_ref()).is_some_and(|d| d.path == home));
 }
@@ -318,7 +318,7 @@ fn goes_up_to_the_top_of_the_machine_and_from_there_to_the_machines() {
     // From the machines a machine's row goes to its home.
     let r = rig.rect(("files-row", "files", "local"));
     rig.click(r);
-    let home = std::env::var("HOME").unwrap();
+    let home = browse_path(&std::env::home_dir().unwrap().to_string_lossy());
     rig.until("home", |x| x.state().active().and_then(|p| p.directory.as_ref()).is_some_and(|d| d.path == home));
 }
 
@@ -376,7 +376,7 @@ fn offers_a_files_actions_on_a_right_click() {
     rig.choose("Copy Absolute Path");
     rig.frame();
     rig.frame();
-    assert_eq!(rig.clipboard.0, Some(rig.path("notes.txt")));
+    assert_eq!(rig.clipboard.0, Some(native_spelling(&rig.path("notes.txt"))));
 }
 
 #[test]
@@ -628,7 +628,7 @@ fn opens_the_only_workspace_straight_from_the_plus() {
     let plus = rig.rect(("files-add-page", "files"));
     rig.click(plus);
     assert_eq!(rig.state().pages.len(), 2);
-    let root = rig.root.to_string_lossy().into_owned();
+    let root = rig.path("");
     assert_eq!(rig.state().active().unwrap().directory.as_ref().unwrap().path, root);
 }
 
@@ -810,12 +810,13 @@ fn reads_a_file_outside_the_workspace_against_the_top_of_its_filesystem() {
     let elsewhere = TempDir::new("else");
     let path = elsewhere.0.join("x.txt");
     std::fs::write(&path, "x\n").unwrap();
-    let path = path.to_string_lossy().into_owned();
+    let path = browse_path(&path.to_string_lossy());
     rig.props.open_request = Some(rig.request(&path, None, 1));
     let key = location_key(&None, &path);
     rig.until("the read", |x| matches!(x.state().viewers.get(&key), Some(ViewerState::Ready { .. })));
+    let top = filesystem_root(&path);
     let file = Location::new(&None, path);
-    assert_eq!(rig.state().document_root(&file), "/");
+    assert_eq!(rig.state().document_root(&file), top);
 }
 
 // ---- open requests
@@ -844,7 +845,7 @@ fn opens_the_file_a_request_names_on_a_preview_page_in_its_workspace() {
     assert_eq!(rig.state().pages.len(), 1, "the untouched first page is where it goes");
     let page = rig.state().active().unwrap().clone();
     assert!(page.preview);
-    assert_eq!(page.directory.unwrap().path, rig.root.to_string_lossy());
+    assert_eq!(page.directory.unwrap().path, rig.path(""));
     assert!(page.expanded.contains(&rig.key("src")), "with its folder open");
 }
 

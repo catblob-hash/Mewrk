@@ -164,7 +164,7 @@ impl PathResolver {
     }
 
     pub fn home_dir(&self) -> Result<PathBuf> {
-        dirs::home_dir().ok_or_else(|| Error::Message("no home directory".to_owned()))
+        std::env::home_dir().ok_or_else(|| Error::Message("no home directory".to_owned()))
     }
 }
 

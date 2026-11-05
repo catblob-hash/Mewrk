@@ -8,13 +8,13 @@ Mewrk 是桌面编程 Agent，模型看到什么、做什么都由你掌控：�
 
 这个仓库是 Rust 重写版。界面、宿主和模型层都在同一个原生进程里，没有网页渲染器，也没有 Node sidecar。功能和结构与 Mewrk 1.0 对齐，样式是 Fluent。
 
-**状态：1.0.0，重写版的第一次发布。** [下载 DMG](https://github.com/catblob-hash/Mewrk/releases/tag/v1.0.0)，需要 Apple 芯片和 macOS 13 或更新版本，已签名并通过公证。还没有更新渠道，所以应用不会提示新版本。目前只在 Apple 芯片的 macOS 上运行过，也只连过本地模拟供应商，没有用真实模型 API、Windows 或 Linux 验证过。验证情况见 [crates/mewrk/README.md](crates/mewrk/README.md)。
+**状态：1.0.0，重写版的第一次发布。** [下载安装包](https://github.com/catblob-hash/Mewrk/releases/tag/v1.0.0)，适用于 64 位 Windows 10 或 11。安装包没有签名，运行前 SmartScreen 会提示警告。macOS 暂时需要从源码构建。还没有更新渠道，所以应用不会提示新版本。目前在 Apple 芯片的 macOS 和 Windows 11 上运行过，也只连过本地模拟供应商，没有用真实模型 API 或 Linux 验证过。验证情况和 Windows 版暂缺的功能见 [crates/mewrk/README.md](crates/mewrk/README.md)。
 
 ![Mewrk 窗口：一个已完成的任务，旁边开着终端、文件和审阅面板](docs/img/mewrk-window.png)
 
 ## 从源码构建
 
-需要 Apple 芯片的 macOS、stable 版 Rust、Xcode Command Line Tools、`cmake` 和 `ninja`。
+macOS 需要 Apple 芯片、stable 版 Rust、Xcode Command Line Tools、`cmake` 和 `ninja`。
 
 ```bash
 ./scripts/bundle-macos.sh
@@ -23,7 +23,15 @@ open target/release/Mewrk.app
 
 第一次构建会把 Chromium Embedded Framework 下载到 `.cef`（解压后约 460 MB）。脚本优先用 `$APPLE_SIGNING_IDENTITY` 签名，没有设置时用 ad hoc 签名。`./scripts/release-macos.sh` 会在 `target/dist` 生成公证过的 DMG，能在任意 Apple 芯片的 Mac 上运行，不限于构建它的那台。
 
-到 **设置 → 提供商 → 模型提供商** 添加一个提供商。数据放在 `~/Library/Application Support/dev.mewrk.native`，格式和 Mewrk 1.0 相同。
+Windows 需要带 MSVC 工具链的 stable 版 Rust、Windows SDK、Python 和 [NSIS](https://nsis.sourceforge.io) 3。在 Git Bash 里运行：
+
+```bash
+./scripts/package-windows.sh
+```
+
+安装包会生成在 `target/dist`。不打包的话，`cargo run -p mewrk` 可以直接运行。预览面板用 Windows 自带的 WebView2 运行时，不需要另外下载。
+
+到 **设置 → 提供商 → 模型提供商** 添加一个提供商。数据在 macOS 上放在 `~/Library/Application Support/dev.mewrk.native`，在 Windows 上放在 `%APPDATA%\dev.mewrk.native`，格式和 Mewrk 1.0 相同。
 
 ## 目录
 

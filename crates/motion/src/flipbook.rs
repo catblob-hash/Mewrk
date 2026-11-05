@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
-use memmap2::{Advice, MmapOptions, MmapRaw};
+#[cfg(unix)]
+use memmap2::Advice;
+use memmap2::{MmapOptions, MmapRaw};
 
 const MAGIC: &[u8; 8] = b"MWRKFLIP";
 const VERSION: u32 = 1;
@@ -82,7 +84,20 @@ impl Flipbook {
         if layout.width == 0 || layout.height == 0 || count == 0 || count > layout.capacity || length < layout.file_bytes(count) {
             return Err("a frame file cut short".to_owned());
         }
-        Ok(Arc::new(Self { map: Arc::new(map), layout, published: Arc::new(AtomicU32::new(count)), complete: Arc::new(AtomicBool::new(true)), opaque: Arc::new(AtomicBool::new(word(32) == 1)) }))
+        let opaque = word(32) == 1;
+        // What `FlipWriter::finish` couldn't give back on Windows goes now, if nothing maps the file any more. If something does this is
+        // refused, and it waits for a later open.
+        #[cfg(windows)]
+        let map = if length > layout.file_bytes(count) {
+            drop(map);
+            if let Ok(writable) = OpenOptions::new().write(true).open(path) {
+                let _ = writable.set_len(layout.file_bytes(count) as u64);
+            }
+            MmapOptions::new().map_raw_read_only(&file).map_err(|e| e.to_string())?
+        } else {
+            map
+        };
+        Ok(Arc::new(Self { map: Arc::new(map), layout, published: Arc::new(AtomicU32::new(count)), complete: Arc::new(AtomicBool::new(true)), opaque: Arc::new(AtomicBool::new(opaque)) }))
     }
 
     /// Whether every pixel of every frame is known to be solid.
@@ -153,9 +168,13 @@ impl Flipbook {
 
     /// Asks the system to read a frame in ahead of time, so that uploading it doesn't wait on the disk.
     pub fn prefetch(&self, index: u32) {
+        #[cfg(unix)]
         if index < self.count() {
             let _ = self.map.advise_range(Advice::WillNeed, self.layout.file_bytes(index), self.layout.frame_bytes());
         }
+        // Windows has no advice on a mapping: the frame is read when it is first touched.
+        #[cfg(not(unix))]
+        let _ = index;
     }
 }
 
@@ -192,7 +211,8 @@ impl FlipWriter {
             let _ = fs::remove_file(&temporary);
             reason.to_string()
         };
-        // Sparse until written, so a capacity that turns out generous costs nothing.
+        // Sparse until written, so a capacity that turns out generous costs nothing. Windows does allocate it, until a later `Flipbook::open`
+        // gives back what wasn't used.
         file.set_len(layout.file_bytes(capacity) as u64).map_err(unmade)?;
         let map = MmapRaw::map_raw(&file).map_err(unmade)?;
         // SAFETY: the map is the whole file, far longer than the header, and only this writer holds it yet.
@@ -244,7 +264,12 @@ impl FlipWriter {
             std::ptr::copy_nonoverlapping(u32::from(self.all_solid).to_le_bytes().as_ptr(), header.add(32), 4);
             std::ptr::copy_nonoverlapping(1u32.to_le_bytes().as_ptr(), header.add(24), 4);
         }
-        self.file.set_len(self.layout.file_bytes(self.written) as u64).map_err(|e| e.to_string())?;
+        // Windows won't shorten a file with a view on it (ERROR_USER_MAPPED_FILE), and this one has this writer's and its readers', which
+        // are meant to last through this. A longer file is still a whole book, and `Flipbook::open` shortens it once nothing maps it. The
+        // rename needs nothing more: std opens every handle here with FILE_SHARE_DELETE, and a view doesn't stand in the way of a new name.
+        if cfg!(not(windows)) {
+            self.file.set_len(self.layout.file_bytes(self.written) as u64).map_err(|e| e.to_string())?;
+        }
         fs::rename(&self.temporary, &self.destination).map_err(|e| e.to_string())?;
         self.finished = true;
         self.opaque.store(self.all_solid, Ordering::Release);
@@ -348,7 +373,61 @@ mod tests {
         assert_eq!(book.count(), 2);
         assert_eq!(book.duration_us(), 200);
         assert_eq!(book.index_at(350), Some(1));
+        // Not on Windows, where `live` and `book` stand in the way of shortening it: see the test below.
+        #[cfg(not(windows))]
         assert_eq!(fs::metadata(&path).unwrap().len() as usize, (HEADER + 100 * 8).next_multiple_of(PAGE) + 2 * frame(0).len());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_what_it_set_aside_goes_back_at_the_first_open_with_nothing_mapping_it() {
+        let dir = folder("trim");
+        let path = dir.join("book.flip");
+        let mut writer = FlipWriter::create(&path, 2, 2, 100).unwrap();
+        writer.push(&frame(1), 100);
+        writer.push(&frame(2), 200);
+        let live = writer.book();
+        writer.finish().unwrap();
+        let reserved = (HEADER + 100 * 8).next_multiple_of(PAGE) + 100 * frame(0).len();
+        assert_eq!(fs::metadata(&path).unwrap().len() as usize, reserved, "the writer's map, which `live` still holds, keeps it this long");
+        let book = Flipbook::open(&path).unwrap();
+        assert_eq!(book.frame(1).unwrap().as_ref(), &frame(2)[..], "a longer file is still a whole book");
+        assert_eq!(fs::metadata(&path).unwrap().len() as usize, reserved, "and an open that can't shorten it says nothing of it");
+        drop((live, book));
+        let book = Flipbook::open(&path).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len() as usize, (HEADER + 100 * 8).next_multiple_of(PAGE) + 2 * frame(0).len());
+        assert_eq!(book.count(), 2);
+        assert!(book.is_complete());
+        assert_eq!(book.frame(1).unwrap().as_ref(), &frame(2)[..]);
+    }
+
+    #[test]
+    fn a_book_something_still_maps_can_be_baked_over_and_removed_and_its_map_still_reads() {
+        let dir = folder("mapped");
+        let path = dir.join("book.flip");
+        let bake = |value: u8| {
+            let mut writer = FlipWriter::create(&path, 2, 2, 4).unwrap();
+            writer.push(&frame(value), 100);
+            writer.finish().unwrap()
+        };
+        let old = bake(1);
+        let open = Flipbook::open(&path).unwrap();
+        let new = bake(2);
+        assert_eq!(old.frame(0).unwrap().as_ref(), &frame(1)[..]);
+        assert_eq!(open.frame(0).unwrap().as_ref(), &frame(1)[..]);
+        assert_eq!(Flipbook::open(&path).unwrap().frame(0).unwrap().as_ref(), &frame(2)[..]);
+        prune(&dir, 0, &dir.join("another"));
+        assert!(!path.exists(), "a folder over its budget loses a book even if something is showing it");
+        assert_eq!(new.frame(0).unwrap().as_ref(), &frame(2)[..]);
+
+        let image = dir.join("image").join("motion");
+        let inside = {
+            let mut writer = FlipWriter::create(&image.join("frames.flip"), 2, 2, 1).unwrap();
+            writer.push(&frame(3), 100);
+            writer.finish().unwrap()
+        };
+        fs::remove_dir_all(dir.join("image")).unwrap();
+        assert_eq!(inside.frame(0).unwrap().as_ref(), &frame(3)[..], "as when the host removes an image that is the background");
     }
 
     #[test]
@@ -387,7 +466,8 @@ mod tests {
         writer.push(&frame(1), 100);
         writer.finish().unwrap();
         let whole = fs::read(path.with_extension("two")).unwrap();
-        fs::write(&path, &whole[..whole.len() - 1]).unwrap();
+        // By what its one frame needs, not by the file: on Windows it is still as long as it was made.
+        fs::write(&path, &whole[..Layout { width: 2, height: 2, capacity: 4 }.file_bytes(1) - 1]).unwrap();
         assert!(Flipbook::open(&path).is_err(), "cut short by a byte");
     }
 

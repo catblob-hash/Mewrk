@@ -111,7 +111,9 @@ impl Face {
         let (_, font) = best?;
         let metrics = font.metrics(&[]);
         let has = |tag: &str| font.variations().any(|v| v.tag() == swash::tag_from_str_lossy(tag));
-        let (has_wght, has_opsz) = (has("wght"), has("opsz"));
+        // Through swash, Segoe UI Variable's kerning comes out wrong once `opsz` is set with a heavier `wght`: at 20 px semibold, `w.` advances 36 px
+        // where it should be 15. Its default optical size is the text cut, which reads well at every size this interface uses.
+        let (has_wght, has_opsz) = (has("wght"), has("opsz") && !cfg!(windows));
         let (offset, key, ascent, descent, units_per_em, x_height) = (font.offset, font.key, metrics.ascent, metrics.descent, metrics.units_per_em as f32, metrics.x_height);
         Some(Face { data: data.clone(), offset, key, has_wght, has_opsz, ascent, descent, units_per_em, x_height })
     }
@@ -263,9 +265,11 @@ impl FontBook {
         // CJK text in headings is the main beneficiary: a designed semibold is far crisper than smearing the
         // regular weight.
         let mut semibold = FxMap::default();
-        if let (Some(regular), Some(path)) = (cjk_id, cjk.as_ref())
+        // Windows keeps YaHei's bold in a file of its own. Elsewhere one collection holds the weights.
+        let bold_file = if cfg!(target_os = "windows") { first_existing(&["C:\\Windows\\Fonts\\msyhbd.ttc"]) } else { None };
+        if let (Some(regular), Some(path)) = (cjk_id, bold_file.as_ref().or(cjk.as_ref()))
             && let Some(face) = Face::open(path, 600)
-                && face.offset != faces[regular as usize].offset {
+                && (bold_file.is_some() || face.offset != faces[regular as usize].offset) {
                     faces.push(face);
                     semibold.insert(regular, faces.len() as u16 - 1);
                 }

@@ -122,6 +122,10 @@ impl Webview {
     pub fn clear_all_browsing_data(&self) -> Result<()> {
         no_webview()
     }
+
+    pub fn set_window_hidden(&self, _hidden: bool) -> Result<()> {
+        no_webview()
+    }
 }
 
 pub struct PlatformWebview;

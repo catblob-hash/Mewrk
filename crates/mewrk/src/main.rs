@@ -1,5 +1,8 @@
 //! Mewrk, in pure Rust: the window driver. What it draws is `mewrk_shell::root`.
 
+// A release build starts without a console window behind it.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,7 +27,7 @@ mewrk [--theme system|light|dark] [--exit-after SECONDS] [--scene NAME] [--lang 
 headless: --headless [--size WxH] [--scale F] [--frames N] [--shot PNG] [--bench SECONDS] [--json PATH] [--scroll PX] [--scene NAME] [--right-click XxY]
 diagnostics: MEWRK_TRACE=1 prints each frame's cost, MEWRK_ANIMATE=1 draws without end, --fullscreen-test toggles full screen every 4 s
 accessibility: --a11y-probe JSON [--a11y-steps 'press:NAME;focus:NAME;set:NAME=VALUE;click:NAME;at:X,Y;type:WORDS'] asks the window what an assistive client would and quits; headless, --a11y builds the tree every frame
-Data lives in MEWRK_DATA_DIR, or ~/Library/Application Support/dev.mewrk.native.";
+Data lives in MEWRK_DATA_DIR, or under the system's folder for application data: ~/Library/Application Support/dev.mewrk.native, %APPDATA%\\dev.mewrk.native.";
 
 const IDENTIFIER: &str = "dev.mewrk.native";
 
@@ -34,8 +37,12 @@ fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("MEWRK_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join("Library/Application Support").join(IDENTIFIER)
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from).join("Library/Application Support");
+    // `%APPDATA%`, where Mewrk 1.0 keeps its own folder too.
+    #[cfg(not(target_os = "macos"))]
+    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join(IDENTIFIER)
 }
 
 /// Why the app did not start, for what the driver does next.
@@ -136,7 +143,9 @@ impl Core {
         let time = t0.duration_since(self.started).as_secs_f32();
         let theme = root::theme(&self.app, self.forced_theme);
         mewrk_settings_global::on_scheme_changed(&mut self.app, theme.dark);
-        let scale = self.window_scale * mewrk_settings_global::zoom(&self.app);
+        let zoom = mewrk_settings_global::zoom(&self.app);
+        self.app.window_zoom = zoom;
+        let scale = self.window_scale * zoom;
         if scale != self.scale {
             // What the pointer was measured in just changed under it.
             if let Some((x, y)) = self.input.pointer {
@@ -392,6 +401,12 @@ fn forced_theme(args: &Args) -> Option<bool> {
     }
 }
 
+#[cfg(windows)]
+fn rss_mib() -> f64 {
+    mewrk_shell::native::peak_memory_mib()
+}
+
+#[cfg(unix)]
 fn rss_mib() -> f64 {
     // SAFETY: rusage is plain old data and getrusage fully initialises it on success.
     unsafe {
@@ -435,7 +450,7 @@ enum UserEvent {
     Wake,
     Show,
     Exit(i32),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     Native(mewrk_shell::native::NativeEvent),
     A11y(accesskit_winit::Event),
 }
@@ -612,7 +627,7 @@ struct Shell {
     /// `MEWRK_ANIMATE`: frames without end, to see what the display gives a window that always has something to draw.
     animate_test: bool,
     exit_code: i32,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     native: Option<mewrk_shell::native::NativeShell>,
     /// What the window's last set theme was, to change it only when it changes.
     window_theme: Option<Option<winit::window::Theme>>,
@@ -651,20 +666,41 @@ const BLOCKED_RETRY: Duration = Duration::from_millis(100);
 
 impl Shell {
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<Option<WindowState>, String> {
-        use winit::platform::macos::WindowAttributesExtMacOS;
         let attributes = Window::default_attributes()
             .with_title("Mewrk")
             .with_inner_size(LogicalSize::new(1440.0, 900.0))
             .with_min_inner_size(LogicalSize::new(680.0, 520.0))
-            .with_titlebar_transparent(true)
-            .with_fullsize_content_view(true)
-            .with_title_hidden(true)
             // AccessKit has to take over the view before anything can be observing it, which a window on show already is.
             .with_visible(false);
+        #[cfg(target_os = "macos")]
+        let attributes = {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attributes.with_titlebar_transparent(true).with_fullsize_content_view(true).with_title_hidden(true)
+        };
+        // Frameless, as Mewrk 1.0 was: the top bar is the title bar and `chrome::window_caption` its buttons. The system still
+        // gives it the shadow and the corners of any other window.
+        #[cfg(windows)]
+        let attributes = {
+            use winit::platform::windows::{CornerPreference, IconExtWindows, WindowAttributesExtWindows};
+            let icon = |size| winit::window::Icon::from_resource(1, Some(PhysicalSize::new(size, size))).ok();
+            let attributes = attributes.with_decorations(false).with_undecorated_shadow(true).with_corner_preference(CornerPreference::Round).with_window_icon(icon(32)).with_taskbar_icon(icon(256));
+            // Windows would cascade each new window further down the screen, and this size leaves a laptop's edge behind. In the middle, clear of the taskbar.
+            match event_loop.primary_monitor() {
+                Some(monitor) => {
+                    let (at, room, scale) = (monitor.position(), monitor.size(), monitor.scale_factor());
+                    let width = (1440.0 * scale).min(room.width as f64 * 0.92);
+                    let height = (900.0 * scale).min(room.height as f64 * 0.86);
+                    attributes.with_inner_size(PhysicalSize::new(width, height)).with_position(PhysicalPosition::new(at.x as f64 + (room.width as f64 - width) / 2.0, at.y as f64 + (room.height as f64 - height) * 0.4))
+                }
+                None => attributes,
+            }
+        };
         let window = Arc::new(event_loop.create_window(attributes).map_err(|e| e.to_string())?);
         window.set_ime_allowed(true);
         place_traffic_lights(&window);
-        #[cfg(target_os = "macos")]
+        #[cfg(windows)]
+        mewrk_shell::native::install_frame(content_view(&window));
+        #[cfg(any(target_os = "macos", windows))]
         self.install_native();
         #[cfg(target_os = "macos")]
         if let Some(native) = &self.native {
@@ -680,11 +716,11 @@ impl Shell {
         if let Err(error) = mewrk_shell::native::keep_child_views_accessible(content_view(&window)) {
             eprintln!("accessibility: {error}");
         }
+        // Windows paints a window as soon as it is shown, so it stays hidden until there is a first frame to show: see `resumed`.
+        #[cfg(not(windows))]
         window.set_visible(true);
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(Box::new(event_loop.owned_display_handle())));
-        let surface = instance.create_surface(window.clone()).map_err(|e| e.to_string())?;
-        let gpu = Arc::new(Gpu::new(instance, Some(&surface))?);
+        let (surface, gpu) = connect_gpu(event_loop, &window)?;
         let renderer = Renderer::new(gpu.clone());
         let size = window.inner_size();
         let caps = surface.get_capabilities(&gpu.adapter);
@@ -720,6 +756,12 @@ impl Shell {
                     None => window.theme().is_none_or(|t| t == winit::window::Theme::Dark),
                 };
                 let core = fatal::FatalCore::new(fatal_app(&self.args, message), gpu, scale, (config.width, config.height), dark);
+                // This view has no caption buttons of its own, so the system's title bar comes back for it.
+                #[cfg(windows)]
+                {
+                    window.set_decorations(true);
+                    window.set_visible(true);
+                }
                 window.focus_window();
                 window.request_redraw();
                 self.fatal = Some(FatalWindow { window, surface, config, core });
@@ -746,6 +788,18 @@ impl Shell {
         window.focus_window();
         window.request_redraw();
         Ok(Some(WindowState { window, surface, config, core, present_blocked: false, surface_stale: false, fullscreen: false, a11y }))
+    }
+
+    #[cfg(windows)]
+    fn install_native(&mut self) {
+        let proxy = self.proxy.clone();
+        fluent::set_reduced_motion(mewrk_shell::native::reduce_motion());
+        self.native = mewrk_shell::native::install(
+            move |event| {
+                let _ = proxy.send_event(UserEvent::Native(event));
+            },
+            mewrk_client::i18n::system_prefers_chinese(),
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -795,10 +849,21 @@ impl Shell {
     }
 
     fn tray_installed(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         return self.native.as_ref().is_some_and(|native| native.tray_installed());
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         false
+    }
+
+    /// A frame, because something is waiting for one. Windows sends no paint to a hidden window, and the app's work arrives on
+    /// frames, so a window hidden in the notification area draws one itself.
+    fn frame_soon(&mut self) {
+        let Some(state) = &self.state else { return };
+        if cfg!(windows) && state.window.is_visible() == Some(false) {
+            self.redraw();
+        } else {
+            state.window.request_redraw();
+        }
     }
 
     /// Quit: what the app holds that the host's barrier does not, then the barrier: every save before leaving, then the exit
@@ -810,7 +875,11 @@ impl Shell {
         state.core.app.host.request_exit(0);
     }
 
+    #[cfg(not(target_os = "macos"))]
+    fn step_a11y_probe(&mut self) {}
+
     /// One step of `--a11y-probe` when its time has come. A step and the answer to it are a second apart, so the frame it caused has run.
+    #[cfg(target_os = "macos")]
     fn step_a11y_probe(&mut self) {
         use objc2::{msg_send, runtime::AnyObject};
         let Some(probe) = self.a11y_probe.as_mut() else { return };
@@ -875,9 +944,9 @@ impl Shell {
         use mewrk_pane_files::attachment_drop::{handle_native_drag, DragPoint, NativeDragEvent};
         let Some(state) = self.state.as_mut() else { return };
         let position = {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             let point = mewrk_shell::native::pointer_in_view(state.core.app.native_view);
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", windows)))]
             let point = state.core.input.pointer;
             let zoom = state.core.scale / state.core.window_scale;
             let (x, y) = point.unwrap_or((0.0, 0.0));
@@ -999,6 +1068,9 @@ impl Shell {
         if requests.zoom {
             state.window.set_maximized(!state.window.is_maximized());
         }
+        if requests.minimize {
+            state.window.set_minimized(true);
+        }
         // The window's own light or dark: the title bar's controls and native pages read it.
         let wanted_theme = match (state.core.forced_theme, state.core.app.doc.global_settings.theme) {
             (Some(true), _) | (None, mewrk_client::model::ThemePreference::Night) => Some(winit::window::Theme::Dark),
@@ -1011,12 +1083,12 @@ impl Shell {
             // AppKit puts the lights back whenever it lays the title bar out again.
             place_traffic_lights(&state.window);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(native) = &mut self.native {
             native.sync_language(state.core.app.language_is_chinese());
         }
 
-        let (show_requested, hide_requested, quit_requested) = (requests.show, requests.hide, requests.quit);
+        let (show_requested, hide_requested, quit_requested, close_requested) = (requests.show, requests.hide, requests.quit, requests.close);
         state.window.set_cursor(match outcome.cursor {
             CursorKind::Default => winit::window::CursorIcon::Default,
             CursorKind::Hand => winit::window::CursorIcon::Pointer,
@@ -1034,6 +1106,10 @@ impl Shell {
         self.next_wake = outcome.wake_in.map(|s| Instant::now() + Duration::from_secs_f32(s.max(0.001)));
         self.next_motion = outcome.motion_next;
         if outcome.animating || self.fullscreen_test.is_some() || self.animate_test {
+            if cfg!(windows) && state.window.is_visible() == Some(false) {
+                // No paint comes to a hidden window, and nobody is watching this one.
+                self.next_wake = Some(Instant::now() + BLOCKED_RETRY);
+            }
             state.window.request_redraw();
         }
         if show_requested {
@@ -1045,6 +1121,15 @@ impl Shell {
         if quit_requested {
             self.request_quit();
         }
+        if close_requested {
+            self.close_main_window();
+        }
+    }
+
+    /// The window's close: without a menu bar item or a notification-area icon there would be no way back to a hidden window,
+    /// so then it has to quit.
+    fn close_main_window(&mut self) {
+        if self.tray_installed() { self.hide_main_window() } else { self.request_quit() }
     }
 
     fn on_key(&mut self, event: winit::event::KeyEvent) {
@@ -1052,7 +1137,8 @@ impl Shell {
         if event.state != ElementState::Pressed {
             return;
         }
-        let cmd = self.modifiers.super_key();
+        // `KeyPress::cmd` is the platform's chord key. The Windows key belongs to the system.
+        let cmd = if cfg!(target_os = "macos") { self.modifiers.super_key() } else { self.modifiers.control_key() };
         let ctrl = self.modifiers.control_key();
         let alt = self.modifiers.alt_key();
         // Option types accented letters in a text field and is Meta in a terminal, so the same chord means two things
@@ -1125,6 +1211,17 @@ impl ApplicationHandler<UserEvent> for Shell {
             Err(e) => {
                 self.error = Some(e);
                 event_loop.exit();
+                return;
+            }
+        }
+        // A first frame, and then the window, so that it never shows as an empty white rectangle.
+        #[cfg(windows)]
+        if self.state.is_some() {
+            self.redraw();
+            if let Some(state) = &self.state {
+                state.window.set_visible(true);
+                state.window.focus_window();
+                state.window.request_redraw();
             }
         }
     }
@@ -1151,6 +1248,11 @@ impl ApplicationHandler<UserEvent> for Shell {
                 }
             }
             UserEvent::Show => self.show_main_window(),
+            #[cfg(windows)]
+            UserEvent::Native(native) => match native {
+                mewrk_shell::native::NativeEvent::Quit => self.request_quit(),
+                mewrk_shell::native::NativeEvent::Show => self.show_main_window(),
+            },
             #[cfg(target_os = "macos")]
             UserEvent::Native(native) => match native {
                 mewrk_shell::native::NativeEvent::Quit => self.request_quit(),
@@ -1180,10 +1282,8 @@ impl ApplicationHandler<UserEvent> for Shell {
                 event_loop.exit();
             }
             UserEvent::Wake => {
-                if let Some(state) = &self.state
-                    && !state.present_blocked
-                {
-                    state.window.request_redraw();
+                if self.state.as_ref().is_some_and(|state| !state.present_blocked) {
+                    self.frame_soon();
                 }
             }
         }
@@ -1206,19 +1306,21 @@ impl ApplicationHandler<UserEvent> for Shell {
             return;
         }
         if let WindowEvent::CloseRequested = event {
-            // Without a menu bar item there would be no way back to a hidden window, so the close has to quit.
-            if self.tray_installed() { self.hide_main_window() } else { self.request_quit() }
+            self.close_main_window();
             return;
         }
         let Some(state) = self.state.as_mut() else { return };
         let input = &mut state.core.input;
         let scale = state.core.scale;
         match event {
+            // Windows says a minimized window is 0 by 0. Nothing is laid out for that: a terminal would reflow to one column.
+            WindowEvent::Resized(size) if size.width == 0 || size.height == 0 => return,
             WindowEvent::Resized(size) => {
                 state.config.width = size.width.max(1);
                 state.config.height = size.height.max(1);
                 state.surface_stale = true;
                 state.core.size_px = (state.config.width, state.config.height);
+                state.core.app.window_maximized = state.window.is_maximized();
                 state.sync_fullscreen();
                 // AppKit puts the lights back whenever it lays the title bar out again.
                 place_traffic_lights(&state.window);
@@ -1236,7 +1338,7 @@ impl ApplicationHandler<UserEvent> for Shell {
                     return;
                 }
                 state.present_blocked = false;
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 fluent::set_reduced_motion(mewrk_shell::native::reduce_motion());
                 // The panels that read something a terminal may have changed, and Git's polling, which backs off.
                 mewrk_settings_global::window_refocused(&mut state.core.app);
@@ -1391,11 +1493,11 @@ impl ApplicationHandler<UserEvent> for Shell {
             Some(when) if when <= Instant::now() && self.next_wake.is_none_or(|at| at > Instant::now()) => event_loop.set_control_flow(ControlFlow::Poll),
             Some(when) if when <= Instant::now() => {
                 self.next_wake = None;
-                if let Some(state) = &mut self.state {
+                if let Some(state) = &self.state {
                     if state.present_blocked {
                         self.redraw();
                     } else {
-                        state.window.request_redraw();
+                        self.frame_soon();
                     }
                 }
                 event_loop.set_control_flow(if self.next_wake.is_some() { ControlFlow::Poll } else { ControlFlow::Wait });
@@ -1429,17 +1531,42 @@ fn tray_template_png() -> Option<Vec<u8>> {
     Some(png.into_inner())
 }
 
+/// The window's surface and the GPU behind it. On Windows, Direct3D 12 comes first: every PC that runs this has it and the compositor
+/// is built around it, where Vulkan depends on the driver. wgpu on its own would take whichever it likes. `WGPU_BACKEND` overrides.
+fn connect_gpu(event_loop: &ActiveEventLoop, window: &Arc<Window>) -> Result<(wgpu::Surface<'static>, Arc<Gpu>), String> {
+    let chosen = std::env::var_os("WGPU_BACKEND").is_some();
+    let choices: &[wgpu::Backends] = if cfg!(windows) && !chosen { &[wgpu::Backends::DX12, wgpu::Backends::VULKAN] } else { &[wgpu::Backends::all()] };
+    let mut failure = String::from("no GPU backend");
+    for backends in choices {
+        let mut descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(event_loop.owned_display_handle()));
+        descriptor.backends = *backends;
+        let instance = wgpu::Instance::new(descriptor.with_env());
+        let attempt = instance.create_surface(window.clone()).map_err(|e| e.to_string()).and_then(|surface| Ok((Arc::new(Gpu::new(instance, Some(&surface))?), surface)));
+        match attempt {
+            Ok((gpu, surface)) => return Ok((surface, gpu)),
+            Err(error) => failure = error,
+        }
+    }
+    Err(failure)
+}
+
 /// The view winit draws into, which native child views get added to.
 fn content_view(window: &Window) -> *mut std::ffi::c_void {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let Ok(handle) = window.window_handle() else { return std::ptr::null_mut() };
     match handle.as_raw() {
         RawWindowHandle::AppKit(h) => h.ns_view.as_ptr(),
+        RawWindowHandle::Win32(h) => h.hwnd.get() as *mut std::ffi::c_void,
         _ => std::ptr::null_mut(),
     }
 }
 
+/// Only a Mac has them.
+#[cfg(not(target_os = "macos"))]
+fn place_traffic_lights(_window: &Window) {}
+
 /// Puts the traffic lights where Mewrk's layout expects them. Full screen has its own, in `native`.
+#[cfg(target_os = "macos")]
 fn place_traffic_lights(window: &Window) {
     let view = content_view(window);
     if view.is_null() {
@@ -1484,7 +1611,7 @@ fn run_windowed(args: Args) -> Result<(), String> {
         fullscreen_test,
         animate_test: std::env::var_os("MEWRK_ANIMATE").is_some(),
         exit_code: 0,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         native: None,
         window_theme: None,
         drag: FileDrag::default(),
@@ -1505,6 +1632,14 @@ fn run_windowed(args: Args) -> Result<(), String> {
 
 fn main() {
     let args = Args(std::env::args().skip(1).collect());
+    // What prints has to reach the terminal it was started from, in a build without a console of its own.
+    #[cfg(windows)]
+    {
+        if args.flag("--help") || args.flag("-h") || args.flag("--headless") {
+            mewrk_shell::native::attach_parent_console();
+        }
+        mewrk_shell::native::hear_ctrl_c();
+    }
     if args.flag("--help") || args.flag("-h") {
         println!("{USAGE}");
         return;

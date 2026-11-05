@@ -404,6 +404,8 @@ fn classify_placed(
     let app_data = canonical_workspace(app_data)
         .map_err(|error| format!("Could not access application data directory: {error}"))?;
     let roots = trusted_roots(&workspace, &app_data, additional_directories);
+    #[cfg(windows)]
+    refuse_share_outside_roots(&requested, &roots)?;
     let denied = protected_stores(&app_data);
     let restricted = ExecutionScope::restricted(roots).denying(denied.clone());
     let unrestricted = ExecutionScope::Unrestricted.denying(denied);
@@ -460,6 +462,45 @@ fn classify_placed(
 /// cannot widen the set. An entry that no longer resolves is dropped rather than
 /// reported — the directory may have been deleted or unplugged since it was
 /// granted, and a stale grant must narrow the boundary, not block every call.
+/// What a path says about another machine, lower-cased with one kind of slash: `server\share\dir`, whichever way it is
+/// spelled. `None` for a path on this one. A device path that isn't a drive counts as remote, since it can reach a share
+/// by way of `GLOBALROOT`.
+#[cfg(windows)]
+fn network_share_key(path: &str) -> Option<String> {
+    let path = path.replace('/', "\\").to_lowercase();
+    let rest = path.strip_prefix(r"\\")?;
+    let Some(device) = rest.strip_prefix(r"?\").or_else(|| rest.strip_prefix(r".\")) else {
+        return Some(rest.trim_end_matches('\\').to_owned());
+    };
+    let mut letters = device.chars();
+    if letters.next().is_some_and(|letter| letter.is_ascii_alphabetic()) && letters.next() == Some(':') {
+        return None;
+    }
+    Some(device.strip_prefix(r"unc\").unwrap_or(device).trim_end_matches('\\').to_owned())
+}
+
+/// Resolving a path on another machine is already a connection, and Windows answers an SMB server with the user's
+/// credentials, before any approval card could ask. So such a path is judged by its spelling, and only a workspace or an
+/// added directory on that share lets it go further.
+#[cfg(windows)]
+fn refuse_share_outside_roots(requested: &str, roots: &[PathBuf]) -> Result<(), String> {
+    let Some(share) = network_share_key(requested) else {
+        return Ok(());
+    };
+    let stays_put = !share.split('\\').any(|part| part == "..");
+    let inside = stays_put
+        && roots
+            .iter()
+            .filter_map(|root| network_share_key(&root.to_string_lossy()))
+            .any(|root| share == root || share.starts_with(&format!("{root}\\")));
+    if inside {
+        return Ok(());
+    }
+    Err(format!(
+        "{requested} is on another machine and outside this workspace, so Mewrk did not touch it: Windows would send your credentials to that server. Add the share as a workspace or an additional directory to use it."
+    ))
+}
+
 fn trusted_roots(workspace: &Path, app_data: &Path, additional: &[String]) -> Vec<PathBuf> {
     let mut roots = vec![workspace.to_path_buf()];
     if app_data != workspace {
@@ -2258,7 +2299,7 @@ fn writable_command_environment(scene: &ShellScene<'_>) -> Option<Reason> {
             .ok()
             .is_some_and(|canonical| scene.roots.iter().any(|root| path_within(&canonical, root)))
     };
-    if dirs::home_dir().is_some_and(|home| inside_roots(&home)) {
+    if std::env::home_dir().is_some_and(|home| inside_roots(&home)) {
         return Some(Reason::new(
             "可信目录包含用户主目录，允许编辑模式下模型可以改写 Shell 与 Git 的启动配置，因此命令需要逐条确认",
             "The trusted directories contain the home directory, where Accept edits lets the model rewrite shell and Git startup files, so each command is confirmed",
@@ -6550,7 +6591,7 @@ fn is_ancestor_of_protected(path: &DeletePath) -> bool {
 fn host_home() -> Option<DeletePath> {
     static HOME: std::sync::OnceLock<Option<DeletePath>> = std::sync::OnceLock::new();
     HOME.get_or_init(|| {
-        let home = dirs::home_dir()?;
+        let home = std::env::home_dir()?;
         workspace_delete_path(&fs::canonicalize(&home).unwrap_or(home))
     })
     .clone()
@@ -7009,6 +7050,48 @@ mod tests {
     use crate::path_guard::resolve_existing_with_scope;
     use serde_json::{json, Map};
     use std::fs;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_share_is_known_however_it_is_spelled() {
+        for spelling in [r"\\Server\Share\x.txt", "//server/share/x.txt", r"\/server\share/x.txt", r"\\?\UNC\server\share\x.txt", r"\\.\UNC\server\share\x.txt"] {
+            assert_eq!(network_share_key(spelling).as_deref(), Some(r"server\share\x.txt"), "{spelling}");
+        }
+        for local in [r"C:\Users\x", "relative/path", r"\rooted", "/rooted", r"\\?\C:\Users\x", r"\\.\D:\x"] {
+            assert_eq!(network_share_key(local), None, "{local}");
+        }
+        assert!(network_share_key(r"\\?\GLOBALROOT\Device\Mup\server\share\x").is_some());
+    }
+
+    /// Nothing here may touch the network: a server that can't be reached takes seconds to say so, and one that can gets the user's
+    /// credentials. The refusal comes first, whichever security level is asked.
+    #[cfg(windows)]
+    #[test]
+    fn a_share_outside_the_roots_is_refused_without_being_touched() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let app_data = root.path().join("app-data");
+        fs::create_dir_all(&app_data).unwrap();
+        for level in [SecurityLevel::RequestApproval, SecurityLevel::AllowEdits, SecurityLevel::FullAccess] {
+            let started = std::time::Instant::now();
+            let error = classify(level, &workspace, &app_data, &[], &request(&workspace, "read", json!({ "path": r"\\192.0.2.1\share\x.txt" }))).unwrap_err();
+            assert!(error.contains("another machine"), "{error}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(2), "it went looking");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_share_that_holds_a_root_is_judged_like_any_other_path() {
+        let roots = [PathBuf::from(r"\\?\UNC\nas\work\project")];
+        assert_eq!(refuse_share_outside_roots(r"\\nas\work\project\src\a.rs", &roots), Ok(()));
+        assert_eq!(refuse_share_outside_roots("//NAS/work/project", &roots), Ok(()));
+        assert_eq!(refuse_share_outside_roots(r"C:\elsewhere\a.rs", &roots), Ok(()));
+        assert!(refuse_share_outside_roots(r"\\nas\work\project-two\a.rs", &roots).is_err());
+        assert!(refuse_share_outside_roots(r"\\nas\work\project\..\other\a.rs", &roots).is_err());
+        assert!(refuse_share_outside_roots(r"\\elsewhere\work\project\a.rs", &roots).is_err());
+    }
 
     fn request(workspace: &Path, tool_name: &str, input: Value) -> ToolExecutionRequest {
         ToolExecutionRequest {
@@ -9373,18 +9456,25 @@ mod tests {
             assert!(!decision.requires_approval, "{tool}");
             assert_eq!(decision.rule_id, "filesystem.trusted_read", "{tool}");
         }
-        // Another conversation's file is nothing of this one's: the call is
-        // judged as a path on the remote machine, outside its root.
+        // Another conversation's file is nothing of this one's: it is not served
+        // here, and the call is judged as a path on the remote machine.
         let other = spill("another-conversation");
-        let decision = classify_remote(
-            &fixture,
-            SecurityLevel::RequestApproval,
-            "read",
-            json!({"path": other, "workspace": 2}),
-        )
-        .unwrap();
-        assert!(decision.requires_approval);
-        assert_eq!(decision.rule_id, "filesystem.outside_trusted_roots");
+        let input = json!({"path": other, "workspace": 2});
+        assert!(!crate::tool_output::names_host_file(
+            &fixture.app_data,
+            &request(&fixture.workspace, "read", input.clone()),
+        ));
+        let decision =
+            classify_remote(&fixture, SecurityLevel::RequestApproval, "read", input).unwrap();
+        if cfg!(windows) {
+            // This machine's spelling is no absolute path to a POSIX one: it is
+            // a name under the root, which is where the call lands and stays.
+            let target = decision.target.as_ref().unwrap().to_string_lossy().into_owned();
+            assert!(target.starts_with("/home/dev/app/"), "{target}");
+        } else {
+            assert!(decision.requires_approval);
+            assert_eq!(decision.rule_id, "filesystem.outside_trusted_roots");
+        }
     }
 
     #[test]

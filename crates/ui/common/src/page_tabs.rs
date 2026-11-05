@@ -553,7 +553,8 @@ fn tab_key_press(app: &mut App, press: &KeyPress, ids: &[String], id: &str, pinn
     match press.key {
         Key::Left | Key::Right => {
             let delta: i64 = if press.key == Key::Left { -1 } else { 1 };
-            if press.ctrl && press.shift && !press.alt && !press.cmd {
+            // On Windows `cmd` is Control too, so the key to tell apart is the Mac's Command.
+            if press.ctrl && press.shift && !press.alt && (!press.cmd || cfg!(windows)) {
                 let Some(reorder) = on_reorder else { return false };
                 if pinned {
                     return true;

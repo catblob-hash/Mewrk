@@ -71,6 +71,8 @@ fn start_with(seeded: bool) -> (Rig, App) {
     // The shell's startup files are read from here, and a test must not run the machine's own.
     unsafe {
         std::env::set_var("HOME", &home);
+        // Where `std::env::home_dir` looks on Windows.
+        std::env::set_var("USERPROFILE", &home);
         std::env::set_var("LANG", "en_US.UTF-8");
     }
     set_theme(Theme::dark());

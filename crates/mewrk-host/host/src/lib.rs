@@ -9645,7 +9645,7 @@ fn finalize_app_shutdown(app_handle: &AppHandle, coordinator: &app_exit::AppExit
 #[cfg(all(unix, not(test)))]
 fn restrict_user_data_directory() {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    let Some(directory) = dirs::home_dir().map(|home| home.join(".mewrk")) else {
+    let Some(directory) = std::env::home_dir().map(|home| home.join(".mewrk")) else {
         return;
     };
     let result = match std::fs::symlink_metadata(&directory) {

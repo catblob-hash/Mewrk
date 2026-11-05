@@ -70,7 +70,7 @@ impl FileSandbox {
     }
 
     fn local(sandbox: &SandboxSpec, workspace: &ResolvedWorkspace) -> Result<Self, String> {
-        let home = dirs::home_dir().ok_or("This account has no home directory")?;
+        let home = std::env::home_dir().ok_or("This account has no home directory")?;
         // The `PATH` a command here gets: this process's, which is the login
         // shell's (`child_environment::adopt_login_shell_path`), and whatever
         // the workspace's variables put in front of it.
@@ -294,7 +294,7 @@ mod tests {
                 "{refusal}"
             );
         }
-        let home = dirs::home_dir().unwrap();
+        let home = std::env::home_dir().unwrap();
         if home.join(".ssh").is_dir() {
             let secret = home.join(".ssh").to_string_lossy().into_owned();
             let refusal = refusal(&workspace, &call("ls", &secret)).expect("refused");

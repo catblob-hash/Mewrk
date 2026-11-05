@@ -1094,7 +1094,7 @@ fn acquire_credential_file_lock() -> Option<std::fs::File> {
     if cfg!(test) {
         return None;
     }
-    let directory = dirs::home_dir()?.join(".mewrk");
+    let directory = std::env::home_dir()?.join(".mewrk");
     std::fs::create_dir_all(&directory).ok()?;
     let path = directory.join(".keyring.lock");
     match std::fs::symlink_metadata(&path) {
@@ -16920,7 +16920,7 @@ pub(crate) fn run_memory_roots(request: &RunModelRequest) -> crate::mewrk_memory
             .collect()
     };
     crate::mewrk_memory::MemoryRoots {
-        global: crate::mewrk_memory::global_root(dirs::home_dir().as_deref()),
+        global: crate::mewrk_memory::global_root(std::env::home_dir().as_deref()),
         projects,
         access: request.memory_tier_access(),
     }
@@ -38164,7 +38164,7 @@ mod tests {
         crate::capabilities::place_in_workspace(&mut request, false);
         assert_eq!(
             folder(&request),
-            dirs::home_dir().map(|home| home.to_string_lossy().into_owned())
+            std::env::home_dir().map(|home| home.to_string_lossy().into_owned())
         );
     }
 

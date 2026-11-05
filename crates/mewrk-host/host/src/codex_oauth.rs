@@ -1351,7 +1351,7 @@ pub fn host() -> &'static CodexOauthHost {
                 .join("codex-oauth")
         };
         #[cfg(not(test))]
-        let root = dirs::home_dir()
+        let root = std::env::home_dir()
             .expect("无法确定用户主目录")
             .join(".mewrk")
             .join("codex-oauth");

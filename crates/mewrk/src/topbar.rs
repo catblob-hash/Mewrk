@@ -7,7 +7,7 @@ use mewrk_client::workspaces::is_temporary_workspace;
 use mewrk_pane_terminal::new_terminal_sections;
 
 use crate::actions::{close_pane, open_git_review, open_pane, toggle_pane, toggle_preview, toggle_tasks_tab};
-use crate::chrome::{drag_region, shell_nav_closed_width, shell_nav_inset, TOPBAR_HEIGHT};
+use crate::chrome::{drag_region, shell_nav_closed_width, shell_nav_inset, window_caption_width, TOPBAR_HEIGHT};
 use crate::effects::review_pages;
 use crate::menu::{MenuItem, MenuSection, PopoverMenu, Submenu};
 use crate::panes::{new_terminal_menu, preview_workspace_menu_items};
@@ -224,5 +224,5 @@ pub fn topbar(app: &mut App, sidebar_open: bool) -> E {
         actions = actions.child(pane_toolbar(app, &layout, id));
     }
     let left = if sidebar_open { 16.0 } else { shell_nav_inset() + shell_nav_closed_width() + 14.0 };
-    drag_region(row().key("topbar").h(TOPBAR_HEIGHT).shrink0().pl(left).pr(12.0).items_center().justify_between().gap(12.0).child(row().flex1().min_w(0.0).items_center().gap(7.0).child(leading)).child(actions))
+    drag_region(row().key("topbar").h(TOPBAR_HEIGHT).shrink0().pl(left).pr(if cfg!(windows) { window_caption_width() + 6.0 } else { 12.0 }).items_center().justify_between().gap(12.0).child(row().flex1().min_w(0.0).items_center().gap(7.0).child(leading)).child(actions))
 }

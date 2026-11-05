@@ -1,0 +1,45 @@
+// Resources of mewrk.exe: the icon, the version block and the application manifest.
+// build.rs passes the version as macros, taken from CARGO_PKG_VERSION. The defaults below let rc.exe compile this file on its own.
+// Paths are relative to the crate root, where the build script runs.
+
+#ifndef MEWRK_FILEVERSION
+#define MEWRK_FILEVERSION 1,0,0,0
+#endif
+#ifndef MEWRK_VERSION_STR
+#define MEWRK_VERSION_STR "1.0.0"
+#endif
+
+// The first icon in the group is the one Explorer shows for the file.
+1 ICON "assets/icon.ico"
+
+// RT_MANIFEST (24), resource 1: the one the loader reads.
+1 24 "assets/mewrk.exe.manifest"
+
+1 VERSIONINFO
+FILEVERSION MEWRK_FILEVERSION
+PRODUCTVERSION MEWRK_FILEVERSION
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Mewrk"
+            VALUE "FileDescription", "Mewrk"
+            VALUE "FileVersion", MEWRK_VERSION_STR
+            VALUE "InternalName", "mewrk"
+            VALUE "LegalCopyright", "GPL-3.0-or-later"
+            VALUE "OriginalFilename", "mewrk.exe"
+            VALUE "ProductName", "Mewrk"
+            VALUE "ProductVersion", MEWRK_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
