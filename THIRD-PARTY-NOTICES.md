@@ -1,0 +1,205 @@
+# Third-party notices
+
+Mewrk is distributed under GPL-3.0-or-later (see [`LICENSE`](LICENSE)). This repository has no releases yet, so nothing below is
+redistributed in a release artifact today. The notices are kept for the code and data in this tree, and for what `scripts/bundle-macos.sh`
+puts in a local build. The text about bundles and release artifacts describes how Mewrk 1.0 shipped; check it against the bundle before the
+first release. Library dependencies are not vendored: `Cargo.lock` pins them, and an inventory of their licenses has to be generated for a release.
+
+---
+
+## Chromium Embedded Framework and Chromium — BSD-3-Clause and others (macOS bundles)
+
+**Redistributed in:** `Mewrk.app/Contents/Frameworks/Chromium Embedded Framework.framework`
+
+On macOS the built-in browser's pages run in the
+[Chromium Embedded Framework](https://github.com/chromiumembedded/cef) (CEF), the
+binary distribution published at <https://cef-builds.spotifycdn.com>, copied into the
+bundle unmodified by [`scripts/bundle-macos.sh`](scripts/bundle-macos.sh).
+CEF is BSD-3-Clause (Copyright (c) 2012 Marshall A. Greenblatt, as its headers state);
+the notice ships in the bundle as `Contents/Resources/CEF-LICENSE.txt`. The Chromium it
+contains carries the licenses of Chromium and its third-party components, all listed in
+the distribution's `CREDITS.html`, which ships next to this file in the bundle as
+`Contents/Resources/CHROMIUM-CREDITS.html`.
+
+---
+
+## `tauri-apps/tauri` (`tauri-runtime-cef`) — Apache-2.0 OR MIT
+
+**Adapted file:**
+[`crates/mewrk-host/host/src/cef_host/pump.rs`](crates/mewrk-host/host/src/cef_host/pump.rs)
+
+The CEF external message pump is adapted from
+`crates/tauri-runtime-cef/src/external_message_pump/{mod,macos}.rs` in
+[tauri](https://github.com/tauri-apps/tauri), as published in `tauri-runtime-cef`
+3.0.0-alpha.2 — itself a port of cefclient's `main_message_loop_external_pump`.
+Copyright 2019-2024 Tauri Programme within The Commons Conservancy; used here under
+the MIT option. The scheduling and reentrancy logic is unchanged; the module was
+folded into one file and given a stop switch for shutdown.
+
+---
+
+## `ggml-org/llama.cpp` — MIT (Windows and Linux builds)
+
+**Not in the app; downloaded with the local helper model.** On Windows and Linux the
+optional local helper model (conversation titles, shell command explanations) runs on
+llama.cpp's own release build, [release `b11074`](https://github.com/ggml-org/llama.cpp/releases/tag/b11074)
+as llama.cpp publishes it (the Vulkan build on x64, which carries every CPU variant as
+well). When the user picks that build of the model, the app downloads the release
+archive, checks it against its pinned SHA-256 and keeps only its libraries (`llama`,
+`ggml`, `ggml-base`, the `ggml-cpu-*` variants, `ggml-vulkan` and, on Windows, LLVM's
+OpenMP runtime `libomp.dll`, Apache-2.0 WITH LLVM-exception), which it loads at run
+time. Nothing of llama.cpp is compiled into `mewrk.exe` / `mewrk`; macOS builds use
+Core ML or MLX instead.
+
+llama.cpp is MIT: Copyright (c) 2023-2026 The ggml authors. The MIT text is in
+[`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md).
+
+On Windows x64 the same download includes LunarG's Vulkan Runtime Components
+1.4.357.0, from which the app keeps the Khronos Vulkan loader (`vulkan-1.dll`,
+Apache-2.0, Copyright (c) 2015-2026 The Khronos Group Inc., LunarG, Inc. and Valve
+Corporation). It is used only on a system whose GPU driver installed no Vulkan loader
+of its own; GPU drivers normally do.
+
+The model (Qwen3.5-0.8B, Apache-2.0) is not in the app. When the user turns the
+feature on and picks a build, the app downloads that build, converted from the official
+release (the GGUF file on Windows and Linux, the Core ML package or the MLX weights on
+a Mac), from [`catblob-hash/Mewrk-Qwen3.5-0.8B`](https://huggingface.co/catblob-hash/Mewrk-Qwen3.5-0.8B)
+on Hugging Face, where it is published with its Apache-2.0 license.
+
+---
+
+## `ml-explore/mlx` — MIT (macOS builds on Apple silicon)
+
+**Bundled:** `Contents/Frameworks/mewrk-mlx/libmlx.dylib`, Apple's prebuilt MLX
+0.32.2 as published on PyPI (`mlx-metal`), which
+`Contents/Frameworks/mewrk-mlx/libmewrk_mlx.dylib` (Mewrk's model code,
+[`crates/mewrk-host/host/local-model/mlx`](crates/mewrk-host/host/local-model/mlx)) links against. The MLX
+kernel library (`mlx.metallib`, from the same release) is not in the app; it comes with
+the local helper model's GPU build when the user downloads that build.
+
+```
+MIT License
+
+Copyright © 2023 Apple Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## `anthropic-experimental/sandbox-runtime` — Apache-2.0
+
+**Adapted file:**
+[`crates/mewrk-host/host/remote-agent/src/agent/sandbox/seatbelt.rs`](crates/mewrk-host/host/remote-agent/src/agent/sandbox/seatbelt.rs)
+
+The macOS Seatbelt profile the agent's sandbox generates follows the one
+[sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime) generates
+for Claude Code (v0.0.77, commit `ddbeb74`), itself based on Chromium's sandbox policy:
+its lists of allowed Mach services, sysctls, IOKit classes and device ioctls are taken
+from it, as are the path-to-rule conventions (subpaths for directories, anchored
+regular expressions for names protected at any depth, write denials on the ancestors of
+protected paths). Copyright Anthropic, PBC, licensed under the Apache License 2.0. The
+profile was rewritten rather than copied: the keychain services are left out, `/dev` is
+closed but for a short list, pseudo terminals are not allowed, and the protected names,
+the bare-repository rule and the hard-link denials are Mewrk's. The Linux side
+(bubblewrap arguments, the seccomp filter) follows the same project's approach without
+taking its code.
+
+---
+
+## `@cherrystudio/provider-registry` — MIT
+
+**Vendored file:** [`crates/mewrk-host/host/resources/model-registry/models.json`](crates/mewrk-host/host/resources/model-registry/models.json)
+
+Copied verbatim from `packages/provider-registry/data/models.json` in the
+[Cherry Studio](https://github.com/CherryHQ/cherry-studio) repository, at commit
+`ab6dae4b1c88c677e9eb6f2501f9ff39ff3a790f` (2026-08-22), package version
+`0.0.1-alpha.1`. See
+[`crates/mewrk-host/host/resources/model-registry/README.md`](crates/mewrk-host/host/resources/model-registry/README.md)
+for what the file is used for and how to resynchronize it.
+
+The Cherry Studio repository as a whole is AGPL-3.0. Only the
+`packages/provider-registry/` subpackage is MIT-licensed, and only data from that
+subpackage is vendored here.
+
+The subpackage declares `"license": "MIT"` and `"author": "Cherry Studio"` in its
+`package.json` and ships no separate `LICENSE` file, so the copyright line below
+names that declared author.
+
+```
+MIT License
+
+Copyright (c) Cherry Studio (CherryHQ)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## `material-icon-theme` — MIT
+
+**Vendored files:** the file-type icons in
+[`crates/panes/files/assets/file-icons`](crates/panes/files/assets/file-icons), with the theme's license beside them
+
+The icons Mewrk draws beside file names are those of
+[Material Icon Theme](https://github.com/material-extensions/vscode-material-icon-theme),
+taken unmodified from the `material-icon-theme` npm package (`5.39.0` when this notice was written).
+The theme's folder icons and the extension's own code are not distributed.
+
+Many of these icons depict the logo of the language, tool or product whose files
+they mark. Those marks remain their owners'; Mewrk uses them only to identify a
+file's type, and the license below covers the drawings, not the marks.
+
+```
+The MIT License (MIT)
+Copyright (c) 2025 Material Extensions
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```

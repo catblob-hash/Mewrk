@@ -1,0 +1,15 @@
+[package]
+name = "stress"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-rt.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hdrhistogram.workspace = true
+fastrand.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+chaos.workspace = true

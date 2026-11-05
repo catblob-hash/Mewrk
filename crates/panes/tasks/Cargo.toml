@@ -1,0 +1,26 @@
+[package]
+name = "mewrk-pane-tasks"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "The tasks and history pane, upstream's TaskContainer, SubagentPanel, ShellTaskPanel, WorkflowRunPanel and HistoryPane."
+
+[dependencies]
+mewrk-client = { path = "../../mewrk-client" }
+mewrk-ui-common = { path = "../../ui/common" }
+mewrk-pane-browser = { path = "../browser" }
+mewrk-pane-git = { path = "../git" }
+mewrk-pane-terminal = { path = "../terminal" }
+fluent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `LayoutStyle`'s percentages, for what `El` has no method for.
+taffy = "0.9"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# The read-only shell page feeds this emulator directly: mewrk-term only offers a PTY-backed terminal.
+alacritty_terminal.workspace = true
+# Never named in code; see the same line in mewrk-term.
+rustix-std = { package = "rustix", version = "0.38", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+accesskit.workspace = true

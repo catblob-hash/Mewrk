@@ -1,0 +1,29 @@
+[package]
+name = "mewrk-tauri-shim"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "The narrow part of Tauri's API the Mewrk host uses, with WKWebView as the page engine on macOS, so the host's code stays unchanged."
+
+[lib]
+name = "tauri"
+path = "src/lib.rs"
+
+[dependencies]
+mewrk-tauri-shim-macros = { path = "macros" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+url = "2"
+dirs = "6"
+parking_lot = "0.12"
+
+# The page engine: the system's WKWebView, reached through bindings. Nothing here compiles C or ships an engine.
+[target.'cfg(target_os = "macos")'.dependencies]
+base64 = "0.22"
+zeroize = "1"
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry", "NSHTTPCookie", "NSJSONSerialization", "NSKeyValueCoding", "NSKeyValueObserving", "NSObject", "NSProcessInfo", "NSSet", "NSString", "NSThread", "NSURL", "NSURLRequest", "NSURLResponse", "NSValue", "block2"] }
+objc2-app-kit = { version = "0.3", features = ["NSAppearance", "NSBitmapImageRep", "NSEvent", "NSGraphics", "NSGraphicsContext", "NSImage", "NSImageRep", "NSPDFImageRep", "NSResponder", "NSView", "NSWindow", "objc2-core-foundation", "objc2-quartz-core"] }
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKBackForwardList", "WKBackForwardListItem", "WKContentWorld", "WKError", "WKFrameInfo", "WKHTTPCookieStore", "WKNavigation", "WKNavigationAction", "WKNavigationDelegate", "WKNavigationResponse", "WKOpenPanelParameters", "WKPDFConfiguration", "WKPreferences", "WKScriptMessage", "WKScriptMessageHandler", "WKSnapshotConfiguration", "WKUIDelegate", "WKURLSchemeHandler", "WKURLSchemeTask", "WKUserContentController", "WKUserScript", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataRecord", "WKWebsiteDataStore", "WKWindowFeatures"] }

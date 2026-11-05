@@ -1,0 +1,27 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fluent-agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-rt.workspace = true
+fluent.workspace = true
+chaos.workspace = true
+tokio.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+fastrand.workspace = true
+image.workspace = true
+rfd.workspace = true
+arboard.workspace = true
+pollster.workspace = true
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"

@@ -1,0 +1,10 @@
+[package]
+name = "mewrk-tauri-shim-macros"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "The attribute macros the Mewrk host writes against Tauri, as no-ops: commands are called directly."
+
+[lib]
+proc-macro = true
+path = "src/lib.rs"

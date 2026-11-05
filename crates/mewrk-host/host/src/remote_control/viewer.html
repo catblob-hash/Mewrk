@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="{{lang}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>{{TITLE}}</title>
+<style>{{STYLE}}</style>
+</head>
+<body>
+<div id="app">
+  <header id="bar">
+    <strong id="name"></strong>
+    <span id="phase" class="badge" role="status"></span>
+    <span id="size" class="size"></span>
+    <span id="readonly" class="badge" data-tone="muted" hidden>{{readonly}}</span>
+    <span id="model" class="badge" data-tone="info" hidden>{{model_active}}</span>
+    <span class="spacer"></span>
+    <nav id="tools" aria-label="{{tools}}"></nav>
+  </header>
+  <main id="stage" aria-label="{{screen_label}}">
+    <img id="screen" alt="" draggable="false">
+    <textarea id="keys" rows="1" tabindex="0" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="{{screen_label}}"></textarea>
+    <div id="waiting" class="hint" hidden>{{waiting}}</div>
+    <div id="overlay" hidden>
+      <div id="busy" class="card" hidden>
+        <div id="spinner" class="spinner" aria-hidden="true"></div>
+        <p id="busy-title" class="title"></p>
+        <p id="busy-detail" class="detail" hidden></p>
+      </div>
+      <form id="signin" class="card" method="post" autocomplete="off" hidden>
+        <p class="title">{{signin_title}}</p>
+        <p class="where">{{signin_where}}<br><strong id="where"></strong></p>
+        <p id="refused" class="notice" role="alert" hidden></p>
+        <label id="username-row" hidden>{{signin_username}}<input id="username" type="text" autocomplete="off" maxlength="128" spellcheck="false"></label>
+        <label>{{signin_password}}<input id="password" type="password" autocomplete="off" maxlength="1024"></label>
+        <label class="check"><input id="remember" type="checkbox" checked><span>{{signin_remember}}</span></label>
+        <button id="submit" type="submit">{{signin_submit}}</button>
+      </form>
+    </div>
+  </main>
+</div>
+<script type="application/json" id="i18n">{{I18N}}</script>
+<script>{{SCRIPT}}</script>
+</body>
+</html>

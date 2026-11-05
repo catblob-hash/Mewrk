@@ -1,0 +1,27 @@
+[package]
+name = "mewrk-aisdk"
+version.workspace = true
+edition.workspace = true
+description = "In-process port of Mewrk's Node AI SDK sidecar: one model step per frame, no Node."
+
+[dependencies]
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-graviola.workspace = true
+graviola.workspace = true
+webpki-roots.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+memchr.workspace = true
+fastrand.workspace = true
+base64-simd.workspace = true
+regex.workspace = true
+# Pure Rust through miniz_oxide: gzip/deflate response bodies, as undici's fetch decodes them.
+flate2 = "1"

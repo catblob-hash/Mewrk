@@ -1,0 +1,38 @@
+[package]
+name = "mewrk-core"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "Mewrk's engine without any UI: conversations, storage, model protocols, the agent loop and its tools."
+
+[dependencies]
+agent-rt.workspace = true
+git-core.workspace = true
+tokio.workspace = true
+http.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+fastrand.workspace = true
+base64-simd.workspace = true
+memchr.workspace = true
+libc.workspace = true
+regex.workspace = true
+ignore.workspace = true
+globset.workspace = true
+similar.workspace = true
+memmap2.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-graviola.workspace = true
+webpki-roots.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true
+
+[dev-dependencies]
+chaos.workspace = true

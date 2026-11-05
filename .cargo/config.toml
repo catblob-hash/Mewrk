@@ -1,0 +1,11 @@
+# Pure Rust has no C objects to link, so rust-lld alone can produce static Linux binaries from macOS.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "relocation-model=static"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+# One copy of the Chromium Embedded Framework for every build, instead of one per Cargo output directory.
+[env]
+CEF_PATH = { value = ".cef", relative = true }

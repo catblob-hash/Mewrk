@@ -1,0 +1,53 @@
+[package]
+name = "mewrk"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+
+# The shell is a library so `tests/suite` can drive it. One test binary, on purpose: each links the whole host.
+[lib]
+name = "mewrk_shell"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[[bin]]
+name = "mewrk"
+path = "src/main.rs"
+test = false
+
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"
+
+[dependencies]
+mewrk-client = { path = "../mewrk-client" }
+mewrk-pane-tasks = { path = "../panes/tasks" }
+mewrk-pane-files = { path = "../panes/files" }
+mewrk-pane-terminal = { path = "../panes/terminal" }
+mewrk-pane-git = { path = "../panes/git" }
+mewrk-pane-browser = { path = "../panes/browser" }
+mewrk-settings-global = { path = "../ui/settings-global" }
+mewrk-settings-conv = { path = "../ui/settings-conv" }
+mewrk-ui-common = { path = "../ui/common" }
+mewrk-ui-chat = { path = "../ui/chat" }
+mewrk-ui-composer = { path = "../ui/composer" }
+fluent.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+rfd.workspace = true
+arboard.workspace = true
+pollster.workspace = true
+libc.workspace = true
+accesskit_winit.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+# The menu bar's picture is the brand mark, drawn once at start.
+resvg = { version = "0.45", default-features = false }
+
+[dev-dependencies]
+accesskit.workspace = true

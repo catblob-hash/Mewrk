@@ -1,0 +1,9 @@
+[package]
+name = "mewrk-cef-helper"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "The executable a bundled Mewrk launches Chromium's renderer, GPU and utility processes from."
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cef = { version = "=154.0.0", default-features = false, features = ["sandbox"] }

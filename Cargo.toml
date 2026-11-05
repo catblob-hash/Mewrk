@@ -1,0 +1,87 @@
+[workspace]
+resolver = "3"
+members = ["crates/ui/common", "crates/ui/composer", "crates/panes/terminal", "crates/panes/git", "crates/panes/files", "crates/panes/tasks", "crates/panes/browser", "crates/ui/settings-global", "crates/ui/settings-conv", "crates/ui/chat", "crates/mewrk-client", "crates/agent-rt", "crates/chaos", "crates/stress", "crates/fluent", "crates/app", "crates/mewrk-core", "crates/mewrk-term", "crates/mewrk-panes", "crates/mewrk", "crates/mewrk-host/tauri-shim", "crates/mewrk-host/tauri-shim/macros", "crates/mewrk-host/tauri-dialog-shim", "crates/mewrk-host/aisdk-rs", "crates/mewrk-host/cef-helper", "crates/mewrk-host/host", "crates/mewrk-host/host/agent-kernel", "crates/mewrk-host/host/workflow-core", "crates/mewrk-host/host/workflow-script", "crates/mewrk-host/host/remote-agent", "crates/mewrk-host/host/local-model"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+agent-rt = { path = "crates/agent-rt" }
+chaos = { path = "crates/chaos" }
+fluent = { path = "crates/fluent" }
+git-core = { path = "crates/mewrk-host/host/git-core", package = "mewrk-git-core" }
+mewrk-core = { path = "crates/mewrk-core" }
+mewrk-term = { path = "crates/mewrk-term" }
+mewrk-panes = { path = "crates/mewrk-panes" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "fs", "signal", "process"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+rustls-graviola = "0.4"
+graviola = "0.4"
+webpki-roots = "1"
+rustls-pki-types = { version = "1", features = ["std"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memchr = "2"
+parking_lot = "0.12"
+fastrand = "2"
+socket2 = { version = "0.6", features = ["all"] }
+base64-simd = "0.8"
+hdrhistogram = { version = "7", default-features = false }
+libc = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+fast_image_resize = "6"
+
+wgpu = { version = "30", default-features = false, features = ["metal", "dx12", "vulkan", "wgsl"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11"] }
+swash = "0.2"
+fontdb = { version = "0.24", default-features = false, features = ["std", "fs", "memmap", "fontconfig"] }
+etagere = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+memmap2 = "0.9"
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+arboard = { version = "3", default-features = false }
+regex = "1"
+ignore = "0.4"
+globset = "0.4"
+similar = "2.7"
+http-rs = { package = "http", version = "1" }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKNavigation"] }
+security-framework = { version = "3", default-features = false }
+alacritty_terminal = "0.25"
+accesskit = "0.25"
+accesskit_winit = { version = "0.34", default-features = false, features = ["rwh_06"] }
+
+# Debug info is most of what a build leaves on disk, and every test binary links the whole host.
+[profile.dev]
+debug = false
+
+# Shipped binaries: everything the optimiser has. panic=abort removes unwind tables from the hot paths.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Fast iteration on real workloads: a debug build would make every timing below meaningless.
+[profile.dev-opt]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true
+strip = "none"
+panic = "unwind"

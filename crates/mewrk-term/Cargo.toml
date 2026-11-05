@@ -1,0 +1,16 @@
+[package]
+name = "mewrk-term"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+
+[dependencies]
+fluent.workspace = true
+alacritty_terminal.workspace = true
+parking_lot.workspace = true
+# Never named in code. alacritty_terminal hands std's OwnedFd to rustix 0.38 and leaves turning on rustix's `std`
+# to some other crate in the tree, and the crates that used to do it have moved on to rustix 1.
+rustix-std = { package = "rustix", version = "0.38", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+libc.workspace = true

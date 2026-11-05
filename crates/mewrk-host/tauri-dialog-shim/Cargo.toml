@@ -1,0 +1,14 @@
+[package]
+name = "mewrk-tauri-dialog-shim"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "tauri-plugin-dialog's calls, on native dialogs."
+
+[lib]
+name = "tauri_plugin_dialog"
+path = "src/lib.rs"
+
+[dependencies]
+tauri = { path = "../tauri-shim", package = "mewrk-tauri-shim" }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }

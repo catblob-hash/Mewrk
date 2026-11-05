@@ -1,0 +1,222 @@
+:root {
+  color-scheme: dark;
+  --bg: #121315;
+  --bar: #1c1d20;
+  --line: #2d2f34;
+  --fg: #e7e8ea;
+  --muted: #9a9ea7;
+  --info: #7aa8ff;
+  --ok: #4fc08d;
+  --warn: #e3a93f;
+  --bad: #ee6c6c;
+}
+
+[hidden] { display: none !important; }
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+}
+
+#bar {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 4px 10px;
+  background: var(--bar);
+  border-bottom: 1px solid var(--line);
+}
+
+#name {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.size {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.spacer { flex: 1; }
+
+.badge {
+  flex: none;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.badge[data-tone="ok"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+.badge[data-tone="warn"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+.badge[data-tone="bad"] { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+.badge[data-tone="info"] { color: var(--info); border-color: color-mix(in srgb, var(--info) 45%, transparent); }
+
+#tools {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
+button {
+  font: inherit;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { background: #26282c; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--info); outline-offset: 1px; }
+button:disabled { opacity: 0.4; cursor: default; }
+
+#stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: #0c0d0e;
+}
+
+#screen {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+}
+
+#screen:not([src]) { visibility: hidden; }
+
+.covered #screen { opacity: 0.3; }
+
+/* The page's keyboard: focused and typed into, never seen. It sits where the
+   person last pressed so an input method's candidate window opens there. */
+#keys {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  resize: none;
+  overflow: hidden;
+  pointer-events: none;
+  caret-color: transparent;
+}
+
+.hint {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+#overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  overflow: auto;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(360px, 100%);
+  padding: 18px;
+  background: var(--bar);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+
+#busy { align-items: center; text-align: center; }
+#busy[data-tone="bad"] .title { color: var(--bad); }
+
+.card p { margin: 0; }
+.title { font-size: 14px; font-weight: 600; }
+.detail { color: var(--muted); overflow-wrap: anywhere; }
+.where { color: var(--muted); }
+.where strong { color: var(--fg); overflow-wrap: anywhere; }
+.notice { color: var(--bad); }
+
+label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); }
+label.check { flex-direction: row; align-items: center; gap: 8px; }
+
+input[type="text"], input[type="password"] {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+input:disabled { opacity: 0.5; }
+
+#submit {
+  align-self: stretch;
+  padding: 6px 10px;
+  background: var(--info);
+  border-color: var(--info);
+  color: #0b1220;
+  font-weight: 600;
+}
+
+#submit:hover:not(:disabled) { background: color-mix(in srgb, var(--info) 85%, #fff); }
+
+.spinner {
+  width: 22px;
+  height: 22px;
+  border: 2px solid var(--line);
+  border-top-color: var(--info);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation-duration: 3s; }
+}
+
+@media (max-width: 520px) {
+  .size { display: none; }
+}

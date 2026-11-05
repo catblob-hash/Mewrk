@@ -1,0 +1,19 @@
+[package]
+name = "mewrk-pane-git"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "The review pane, upstream's GitReviewPanel and DiffViewer."
+
+[dependencies]
+mewrk-client = { path = "../../mewrk-client" }
+mewrk-ui-common = { path = "../../ui/common" }
+mewrk-panes.workspace = true
+git-core.workspace = true
+fluent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+accesskit.workspace = true

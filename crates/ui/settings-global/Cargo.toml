@@ -1,0 +1,23 @@
+[package]
+name = "mewrk-settings-global"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "Global settings, upstream's GlobalSettings and its pages."
+
+[dependencies]
+mewrk-client = { path = "../../mewrk-client" }
+mewrk-ui-common = { path = "../common" }
+fluent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+rfd.workspace = true
+base64-simd.workspace = true
+fastrand.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+accesskit.workspace = true
+keyring = { version = "3", default-features = false }
+wgpu.workspace = true

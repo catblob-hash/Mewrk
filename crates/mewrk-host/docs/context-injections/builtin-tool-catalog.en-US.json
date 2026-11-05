@@ -1,0 +1,1917 @@
+{
+  "kind": "mewrk-builtin-tool-catalog-snapshot",
+  "language": "en-US",
+  "source": "src-tauri/src/catalog.rs::tool_catalog + english_* mappings used by tool_catalog_for_language",
+  "note": "Authoritative backend design snapshot, not a runtime configuration. Tool and parameter labels/placeholders are retained for adjacent UI redesign; standard function-style provider schemas expose tool descriptions, parameter help/defaults, and specialized schema descriptions/constraints, not UI labels/placeholders.",
+  "toolCount": 61,
+  "tools": [
+    {
+      "name": "ls",
+      "label": "List files",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": true,
+          "defaultValue": ".",
+          "placeholder": "."
+        },
+        {
+          "name": "depth",
+          "label": "Recursion depth",
+          "type": "number",
+          "required": false,
+          "defaultValue": 1,
+          "help": "0 lists only the current directory."
+        }
+      ]
+    },
+    {
+      "name": "grep",
+      "label": "Search content",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "pattern",
+          "label": "Search pattern",
+          "type": "string",
+          "required": true,
+          "placeholder": "TODO|FIXME"
+        },
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": false,
+          "defaultValue": "."
+        },
+        {
+          "name": "glob",
+          "label": "File glob",
+          "type": "string",
+          "required": false,
+          "placeholder": "*.rs",
+          "help": "Only search files whose path matches this glob, such as *.rs or src/**/*.tsx."
+        },
+        {
+          "name": "case_sensitive",
+          "label": "Case sensitive",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": true
+        },
+        {
+          "name": "output_mode",
+          "label": "Output mode",
+          "type": "string",
+          "required": false,
+          "defaultValue": "files_with_matches",
+          "help": "files_with_matches (default) lists the files that match; content lists the matching lines; count gives the number of matching lines per file."
+        },
+        {
+          "name": "context",
+          "label": "Context",
+          "type": "number",
+          "required": false,
+          "help": "content mode only: lines of context to show before and after each match, 0 to 20."
+        },
+        {
+          "name": "before",
+          "label": "Lines before",
+          "type": "number",
+          "required": false,
+          "help": "content mode only: lines of context to show before each match, 0 to 20."
+        },
+        {
+          "name": "after",
+          "label": "Lines after",
+          "type": "number",
+          "required": false,
+          "help": "content mode only: lines of context to show after each match, 0 to 20."
+        },
+        {
+          "name": "limit",
+          "label": "Limit",
+          "type": "number",
+          "required": false,
+          "defaultValue": 250,
+          "help": "Most results of the chosen mode to return: 250 by default, at most 1,000."
+        },
+        {
+          "name": "offset",
+          "label": "Offset",
+          "type": "number",
+          "required": false,
+          "defaultValue": 0,
+          "help": "Results of the chosen mode to skip first, to fetch the next page."
+        }
+      ]
+    },
+    {
+      "name": "pwsh",
+      "label": "PowerShell 7",
+      "description": "",
+      "category": "shell",
+      "dangerous": true,
+      "parameters": []
+    },
+    {
+      "name": "powershell",
+      "label": "Windows PowerShell",
+      "description": "",
+      "category": "shell",
+      "dangerous": true,
+      "parameters": []
+    },
+    {
+      "name": "bash",
+      "label": "Bash",
+      "description": "",
+      "category": "shell",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "command",
+          "label": "Command",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "git status --short"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": false,
+          "placeholder": "Show working tree status"
+        },
+        {
+          "name": "timeout",
+          "label": "Timeout (ms)",
+          "type": "number",
+          "required": false,
+          "placeholder": "120000"
+        },
+        {
+          "name": "run_in_background",
+          "label": "Run in background",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false
+        }
+      ]
+    },
+    {
+      "name": "zsh",
+      "label": "zsh",
+      "description": "",
+      "category": "shell",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "command",
+          "label": "Command",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "ls -la"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": false,
+          "placeholder": "List files in the current directory"
+        },
+        {
+          "name": "timeout",
+          "label": "Timeout (ms)",
+          "type": "number",
+          "required": false,
+          "placeholder": "120000"
+        },
+        {
+          "name": "run_in_background",
+          "label": "Run in background",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false
+        }
+      ]
+    },
+    {
+      "name": "sh",
+      "label": "sh",
+      "description": "",
+      "category": "shell",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "command",
+          "label": "Command",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "ls -la"
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": false,
+          "placeholder": "List files in the current directory"
+        },
+        {
+          "name": "timeout",
+          "label": "Timeout (ms)",
+          "type": "number",
+          "required": false,
+          "placeholder": "120000"
+        },
+        {
+          "name": "run_in_background",
+          "label": "Run in background",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false
+        }
+      ]
+    },
+    {
+      "name": "write",
+      "label": "Write file",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": true,
+          "placeholder": "src/example.ts"
+        },
+        {
+          "name": "content",
+          "label": "File content",
+          "type": "multiline",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "edit",
+      "label": "Edit file",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "find",
+          "label": "Find text",
+          "type": "multiline",
+          "required": true
+        },
+        {
+          "name": "replace",
+          "label": "Replacement",
+          "type": "multiline",
+          "required": true
+        },
+        {
+          "name": "replace_all",
+          "label": "Replace all",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": false
+        }
+      ]
+    },
+    {
+      "name": "find",
+      "label": "Find files",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "*.tsx"
+        },
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": false,
+          "defaultValue": "."
+        }
+      ]
+    },
+    {
+      "name": "read",
+      "label": "Read file",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "start_line",
+          "label": "Start line",
+          "type": "number",
+          "required": false,
+          "defaultValue": 1,
+          "help": "Text files only; 1-based."
+        },
+        {
+          "name": "end_line",
+          "label": "End line",
+          "type": "number",
+          "required": false,
+          "help": "Text files only; inclusive."
+        }
+      ]
+    },
+    {
+      "name": "lsp",
+      "label": "Code navigation",
+      "description": "",
+      "category": "filesystem",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "operation",
+          "label": "Operation",
+          "type": "string",
+          "required": true,
+          "placeholder": "goToDefinition",
+          "help": "One of nine: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls."
+        },
+        {
+          "name": "filePath",
+          "label": "File path",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "line",
+          "label": "Line",
+          "type": "number",
+          "required": true,
+          "help": "1-based, as shown in editors."
+        },
+        {
+          "name": "character",
+          "label": "Character",
+          "type": "number",
+          "required": true,
+          "help": "1-based, as shown in editors."
+        },
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": false,
+          "placeholder": "LspRegistry",
+          "help": "workspaceSymbol only; most language servers return nothing for an empty query."
+        }
+      ]
+    },
+    {
+      "name": "web_search",
+      "label": "Web search",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "Anthropic Claude 4.5 release date",
+          "help": "One self-contained query; no pronouns pointing back at the conversation. Break a long question into several searches."
+        }
+      ]
+    },
+    {
+      "name": "web_fetch",
+      "label": "Fetch web pages",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "urls",
+          "label": "URLs",
+          "type": "json",
+          "required": true,
+          "placeholder": "[\"https://example.com/docs/changelog\"]",
+          "help": "Absolute http(s) page URLs. Search first when you do not know the URL."
+        }
+      ]
+    },
+    {
+      "name": "preview_start",
+      "label": "Start preview",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "dev",
+          "help": "Server name from .mewrk/launch.json."
+        }
+      ]
+    },
+    {
+      "name": "preview_stop",
+      "label": "Stop preview",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": true,
+          "help": "Server ID to stop"
+        }
+      ]
+    },
+    {
+      "name": "preview_list",
+      "label": "List previews",
+      "description": "",
+      "category": "web",
+      "dangerous": false,
+      "parameters": []
+    },
+    {
+      "name": "preview_logs",
+      "label": "Server logs",
+      "description": "",
+      "category": "web",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "level",
+          "label": "Level",
+          "type": "string",
+          "required": false,
+          "defaultValue": "all",
+          "help": "Filter by level: 'all' (default) shows all output, 'error' shows only lines containing error/exception/failed/fatal"
+        },
+        {
+          "name": "lines",
+          "label": "Line limit",
+          "type": "number",
+          "required": false,
+          "defaultValue": 50,
+          "help": "Max lines to return (default: 50)"
+        },
+        {
+          "name": "search",
+          "label": "Text filter",
+          "type": "string",
+          "required": false,
+          "placeholder": "[DEBUG]",
+          "help": "Filter to lines containing this text (e.g., '[DEBUG]', 'POST /api')"
+        }
+      ]
+    },
+    {
+      "name": "preview_console_logs",
+      "label": "Console logs",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "level",
+          "label": "Level",
+          "type": "string",
+          "required": false,
+          "defaultValue": "all",
+          "help": "Filter by level: 'all' (default), 'error' (errors only), 'warn' (warnings + errors)"
+        },
+        {
+          "name": "lines",
+          "label": "Line limit",
+          "type": "number",
+          "required": false,
+          "defaultValue": 50,
+          "help": "Max lines to return (default: 50, max: 200)"
+        }
+      ]
+    },
+    {
+      "name": "preview_screenshot",
+      "label": "Page screenshot",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "scale",
+          "label": "Scale",
+          "type": "number",
+          "required": false,
+          "help": "Scale factor in [0.1, 1] for the returned image; smaller images use fewer tokens. preview_click and preview_fill find elements by CSS selector or by a uid from preview_snapshot, not by pixel coordinates; pixel coordinates on remote-control screens go through preview_input."
+        }
+      ]
+    },
+    {
+      "name": "preview_snapshot",
+      "label": "Page snapshot",
+      "description": "",
+      "category": "web",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        }
+      ]
+    },
+    {
+      "name": "preview_inspect",
+      "label": "Inspect element",
+      "description": "",
+      "category": "web",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "selector",
+          "label": "CSS selector",
+          "type": "string",
+          "required": true,
+          "placeholder": ".button",
+          "help": "CSS selector (e.g., '.button', '#header')"
+        },
+        {
+          "name": "styles",
+          "label": "CSS properties",
+          "type": "json",
+          "required": false,
+          "placeholder": "[\"padding\",\"color\"]",
+          "help": "CSS properties to return (e.g., ['padding', 'color']). Defaults to common properties."
+        }
+      ]
+    },
+    {
+      "name": "preview_click",
+      "label": "Click element",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "selector",
+          "label": "CSS selector",
+          "type": "string",
+          "required": false,
+          "placeholder": "button.primary",
+          "help": "CSS selector for the element to click. Give this or uid."
+        },
+        {
+          "name": "uid",
+          "label": "Element uid",
+          "type": "number",
+          "required": false,
+          "placeholder": "12",
+          "help": "The uid preview_snapshot printed for the element to click, the number in brackets at the start of its line. Give this or selector."
+        },
+        {
+          "name": "doubleClick",
+          "label": "Double-click",
+          "type": "boolean",
+          "required": false,
+          "help": "Perform a double-click"
+        }
+      ]
+    },
+    {
+      "name": "preview_fill",
+      "label": "Fill input",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "selector",
+          "label": "CSS selector",
+          "type": "string",
+          "required": false,
+          "placeholder": "input[name=email]",
+          "help": "CSS selector for the input element. Give this or uid."
+        },
+        {
+          "name": "uid",
+          "label": "Element uid",
+          "type": "number",
+          "required": false,
+          "placeholder": "7",
+          "help": "The uid preview_snapshot printed for the input element, the number in brackets at the start of its line. Give this or selector."
+        },
+        {
+          "name": "value",
+          "label": "Value",
+          "type": "string",
+          "required": true,
+          "help": "Value to fill"
+        }
+      ]
+    },
+    {
+      "name": "preview_eval",
+      "label": "Run script",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "expression",
+          "label": "Expression",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "document.title",
+          "help": "JavaScript expression to evaluate in the page context. Return values are serialized as JSON."
+        }
+      ]
+    },
+    {
+      "name": "preview_network",
+      "label": "Network requests",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "filter",
+          "label": "Filter",
+          "type": "string",
+          "required": false,
+          "defaultValue": "all",
+          "help": "Filter: 'all' (default) shows all requests, 'failed' shows only 4xx/5xx and network errors. Ignored when requestId is provided."
+        },
+        {
+          "name": "requestId",
+          "label": "Request ID",
+          "type": "string",
+          "required": false,
+          "help": "If provided, returns the response body for this specific request instead of listing all requests. Get requestIds from the listing output."
+        }
+      ]
+    },
+    {
+      "name": "preview_resize",
+      "label": "Resize viewport",
+      "description": "",
+      "category": "web",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "preset",
+          "label": "Device preset",
+          "type": "string",
+          "required": false,
+          "help": "Device preset. Overrides width/height if provided. \"desktop\" clears the size emulation (back to the pane's responsive size)."
+        },
+        {
+          "name": "width",
+          "label": "Width",
+          "type": "number",
+          "required": false,
+          "placeholder": "1280",
+          "help": "Viewport width in CSS pixels (requires height)"
+        },
+        {
+          "name": "height",
+          "label": "Height",
+          "type": "number",
+          "required": false,
+          "placeholder": "720",
+          "help": "Viewport height in CSS pixels (requires width)"
+        },
+        {
+          "name": "colorScheme",
+          "label": "Color scheme",
+          "type": "string",
+          "required": false,
+          "help": "Emulate prefers-color-scheme media feature for dark/light mode testing."
+        }
+      ]
+    },
+    {
+      "name": "preview_upload_image",
+      "label": "Upload image",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "image_id",
+          "label": "Image number",
+          "type": "string",
+          "required": true,
+          "placeholder": "3",
+          "help": "The conversation image number, e.g. 3, #3, or [Image #3]. A 64-character hex digest also resolves."
+        },
+        {
+          "name": "selector",
+          "label": "CSS selector",
+          "type": "string",
+          "required": false,
+          "placeholder": "input[type=file]",
+          "help": "CSS selector of the target file input. Omitted, the image goes into the file chooser the page has open, or else into the first file input on the page, hidden or not."
+        },
+        {
+          "name": "filename",
+          "label": "File name",
+          "type": "string",
+          "required": false,
+          "placeholder": "photo.png",
+          "help": "The file name the page sees. Defaults to the attachment's own name."
+        }
+      ]
+    },
+    {
+      "name": "preview_dialog",
+      "label": "Answer dialog",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID"
+        },
+        {
+          "name": "accept",
+          "label": "Accept",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": true,
+          "help": "On the web page default true. On a phone or tablet there is no default: give button or accept."
+        },
+        {
+          "name": "prompt_text",
+          "label": "Prompt text",
+          "type": "string",
+          "required": false,
+          "help": "On the web page used only when accepting a prompt. On an iPhone or iPad the text for the alert's field; without accept it is only typed."
+        },
+        {
+          "name": "button",
+          "label": "Button",
+          "type": "string",
+          "required": false,
+          "help": "Phone or tablet only: the exact label of the button to press."
+        }
+      ]
+    },
+    {
+      "name": "preview_input",
+      "label": "Remote input",
+      "description": "",
+      "category": "web",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID of the remote-control screen. Defaults to the screen the preview pane shows."
+        },
+        {
+          "name": "actions",
+          "label": "Actions",
+          "type": "json",
+          "required": true,
+          "placeholder": "[{\"action\":\"click\",\"x\":100,\"y\":200}]",
+          "help": "Actions to run in order, at most 20; the first one that fails stops the rest. x and y are pixels of the latest preview_screenshot (or preview_snapshot's @x,y boxes). Actions: click, long_press, drag, scroll, move, type, key, wait; a type with via \"paste\" pastes through the clipboard (desktops only)."
+        },
+        {
+          "name": "screenshot",
+          "label": "Screenshot",
+          "type": "boolean",
+          "required": false,
+          "help": "Also return a screenshot of the screen after the actions."
+        }
+      ]
+    },
+    {
+      "name": "preview_zoom",
+      "label": "Zoom in",
+      "description": "",
+      "category": "screen",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID of the remote-control screen. Defaults to the one the preview pane shows, else the only one connected."
+        },
+        {
+          "name": "x",
+          "label": "X",
+          "type": "number",
+          "required": true,
+          "help": "Left edge of the region, in the screenshot's frame."
+        },
+        {
+          "name": "y",
+          "label": "Y",
+          "type": "number",
+          "required": true,
+          "help": "Top edge of the region, in the screenshot's frame."
+        },
+        {
+          "name": "width",
+          "label": "Width",
+          "type": "number",
+          "required": true,
+          "help": "Width of the region, in the screenshot's frame."
+        },
+        {
+          "name": "height",
+          "label": "Height",
+          "type": "number",
+          "required": true,
+          "help": "Height of the region, in the screenshot's frame."
+        }
+      ]
+    },
+    {
+      "name": "preview_wait",
+      "label": "Wait for the screen",
+      "description": "",
+      "category": "screen",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID of the remote-control screen. Defaults to the one the preview pane shows, else the only one connected."
+        },
+        {
+          "name": "until",
+          "label": "Wait until",
+          "type": "string",
+          "required": false,
+          "help": "change (default) or still."
+        },
+        {
+          "name": "timeout",
+          "label": "Timeout (ms)",
+          "type": "number",
+          "required": false,
+          "help": "Milliseconds to wait at most, 100-20000; 5000 by default."
+        },
+        {
+          "name": "x",
+          "label": "X",
+          "type": "number",
+          "required": false,
+          "help": "Region to watch, in the latest screenshot's frame; give all four or none."
+        },
+        {
+          "name": "y",
+          "label": "Y",
+          "type": "number",
+          "required": false,
+          "help": "Region to watch, in the latest screenshot's frame; give all four or none."
+        },
+        {
+          "name": "width",
+          "label": "Width",
+          "type": "number",
+          "required": false,
+          "help": "Region to watch, in the latest screenshot's frame; give all four or none."
+        },
+        {
+          "name": "height",
+          "label": "Height",
+          "type": "number",
+          "required": false,
+          "help": "Region to watch, in the latest screenshot's frame; give all four or none."
+        }
+      ]
+    },
+    {
+      "name": "screen_app",
+      "label": "Screen apps",
+      "description": "",
+      "category": "screen",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID of the Android device, iPhone or iPad. Defaults to the one the preview pane shows, else the only one connected."
+        },
+        {
+          "name": "action",
+          "label": "Action",
+          "type": "string",
+          "required": false,
+          "help": "list (default), foreground, info, launch, activate, stop or open_url."
+        },
+        {
+          "name": "app",
+          "label": "App",
+          "type": "string",
+          "required": false,
+          "help": "Android package or iOS bundle id. Required for info, launch, activate and stop; for open_url, the app to open the URL in."
+        },
+        {
+          "name": "url",
+          "label": "URL",
+          "type": "string",
+          "required": false,
+          "help": "For open_url: the URL or deep link."
+        },
+        {
+          "name": "filter",
+          "label": "Filter",
+          "type": "string",
+          "required": false,
+          "help": "For list: only entries containing this text, case-insensitive."
+        },
+        {
+          "name": "limit",
+          "label": "Limit",
+          "type": "number",
+          "required": false,
+          "help": "For list: at most this many entries, 1-1000; 200 by default."
+        },
+        {
+          "name": "scope",
+          "label": "Scope",
+          "type": "string",
+          "required": false,
+          "help": "For list, Android only: launchable (default), third_party or all."
+        },
+        {
+          "name": "activity",
+          "label": "Activity",
+          "type": "string",
+          "required": false,
+          "help": "For launch, Android only: the activity to start instead of the launcher one, as .MainActivity or a full class name."
+        },
+        {
+          "name": "restart",
+          "label": "Restart",
+          "type": "boolean",
+          "required": false,
+          "help": "For launch: stop the app first."
+        },
+        {
+          "name": "arguments",
+          "label": "Launch arguments",
+          "type": "json",
+          "required": false,
+          "help": "For launch, iOS only: launch arguments for the app (a fresh start only)."
+        },
+        {
+          "name": "environment",
+          "label": "Environment variables",
+          "type": "json",
+          "required": false,
+          "help": "For launch, iOS only: environment variables for the app (a fresh start only)."
+        }
+      ]
+    },
+    {
+      "name": "screen_device",
+      "label": "Screen device",
+      "description": "",
+      "category": "screen",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID of the Android device, iPhone or iPad. Defaults to the one the preview pane shows, else the only one connected."
+        },
+        {
+          "name": "action",
+          "label": "Action",
+          "type": "string",
+          "required": false,
+          "help": "info (default), lock, unlock, wake, rotate, appearance, animations, location, clear_location, notifications, quick_settings, collapse, stay_awake or dismiss_keyboard."
+        },
+        {
+          "name": "value",
+          "label": "Value",
+          "type": "string",
+          "required": false,
+          "help": "For rotate, appearance, animations and stay_awake: the new value."
+        },
+        {
+          "name": "sections",
+          "label": "Sections",
+          "type": "json",
+          "required": false,
+          "help": "For info: any of device, display, power and notifications."
+        },
+        {
+          "name": "latitude",
+          "label": "Latitude",
+          "type": "number",
+          "required": false,
+          "help": "For location: degrees, -90 to 90."
+        },
+        {
+          "name": "longitude",
+          "label": "Longitude",
+          "type": "number",
+          "required": false,
+          "help": "For location: degrees, -180 to 180."
+        }
+      ]
+    },
+    {
+      "name": "screen_clipboard",
+      "label": "Screen clipboard",
+      "description": "",
+      "category": "screen",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID of the iPhone, iPad or desktop. Defaults to the one the preview pane shows, else the only one connected."
+        },
+        {
+          "name": "action",
+          "label": "Action",
+          "type": "string",
+          "required": true,
+          "help": "read or write."
+        },
+        {
+          "name": "text",
+          "label": "Text",
+          "type": "multiline",
+          "required": false,
+          "help": "For write: the text; at most 60000 characters on a desktop."
+        }
+      ]
+    },
+    {
+      "name": "screen_package",
+      "label": "Install apps",
+      "description": "",
+      "category": "screen",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID of the Android device. Defaults to the one the preview pane shows, else the only one connected."
+        },
+        {
+          "name": "action",
+          "label": "Action",
+          "type": "string",
+          "required": true,
+          "help": "install, uninstall, clear_data, grant or revoke."
+        },
+        {
+          "name": "path",
+          "label": "Path",
+          "type": "string",
+          "required": false,
+          "help": "For install: the .apk file, relative to the workspace or absolute."
+        },
+        {
+          "name": "app",
+          "label": "App",
+          "type": "string",
+          "required": false,
+          "help": "For uninstall, clear_data, grant and revoke: the package name."
+        },
+        {
+          "name": "permission",
+          "label": "Permission",
+          "type": "string",
+          "required": false,
+          "help": "For grant and revoke: the permission, such as android.permission.POST_NOTIFICATIONS."
+        },
+        {
+          "name": "keep_data",
+          "label": "Keep data",
+          "type": "boolean",
+          "required": false,
+          "help": "For uninstall: keep the app's data and cache."
+        },
+        {
+          "name": "replace_existing",
+          "label": "Replace existing",
+          "type": "boolean",
+          "required": false,
+          "help": "For install: replace an installed version; true by default."
+        },
+        {
+          "name": "downgrade",
+          "label": "Allow downgrade",
+          "type": "boolean",
+          "required": false,
+          "help": "For install: allow a lower version code than the installed one (debuggable apps only)."
+        },
+        {
+          "name": "grant_permissions",
+          "label": "Grant all permissions",
+          "type": "boolean",
+          "required": false,
+          "help": "For install: grant every runtime permission the app requests."
+        }
+      ]
+    },
+    {
+      "name": "android_logcat",
+      "label": "Read Android logs",
+      "description": "",
+      "category": "android",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID of the Android device. Defaults to the one the preview pane shows, else the only one connected."
+        },
+        {
+          "name": "lines",
+          "label": "Line limit",
+          "type": "number",
+          "required": false,
+          "help": "Lines to return, 1-2000; 200 by default."
+        },
+        {
+          "name": "level",
+          "label": "Level",
+          "type": "string",
+          "required": false,
+          "help": "Lowest priority to keep: V, D, I, W, E or F."
+        },
+        {
+          "name": "tag",
+          "label": "Tag",
+          "type": "string",
+          "required": false,
+          "help": "Only this tag."
+        },
+        {
+          "name": "package",
+          "label": "Package",
+          "type": "string",
+          "required": false,
+          "help": "Only lines of this app."
+        },
+        {
+          "name": "buffer",
+          "label": "Log buffer",
+          "type": "string",
+          "required": false,
+          "help": "main, system, crash, events or all."
+        },
+        {
+          "name": "contains",
+          "label": "Contains text",
+          "type": "string",
+          "required": false,
+          "help": "Only lines containing this text, case-insensitive."
+        }
+      ]
+    },
+    {
+      "name": "android_shell",
+      "label": "Android shell",
+      "description": "",
+      "category": "android",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "serverId",
+          "label": "Server ID",
+          "type": "string",
+          "required": false,
+          "help": "Server ID of the Android device. Defaults to the one the preview pane shows, else the only one connected."
+        },
+        {
+          "name": "command",
+          "label": "Command",
+          "type": "multiline",
+          "required": true,
+          "help": "The shell command line."
+        },
+        {
+          "name": "timeout",
+          "label": "Timeout (ms)",
+          "type": "number",
+          "required": false,
+          "help": "Milliseconds to wait, 1000-20000; 10000 by default."
+        }
+      ]
+    },
+    {
+      "name": "agent_spawn",
+      "label": "Subagent",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "prompt",
+          "label": "Prompt",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "Inspect routing under src/ and summarize the key files",
+          "help": "Child agents do not see this conversation by default; include all required context in the task."
+        },
+        {
+          "name": "agent_type",
+          "label": "Named agent type",
+          "type": "string",
+          "required": false,
+          "placeholder": "code-reviewer",
+          "help": "Optional trusted definition name; the available names and what each is for are listed in this turn's available-agents context. Copy one of those names — the host resolves it, and matches case- and separator-insensitively when that is unambiguous. Cannot be combined with context=conversation."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "review-api",
+          "help": "Required. Name the child yourself: it is the address task_wait takes, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree."
+        },
+        {
+          "name": "label",
+          "label": "Display name",
+          "type": "string",
+          "required": false,
+          "placeholder": "Inspect routing",
+          "help": "Short name shown in the timeline."
+        },
+        {
+          "name": "context",
+          "label": "Context",
+          "type": "string",
+          "required": false,
+          "defaultValue": "none",
+          "help": "none (default): task only; conversation: include a copy of the current conversation history."
+        },
+        {
+          "name": "schema",
+          "label": "Output schema",
+          "type": "json",
+          "required": false,
+          "placeholder": "{\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\"}},\"required\":[\"verdict\"]}",
+          "help": "Optional JSON Schema subset. When set, the child must call structured_output with a result matching it, and that value comes back with task_wait. The top level must be an object schema; type, properties, required, items, enum, const, additionalProperties, minItems/maxItems, minLength/maxLength and minimum/maximum are supported and every other keyword is rejected on the spot."
+        }
+      ]
+    },
+    {
+      "name": "task_wait",
+      "label": "Wait for tasks",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "tasks",
+          "label": "Tasks",
+          "type": "json",
+          "required": false,
+          "placeholder": "[\"a1\", \"shell:1\"]",
+          "help": "Array of task addresses: a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>), a background command as shell:<id>, a terminal as terminal:<id>, a dev server as preview:<serverId> (preview:<serverId>@<workspace> when the conversation has several workspaces). The wait ends once every named task has produced a result. Omit to wait for every child agent, workflow run and background command in this conversation (terminals and dev servers excluded)."
+        },
+        {
+          "name": "timeout_seconds",
+          "label": "Timeout (seconds)",
+          "type": "number",
+          "required": false,
+          "defaultValue": 60,
+          "help": "5-600 seconds; default: 60."
+        }
+      ]
+    },
+    {
+      "name": "task_list",
+      "label": "List tasks",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": []
+    },
+    {
+      "name": "task_stop",
+      "label": "Stop a task",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "task",
+          "label": "Task address",
+          "type": "string",
+          "required": true,
+          "placeholder": "shell:1",
+          "help": "Address of the task to stop: a background command as shell:<id>, a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>). Terminal sessions cannot be stopped with this tool, and dev servers are stopped with preview_stop. The stopped task's result is still delivered."
+        }
+      ]
+    },
+    {
+      "name": "send_message",
+      "label": "Send message",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "to",
+          "label": "Child agent",
+          "type": "string",
+          "required": true,
+          "placeholder": "review-api",
+          "help": "Name the child was spawned with."
+        },
+        {
+          "name": "message",
+          "label": "Message",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "Retry with the v2 endpoint and report the result"
+        },
+        {
+          "name": "summary",
+          "label": "Summary",
+          "type": "string",
+          "required": false,
+          "placeholder": "Retry with the v2 endpoint",
+          "help": "Optional 5–10 word preview shown on the timeline."
+        }
+      ]
+    },
+    {
+      "name": "box",
+      "label": "Background result",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "none",
+          "label": "Empty argument",
+          "type": "json",
+          "required": true,
+          "placeholder": "[]",
+          "help": "Always an empty list."
+        }
+      ]
+    },
+    {
+      "name": "skill",
+      "label": "Skill",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "commit-helper",
+          "help": "Name of a skill this conversation selected; the schema lists them as an enum."
+        }
+      ]
+    },
+    {
+      "name": "tool_search",
+      "label": "Tool discovery",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "query",
+          "label": "Query",
+          "type": "string",
+          "required": true,
+          "placeholder": "select:mcp__github__create_issue",
+          "help": "`select:<name>[,<name>…]` to fetch exact tools, or keywords to search for them."
+        },
+        {
+          "name": "max_results",
+          "label": "Maximum results",
+          "type": "number",
+          "required": false,
+          "defaultValue": 5,
+          "placeholder": "5",
+          "help": "How many tools a keyword search may return; ignored when fetching by name."
+        }
+      ]
+    },
+    {
+      "name": "read_global_memory",
+      "label": "Read global memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "user-preferences",
+          "help": "A document name listed in the memory index. The .md suffix is optional."
+        }
+      ]
+    },
+    {
+      "name": "read_project_memory",
+      "label": "Read project memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "build-environment",
+          "help": "A document name listed in the memory index. The .md suffix is optional."
+        }
+      ]
+    },
+    {
+      "name": "create_global_memory",
+      "label": "Create global memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "user-preferences",
+          "help": "A single document name inside the memory directory. Path separators are forbidden; the .md suffix is optional."
+        },
+        {
+          "name": "content",
+          "label": "File content",
+          "type": "multiline",
+          "required": true,
+          "help": "The document's complete Markdown body."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "The user's long-standing language and code-style preferences",
+          "help": "One sentence describing what this memory records. It is written into the MEMORY.md index so a later run can decide whether to read the document."
+        }
+      ]
+    },
+    {
+      "name": "create_project_memory",
+      "label": "Create project memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "build-environment",
+          "help": "A single document name inside the memory directory. Path separators are forbidden; the .md suffix is optional."
+        },
+        {
+          "name": "content",
+          "label": "File content",
+          "type": "multiline",
+          "required": true,
+          "help": "The document's complete Markdown body."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "Tests must run in the project's own environment",
+          "help": "One sentence describing what this memory records. It is written into the MEMORY.md index so a later run can decide whether to read the document."
+        }
+      ]
+    },
+    {
+      "name": "edit_global_memory",
+      "label": "Edit global memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "user-preferences",
+          "help": "The memory document to modify. The .md suffix is optional."
+        },
+        {
+          "name": "old_text",
+          "label": "Original text",
+          "type": "multiline",
+          "required": true,
+          "help": "The passage to replace. It must match exactly once; supply a longer excerpt when it is not unique."
+        },
+        {
+          "name": "new_text",
+          "label": "New text",
+          "type": "multiline",
+          "required": true,
+          "help": "The replacement text. Leave it empty to delete the passage."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "The user's long-standing language and code-style preferences",
+          "help": "One sentence describing this memory after the change. It refreshes the document's entry in the MEMORY.md index."
+        }
+      ]
+    },
+    {
+      "name": "edit_project_memory",
+      "label": "Edit project memory",
+      "description": "",
+      "category": "memory",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "build-environment",
+          "help": "The memory document to modify. The .md suffix is optional."
+        },
+        {
+          "name": "old_text",
+          "label": "Original text",
+          "type": "multiline",
+          "required": true,
+          "help": "The passage to replace. It must match exactly once; supply a longer excerpt when it is not unique."
+        },
+        {
+          "name": "new_text",
+          "label": "New text",
+          "type": "multiline",
+          "required": true,
+          "help": "The replacement text. Leave it empty to delete the passage."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "Tests must run in the project's own environment",
+          "help": "One sentence describing this memory after the change. It refreshes the document's entry in the MEMORY.md index."
+        }
+      ]
+    },
+    {
+      "name": "workflow",
+      "label": "Workflow",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "script",
+          "label": "JavaScript",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "export const meta = { name: \"…\", description: \"…\" }\n…",
+          "help": "JavaScript orchestration starting with `export const meta = {…}`: spawn steps with agent()/parallel()/pipeline(), narrate with phase()/log(); the body's return value is the run result. Adding { isolation: \"worktree\" } to a step gives it its own git worktree checked out from HEAD (uncommitted changes are not in it; a step that leaves changes keeps its worktree, one that changes nothing has it removed)."
+        },
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "review-sweep",
+          "help": "Required. This run's address in the same namespace agents are named in, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree, so a resume still needs a fresh one."
+        },
+        {
+          "name": "args",
+          "label": "Arguments",
+          "type": "json",
+          "required": false,
+          "help": "JSON value exposed to the script as the global `args`, verbatim; pass arrays and objects directly, not as encoded strings."
+        },
+        {
+          "name": "token_budget",
+          "label": "Token budget",
+          "type": "number",
+          "required": false,
+          "help": "Hard token ceiling for this run, readable as budget in the script; once exhausted, further agent() calls throw."
+        },
+        {
+          "name": "resume_run_id",
+          "label": "Resume run ID",
+          "type": "string",
+          "required": false,
+          "placeholder": "run0a1b2c3d",
+          "help": "Run id from a previous run; steps whose prompt and options are unchanged replay, a step the last attempt left running re-runs alone, and everything from the first changed or failed step re-runs. script and args may be omitted to reuse the last ones; an edited script is approved again."
+        }
+      ]
+    },
+    {
+      "name": "ask_user",
+      "label": "Ask user",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "questions",
+          "label": "Questions",
+          "type": "json",
+          "required": true,
+          "placeholder": "[{\"question\":\"Which approach should I use?\",\"header\":\"Approach\",\"options\":[{\"label\":\"Approach A\",\"description\":\"Keep the change small\"},{\"label\":\"Approach B\",\"description\":\"Perform a full rewrite\"}],\"multiSelect\":false}]",
+          "help": "Claude Code AskUserQuestion format: 1-4 questions, each with header, question, 2-4 label/description options, and multiSelect. Do not add Other."
+        }
+      ]
+    },
+    {
+      "name": "fork",
+      "label": "Fork conversation",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": true,
+      "parameters": [
+        {
+          "name": "prompt",
+          "label": "Prompt",
+          "type": "multiline",
+          "required": true,
+          "placeholder": "The task to complete in the forked conversation",
+          "help": "First user message of the forked conversation, and your only chance to instruct it; state the task and all the background it needs"
+        }
+      ]
+    },
+    {
+      "name": "plan",
+      "label": "Plan document",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "action",
+          "label": "Action",
+          "type": "string",
+          "required": true,
+          "placeholder": "write",
+          "help": "Choose an action: write stores or replaces the plan, read returns the current one."
+        },
+        {
+          "name": "content",
+          "label": "File content",
+          "type": "string",
+          "required": false,
+          "help": "Required for write; the plan's Markdown body, which replaces the previous one in full."
+        }
+      ]
+    },
+    {
+      "name": "exit_plan_mode",
+      "label": "Exit plan mode",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": []
+    },
+    {
+      "name": "read_handoff_note",
+      "label": "Read handoff note",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "current-state",
+          "help": "A note name listed in the handoff index. The .md suffix is optional."
+        }
+      ]
+    },
+    {
+      "name": "create_handoff_note",
+      "label": "Write handoff note",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "current-state",
+          "help": "The handoff note's name. Path separators are forbidden; the .md suffix is optional."
+        },
+        {
+          "name": "content",
+          "label": "File content",
+          "type": "multiline",
+          "required": true,
+          "help": "The note's complete Markdown body."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "The goal, the work done and the next step",
+          "help": "One sentence describing what this handoff note holds. It is written into the handoff index."
+        }
+      ]
+    },
+    {
+      "name": "edit_handoff_note",
+      "label": "Edit handoff note",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "label": "Name",
+          "type": "string",
+          "required": true,
+          "placeholder": "current-state",
+          "help": "The handoff note to modify. The .md suffix is optional."
+        },
+        {
+          "name": "old_text",
+          "label": "Original text",
+          "type": "multiline",
+          "required": true,
+          "help": "The passage to replace. It must match exactly once; supply a longer excerpt when it is not unique."
+        },
+        {
+          "name": "new_text",
+          "label": "New text",
+          "type": "multiline",
+          "required": true,
+          "help": "The replacement text. Leave it empty to delete the passage."
+        },
+        {
+          "name": "description",
+          "label": "Description",
+          "type": "string",
+          "required": true,
+          "placeholder": "The goal, the work done and the next step",
+          "help": "One sentence describing this handoff note after the change. It refreshes the note's entry in the handoff index."
+        }
+      ]
+    },
+    {
+      "name": "handoff",
+      "label": "Hand off",
+      "description": "",
+      "category": "orchestration",
+      "dangerous": false,
+      "parameters": []
+    }
+  ]
+}

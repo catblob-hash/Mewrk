@@ -1,0 +1,41 @@
+[package]
+name = "mewrk-ui-chat"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "The conversation view, upstream's StreamedConversationView, ContextStream, the composer and its docks."
+
+[dependencies]
+mewrk-client = { path = "../../mewrk-client" }
+fluent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+mewrk-ui-common = { path = "../common" }
+mewrk-panes.workspace = true
+mewrk-pane-tasks = { path = "../../panes/tasks" }
+mewrk-pane-git = { path = "../../panes/git" }
+mewrk-pane-files = { path = "../../panes/files" }
+mewrk-pane-browser = { path = "../../panes/browser" }
+mewrk-ui-composer = { path = "../composer" }
+regex.workspace = true
+taffy = "0.9"
+url = "2"
+image.workspace = true
+
+[lib]
+# The disk runs full: every test lives in the one `tests/suite` binary.
+test = false
+doctest = false
+
+[dev-dependencies]
+accesskit.workspace = true
+wgpu.workspace = true
+image.workspace = true
+
+[[test]]
+name = "suite"
+path = "tests/suite/main.rs"
+
+[[example]]
+name = "chat_shot"
+path = "examples/chat_shot.rs"

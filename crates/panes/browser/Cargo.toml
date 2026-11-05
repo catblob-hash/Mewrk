@@ -1,0 +1,30 @@
+[package]
+name = "mewrk-pane-browser"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "The preview pane, upstream's BrowserPanel and PreviewPane."
+
+[dependencies]
+mewrk-client = { path = "../../mewrk-client" }
+mewrk-pane-files = { path = "../files" }
+fluent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# For `attach_main_view`: where a page's native view goes.
+tauri = { path = "../../mewrk-host/tauri-shim", package = "mewrk-tauri-shim" }
+url = "2"
+regex.workspace = true
+unicode-normalization = "0.1"
+base64 = "0.22"
+image.workspace = true
+arboard.workspace = true
+dirs = "6"
+
+[dev-dependencies]
+accesskit.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2.workspace = true
+objc2-foundation = { workspace = true, features = ["NSRunLoop", "NSDate", "NSObjCRuntime", "NSString"] }
+objc2-app-kit.workspace = true

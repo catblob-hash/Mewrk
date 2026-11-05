@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleLocalizations</key>
+  <array>
+    <string>en</string>
+    <string>zh-Hans</string>
+  </array>
+  <key>CFBundleName</key><string>Mewrk</string>
+  <key>CFBundleDisplayName</key><string>Mewrk</string>
+  <key>CFBundleIdentifier</key><string>dev.mewrk.native</string>
+  <key>CFBundleExecutable</key><string>mewrk</string>
+  <key>CFBundleIconFile</key><string>icon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSDesktopFolderUsageDescription</key><string>Mewrk opens projects in your Desktop folder and runs the commands and agent tools you start there.</string>
+  <key>NSDocumentsFolderUsageDescription</key><string>Mewrk opens projects in your Documents folder and runs the commands and agent tools you start there.</string>
+  <key>NSDownloadsFolderUsageDescription</key><string>Mewrk opens projects in your Downloads folder and runs the commands and agent tools you start there.</string>
+  <key>NSRemovableVolumesUsageDescription</key><string>Mewrk opens projects on removable volumes and runs the commands and agent tools you start there.</string>
+  <key>NSNetworkVolumesUsageDescription</key><string>Mewrk opens projects on network volumes and runs the commands and agent tools you start there.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Mewrk connects to SSH machines, model servers such as Ollama or LM Studio, and development servers on your local network.</string>
+  <key>NSAppleEventsUsageDescription</key><string>Programs you run in Mewrk, such as scripts in the terminal, may ask to control other apps.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Programs you run in Mewrk may use the microphone.</string>
+  <key>NSCameraUsageDescription</key><string>Programs you run in Mewrk may use the camera.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>Programs you run in Mewrk may use Bluetooth.</string>
+</dict>
+</plist>

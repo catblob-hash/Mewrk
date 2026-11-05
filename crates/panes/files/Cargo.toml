@@ -1,0 +1,40 @@
+[package]
+name = "mewrk-pane-files"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "The files pane and file previews, upstream's FilesPane and FilePreview."
+
+[dependencies]
+mewrk-client = { path = "../../mewrk-client" }
+mewrk-panes.workspace = true
+mewrk-ui-common = { path = "../../ui/common" }
+fluent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+base64-simd.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "ico", "tiff"] }
+resvg = { version = "0.45", default-features = false }
+html5ever = "0.38"
+markup5ever_rcdom = "0.38"
+swash.workspace = true
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "pcm", "flac", "ogg", "vorbis", "aac", "isomp4", "aiff", "caf", "adpcm", "alac", "mkv"] }
+# Symphonia reads the containers Opus comes in but has no decoder for it.
+opus-pure = "0.2"
+miniz_oxide = "0.8"
+# WOFF2's Brotli and its `glyf`, `loca` and `hmtx` transforms. WOFF is `sfnt_bytes`' own, so no zlib backend.
+wuff = { version = "0.2.9", default-features = false, features = ["brotli"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+block2 = "0.6"
+objc2-foundation = { workspace = true, features = ["NSData", "NSError", "NSString", "NSURL", "NSURLRequest", "NSGeometry", "NSThread", "NSObject", "NSRunLoop", "NSDate", "block2"] }
+objc2-app-kit = { workspace = true, features = ["NSView", "NSResponder", "NSImage"] }
+objc2-web-kit = { workspace = true, features = ["WKWebpagePreferences", "WKNavigationDelegate", "WKNavigationAction", "WKPreferences", "WKFrameInfo", "block2"] }
+objc2-pdf-kit = { version = "0.3", features = ["PDFView", "PDFDocument", "PDFPage", "objc2-app-kit"] }
+objc2-avf-audio = { version = "0.3", features = ["AVAudioPlayer"] }
+
+[dev-dependencies]
+accesskit.workspace = true
+wgpu.workspace = true

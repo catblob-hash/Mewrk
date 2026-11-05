@@ -1,0 +1,28 @@
+[package]
+name = "mewrk-ui-common"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "Elements more than one surface uses: menus, Markdown."
+
+[dependencies]
+mewrk-client = { path = "../../mewrk-client" }
+mewrk-panes.workspace = true
+fluent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }
+html5ever = "0.38"
+markup5ever_rcdom = "0.38"
+base64-simd.workspace = true
+image.workspace = true
+resvg = { version = "0.45", default-features = false }
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+accesskit.workspace = true
+wgpu.workspace = true
+image.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "fluent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wgpu.workspace = true
+winit.workspace = true
+swash.workspace = true
+fontdb.workspace = true
+etagere.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+memmap2.workspace = true
+taffy = "0.9"
+accesskit.workspace = true
+resvg = { version = "0.45", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSRange", "NSString"] }
+
+[dev-dependencies]
+accesskit_consumer = "0.39"

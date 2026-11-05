@@ -1,0 +1,11 @@
+[package]
+name = "mewrk-panes"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+
+[dependencies]
+fluent.workspace = true
+git-core.workspace = true
+ignore.workspace = true
+parking_lot.workspace = true

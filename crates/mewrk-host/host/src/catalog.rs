@@ -1,0 +1,3765 @@
+use chrono::{Duration, Utc};
+use serde_json::{json, Value};
+
+use crate::model::{
+    ApiProvider, AppDocument, AppLanguage, CapabilityCatalog, ConversationPreset,
+    ConversationPresetSettings, GlobalSettings, PresetLibrary, ProviderFamily, ResolvedLanguage,
+    ThemePreference, ToolCategory, ToolDescriptor, ToolParameter, ToolParameterType, Workspace,
+    WorkspaceKind,
+};
+
+#[cfg(test)]
+use crate::model::{ContextItem, Conversation, ConversationSettings, SecurityLevel, ToolResult};
+
+fn parameter(
+    name: &str,
+    label: &str,
+    parameter_type: ToolParameterType,
+    required: bool,
+    default_value: Option<Value>,
+    placeholder: Option<&str>,
+    help: Option<&str>,
+) -> ToolParameter {
+    ToolParameter {
+        name: name.into(),
+        label: label.into(),
+        parameter_type,
+        required,
+        placeholder: placeholder.map(str::to_owned),
+        help: help.map(str::to_owned),
+        default_value,
+    }
+}
+
+
+fn descriptor(
+    name: &str,
+    label: &str,
+    description: &str,
+    category: ToolCategory,
+    dangerous: bool,
+    parameters: Vec<ToolParameter>,
+) -> ToolDescriptor {
+    ToolDescriptor {
+        force_confirmation: false,
+        approval_note: None,
+        name: name.into(),
+        label: label.into(),
+        description: description.into(),
+        category,
+        dangerous,
+        parameters,
+        input_schema: None,
+    }
+}
+
+/// The parameters of both PowerShell tools: `pwsh` (PowerShell 7) and
+/// `powershell` (Windows PowerShell 5.1) are two tools with one shape
+/// (`shell_backend`).
+fn powershell_parameters() -> Vec<ToolParameter> {
+    use ToolParameterType::{Boolean, Multiline, Number, String as StringType};
+    vec![
+        parameter(
+            "command",
+            "命令",
+            Multiline,
+            true,
+            None,
+            Some("Get-ChildItem -Force"),
+            None,
+        ),
+        parameter(
+            "description",
+            "说明",
+            StringType,
+            false,
+            None,
+            Some("列出当前目录的文件"),
+            None,
+        ),
+        // No catalog default: the default lives in the host
+        // (tool_executor::SHELL_DEFAULT_TIMEOUT) and in the schema text.
+        // A default here would prefill the manual tool-call form and send
+        // the value explicitly, which is noise in the recorded input.
+        parameter(
+            "timeout",
+            "超时（毫秒）",
+            Number,
+            false,
+            None,
+            Some("120000"),
+            None,
+        ),
+        parameter(
+            "run_in_background",
+            "后台运行",
+            Boolean,
+            false,
+            Some(json!(false)),
+            None,
+            None,
+        ),
+    ]
+}
+
+pub fn tool_catalog() -> Vec<ToolDescriptor> {
+    use ToolParameterType::{Boolean, Json, Multiline, Number, String as StringType};
+
+    vec![
+        descriptor(
+            "ls",
+            "列出文件",
+            "",
+            ToolCategory::Filesystem,
+            false,
+            vec![
+                parameter(
+                    "path",
+                    "目录",
+                    StringType,
+                    true,
+                    Some(json!(".")),
+                    Some("."),
+                    None,
+                ),
+                parameter(
+                    "depth",
+                    "递归深度",
+                    Number,
+                    false,
+                    Some(json!(1)),
+                    None,
+                    Some("0 仅列出当前目录"),
+                ),
+            ],
+        ),
+        descriptor(
+            "grep",
+            "搜索内容",
+            "",
+            ToolCategory::Filesystem,
+            false,
+            vec![
+                parameter(
+                    "pattern",
+                    "搜索内容",
+                    StringType,
+                    true,
+                    None,
+                    Some("TODO|FIXME"),
+                    None,
+                ),
+                parameter(
+                    "path",
+                    "范围",
+                    StringType,
+                    false,
+                    Some(json!(".")),
+                    None,
+                    None,
+                ),
+                parameter(
+                    "glob",
+                    "文件通配",
+                    StringType,
+                    false,
+                    None,
+                    Some("*.rs"),
+                    Some("只搜索路径匹配该 glob 的文件，例如 *.rs 或 src/**/*.tsx"),
+                ),
+                parameter(
+                    "case_sensitive",
+                    "区分大小写",
+                    Boolean,
+                    false,
+                    Some(json!(true)),
+                    None,
+                    None,
+                ),
+                parameter(
+                    "output_mode",
+                    "输出模式",
+                    StringType,
+                    false,
+                    Some(json!("files_with_matches")),
+                    None,
+                    Some("files_with_matches（默认）只列出含匹配的文件；content 列出匹配行；count 统计每个文件的匹配行数"),
+                ),
+                parameter(
+                    "context",
+                    "上下文行数",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("仅 content 模式：每处匹配前后各带几行上下文，0 至 20"),
+                ),
+                parameter(
+                    "before",
+                    "前置行数",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("仅 content 模式：每处匹配之前的上下文行数，0 至 20"),
+                ),
+                parameter(
+                    "after",
+                    "后置行数",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("仅 content 模式：每处匹配之后的上下文行数，0 至 20"),
+                ),
+                parameter(
+                    "limit",
+                    "条数上限",
+                    Number,
+                    false,
+                    Some(json!(250)),
+                    None,
+                    Some("最多返回所选模式的结果条数，默认 250，至多 1000"),
+                ),
+                parameter(
+                    "offset",
+                    "跳过",
+                    Number,
+                    false,
+                    Some(json!(0)),
+                    None,
+                    Some("先跳过所选模式的这么多条结果，用于翻到下一页"),
+                ),
+            ],
+        ),
+        descriptor(
+            "pwsh",
+            "PowerShell 7",
+            "",
+            ToolCategory::Shell,
+            true,
+            powershell_parameters(),
+        ),
+        descriptor(
+            "powershell",
+            "Windows PowerShell",
+            "",
+            ToolCategory::Shell,
+            true,
+            powershell_parameters(),
+        ),
+        descriptor(
+            "bash",
+            "Bash",
+            "",
+            ToolCategory::Shell,
+            true,
+            vec![
+                parameter(
+                    "command",
+                    "命令",
+                    Multiline,
+                    true,
+                    None,
+                    Some("git status --short"),
+                    None,
+                ),
+                parameter(
+                    "description",
+                    "说明",
+                    StringType,
+                    false,
+                    None,
+                    Some("查看工作树状态"),
+                    None,
+                ),
+                // No catalog default: the default lives in the host
+                // (tool_executor::SHELL_DEFAULT_TIMEOUT) and in the schema text.
+                // A default here would prefill the manual tool-call form and send
+                // the value explicitly, which is noise in the recorded input.
+                parameter(
+                    "timeout",
+                    "超时（毫秒）",
+                    Number,
+                    false,
+                    None,
+                    Some("120000"),
+                    None,
+                ),
+                parameter(
+                    "run_in_background",
+                    "后台运行",
+                    Boolean,
+                    false,
+                    Some(json!(false)),
+                    None,
+                    None,
+                ),
+            ],
+        ),
+        descriptor(
+            "zsh",
+            "zsh",
+            "",
+            ToolCategory::Shell,
+            true,
+            vec![
+                parameter(
+                    "command",
+                    "命令",
+                    Multiline,
+                    true,
+                    None,
+                    Some("ls -la"),
+                    None,
+                ),
+                parameter(
+                    "description",
+                    "说明",
+                    StringType,
+                    false,
+                    None,
+                    Some("列出当前目录的文件"),
+                    None,
+                ),
+                parameter(
+                    "timeout",
+                    "超时（毫秒）",
+                    Number,
+                    false,
+                    None,
+                    Some("120000"),
+                    None,
+                ),
+                parameter(
+                    "run_in_background",
+                    "后台运行",
+                    Boolean,
+                    false,
+                    Some(json!(false)),
+                    None,
+                    None,
+                ),
+            ],
+        ),
+        descriptor(
+            "sh",
+            "sh",
+            "",
+            ToolCategory::Shell,
+            true,
+            vec![
+                parameter(
+                    "command",
+                    "命令",
+                    Multiline,
+                    true,
+                    None,
+                    Some("ls -la"),
+                    None,
+                ),
+                parameter(
+                    "description",
+                    "说明",
+                    StringType,
+                    false,
+                    None,
+                    Some("列出当前目录的文件"),
+                    None,
+                ),
+                parameter(
+                    "timeout",
+                    "超时（毫秒）",
+                    Number,
+                    false,
+                    None,
+                    Some("120000"),
+                    None,
+                ),
+                parameter(
+                    "run_in_background",
+                    "后台运行",
+                    Boolean,
+                    false,
+                    Some(json!(false)),
+                    None,
+                    None,
+                ),
+            ],
+        ),
+        descriptor(
+            "write",
+            "写入文件",
+            "",
+            ToolCategory::Filesystem,
+            true,
+            vec![
+                parameter(
+                    "path",
+                    "文件路径",
+                    StringType,
+                    true,
+                    None,
+                    Some("src/example.ts"),
+                    None,
+                ),
+                parameter("content", "文件内容", Multiline, true, None, None, None),
+            ],
+        ),
+        descriptor(
+            "edit",
+            "编辑文件",
+            "",
+            ToolCategory::Filesystem,
+            true,
+            vec![
+                parameter("path", "文件路径", StringType, true, None, None, None),
+                parameter("find", "查找内容", Multiline, true, None, None, None),
+                parameter("replace", "替换为", Multiline, true, None, None, None),
+                parameter(
+                    "replace_all",
+                    "全部替换",
+                    Boolean,
+                    false,
+                    Some(json!(false)),
+                    None,
+                    None,
+                ),
+            ],
+        ),
+        descriptor(
+            "find",
+            "查找文件",
+            "",
+            ToolCategory::Filesystem,
+            false,
+            vec![
+                parameter(
+                    "query",
+                    "文件名模式",
+                    StringType,
+                    true,
+                    None,
+                    Some("*.tsx"),
+                    None,
+                ),
+                parameter(
+                    "path",
+                    "目录",
+                    StringType,
+                    false,
+                    Some(json!(".")),
+                    None,
+                    None,
+                ),
+            ],
+        ),
+        descriptor(
+            "read",
+            "读取文件",
+            "",
+            ToolCategory::Filesystem,
+            false,
+            vec![
+                parameter("path", "文件路径", StringType, true, None, None, None),
+                parameter(
+                    "start_line",
+                    "起始行",
+                    Number,
+                    false,
+                    Some(json!(1)),
+                    None,
+                    Some("仅文本文件；从 1 开始"),
+                ),
+                parameter(
+                    "end_line",
+                    "结束行",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("仅文本文件；包含该行"),
+                ),
+            ],
+        ),
+        descriptor(
+            "lsp",
+            "代码语义导航",
+            "",
+            ToolCategory::Filesystem,
+            false,
+            vec![
+                parameter(
+                    "operation",
+                    "操作",
+                    StringType,
+                    true,
+                    None,
+                    Some("goToDefinition"),
+                    Some("九种之一：goToDefinition、findReferences、hover、documentSymbol、workspaceSymbol、goToImplementation、prepareCallHierarchy、incomingCalls、outgoingCalls"),
+                ),
+                parameter("filePath", "文件路径", StringType, true, None, None, None),
+                parameter(
+                    "line",
+                    "行号",
+                    Number,
+                    true,
+                    None,
+                    None,
+                    Some("从 1 开始，与编辑器显示的一致"),
+                ),
+                parameter(
+                    "character",
+                    "列号",
+                    Number,
+                    true,
+                    None,
+                    None,
+                    Some("从 1 开始，与编辑器显示的一致"),
+                ),
+                parameter(
+                    "query",
+                    "符号名",
+                    StringType,
+                    false,
+                    None,
+                    Some("LspRegistry"),
+                    Some("只用于 workspaceSymbol；空查询在多数语言服务器上没有结果"),
+                ),
+            ],
+        ),
+        descriptor(
+            "web_search",
+            "联网搜索",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![parameter(
+                "query",
+                "查询",
+                StringType,
+                true,
+                None,
+                Some("Anthropic Claude 4.5 发布日期"),
+                Some("一句自足的查询；不要用代词指代上文，长问题拆成多次检索"),
+            )],
+        ),
+        descriptor(
+            "web_fetch",
+            "抓取网页",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![parameter(
+                "urls",
+                "网址",
+                Json,
+                true,
+                None,
+                Some("[\"https://example.com/docs/changelog\"]"),
+                Some("一批绝对 http(s) 地址；不知道地址时先用联网搜索"),
+            )],
+        ),
+        descriptor(
+            "preview_start",
+            "启动预览",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![parameter(
+                "name",
+                "名称",
+                StringType,
+                true,
+                None,
+                Some("dev"),
+                Some(".mewrk/launch.json 里的服务器名称"),
+            )],
+        ),
+        descriptor(
+            "preview_stop",
+            "停止预览",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![parameter(
+                "serverId",
+                "服务器 ID",
+                StringType,
+                true,
+                None,
+                None,
+                Some("要停止的服务器 ID"),
+            )],
+        ),
+        descriptor(
+            "preview_list",
+            "预览列表",
+            "",
+            ToolCategory::Web,
+            false,
+            Vec::new(),
+        ),
+        descriptor(
+            "preview_logs",
+            "服务器日志",
+            "",
+            ToolCategory::Web,
+            false,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "level",
+                    "级别",
+                    StringType,
+                    false,
+                    Some(json!("all")),
+                    None,
+                    Some("按级别过滤：all（默认）返回全部输出，error 只返回含 error、exception、failed 或 fatal 的行"),
+                ),
+                parameter(
+                    "lines",
+                    "行数上限",
+                    Number,
+                    false,
+                    Some(json!(50)),
+                    None,
+                    Some("最多返回行数（默认 50）"),
+                ),
+                parameter(
+                    "search",
+                    "文本过滤",
+                    StringType,
+                    false,
+                    None,
+                    Some("[DEBUG]"),
+                    Some("只保留包含该文本的行（例如 [DEBUG]、POST /api）"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_console_logs",
+            "控制台日志",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "level",
+                    "级别",
+                    StringType,
+                    false,
+                    Some(json!("all")),
+                    None,
+                    Some("按级别过滤：all（默认）、error（只看错误）、warn（警告加错误）"),
+                ),
+                parameter(
+                    "lines",
+                    "行数上限",
+                    Number,
+                    false,
+                    Some(json!(50)),
+                    None,
+                    Some("最多返回行数（默认 50，上限 200）"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_screenshot",
+            "页面截图",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "scale",
+                    "缩放",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("返回图像的缩放系数，取值 0.1 到 1；图像越小消耗的 token 越少。preview_click 和 preview_fill 按 CSS 选择器或 preview_snapshot 给出的 uid 找元素，而不是按像素坐标；遥控屏幕上的像素坐标交给 preview_input"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_snapshot",
+            "页面快照",
+            "",
+            ToolCategory::Web,
+            false,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_inspect",
+            "检查元素",
+            "",
+            ToolCategory::Web,
+            false,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "selector",
+                    "CSS Selector",
+                    StringType,
+                    true,
+                    None,
+                    Some(".button"),
+                    Some("要检查的元素 CSS 选择器"),
+                ),
+                parameter(
+                    "styles",
+                    "CSS 属性",
+                    Json,
+                    false,
+                    None,
+                    Some("[\"padding\",\"color\"]"),
+                    Some("要返回的 CSS 属性名数组；不给时返回一组常用属性"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_click",
+            "点击元素",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "selector",
+                    "CSS Selector",
+                    StringType,
+                    false,
+                    None,
+                    Some("button.primary"),
+                    Some("要点击的元素 CSS 选择器；也可以改给 uid"),
+                ),
+                parameter(
+                    "uid",
+                    "元素 uid",
+                    Number,
+                    false,
+                    None,
+                    Some("12"),
+                    Some("preview_snapshot 给这个元素标出的 uid，即行首方括号里的数字；也可以改给 CSS 选择器"),
+                ),
+                parameter(
+                    "doubleClick",
+                    "双击",
+                    Boolean,
+                    false,
+                    None,
+                    None,
+                    Some("改为双击"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_fill",
+            "填写输入",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "selector",
+                    "CSS Selector",
+                    StringType,
+                    false,
+                    None,
+                    Some("input[name=email]"),
+                    Some("要填写的输入框 CSS 选择器；也可以改给 uid"),
+                ),
+                parameter(
+                    "uid",
+                    "元素 uid",
+                    Number,
+                    false,
+                    None,
+                    Some("7"),
+                    Some("preview_snapshot 给这个输入框标出的 uid，即行首方括号里的数字；也可以改给 CSS 选择器"),
+                ),
+                parameter(
+                    "value",
+                    "值",
+                    StringType,
+                    true,
+                    None,
+                    None,
+                    Some("要填入的值"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_eval",
+            "执行脚本",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "expression",
+                    "表达式",
+                    Multiline,
+                    true,
+                    None,
+                    Some("document.title"),
+                    Some("在页面上下文里求值的 JavaScript 表达式；返回值按 JSON 序列化"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_network",
+            "网络请求",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "filter",
+                    "过滤",
+                    StringType,
+                    false,
+                    Some(json!("all")),
+                    None,
+                    Some("过滤：all（默认）返回全部请求，failed 只返回 4xx、5xx 与网络错误；给了 requestId 时本项被忽略"),
+                ),
+                parameter(
+                    "requestId",
+                    "请求 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("给出时返回该请求的响应正文，而不是列出全部请求；requestId 取自列表输出"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_resize",
+            "调整视口",
+            "",
+            ToolCategory::Web,
+            false,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "preset",
+                    "设备预设",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("设备预设；给出时覆盖 width 与 height。desktop 清除尺寸模拟，回到面板自身的响应式尺寸"),
+                ),
+                parameter(
+                    "width",
+                    "宽度",
+                    Number,
+                    false,
+                    None,
+                    Some("1280"),
+                    Some("视口宽度，单位 CSS 像素（需同时给 height）"),
+                ),
+                parameter(
+                    "height",
+                    "高度",
+                    Number,
+                    false,
+                    None,
+                    Some("720"),
+                    Some("视口高度，单位 CSS 像素（需同时给 width）"),
+                ),
+                parameter(
+                    "colorScheme",
+                    "配色方案",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("模拟 prefers-color-scheme 媒体特性，用于测试深色与浅色"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_upload_image",
+            "上传图片",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "image_id",
+                    "图片编号",
+                    StringType,
+                    true,
+                    None,
+                    Some("3"),
+                    Some("对话里的图片编号，如 3、#3 或 [Image #3]；也接受 64 位十六进制摘要"),
+                ),
+                parameter(
+                    "selector",
+                    "CSS Selector",
+                    StringType,
+                    false,
+                    None,
+                    Some("input[type=file]"),
+                    Some("目标 file 输入框的 CSS 选择器；不给时放进页面已打开的文件选择框，没有就放进页面上第一个 file 输入框（隐藏的也算）"),
+                ),
+                parameter(
+                    "filename",
+                    "文件名",
+                    StringType,
+                    false,
+                    None,
+                    Some("photo.png"),
+                    Some("页面看到的文件名；不给时用附件原名"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_dialog",
+            "回答对话框",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("服务器 ID"),
+                ),
+                parameter(
+                    "accept",
+                    "接受",
+                    Boolean,
+                    false,
+                    Some(json!(true)),
+                    None,
+                    Some("网页上默认接受；手机或平板上没有默认，须给 button 或 accept"),
+                ),
+                parameter(
+                    "prompt_text",
+                    "Prompt 输入",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("网页上仅在接受 prompt 时生效；iPhone 或 iPad 上填进弹窗的输入框，不给 accept 时只输入"),
+                ),
+                parameter(
+                    "button",
+                    "按钮",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("仅手机或平板：要按的按钮的完整标签"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_input",
+            "遥控输入",
+            "",
+            ToolCategory::Web,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("遥控屏幕的服务器 ID；不给时用预览面板正在显示的屏幕"),
+                ),
+                parameter(
+                    "actions",
+                    "动作序列",
+                    Json,
+                    true,
+                    None,
+                    Some("[{\"action\":\"click\",\"x\":100,\"y\":200}]"),
+                    Some("按顺序执行的动作数组，至多 20 个，遇错即停；x、y 是 preview_screenshot 截图（或 preview_snapshot 的 @x,y 框）上的像素。动作有 click、long_press、drag、scroll、move、type、key、wait；type 带 via: \"paste\" 时经剪贴板粘贴（仅桌面）"),
+                ),
+                parameter(
+                    "screenshot",
+                    "截图",
+                    Boolean,
+                    false,
+                    None,
+                    None,
+                    Some("执行完后再返回一张屏幕截图"),
+                ),
+            ],
+        ),
+        // The remote-control tool groups: the screen tools (`preview_zoom`, `preview_wait`,
+        // `screen_*`) and the Android-only ones of a screen that `preview_start` connected. Off in
+        // the built-in preset (see `builtin_preset_enabled_tools`).
+        descriptor(
+            "preview_zoom",
+            "局部放大",
+            "",
+            ToolCategory::Screen,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("遥控屏幕的服务器 ID；不给时用预览面板正在显示的屏幕，否则用唯一已连接的那块"),
+                ),
+                parameter(
+                    "x",
+                    "X",
+                    Number,
+                    true,
+                    None,
+                    None,
+                    Some("区域左边，取最近一次截图的坐标"),
+                ),
+                parameter(
+                    "y",
+                    "Y",
+                    Number,
+                    true,
+                    None,
+                    None,
+                    Some("区域上边，取最近一次截图的坐标"),
+                ),
+                parameter(
+                    "width",
+                    "宽度",
+                    Number,
+                    true,
+                    None,
+                    None,
+                    Some("区域宽度，取最近一次截图的坐标"),
+                ),
+                parameter(
+                    "height",
+                    "高度",
+                    Number,
+                    true,
+                    None,
+                    None,
+                    Some("区域高度，取最近一次截图的坐标"),
+                ),
+            ],
+        ),
+        descriptor(
+            "preview_wait",
+            "等待屏幕",
+            "",
+            ToolCategory::Screen,
+            false,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("遥控屏幕的服务器 ID；不给时用预览面板正在显示的屏幕，否则用唯一已连接的那块"),
+                ),
+                parameter(
+                    "until",
+                    "等到",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("change（默认）画面一变就返回，still 画面静止后返回"),
+                ),
+                parameter(
+                    "timeout",
+                    "超时",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("最多等多少毫秒，100–20000，默认 5000"),
+                ),
+                parameter(
+                    "x",
+                    "X",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("只看这个区域：左边，四个一起给或都不给"),
+                ),
+                parameter(
+                    "y",
+                    "Y",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("只看这个区域：上边"),
+                ),
+                parameter(
+                    "width",
+                    "宽度",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("只看这个区域：宽度"),
+                ),
+                parameter(
+                    "height",
+                    "高度",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("只看这个区域：高度"),
+                ),
+            ],
+        ),
+        descriptor(
+            "screen_app",
+            "屏幕应用",
+            "",
+            ToolCategory::Screen,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("手机或平板的服务器 ID；不给时用预览面板正在显示的那台，否则用唯一已连接的那台"),
+                ),
+                parameter(
+                    "action",
+                    "操作",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("list（默认）列出应用，foreground 前台应用，info 单个应用的状态，launch 启动，activate 切到前台，stop 强行停止，open_url 打开链接"),
+                ),
+                parameter(
+                    "app",
+                    "应用",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("Android 包名或 iOS bundle id；info、launch、activate、stop 必填，open_url 时指定由哪个应用打开"),
+                ),
+                parameter(
+                    "url",
+                    "链接",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("仅 open_url：要打开的网址或深层链接"),
+                ),
+                parameter(
+                    "filter",
+                    "筛选",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("仅 list：只列包含这段文字的项，不分大小写"),
+                ),
+                parameter(
+                    "limit",
+                    "上限",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("仅 list：最多列多少项，1–1000，默认 200"),
+                ),
+                parameter(
+                    "scope",
+                    "范围",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("仅 list，仅 Android：launchable（默认）、third_party 或 all"),
+                ),
+                parameter(
+                    "activity",
+                    "Activity",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("仅 launch，仅 Android：要启动的 Activity，写 .MainActivity 或完整类名"),
+                ),
+                parameter(
+                    "restart",
+                    "重新启动",
+                    Boolean,
+                    false,
+                    None,
+                    None,
+                    Some("仅 launch：先停止再启动"),
+                ),
+                parameter(
+                    "arguments",
+                    "启动参数",
+                    Json,
+                    false,
+                    None,
+                    None,
+                    Some("仅 launch，仅 iOS：应用的启动参数"),
+                ),
+                parameter(
+                    "environment",
+                    "环境变量",
+                    Json,
+                    false,
+                    None,
+                    None,
+                    Some("仅 launch，仅 iOS：应用的环境变量"),
+                ),
+            ],
+        ),
+        descriptor(
+            "screen_device",
+            "屏幕设备",
+            "",
+            ToolCategory::Screen,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("手机或平板的服务器 ID；不给时用预览面板正在显示的那台，否则用唯一已连接的那台"),
+                ),
+                parameter(
+                    "action",
+                    "操作",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("info（默认）读取状态；lock、unlock、wake、rotate、appearance、animations、location、clear_location、notifications、quick_settings、collapse、stay_awake、dismiss_keyboard 改变设备"),
+                ),
+                parameter(
+                    "value",
+                    "值",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("rotate、appearance、animations、stay_awake 的新值"),
+                ),
+                parameter(
+                    "sections",
+                    "分区",
+                    Json,
+                    false,
+                    None,
+                    None,
+                    Some("仅 info：device、display、power、notifications 中的任意几个"),
+                ),
+                parameter(
+                    "latitude",
+                    "纬度",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("仅 location：-90 到 90 度"),
+                ),
+                parameter(
+                    "longitude",
+                    "经度",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("仅 location：-180 到 180 度"),
+                ),
+            ],
+        ),
+        descriptor(
+            "screen_clipboard",
+            "屏幕剪贴板",
+            "",
+            ToolCategory::Screen,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("iPhone、iPad 或桌面的服务器 ID；不给时用预览面板正在显示的那台，否则用唯一已连接的那台"),
+                ),
+                parameter(
+                    "action",
+                    "操作",
+                    StringType,
+                    true,
+                    None,
+                    None,
+                    Some("read 读取，write 写入"),
+                ),
+                parameter(
+                    "text",
+                    "文本",
+                    Multiline,
+                    false,
+                    None,
+                    None,
+                    Some("仅 write：要写入的文字；桌面上至多 60000 个字符"),
+                ),
+            ],
+        ),
+        descriptor(
+            "screen_package",
+            "安装应用",
+            "",
+            ToolCategory::Screen,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("Android 设备的服务器 ID；不给时用预览面板正在显示的设备，否则用唯一已连接的那台"),
+                ),
+                parameter(
+                    "action",
+                    "操作",
+                    StringType,
+                    true,
+                    None,
+                    None,
+                    Some("install 安装，uninstall 卸载，clear_data 清除数据，grant 授予权限，revoke 撤销权限"),
+                ),
+                parameter(
+                    "path",
+                    "路径",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("仅 install：本机工作区里的 .apk 文件，相对工作区或绝对路径"),
+                ),
+                parameter(
+                    "app",
+                    "应用",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("uninstall、clear_data、grant、revoke 时的包名"),
+                ),
+                parameter(
+                    "permission",
+                    "权限",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("仅 grant 与 revoke：权限名，例如 android.permission.POST_NOTIFICATIONS"),
+                ),
+                parameter(
+                    "keep_data",
+                    "保留数据",
+                    Boolean,
+                    false,
+                    None,
+                    None,
+                    Some("仅 uninstall：保留应用的数据与缓存"),
+                ),
+                parameter(
+                    "replace_existing",
+                    "覆盖安装",
+                    Boolean,
+                    false,
+                    None,
+                    None,
+                    Some("仅 install：覆盖已安装的版本，默认开启"),
+                ),
+                parameter(
+                    "downgrade",
+                    "允许降级",
+                    Boolean,
+                    false,
+                    None,
+                    None,
+                    Some("仅 install：允许版本号低于已安装版本（仅限可调试应用）"),
+                ),
+                parameter(
+                    "grant_permissions",
+                    "授予全部权限",
+                    Boolean,
+                    false,
+                    None,
+                    None,
+                    Some("仅 install：授予应用申请的全部运行时权限"),
+                ),
+            ],
+        ),
+        descriptor(
+            "android_logcat",
+            "读取 Android 日志",
+            "",
+            ToolCategory::Android,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("Android 设备的服务器 ID；不给时用预览面板正在显示的设备，否则用唯一已连接的那台"),
+                ),
+                parameter(
+                    "lines",
+                    "行数",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("返回最近多少行，1 到 2000，默认 200"),
+                ),
+                parameter(
+                    "level",
+                    "级别",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("保留的最低优先级：V、D、I、W、E 或 F"),
+                ),
+                parameter(
+                    "tag",
+                    "标签",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("只看这个标签"),
+                ),
+                parameter(
+                    "package",
+                    "包名",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("只看这个应用的日志"),
+                ),
+                parameter(
+                    "buffer",
+                    "缓冲区",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("main、system、crash、events 或 all"),
+                ),
+                parameter(
+                    "contains",
+                    "包含文字",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("只保留包含这段文字的行，不区分大小写"),
+                ),
+            ],
+        ),
+        descriptor(
+            "android_shell",
+            "Android Shell",
+            "",
+            ToolCategory::Android,
+            true,
+            vec![
+                parameter(
+                    "serverId",
+                    "服务器 ID",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("Android 设备的服务器 ID；不给时用预览面板正在显示的设备，否则用唯一已连接的那台"),
+                ),
+                parameter(
+                    "command",
+                    "命令",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("在设备 shell 中执行的命令行"),
+                ),
+                parameter(
+                    "timeout",
+                    "超时（毫秒）",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("最多等待多少毫秒，1000 到 20000，默认 10000"),
+                ),
+            ],
+        ),
+        descriptor(
+            "agent_spawn",
+            "子代理",
+            "",
+            ToolCategory::Orchestration,
+            true,
+            vec![
+                parameter(
+                    "prompt",
+                    "任务",
+                    Multiline,
+                    true,
+                    None,
+                    Some("调查 src/ 下的路由结构并总结关键文件"),
+                    Some("默认子代理看不到当前对话，任务描述必须自包含全部背景"),
+                ),
+                parameter(
+                    "agent_type",
+                    "命名类型",
+                    StringType,
+                    false,
+                    None,
+                    Some("code-reviewer"),
+                    Some("可选的可信命名定义名称；可用的名称与用途列在本轮的可用 Agent 清单里。照抄其中一个名称即可——由宿主解析，无歧义时大小写与分隔符不敏感。不能与 context=conversation 同时使用"),
+                ),
+                parameter(
+                    "name",
+                    "名称",
+                    StringType,
+                    true,
+                    None,
+                    Some("review-api"),
+                    Some("必填。用于 task_wait 寻址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名"),
+                ),
+                parameter(
+                    "label",
+                    "显示名",
+                    StringType,
+                    false,
+                    None,
+                    Some("调查路由"),
+                    Some("显示在时间线上的短名称"),
+                ),
+                parameter(
+                    "context",
+                    "初始上下文",
+                    StringType,
+                    false,
+                    Some(json!("none")),
+                    None,
+                    Some("none（默认）：只看到任务；conversation：携带当前对话历史副本"),
+                ),
+                parameter(
+                    "schema",
+                    "输出模式",
+                    Json,
+                    false,
+                    None,
+                    Some(r#"{"type":"object","properties":{"verdict":{"type":"string"}},"required":["verdict"]}"#),
+                    Some("可选的 JSON Schema 子集；给出后子代理必须调用 structured_output 交回符合该模式的结果，返回值会随 task_wait 一起回来。顶层必须是 type 为 object 的对象模式；支持 type、properties、required、items、enum、const、additionalProperties、minItems/maxItems、minLength/maxLength、minimum/maximum，其余关键字会被当场拒绝"),
+                ),
+            ],
+        ),
+        descriptor(
+            "task_wait",
+            "等待任务",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![
+                parameter(
+                    "tasks",
+                    "任务列表",
+                    Json,
+                    false,
+                    None,
+                    Some("[\"a1\", \"shell:1\"]"),
+                    Some("任务地址数组：子代理与工作流直接写名称（工作流也可写 workflow:<runId>），后台命令写 shell:<id>，终端写 terminal:<id>，开发服务器写 preview:<serverId>（对话有多个工作区时写 preview:<serverId>@<工作区编号>）；等待到点名的任务全部给出结果为止，省略时等待本对话全部子代理、工作流与后台命令（不含终端与开发服务器）"),
+                ),
+                parameter(
+                    "timeout_seconds",
+                    "超时秒数",
+                    Number,
+                    false,
+                    Some(json!(60)),
+                    None,
+                    Some("5–600 秒，默认 60"),
+                ),
+            ],
+        ),
+        descriptor(
+            "task_list",
+            "任务列表",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![],
+        ),
+        descriptor(
+            "task_stop",
+            "停止任务",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![parameter(
+                "task",
+                "任务地址",
+                StringType,
+                true,
+                None,
+                Some("shell:1"),
+                Some("要停止的任务地址：后台命令写 shell:<id>，子代理与工作流直接写名称（工作流也可写 workflow:<runId>）；终端会话不能用它停止，开发服务器用 preview_stop。被停任务的结果仍会照常交付"),
+            )],
+        ),
+        // Derived from the conversation's subagent-communication switch and
+        // `agent_spawn`, and absent from the picker: it exists only while the
+        // main agent can message the children it starts. A child never holds it.
+        descriptor(
+            "send_message",
+            "发送消息",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![
+                parameter(
+                    "to",
+                    "子代理",
+                    StringType,
+                    true,
+                    None,
+                    Some("review-api"),
+                    Some("agent_spawn 时起的名字"),
+                ),
+                parameter(
+                    "message",
+                    "消息",
+                    Multiline,
+                    true,
+                    None,
+                    Some("改用 v2 接口再试一次，并报告结果"),
+                    None,
+                ),
+                parameter(
+                    "summary",
+                    "摘要",
+                    StringType,
+                    false,
+                    None,
+                    Some("改用 v2 接口重试"),
+                    Some("时间线上显示的 5–10 词预览"),
+                ),
+            ],
+        ),
+        descriptor(
+            "box",
+            "后台结果",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![parameter(
+                "none",
+                "空参数",
+                Json,
+                true,
+                None,
+                Some("[]"),
+                Some("始终为空数组"),
+            )],
+        ),
+        // The skill tool is host-only, has no file scope or approval, and does not
+        // appear in the picker because its name derives from the conversation's
+        // on-demand skill setting.
+        descriptor(
+            "skill",
+            "技能",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![parameter(
+                "name",
+                "技能名",
+                StringType,
+                true,
+                None,
+                Some("commit-helper"),
+                Some("本对话已选技能的名字，取自 schema 的 enum"),
+            )],
+        ),
+        // Derived from `mcp_tool_discovery_enabled` the same way, and likewise
+        // absent from the picker: it exists only while this run is holding MCP
+        // tool schemas back, and it is the only way to get one of them.
+        descriptor(
+            "tool_search",
+            "工具发现",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![
+                parameter(
+                    "query",
+                    "查询",
+                    StringType,
+                    true,
+                    None,
+                    Some("select:mcp__github__create_issue"),
+                    Some("`select:<名字>[,<名字>…]` 按名取，或者用关键词搜索"),
+                ),
+                parameter(
+                    "max_results",
+                    "最多返回",
+                    Number,
+                    false,
+                    Some(json!(5)),
+                    Some("5"),
+                    Some("关键词搜索最多返回几个工具；按名取时不生效"),
+                ),
+            ],
+        ),
+        descriptor(
+            "read_global_memory",
+            "读取全局记忆",
+            "",
+            ToolCategory::Memory,
+            false,
+            vec![parameter(
+                "name",
+                "文档名",
+                StringType,
+                true,
+                None,
+                Some("构建环境"),
+                Some("记忆索引里列出的文档名，.md 后缀可写可不写"),
+            )],
+        ),
+        descriptor(
+            "read_project_memory",
+            "读取项目记忆",
+            "",
+            ToolCategory::Memory,
+            false,
+            vec![parameter(
+                "name",
+                "文档名",
+                StringType,
+                true,
+                None,
+                Some("构建环境"),
+                Some("记忆索引里列出的文档名，.md 后缀可写可不写"),
+            )],
+        ),
+        descriptor(
+            "create_global_memory",
+            "创建全局记忆",
+            "",
+            ToolCategory::Memory,
+            true,
+            vec![
+                parameter(
+                    "name",
+                    "文档名",
+                    StringType,
+                    true,
+                    None,
+                    Some("用户偏好"),
+                    Some("memory 目录下的单个文档名，不能包含路径分隔符；.md 后缀可写可不写"),
+                ),
+                parameter(
+                    "content",
+                    "记忆内容",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("这份记忆的完整 Markdown 正文"),
+                ),
+                parameter(
+                    "description",
+                    "索引描述",
+                    StringType,
+                    true,
+                    None,
+                    Some("用户长期偏好的语言与代码风格"),
+                    Some("一句话说明这份记忆记录了什么，会写进 MEMORY.md 索引供以后判断要不要读取"),
+                ),
+            ],
+        ),
+        descriptor(
+            "create_project_memory",
+            "创建项目记忆",
+            "",
+            ToolCategory::Memory,
+            false,
+            vec![
+                parameter(
+                    "name",
+                    "文档名",
+                    StringType,
+                    true,
+                    None,
+                    Some("构建环境"),
+                    Some("memory 目录下的单个文档名，不能包含路径分隔符；.md 后缀可写可不写"),
+                ),
+                parameter(
+                    "content",
+                    "记忆内容",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("这份记忆的完整 Markdown 正文"),
+                ),
+                parameter(
+                    "description",
+                    "索引描述",
+                    StringType,
+                    true,
+                    None,
+                    Some("测试必须用项目自带环境运行"),
+                    Some("一句话说明这份记忆记录了什么，会写进 MEMORY.md 索引供以后判断要不要读取"),
+                ),
+            ],
+        ),
+        descriptor(
+            "edit_global_memory",
+            "编辑全局记忆",
+            "",
+            ToolCategory::Memory,
+            true,
+            vec![
+                parameter(
+                    "name",
+                    "文档名",
+                    StringType,
+                    true,
+                    None,
+                    Some("用户偏好"),
+                    Some("要修改的记忆文档名，.md 后缀可写可不写"),
+                ),
+                parameter(
+                    "old_text",
+                    "原文",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("文档中要被替换的原文，必须唯一匹配；不唯一时请提供更长的片段"),
+                ),
+                parameter(
+                    "new_text",
+                    "新文本",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("替换后的文本；留空表示删除这段内容"),
+                ),
+                parameter(
+                    "description",
+                    "索引描述",
+                    StringType,
+                    true,
+                    None,
+                    Some("用户长期偏好的语言与代码风格"),
+                    Some("修改后这份记忆的一句话说明，会刷新 MEMORY.md 索引里的对应条目"),
+                ),
+            ],
+        ),
+        descriptor(
+            "edit_project_memory",
+            "编辑项目记忆",
+            "",
+            ToolCategory::Memory,
+            false,
+            vec![
+                parameter(
+                    "name",
+                    "文档名",
+                    StringType,
+                    true,
+                    None,
+                    Some("构建环境"),
+                    Some("要修改的记忆文档名，.md 后缀可写可不写"),
+                ),
+                parameter(
+                    "old_text",
+                    "原文",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("文档中要被替换的原文，必须唯一匹配；不唯一时请提供更长的片段"),
+                ),
+                parameter(
+                    "new_text",
+                    "新文本",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("替换后的文本；留空表示删除这段内容"),
+                ),
+                parameter(
+                    "description",
+                    "索引描述",
+                    StringType,
+                    true,
+                    None,
+                    Some("测试必须用项目自带环境运行"),
+                    Some("修改后这份记忆的一句话说明，会刷新 MEMORY.md 索引里的对应条目"),
+                ),
+            ],
+        ),
+        descriptor(
+            "workflow",
+            "工作流",
+            "",
+            ToolCategory::Orchestration,
+            true,
+            vec![
+                parameter(
+                    "script",
+                    "编排脚本",
+                    Multiline,
+                    true,
+                    None,
+                    Some("export const meta = { name: \"…\", description: \"…\" }\n…"),
+                    Some("以 `export const meta = {…}` 开头的 JS 编排脚本：用 agent()/parallel()/pipeline()/phase()/log() 派生并组织步骤子代理，正文的 return 值就是运行结果。给某一步加 { isolation: \"worktree\" } 会为它单开一棵从 HEAD 检出的 git 工作树（看不到未提交改动；留下改动就保留，没改动就自动拆除）"),
+                ),
+                parameter(
+                    "name",
+                    "名称",
+                    StringType,
+                    true,
+                    None,
+                    Some("review-sweep"),
+                    Some("必填。这次运行在会话代理命名空间里的地址，也是任务栏里这一行的标题；小写字母开头，可含数字、_ 和 -；整个对话分支树内不可重名，续跑也要换新名字"),
+                ),
+                parameter(
+                    "args",
+                    "输入参数",
+                    Json,
+                    false,
+                    None,
+                    None,
+                    Some("原样暴露给脚本的 JSON 值（全局 args）；数组与对象直接传，不要编码成字符串"),
+                ),
+                parameter(
+                    "token_budget",
+                    "token 预算",
+                    Number,
+                    false,
+                    None,
+                    None,
+                    Some("本次运行允许消耗的 token 硬顶，脚本经 budget 读到；耗尽后新的 agent() 调用抛错"),
+                ),
+                parameter(
+                    "resume_run_id",
+                    "续跑运行 ID",
+                    StringType,
+                    false,
+                    None,
+                    Some("run0a1b2c3d"),
+                    Some("上一次运行报出的运行 ID；提示词与选项没变的步骤即时重放，上次停下时还在跑的步骤单独重跑，从第一个改动或失败的步骤起其余全部重跑。可省略脚本与 args 沿用上次的；传入改过的脚本会重新审批"),
+                ),
+            ],
+        ),
+        descriptor(
+            "ask_user",
+            "提问",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![parameter(
+                "questions",
+                "问题",
+                Json,
+                true,
+                None,
+                Some(
+                    r#"[{"question":"采用哪个方案？","header":"实现方案","options":[{"label":"方案 A","description":"保持改动最小"},{"label":"方案 B","description":"完整重构"}],"multiSelect":false}]"#,
+                ),
+                Some(
+                    "Claude Code AskUserQuestion 格式：1–4 题；每题含 header、question、2–4 个 label/description 选项及 multiSelect；无需添加 Other",
+                ),
+            )],
+        ),
+        descriptor(
+            "fork",
+            "分叉会话",
+            "",
+            ToolCategory::Orchestration,
+            true,
+            vec![parameter(
+                "prompt",
+                "提示词",
+                Multiline,
+                true,
+                None,
+                Some("在分叉出的会话里要完成的任务"),
+                Some("分叉会话的第一条用户消息，也是你唯一一次下达指令的机会；说清任务与需要的全部背景"),
+            )],
+        ),
+        descriptor(
+            "plan",
+            "计划文档",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![
+                parameter(
+                    "action",
+                    "动作",
+                    StringType,
+                    true,
+                    None,
+                    Some("write"),
+                    Some("选择操作：write 写入或覆盖计划、read 读取当前计划"),
+                ),
+                parameter(
+                    "content",
+                    "计划正文",
+                    StringType,
+                    false,
+                    None,
+                    None,
+                    Some("write 必填；计划的 Markdown 正文，整篇覆盖上一版"),
+                ),
+            ],
+        ),
+        descriptor(
+            "exit_plan_mode",
+            "退出计划模式",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![],
+        ),
+        // The handoff tools are derived by the host once the conversation's
+        // context crosses the auto-compact threshold (`handoff.rs`); like the
+        // plan tools, no picker offers them.
+        descriptor(
+            "read_handoff_note",
+            "读取交接文档",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![parameter(
+                "name",
+                "文档名",
+                StringType,
+                true,
+                None,
+                Some("当前进度"),
+                Some("交接索引里列出的文档名，.md 后缀可写可不写"),
+            )],
+        ),
+        descriptor(
+            "create_handoff_note",
+            "写交接文档",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![
+                parameter(
+                    "name",
+                    "文档名",
+                    StringType,
+                    true,
+                    None,
+                    Some("当前进度"),
+                    Some("交接文档名，不能包含路径分隔符；.md 后缀可写可不写"),
+                ),
+                parameter(
+                    "content",
+                    "文档内容",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("交接文档的完整 Markdown 正文"),
+                ),
+                parameter(
+                    "description",
+                    "索引描述",
+                    StringType,
+                    true,
+                    None,
+                    Some("任务目标、已完成的工作与下一步"),
+                    Some("一句话说明这份交接文档写了什么，会写进交接索引"),
+                ),
+            ],
+        ),
+        descriptor(
+            "edit_handoff_note",
+            "修改交接文档",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![
+                parameter(
+                    "name",
+                    "文档名",
+                    StringType,
+                    true,
+                    None,
+                    Some("当前进度"),
+                    Some("要修改的交接文档名，.md 后缀可写可不写"),
+                ),
+                parameter(
+                    "old_text",
+                    "原文",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("文档中要被替换的原文，必须唯一匹配；不唯一时请提供更长的片段"),
+                ),
+                parameter(
+                    "new_text",
+                    "新文本",
+                    Multiline,
+                    true,
+                    None,
+                    None,
+                    Some("替换后的文本；留空表示删除这段内容"),
+                ),
+                parameter(
+                    "description",
+                    "索引描述",
+                    StringType,
+                    true,
+                    None,
+                    Some("任务目标、已完成的工作与下一步"),
+                    Some("修改后这份交接文档的一句话说明，会刷新交接索引里的对应条目"),
+                ),
+            ],
+        ),
+        descriptor(
+            "handoff",
+            "交接",
+            "",
+            ToolCategory::Orchestration,
+            false,
+            vec![],
+        ),
+    ]
+}
+
+/// Returns trusted model-facing tool defaults for the configured language.
+///
+/// Trusted request construction always enters through this function before applying
+/// user-authored description overrides. `tool_catalog` creates an independent tree on
+/// every call, so localizing this copy cannot mutate the Simplified Chinese defaults.
+pub fn tool_catalog_for_language(language: ResolvedLanguage) -> Vec<ToolDescriptor> {
+    let mut tools = tool_catalog();
+    for tool in &mut tools {
+        localize_tool_descriptor(tool, language);
+    }
+    tools
+}
+
+/// A built-in tool's name as people read it in `language`, or `None` for a
+/// tool the catalog does not have.
+pub(crate) fn tool_label(name: &str, language: ResolvedLanguage) -> Option<String> {
+    match language {
+        ResolvedLanguage::EnUs => english_tool_label(name).map(str::to_owned),
+        ResolvedLanguage::ZhCn => {
+            static CHINESE: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+                std::sync::OnceLock::new();
+            CHINESE
+                .get_or_init(|| {
+                    tool_catalog()
+                        .into_iter()
+                        .map(|tool| (tool.name, tool.label))
+                        .collect()
+                })
+                .get(name)
+                .cloned()
+        }
+    }
+}
+
+fn localize_tool_descriptor(tool: &mut ToolDescriptor, language: ResolvedLanguage) {
+    if language != ResolvedLanguage::EnUs {
+        return;
+    }
+    let label = english_tool_label(&tool.name)
+        .unwrap_or_else(|| panic!("missing English defaults for built-in tool {}", tool.name));
+    tool.label = label.to_owned();
+
+    for parameter in &mut tool.parameters {
+        parameter.label = english_parameter_label(&parameter.name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing English label for built-in tool parameter {}.{}",
+                    tool.name, parameter.name
+                )
+            })
+            .to_owned();
+
+        if parameter.help.as_deref().is_some_and(contains_han) {
+            parameter.help = Some(
+                english_parameter_help(&tool.name, &parameter.name)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing English help for built-in tool parameter {}.{}",
+                            tool.name, parameter.name
+                        )
+                    })
+                    .to_owned(),
+            );
+        }
+        if parameter.placeholder.as_deref().is_some_and(contains_han) {
+            parameter.placeholder = Some(
+                english_parameter_placeholder(&tool.name, &parameter.name)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing English placeholder for built-in tool parameter {}.{}",
+                            tool.name, parameter.name
+                        )
+                    })
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+fn contains_han(value: &str) -> bool {
+    value.chars().any(|character| {
+        matches!(
+            character,
+            '\u{3400}'..='\u{4DBF}'
+                | '\u{4E00}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '\u{20000}'..='\u{2FA1F}'
+        )
+    })
+}
+
+fn english_tool_label(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "ls" => "List files",
+        "grep" => "Search content",
+        "pwsh" => "PowerShell 7",
+        "powershell" => "Windows PowerShell",
+        "bash" => "Bash",
+        "zsh" => "zsh",
+        "sh" => "sh",
+        "write" => "Write file",
+        "edit" => "Edit file",
+        "find" => "Find files",
+        "read" => "Read file",
+        "lsp" => "Code navigation",
+        "web_search" => "Web search",
+        "web_fetch" => "Fetch web pages",
+        "preview_start" => "Start preview",
+        "preview_stop" => "Stop preview",
+        "preview_list" => "List previews",
+        "preview_logs" => "Server logs",
+        "preview_console_logs" => "Console logs",
+        "preview_screenshot" => "Page screenshot",
+        "preview_snapshot" => "Page snapshot",
+        "preview_inspect" => "Inspect element",
+        "preview_click" => "Click element",
+        "preview_fill" => "Fill input",
+        "preview_eval" => "Run script",
+        "preview_network" => "Network requests",
+        "preview_resize" => "Resize viewport",
+        "preview_upload_image" => "Upload image",
+        "preview_dialog" => "Answer dialog",
+        "preview_input" => "Remote input",
+        "preview_zoom" => "Zoom in",
+        "preview_wait" => "Wait for the screen",
+        "screen_app" => "Screen apps",
+        "screen_device" => "Screen device",
+        "screen_clipboard" => "Screen clipboard",
+        "screen_package" => "Install apps",
+        "android_logcat" => "Read Android logs",
+        "android_shell" => "Android shell",
+        "agent_spawn" => "Subagent",
+        "task_wait" => "Wait for tasks",
+        "task_list" => "List tasks",
+        "task_stop" => "Stop a task",
+        "send_message" => "Send message",
+        "box" => "Background result",
+        "read_global_memory" => "Read global memory",
+        "read_project_memory" => "Read project memory",
+        "create_global_memory" => "Create global memory",
+        "create_project_memory" => "Create project memory",
+        "edit_global_memory" => "Edit global memory",
+        "edit_project_memory" => "Edit project memory",
+        "ask_user" => "Ask user",
+        "workflow" => "Workflow",
+        "skill" => "Skill",
+        "tool_search" => "Tool discovery",
+        "fork" => "Fork conversation",
+        "plan" => "Plan document",
+        "exit_plan_mode" => "Exit plan mode",
+        "read_handoff_note" => "Read handoff note",
+        "create_handoff_note" => "Write handoff note",
+        "edit_handoff_note" => "Edit handoff note",
+        "handoff" => "Hand off",
+        _ => return None,
+    })
+}
+
+fn english_parameter_label(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "accept" => "Accept",
+        "action" => "Action",
+        "actions" => "Actions",
+        "activity" => "Activity",
+        "after" => "Lines after",
+        "agent_type" => "Named agent type",
+        "app" => "App",
+        "args" => "Arguments",
+        "arguments" => "Launch arguments",
+        "before" => "Lines before",
+        "buffer" => "Log buffer",
+        "button" => "Button",
+        "case_sensitive" => "Case sensitive",
+        "character" => "Character",
+        "colorScheme" => "Color scheme",
+        "command" => "Command",
+        "contains" => "Contains text",
+        "content" => "File content",
+        // Shared by agent_spawn (a history switch) and grep (a line count): labels are
+        // keyed by parameter name alone, so the one word that fits both.
+        "context" => "Context",
+        "depth" => "Recursion depth",
+        "description" => "Description",
+        "doubleClick" => "Double-click",
+        "downgrade" => "Allow downgrade",
+        "end_line" => "End line",
+        "environment" => "Environment variables",
+        "expression" => "Expression",
+        "filename" => "File name",
+        "filter" => "Filter",
+        "filePath" => "File path",
+        "find" => "Find text",
+        "glob" => "File glob",
+        "grant_permissions" => "Grant all permissions",
+        "height" => "Height",
+        "image_id" => "Image number",
+        "keep_data" => "Keep data",
+        "label" => "Display name",
+        "latitude" => "Latitude",
+        "level" => "Level",
+        "limit" => "Limit",
+        "line" => "Line",
+        "lines" => "Line limit",
+        "longitude" => "Longitude",
+        "operation" => "Operation",
+        "output_mode" => "Output mode",
+        "package" => "Package",
+        "permission" => "Permission",
+        "max_results" => "Maximum results",
+        "message" => "Message",
+        "name" => "Name",
+        "new_text" => "New text",
+        "none" => "Empty argument",
+        "offset" => "Offset",
+        "old_text" => "Original text",
+        "path" => "Path",
+        "pattern" => "Search pattern",
+        "preset" => "Device preset",
+        "prompt" => "Prompt",
+        "prompt_text" => "Prompt text",
+        "query" => "Query",
+        "questions" => "Questions",
+        "requestId" => "Request ID",
+        "replace" => "Replacement",
+        "replace_all" => "Replace all",
+        "replace_existing" => "Replace existing",
+        "resume_run_id" => "Resume run ID",
+        "restart" => "Restart",
+        "run_in_background" => "Run in background",
+        "scale" => "Scale",
+        "screenshot" => "Screenshot",
+        "script" => "JavaScript",
+        "scope" => "Scope",
+        "search" => "Text filter",
+        "sections" => "Sections",
+        "selector" => "CSS selector",
+        "serverId" => "Server ID",
+        "start_line" => "Start line",
+        "styles" => "CSS properties",
+        "summary" => "Summary",
+        "tag" => "Tag",
+        "task" => "Task address",
+        "tasks" => "Tasks",
+        "text" => "Text",
+        "timeout" => "Timeout (ms)",
+        "timeout_seconds" => "Timeout (seconds)",
+        "to" => "Child agent",
+        "token_budget" => "Token budget",
+        "uid" => "Element uid",
+        "until" => "Wait until",
+        "url" => "URL",
+        "value" => "Value",
+        "width" => "Width",
+        "urls" => "URLs",
+        "x" => "X",
+        "y" => "Y",
+        "schema" => "Output schema",
+        _ => return None,
+    })
+}
+
+fn english_parameter_help(tool: &str, parameter: &str) -> Option<&'static str> {
+    Some(match (tool, parameter) {
+        ("ls", "depth") => "0 lists only the current directory.",
+        ("grep", "glob") => {
+            "Only search files whose path matches this glob, such as *.rs or src/**/*.tsx."
+        }
+        ("grep", "output_mode") => {
+            "files_with_matches (default) lists the files that match; content lists the matching lines; count gives the number of matching lines per file."
+        }
+        ("grep", "context") => {
+            "content mode only: lines of context to show before and after each match, 0 to 20."
+        }
+        ("grep", "before") => {
+            "content mode only: lines of context to show before each match, 0 to 20."
+        }
+        ("grep", "after") => {
+            "content mode only: lines of context to show after each match, 0 to 20."
+        }
+        ("grep", "limit") => {
+            "Most results of the chosen mode to return: 250 by default, at most 1,000."
+        }
+        ("grep", "offset") => "Results of the chosen mode to skip first, to fetch the next page.",
+        ("skill", "name") => {
+            "Name of a skill this conversation selected; the schema lists them as an enum."
+        }
+        ("tool_search", "query") => {
+            "`select:<name>[,<name>…]` to fetch exact tools, or keywords to search for them."
+        }
+        ("tool_search", "max_results") => {
+            "How many tools a keyword search may return; ignored when fetching by name."
+        }
+        ("read", "start_line") => "Text files only; 1-based.",
+        ("read", "end_line") => "Text files only; inclusive.",
+        ("lsp", "operation") => {
+            "One of nine: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls."
+        }
+        ("lsp", "line") => "1-based, as shown in editors.",
+        ("lsp", "character") => "1-based, as shown in editors.",
+        ("lsp", "query") => {
+            "workspaceSymbol only; most language servers return nothing for an empty query."
+        }
+        ("web_search", "query") => {
+            "One self-contained query; no pronouns pointing back at the conversation. Break a long question into several searches."
+        }
+        ("web_fetch", "urls") => {
+            "Absolute http(s) page URLs. Search first when you do not know the URL."
+        }
+        ("workflow", "script") => {
+            "JavaScript orchestration starting with `export const meta = {…}`: spawn steps with agent()/parallel()/pipeline(), narrate with phase()/log(); the body's return value is the run result. Adding { isolation: \"worktree\" } to a step gives it its own git worktree checked out from HEAD (uncommitted changes are not in it; a step that leaves changes keeps its worktree, one that changes nothing has it removed)."
+        }
+        ("workflow", "name") => {
+            "Required. This run's address in the same namespace agents are named in, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree, so a resume still needs a fresh one."
+        }
+        ("workflow", "args") => {
+            "JSON value exposed to the script as the global `args`, verbatim; pass arrays and objects directly, not as encoded strings."
+        }
+        ("workflow", "token_budget") => {
+            "Hard token ceiling for this run, readable as budget in the script; once exhausted, further agent() calls throw."
+        }
+        ("workflow", "resume_run_id") => {
+            "Run id from a previous run; steps whose prompt and options are unchanged replay, a step the last attempt left running re-runs alone, and everything from the first changed or failed step re-runs. script and args may be omitted to reuse the last ones; an edited script is approved again."
+        }
+        ("preview_start", "name") => "Server name from .mewrk/launch.json.",
+        ("preview_stop", "serverId") => "Server ID to stop",
+        ("preview_logs", "serverId")
+        | ("preview_console_logs", "serverId")
+        | ("preview_screenshot", "serverId")
+        | ("preview_snapshot", "serverId")
+        | ("preview_inspect", "serverId")
+        | ("preview_click", "serverId")
+        | ("preview_fill", "serverId")
+        | ("preview_eval", "serverId")
+        | ("preview_network", "serverId")
+        | ("preview_resize", "serverId")
+        | ("preview_upload_image", "serverId")
+        | ("preview_dialog", "serverId") => "Server ID",
+        ("preview_logs", "level") => {
+            "Filter by level: 'all' (default) shows all output, 'error' shows only lines containing error/exception/failed/fatal"
+        }
+
+        ("preview_logs", "lines") => "Max lines to return (default: 50)",
+        ("preview_logs", "search") => {
+            "Filter to lines containing this text (e.g., '[DEBUG]', 'POST /api')"
+        }
+        ("preview_console_logs", "level") => {
+            "Filter by level: 'all' (default), 'error' (errors only), 'warn' (warnings + errors)"
+        }
+        ("preview_console_logs", "lines") => "Max lines to return (default: 50, max: 200)",
+        ("preview_screenshot", "scale") => {
+            "Scale factor in [0.1, 1] for the returned image; smaller images use fewer tokens. preview_click and preview_fill find elements by CSS selector or by a uid from preview_snapshot, not by pixel coordinates; pixel coordinates on remote-control screens go through preview_input."
+        }
+        ("preview_inspect", "selector") => {
+            "CSS selector (e.g., '.button', '#header')"
+        }
+        ("preview_inspect", "styles") => {
+            "CSS properties to return (e.g., ['padding', 'color']). Defaults to common properties."
+        }
+        ("preview_click", "selector") => {
+            "CSS selector for the element to click. Give this or uid."
+        }
+        ("preview_click", "uid") => {
+            "The uid preview_snapshot printed for the element to click, the number in brackets at the start of its line. Give this or selector."
+        }
+        ("preview_click", "doubleClick") => "Perform a double-click",
+        ("preview_fill", "selector") => {
+            "CSS selector for the input element. Give this or uid."
+        }
+        ("preview_fill", "uid") => {
+            "The uid preview_snapshot printed for the input element, the number in brackets at the start of its line. Give this or selector."
+        }
+        ("preview_fill", "value") => "Value to fill",
+        ("preview_eval", "expression") => {
+            "JavaScript expression to evaluate in the page context. Return values are serialized as JSON."
+        }
+        ("preview_network", "filter") => {
+            "Filter: 'all' (default) shows all requests, 'failed' shows only 4xx/5xx and network errors. Ignored when requestId is provided."
+        }
+        ("preview_network", "requestId") => {
+            "If provided, returns the response body for this specific request instead of listing all requests. Get requestIds from the listing output."
+        }
+        ("preview_resize", "preset") => {
+            "Device preset. Overrides width/height if provided. \"desktop\" clears the size emulation (back to the pane's responsive size)."
+        }
+        ("preview_resize", "width") => "Viewport width in CSS pixels (requires height)",
+        ("preview_resize", "height") => "Viewport height in CSS pixels (requires width)",
+        ("preview_resize", "colorScheme") => {
+            "Emulate prefers-color-scheme media feature for dark/light mode testing."
+        }
+        ("preview_upload_image", "image_id") => {
+            "The conversation image number, e.g. 3, #3, or [Image #3]. A 64-character hex digest also resolves."
+        }
+        ("preview_upload_image", "selector") => {
+            "CSS selector of the target file input. Omitted, the image goes into the file chooser the page has open, or else into the first file input on the page, hidden or not."
+        }
+        ("preview_upload_image", "filename") => {
+            "The file name the page sees. Defaults to the attachment's own name."
+        }
+        ("preview_dialog", "accept") => {
+            "On the web page default true. On a phone or tablet there is no default: give button or accept."
+        }
+        ("preview_dialog", "prompt_text") => {
+            "On the web page used only when accepting a prompt. On an iPhone or iPad the text for the alert's field; without accept it is only typed."
+        }
+        ("preview_dialog", "button") => {
+            "Phone or tablet only: the exact label of the button to press."
+        }
+        ("preview_input", "serverId") => {
+            "Server ID of the remote-control screen. Defaults to the screen the preview pane shows."
+        }
+        ("preview_input", "actions") => {
+            "Actions to run in order, at most 20; the first one that fails stops the rest. x and y are pixels of the latest preview_screenshot (or preview_snapshot's @x,y boxes). Actions: click, long_press, drag, scroll, move, type, key, wait; a type with via \"paste\" pastes through the clipboard (desktops only)."
+        }
+        ("preview_input", "screenshot") => "Also return a screenshot of the screen after the actions.",
+        ("preview_zoom", "serverId")
+        | ("preview_wait", "serverId") => {
+            "Server ID of the remote-control screen. Defaults to the one the preview pane shows, else the only one connected."
+        }
+        ("screen_app", "serverId")
+        | ("screen_device", "serverId") => {
+            "Server ID of the Android device, iPhone or iPad. Defaults to the one the preview pane shows, else the only one connected."
+        }
+        ("screen_clipboard", "serverId") => {
+            "Server ID of the iPhone, iPad or desktop. Defaults to the one the preview pane shows, else the only one connected."
+        }
+        ("screen_package", "serverId")
+        | ("android_logcat", "serverId")
+        | ("android_shell", "serverId") => {
+            "Server ID of the Android device. Defaults to the one the preview pane shows, else the only one connected."
+        }
+        ("preview_zoom", "x") => {
+            "Left edge of the region, in the screenshot's frame."
+        }
+        ("preview_zoom", "y") => {
+            "Top edge of the region, in the screenshot's frame."
+        }
+        ("preview_zoom", "width") => {
+            "Width of the region, in the screenshot's frame."
+        }
+        ("preview_zoom", "height") => {
+            "Height of the region, in the screenshot's frame."
+        }
+        ("preview_wait", "until") => {
+            "change (default) or still."
+        }
+        ("preview_wait", "timeout") => {
+            "Milliseconds to wait at most, 100-20000; 5000 by default."
+        }
+        ("preview_wait", "x")
+        | ("preview_wait", "y")
+        | ("preview_wait", "width")
+        | ("preview_wait", "height") => {
+            "Region to watch, in the latest screenshot's frame; give all four or none."
+        }
+        ("screen_app", "action") => {
+            "list (default), foreground, info, launch, activate, stop or open_url."
+        }
+        ("screen_app", "app") => {
+            "Android package or iOS bundle id. Required for info, launch, activate and stop; for open_url, the app to open the URL in."
+        }
+        ("screen_app", "url") => {
+            "For open_url: the URL or deep link."
+        }
+        ("screen_app", "filter") => {
+            "For list: only entries containing this text, case-insensitive."
+        }
+        ("screen_app", "limit") => {
+            "For list: at most this many entries, 1-1000; 200 by default."
+        }
+        ("screen_app", "scope") => {
+            "For list, Android only: launchable (default), third_party or all."
+        }
+        ("screen_app", "activity") => {
+            "For launch, Android only: the activity to start instead of the launcher one, as .MainActivity or a full class name."
+        }
+        ("screen_app", "restart") => {
+            "For launch: stop the app first."
+        }
+        ("screen_app", "arguments") => {
+            "For launch, iOS only: launch arguments for the app (a fresh start only)."
+        }
+        ("screen_app", "environment") => {
+            "For launch, iOS only: environment variables for the app (a fresh start only)."
+        }
+        ("screen_device", "action") => {
+            "info (default), lock, unlock, wake, rotate, appearance, animations, location, clear_location, notifications, quick_settings, collapse, stay_awake or dismiss_keyboard."
+        }
+        ("screen_device", "value") => {
+            "For rotate, appearance, animations and stay_awake: the new value."
+        }
+        ("screen_device", "sections") => {
+            "For info: any of device, display, power and notifications."
+        }
+        ("screen_device", "latitude") => {
+            "For location: degrees, -90 to 90."
+        }
+        ("screen_device", "longitude") => {
+            "For location: degrees, -180 to 180."
+        }
+        ("screen_clipboard", "action") => {
+            "read or write."
+        }
+        ("screen_clipboard", "text") => {
+            "For write: the text; at most 60000 characters on a desktop."
+        }
+        ("screen_package", "action") => {
+            "install, uninstall, clear_data, grant or revoke."
+        }
+        ("screen_package", "path") => {
+            "For install: the .apk file, relative to the workspace or absolute."
+        }
+        ("screen_package", "app") => {
+            "For uninstall, clear_data, grant and revoke: the package name."
+        }
+        ("screen_package", "permission") => {
+            "For grant and revoke: the permission, such as android.permission.POST_NOTIFICATIONS."
+        }
+        ("screen_package", "keep_data") => {
+            "For uninstall: keep the app's data and cache."
+        }
+        ("screen_package", "replace_existing") => {
+            "For install: replace an installed version; true by default."
+        }
+        ("screen_package", "downgrade") => {
+            "For install: allow a lower version code than the installed one (debuggable apps only)."
+        }
+        ("screen_package", "grant_permissions") => {
+            "For install: grant every runtime permission the app requests."
+        }
+        ("android_logcat", "lines") => "Lines to return, 1-2000; 200 by default.",
+        ("android_logcat", "level") => "Lowest priority to keep: V, D, I, W, E or F.",
+        ("android_logcat", "tag") => "Only this tag.",
+        ("android_logcat", "package") => "Only lines of this app.",
+        ("android_logcat", "buffer") => "main, system, crash, events or all.",
+        ("android_logcat", "contains") => "Only lines containing this text, case-insensitive.",
+        ("android_shell", "command") => "The shell command line.",
+        ("android_shell", "timeout") => "Milliseconds to wait, 1000-20000; 10000 by default.",
+        ("agent_spawn", "prompt") => {
+            "Child agents do not see this conversation by default; include all required context in the task."
+        }
+        ("agent_spawn", "agent_type") => {
+            "Optional trusted definition name; the available names and what each is for are listed in this turn's available-agents context. Copy one of those names — the host resolves it, and matches case- and separator-insensitively when that is unambiguous. Cannot be combined with context=conversation."
+        }
+        ("agent_spawn", "name") => {
+            "Required. Name the child yourself: it is the address task_wait takes, and the title the task is listed under. Start with a lowercase letter; digits, _ and - are allowed. It must be unused anywhere in this conversation's branch tree."
+        }
+        ("agent_spawn", "label") => "Short name shown in the timeline.",
+        ("agent_spawn", "context") => {
+            "none (default): task only; conversation: include a copy of the current conversation history."
+        }
+        ("agent_spawn", "schema") => {
+            "Optional JSON Schema subset. When set, the child must call structured_output with a result matching it, and that value comes back with task_wait. The top level must be an object schema; type, properties, required, items, enum, const, additionalProperties, minItems/maxItems, minLength/maxLength and minimum/maximum are supported and every other keyword is rejected on the spot."
+        }
+        ("task_wait", "tasks") => {
+            "Array of task addresses: a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>), a background command as shell:<id>, a terminal as terminal:<id>, a dev server as preview:<serverId> (preview:<serverId>@<workspace> when the conversation has several workspaces). The wait ends once every named task has produced a result. Omit to wait for every child agent, workflow run and background command in this conversation (terminals and dev servers excluded)."
+        }
+        ("task_wait", "timeout_seconds") => "5-600 seconds; default: 60.",
+        ("task_stop", "task") => {
+            "Address of the task to stop: a background command as shell:<id>, a child agent or workflow run by its bare name (a workflow also answers to workflow:<runId>). Terminal sessions cannot be stopped with this tool, and dev servers are stopped with preview_stop. The stopped task's result is still delivered."
+        }
+        ("send_message", "to") => "Name the child was spawned with.",
+        ("send_message", "summary") => "Optional 5–10 word preview shown on the timeline.",
+        ("box", "none") => "Always an empty list.",
+        ("read_global_memory", "name") | ("read_project_memory", "name") => {
+            "A document name listed in the memory index. The .md suffix is optional."
+        }
+        ("create_global_memory", "name") | ("create_project_memory", "name") => {
+            "A single document name inside the memory directory. Path separators are forbidden; the .md suffix is optional."
+        }
+        ("edit_global_memory", "name") | ("edit_project_memory", "name") => {
+            "The memory document to modify. The .md suffix is optional."
+        }
+        ("create_global_memory", "content") | ("create_project_memory", "content") => {
+            "The document's complete Markdown body."
+        }
+        ("edit_global_memory", "old_text") | ("edit_project_memory", "old_text") => {
+            "The passage to replace. It must match exactly once; supply a longer excerpt when it is not unique."
+        }
+        ("edit_global_memory", "new_text") | ("edit_project_memory", "new_text") => {
+            "The replacement text. Leave it empty to delete the passage."
+        }
+        ("create_global_memory", "description")
+        | ("create_project_memory", "description") => {
+            "One sentence describing what this memory records. It is written into the MEMORY.md index so a later run can decide whether to read the document."
+        }
+        ("edit_global_memory", "description") | ("edit_project_memory", "description") => {
+            "One sentence describing this memory after the change. It refreshes the document's entry in the MEMORY.md index."
+        }
+        ("ask_user", "questions") => {
+            "Claude Code AskUserQuestion format: 1-4 questions, each with header, question, 2-4 label/description options, and multiSelect. Do not add Other."
+        }
+        ("fork", "prompt") => {
+            "First user message of the forked conversation, and your only chance to instruct it; state the task and all the background it needs"
+        }
+        ("plan", "action") => {
+            "Choose an action: write stores or replaces the plan, read returns the current one."
+        }
+        ("plan", "content") => {
+            "Required for write; the plan's Markdown body, which replaces the previous one in full."
+        }
+        ("read_handoff_note", "name") => {
+            "A note name listed in the handoff index. The .md suffix is optional."
+        }
+        ("create_handoff_note", "name") => {
+            "The handoff note's name. Path separators are forbidden; the .md suffix is optional."
+        }
+        ("edit_handoff_note", "name") => "The handoff note to modify. The .md suffix is optional.",
+        ("create_handoff_note", "content") => "The note's complete Markdown body.",
+        ("edit_handoff_note", "old_text") => {
+            "The passage to replace. It must match exactly once; supply a longer excerpt when it is not unique."
+        }
+        ("edit_handoff_note", "new_text") => {
+            "The replacement text. Leave it empty to delete the passage."
+        }
+        ("create_handoff_note", "description") => {
+            "One sentence describing what this handoff note holds. It is written into the handoff index."
+        }
+        ("edit_handoff_note", "description") => {
+            "One sentence describing this handoff note after the change. It refreshes the note's entry in the handoff index."
+        }
+        _ => return None,
+    })
+}
+
+fn english_parameter_placeholder(tool: &str, parameter: &str) -> Option<&'static str> {
+    Some(match (tool, parameter) {
+        ("bash", "description") => "Show working tree status",
+        ("pwsh" | "powershell", "description") => "List files in the current directory",
+        ("zsh", "description") | ("sh", "description") => "List files in the current directory",
+        ("web_search", "query") => "Anthropic Claude 4.5 release date",
+        ("agent_spawn", "prompt") => "Inspect routing under src/ and summarize the key files",
+        ("agent_spawn", "label") => "Inspect routing",
+        ("send_message", "message") => "Retry with the v2 endpoint and report the result",
+        ("send_message", "summary") => "Retry with the v2 endpoint",
+        ("read_global_memory", "name")
+        | ("create_global_memory", "name")
+        | ("edit_global_memory", "name") => "user-preferences",
+        ("read_project_memory", "name")
+        | ("create_project_memory", "name")
+        | ("edit_project_memory", "name") => "build-environment",
+        ("create_global_memory", "description") | ("edit_global_memory", "description") => {
+            "The user's long-standing language and code-style preferences"
+        }
+        ("create_project_memory", "description") | ("edit_project_memory", "description") => {
+            "Tests must run in the project's own environment"
+        }
+        ("ask_user", "questions") => {
+            r#"[{"question":"Which approach should I use?","header":"Approach","options":[{"label":"Approach A","description":"Keep the change small"},{"label":"Approach B","description":"Perform a full rewrite"}],"multiSelect":false}]"#
+        }
+        ("fork", "prompt") => "The task to complete in the forked conversation",
+        ("read_handoff_note", "name")
+        | ("create_handoff_note", "name")
+        | ("edit_handoff_note", "name") => "current-state",
+        ("create_handoff_note", "description") | ("edit_handoff_note", "description") => {
+            "The goal, the work done and the next step"
+        }
+        _ => return None,
+    })
+}
+
+/// The two built-in provider rows, freshly identified.
+///
+/// IDs stay random per installation: they key credential storage, so a fixed one
+/// would let two data domains collide on the same secret. Residency — "exactly
+/// one row per built-in family" — is NOT implemented here; it stays the
+/// renderer's `ensureCodexProvider` / `ensureClaudeAgentProvider`, which claim
+/// these rows by FAMILY and therefore keep the IDs a seeded preset was written
+/// against. This function only supplies the first values.
+fn product_default_api_providers() -> Vec<ApiProvider> {
+    vec![builtin_codex_provider(), builtin_claude_agent_provider()]
+}
+
+fn builtin_provider_id() -> String {
+    format!("provider_{}", uuid::Uuid::new_v4())
+}
+
+/// Signed out until the user completes the OAuth flow, so it ships no models:
+/// the Codex catalog lives behind that login and cannot be fetched here.
+fn builtin_codex_provider() -> ApiProvider {
+    ApiProvider {
+        id: builtin_provider_id(),
+        name: "OpenAI Codex".into(),
+        enabled: false,
+        family: ProviderFamily::OpenaiCodex,
+        base_url: String::new(),
+        family_settings: Default::default(),
+        notes: String::new(),
+        models: Vec::new(),
+        active_model_id: None,
+    }
+}
+
+/// Ships no models either: they are what the installed CLI lists under the
+/// user's login, fetched from the provider page once the components are in.
+fn builtin_claude_agent_provider() -> ApiProvider {
+    ApiProvider {
+        id: builtin_provider_id(),
+        name: "Claude Agent".into(),
+        enabled: true,
+        family: ProviderFamily::ClaudeAgent,
+        base_url: String::new(),
+        family_settings: Default::default(),
+        notes: String::new(),
+        models: Vec::new(),
+        active_model_id: None,
+    }
+}
+
+#[cfg(test)]
+pub fn default_api_providers() -> Vec<ApiProvider> {
+    vec![
+        ApiProvider {
+            id: "openai_responses".into(),
+            name: "OpenAI Responses".into(),
+            enabled: true,
+            family: ProviderFamily::OpenaiResponses,
+            base_url: "https://api.openai.com/v1".into(),
+            family_settings: Default::default(),
+            notes: String::new(),
+            models: Vec::new(),
+            active_model_id: None,
+        },
+        ApiProvider {
+            id: "openai_chat".into(),
+            name: "OpenAI Chat Completions".into(),
+            enabled: true,
+            family: ProviderFamily::OpenaiChat,
+            base_url: "https://api.openai.com/v1".into(),
+            family_settings: Default::default(),
+            notes: String::new(),
+            models: Vec::new(),
+            active_model_id: None,
+        },
+        ApiProvider {
+            id: "anthropic_messages".into(),
+            name: "Anthropic Messages".into(),
+            enabled: true,
+            family: ProviderFamily::Anthropic,
+            base_url: "https://api.anthropic.com/v1".into(),
+            family_settings: Default::default(),
+            notes: String::new(),
+            models: Vec::new(),
+            active_model_id: None,
+        },
+    ]
+}
+
+/// Id of the one conversation preset Mewrk ships.
+///
+/// The preset belongs to the build, not to the user's data. Storage rewrites
+/// it from [`builtin_preset`] on every start (`storage::install_builtin_preset`)
+/// and holds every save to what it wrote (`storage::keep_builtin_preset`), so
+/// it can be neither edited nor deleted and always matches the running version.
+/// A user who wants something different applies it and saves the result as a
+/// preset of their own.
+pub(crate) const BUILTIN_PRESET_ID: &str = "preset_mewrk";
+
+/// Presets earlier builds seeded into the document as ordinary user data, each
+/// with the template it opened with. The built-in preset replaces them, so
+/// storage removes both on load.
+pub(crate) const RETIRED_SEEDED_PRESETS: &[(&str, &str)] = &[
+    ("preset_codex", "template_preset_codex"),
+    ("preset_claude_code", "template_preset_claude_code"),
+];
+
+/// The template earlier builds wrote the built-in preset's system prompt
+/// behind. The preset now opens with no messages, so storage removes the row
+/// on load.
+pub(crate) const RETIRED_BUILTIN_PRESET_TEMPLATE_ID: &str = "template_preset_mewrk";
+
+/// Whether `category` is one of the tool groups that act on a remote-control
+/// screen: Screen (the tools of any phone, tablet or desktop screen) and
+/// Android (the ones only an adb device has). They mean nothing until a screen
+/// is connected (`preview_start`) and cost schema tokens in every request until
+/// then, so a preset starts without them and the person switches a group on in
+/// the picker.
+fn is_remote_control_category(category: ToolCategory) -> bool {
+    matches!(category, ToolCategory::Screen | ToolCategory::Android)
+}
+
+/// Whether `name` is a tool of the Screen or Android groups
+/// ([`is_remote_control_category`]), by the catalog this build ships.
+pub(crate) fn is_remote_control_tool(name: &str) -> bool {
+    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            tool_catalog()
+                .into_iter()
+                .filter(|tool| is_remote_control_category(tool.category))
+                .map(|tool| tool.name)
+                .collect()
+        })
+        .contains(name)
+}
+
+/// The tools the built-in preset enables out of a document's catalog `tools`:
+/// every built-in tool except the names the host derives for itself, the
+/// remote-control groups ([`is_remote_control_category`]), and of the shell
+/// command tools only `shell`'s — all of them when `shell` is `None`, which
+/// only a probe of the machine can narrow (`storage::install_builtin_preset`).
+///
+/// Drawn from the document's catalog rather than this build's alone, because a
+/// preset naming a tool the document does not list fails validation, and that
+/// list moves with the renderer's saves. MCP tools the document also lists are
+/// not built-in and are left out.
+///
+/// The memory tools follow the two memory switches, `skill` follows
+/// `skill_tool_enabled`, `tool_search` follows `mcp_tool_discovery_enabled`,
+/// the task-runtime tools appear only once something can produce a task, the
+/// plan tools follow the security level, and the handoff tools follow the
+/// conversation's context. Listing any of them here would be
+/// inert at best: the renderer strips them again when the preset is applied.
+/// Mirrors the renderer's `isHostDerivedToolName` and `seedPresetEnabledTools`.
+pub(crate) fn builtin_preset_enabled_tools(
+    tools: &[ToolDescriptor],
+    shell: Option<crate::shell_backend::ShellBackend>,
+) -> Vec<String> {
+    let built_in = tool_catalog()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<std::collections::HashSet<_>>();
+    tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .filter(|name| {
+            built_in.contains(*name)
+                && !is_remote_control_tool(name)
+                && !crate::mewrk_memory::is_memory_tool(name)
+                && !crate::agents::is_task_runtime_tool_name(name)
+                && !crate::agents::is_subagent_messaging_tool_name(name)
+                && !crate::plan_mode::is_plan_mode_tool_name(name)
+                && !crate::handoff::is_handoff_tool_name(name)
+                && *name != crate::capabilities::SKILL_TOOL
+                && *name != crate::capabilities::TOOL_SEARCH_TOOL
+                && match crate::shell_backend::ShellBackend::of_tool(name) {
+                    Some(backend) => shell.map_or(true, |shell| shell == backend),
+                    None => true,
+                }
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The built-in preset as this build defines it, against the tool catalog of
+/// the document it goes into.
+///
+/// The one shell is this machine's and is chosen by storage, which takes a
+/// probe. It opens with no messages, selects no tool-description file, so it
+/// renders with the built-in one, and no role: none ships, so its children are
+/// anonymous ones on the conversation's model.
+pub(crate) fn builtin_preset(
+    tools: &[ToolDescriptor],
+    shell: Option<crate::shell_backend::ShellBackend>,
+) -> ConversationPreset {
+    ConversationPreset {
+        id: BUILTIN_PRESET_ID.into(),
+        name: "mewrk".into(),
+        description: String::new(),
+        template_id: String::new(),
+        settings: ConversationPresetSettings {
+            enabled_tools: builtin_preset_enabled_tools(tools, shell),
+            tool_description_file_id: None,
+            agent_ids: Vec::new(),
+            agent_definitions: Vec::new(),
+            // With no role selected, an anonymous child is the only kind
+            // `agent_spawn` and `workflow` can start.
+            allow_roleless_subagents: true,
+            // Nothing is selected: skills, MCP servers and hooks are opt-in per
+            // conversation, and that includes the built-in Mewrk SDK skill.
+            hook_ids: Vec::new(),
+            skill_ids: Vec::new(),
+            mcp_ids: Vec::new(),
+            // Native search and fetch, resolved against the conversation
+            // model's family at run time.
+            web_search: crate::model::ConversationWebSearchSettings {
+                max_searches_per_call: 0,
+                provider: crate::model::SearchProviderSelection::Native,
+                fetch_provider: crate::model::FetchProviderSelection::Native,
+                // The basic versions. A newer one is a choice with its own
+                // costs, not a default to hand every new conversation.
+                native_search_tool: crate::model::NativeSearchTool::default(),
+                native_fetch_tool: crate::model::NativeFetchTool::default(),
+                max_results: crate::model::DEFAULT_SEARCH_MAX_RESULTS,
+                compression_cutoff: crate::model::DEFAULT_SEARCH_CUTOFF_LIMIT,
+                fetch_compression_cutoff: crate::model::DEFAULT_SEARCH_CUTOFF_LIMIT,
+                // A shipped domain list would be this application deciding what
+                // the web is allowed to say, so the filter is off and both lists
+                // are the user's to write.
+                domain_filter: crate::model::SearchDomainFilterMode::Off,
+                include_domains: Vec::new(),
+                exclude_domains: Vec::new(),
+            },
+            web_search_enabled: true,
+            // Off: letting the main agent message its children, and handing
+            // them an update tool, is something a conversation turns on.
+            subagent_messaging_enabled: false,
+            security_level: Default::default(),
+            // The memory tools are switched by these two rather than named in
+            // the list.
+            global_memory_enabled: true,
+            project_memory_enabled: true,
+            // Both capability surfaces load on demand rather than inlining every
+            // selected body and every MCP schema into the system prompt.
+            skill_tool_enabled: true,
+            mcp_tool_discovery_enabled: true,
+            // Host messages come the way Claude Code delivers them; `box` is
+            // a choice of the conversation's.
+            host_message_container: crate::model::HostMessageContainer::User,
+            file_write_guards_enabled: true,
+            environment_prompt_enabled: true,
+        },
+    }
+}
+
+fn product_default_presets(tools: &[ToolDescriptor]) -> PresetLibrary {
+    PresetLibrary {
+        conversation_presets: vec![builtin_preset(tools, None)],
+        // Storage refuses an empty default once presets exist.
+        default_conversation_preset_id: BUILTIN_PRESET_ID.into(),
+    }
+}
+
+pub(crate) fn product_default_document() -> AppDocument {
+    let tools = tool_catalog();
+    let now = Utc::now();
+    let timestamp = |minutes: i64| (now - Duration::minutes(minutes)).to_rfc3339();
+    let api_providers = product_default_api_providers();
+    let presets = product_default_presets(&tools);
+    // The one built-in enabled from the start, so it is what a fresh install's
+    // composer shows. Leaving this null would make the renderer pick the first
+    // enabled row anyway and then persist the choice as a change.
+    let active_provider_id = api_providers
+        .iter()
+        .find(|provider| provider.enabled)
+        .map(|provider| provider.id.clone());
+    let document = AppDocument {
+        schema_version: crate::storage::SCHEMA_VERSION,
+        global_settings: GlobalSettings {
+            app_language: AppLanguage::Auto,
+            resolved_app_language: ResolvedLanguage::ZhCn,
+            theme: ThemePreference::System,
+            last_reasoning_effort: Default::default(),
+            active_provider_id,
+            // Keep this field-by-field in sync with `src/seed.ts` DEFAULT_APPEARANCE.
+            appearance: Default::default(),
+            // Empty values use the renderer command catalog's default bindings.
+            shortcuts: Default::default(),
+            environment_tools: Vec::new(),
+            auto_compact: Default::default(),
+        },
+        assets: crate::model::AssetLibrary {
+            api_providers,
+            // New installations have no SSH machines or run-environment variables.
+            execution_environments: Default::default(),
+            // Keep this in sync with `src/seed.ts`: enable the anonymous Exa MCP
+            // search provider and Jina fetch provider by default; other providers
+            // require user credentials.
+            web_search: crate::model::WebSearchAssets {
+                providers: crate::model::SearchProviderKind::CATALOG
+                    .iter()
+                    .copied()
+                    .map(|kind| {
+                        if matches!(
+                            kind,
+                            crate::model::SearchProviderKind::ExaMcp
+                                | crate::model::SearchProviderKind::Jina
+                        ) {
+                            crate::model::SearchProviderConfig::enabled(kind)
+                        } else {
+                            crate::model::SearchProviderConfig::new(kind)
+                        }
+                    })
+                    .collect(),
+            },
+        },
+        presets,
+        // A fresh installation has no directory workspace; the renderer opens a
+        // draft with none selected and its first message lands in the temporary one.
+        workspaces: vec![Workspace {
+            id: "__temporary__".into(),
+            name: "临时工作区".into(),
+            kind: WorkspaceKind::Temporary,
+            path: String::new(),
+            machine: None,
+            additional_workspaces: Vec::new(),
+            created_at: timestamp(0),
+            default_conversation_preset_id: String::new(),
+            last_conversation_settings: None,
+            draft_conversation: None,
+            conversations: Vec::new(),
+        }],
+        tools,
+        capabilities: CapabilityCatalog {
+            hooks: Vec::new(),
+            skills: Vec::new(),
+            mcps: Vec::new(),
+            lsps: Vec::new(),
+            tool_description_files: Vec::new(),
+            agents: Vec::new(),
+            unreadable_levels: Vec::new(),
+        },
+    };
+    document
+}
+
+#[cfg(not(test))]
+pub fn default_document() -> AppDocument {
+    product_default_document()
+}
+
+#[cfg(test)]
+pub fn default_document() -> AppDocument {
+    let mut document = product_default_document();
+    let enabled_tools = document
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    hydrate_test_settings(&mut document, &enabled_tools);
+    document
+}
+
+#[cfg(test)]
+fn hydrate_test_settings(document: &mut AppDocument, enabled_tools: &[String]) {
+    document.presets.conversation_presets = vec![ConversationPreset {
+        id: "conversation_default".into(),
+        name: "默认".into(),
+        description: "测试对话预设。".into(),
+        template_id: String::new(),
+        settings: ConversationPresetSettings {
+            enabled_tools: enabled_tools.to_vec(),
+            web_search_enabled: true,
+            subagent_messaging_enabled: false,
+            tool_description_file_id: None,
+            agent_ids: Vec::new(),
+            agent_definitions: Vec::new(),
+            allow_roleless_subagents: false,
+            hook_ids: Vec::new(),
+            skill_ids: Vec::new(),
+            mcp_ids: Vec::new(),
+            web_search: Default::default(),
+            security_level: Default::default(),
+            global_memory_enabled: false,
+            project_memory_enabled: false,
+            skill_tool_enabled: false,
+            mcp_tool_discovery_enabled: false,
+            host_message_container: Default::default(),
+            file_write_guards_enabled: true,
+            environment_prompt_enabled: true,
+        },
+    }];
+    document.presets.default_conversation_preset_id = "conversation_default".into();
+    document.assets.api_providers = default_api_providers();
+    document.global_settings.active_provider_id = Some("openai_responses".into());
+    // The product seed ships only the temporary workspace. Host tests address a
+    // directory workspace at index 0 and the conversation it carries, so add both here.
+    document.workspaces.insert(
+        0,
+        Workspace {
+            id: "ws_default".into(),
+            name: "Workspace".into(),
+            kind: WorkspaceKind::Directory,
+            // `validate_shape` rejects a directory workspace with a blank path.
+            path: ".".into(),
+            created_at: Utc::now().to_rfc3339(),
+            default_conversation_preset_id: String::new(),
+            last_conversation_settings: None,
+            draft_conversation: None,
+            machine: None,
+            additional_workspaces: Vec::new(),
+            conversations: vec![Conversation {
+                id: "conv_welcome".into(),
+                title: String::new(),
+                created_at: Utc::now().to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
+                settings: ConversationSettings {
+                    enabled_tools: enabled_tools.to_vec(),
+                    web_search_enabled: true,
+                    subagent_messaging_enabled: false,
+                    hook_ids: Vec::new(),
+                    skill_ids: Vec::new(),
+                    mcp_ids: Vec::new(),
+                    tool_description_file_id: None,
+                    agent_ids: Vec::new(),
+                    agent_definitions: Vec::new(),
+                    allow_roleless_subagents: false,
+                    web_search: Default::default(),
+                    reasoning_effort: Default::default(),
+                    security_level: Default::default(),
+                    plan_mode_enabled: false,
+                    global_memory_enabled: false,
+                    project_memory_enabled: false,
+                    skill_tool_enabled: false,
+                    mcp_tool_discovery_enabled: false,
+                    host_message_container: Default::default(),
+                    file_write_guards_enabled: true,
+                    environment_prompt_enabled: true,
+                    compaction_method: None,
+                    legacy_sandbox: Default::default(),
+                    tool_lock: None,
+                },
+                contexts: Vec::new(),
+                queued_messages: Vec::new(),
+                branches: Vec::new(),
+                user_aborted_tasks: Vec::new(),
+                queue_paused: false,
+                worktrees: Vec::new(),
+                run_target: None,
+                additional_directories: Vec::new(),
+                parent_conversation_id: None,
+                fork_of: None,
+                handoff_of: None,
+                preset_id: String::new(),
+                template_id: String::new(),
+                attached_workspaces: Vec::new(),
+            }],
+        },
+    );
+    if let Some(conversation) = document
+        .workspaces
+        .first_mut()
+        .and_then(|workspace| workspace.conversations.first_mut())
+    {
+        let now = Utc::now();
+        let timestamp = |minutes: i64| (now - Duration::minutes(minutes)).to_rfc3339();
+        conversation.settings.enabled_tools = enabled_tools.to_vec();
+        conversation.contexts = vec![
+            ContextItem::System {
+                id: "ctx_welcome_system".into(),
+                content: "测试对话已创建。".into(),
+                local_only: false,
+                hook_execution: None,
+                tools_added: Vec::new(),
+                native_compaction: None,
+                created_at: timestamp(4),
+            },
+            ContextItem::User {
+                id: "ctx_welcome_user".into(),
+                content: "检查工作区，并协助我完成第一个任务。".into(),
+                images: Vec::new(),
+                files: Vec::new(),
+                created_at: timestamp(3),
+            },
+            ContextItem::Reasoning {
+                id: "ctx_welcome_reasoning".into(),
+                content: Some("先读取工作区结构，再决定需要修改的最小范围。".into()),
+                form: Some(crate::model::ReasoningForm::Plaintext),
+                round: None,
+                model_turn_id: None,
+                interrupted: false,
+                duration_ms: None,
+                tokens: None,
+                replay: None,
+                created_at: timestamp(2),
+            },
+            ContextItem::Tool {
+                id: "ctx_welcome_tool".into(),
+                tool_name: "ls".into(),
+                round: None,
+                model_turn_id: None,
+                provider_call_id: None,
+                requested_input: None,
+                input: serde_json::from_value(json!({ "path": ".", "depth": 1 }))
+                    .expect("object literal"),
+                result: ToolResult {
+                    success: true,
+                    output: "工作区尚未扫描；编辑参数后重新执行。".into(),
+                    images: Vec::new(),
+                    diff: None,
+                    executed_at: timestamp(1),
+                    duration_ms: 0,
+                },
+                subagent: None,
+                notice: None,
+                attestation: String::new(),
+                created_at: timestamp(1),
+            },
+            ContextItem::Assistant {
+                id: "ctx_welcome_assistant".into(),
+                content: "我已准备好。可以直接描述你希望在这个工作区完成的目标。".into(),
+                round: None,
+                model_turn_id: None,
+                interrupted: false,
+                sources: Vec::new(),
+                created_at: timestamp(0),
+            },
+        ];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn english_tool_catalog_localizes_every_visible_default_without_mutating_chinese() {
+        let chinese = tool_catalog();
+        let english = tool_catalog_for_language(ResolvedLanguage::EnUs);
+        let chinese_after = tool_catalog_for_language(ResolvedLanguage::ZhCn);
+
+        assert_eq!(chinese.len(), 61);
+        assert_eq!(english.len(), chinese.len());
+        assert_eq!(chinese_after, chinese);
+        for (localized, canonical) in english.iter().zip(&chinese) {
+            let expected_label = english_tool_label(&canonical.name).unwrap_or_else(|| {
+                panic!("{} must have explicit English defaults", canonical.name)
+            });
+            assert_eq!(localized.name, canonical.name);
+            assert_eq!(localized.label, expected_label);
+            // Built-in tool descriptors stay empty; model-visible descriptions
+            // can only come from `~/.mewrk/tool-descriptions` overrides.
+            assert_eq!(localized.description, "");
+            assert_eq!(canonical.description, "");
+            assert_eq!(localized.category, canonical.category);
+            assert_eq!(localized.dangerous, canonical.dangerous);
+            assert!(!contains_han(&localized.label), "{} label", localized.name);
+            assert!(
+                !contains_han(&localized.description),
+                "{} description",
+                localized.name
+            );
+            assert_eq!(localized.parameters.len(), canonical.parameters.len());
+
+            for (parameter, canonical_parameter) in
+                localized.parameters.iter().zip(&canonical.parameters)
+            {
+                assert_eq!(parameter.name, canonical_parameter.name);
+                assert_eq!(parameter.parameter_type, canonical_parameter.parameter_type);
+                assert_eq!(parameter.required, canonical_parameter.required);
+                assert_eq!(parameter.default_value, canonical_parameter.default_value);
+                assert_eq!(
+                    parameter.label,
+                    english_parameter_label(&parameter.name).unwrap_or_else(|| {
+                        panic!(
+                            "{}.{} must have an explicit English label",
+                            localized.name, parameter.name
+                        )
+                    })
+                );
+                assert!(
+                    !contains_han(&parameter.label),
+                    "{}.{} label",
+                    localized.name,
+                    parameter.name
+                );
+                if let Some(help) = &parameter.help {
+                    assert!(
+                        !contains_han(help),
+                        "{}.{} help: {help}",
+                        localized.name,
+                        parameter.name
+                    );
+                }
+                if let Some(placeholder) = &parameter.placeholder {
+                    assert!(
+                        !contains_han(placeholder),
+                        "{}.{} placeholder: {placeholder}",
+                        localized.name,
+                        parameter.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// `send_message` is in the catalog so its cards render and the host can
+    /// classify it, but it is host-derived (the subagent-communication switch
+    /// grants it): the built-in preset never lists it, and the preset leaves
+    /// the switch off.
+    #[test]
+    fn send_message_is_cataloged_but_host_derived_and_off_in_the_builtin_preset() {
+        let catalog = tool_catalog();
+        let send = catalog
+            .iter()
+            .find(|tool| tool.name == "send_message")
+            .expect("send_message is in the catalog");
+        assert_eq!(send.category, ToolCategory::Orchestration);
+        assert!(!send.dangerous);
+        assert_eq!(
+            send.parameters
+                .iter()
+                .map(|parameter| (parameter.name.as_str(), parameter.required))
+                .collect::<Vec<_>>(),
+            [("to", true), ("message", true), ("summary", false)]
+        );
+        assert_eq!(
+            send.parameters[1].parameter_type,
+            crate::model::ToolParameterType::Multiline
+        );
+        let english = tool_catalog_for_language(ResolvedLanguage::EnUs);
+        let english_send = english
+            .iter()
+            .find(|tool| tool.name == "send_message")
+            .unwrap();
+        assert_eq!(english_send.label, "Send message");
+        assert_eq!(english_send.parameters[0].label, "Child agent");
+        assert_eq!(
+            english_send.parameters[0].help.as_deref(),
+            Some("Name the child was spawned with.")
+        );
+
+        let enabled = builtin_preset_enabled_tools(&catalog, None);
+        assert!(!enabled.iter().any(|name| name == "send_message"));
+        assert!(enabled.iter().any(|name| name == "agent_spawn"));
+        let preset = builtin_preset(&catalog, None);
+        assert!(!preset.settings.subagent_messaging_enabled);
+        assert!(!default_document().tools.is_empty());
+    }
+
+    /// The remote-control groups are two categories of their own, in the catalog right after
+    /// `preview_input`, in the order the tools are documented. The expected lists are the spec's;
+    /// a tool cannot be dropped, renamed or moved to another group without a decision.
+    #[test]
+    fn the_remote_control_groups_are_screen_and_android() {
+        let names_of = |category: ToolCategory| {
+            tool_catalog()
+                .into_iter()
+                .filter(|tool| tool.category == category)
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names_of(ToolCategory::Screen),
+            [
+                "preview_zoom",
+                "preview_wait",
+                "screen_app",
+                "screen_device",
+                "screen_clipboard",
+                "screen_package",
+            ]
+        );
+        assert_eq!(
+            names_of(ToolCategory::Android),
+            ["android_logcat", "android_shell"]
+        );
+        for name in names_of(ToolCategory::Screen)
+            .iter()
+            .chain(&names_of(ToolCategory::Android))
+        {
+            assert!(is_remote_control_tool(name), "{name}");
+        }
+        assert!(!is_remote_control_tool("preview_input"));
+        assert!(!is_remote_control_tool("preview_dialog"));
+        assert!(!is_remote_control_tool("read"));
+        // One run of eight, directly after `preview_input`.
+        let catalog = tool_catalog();
+        let position = |name: &str| catalog.iter().position(|tool| tool.name == name).unwrap();
+        assert_eq!(position("preview_zoom"), position("preview_input") + 1);
+        assert_eq!(position("preview_wait"), position("preview_input") + 2);
+        assert_eq!(position("screen_app"), position("preview_input") + 3);
+        assert_eq!(position("screen_device"), position("preview_input") + 4);
+        assert_eq!(position("screen_clipboard"), position("preview_input") + 5);
+        assert_eq!(position("screen_package"), position("preview_input") + 6);
+        assert_eq!(position("android_logcat"), position("preview_input") + 7);
+        assert_eq!(position("android_shell"), position("preview_input") + 8);
+
+        // The category names the renderer's catalog and the pickers use; the two the screen
+        // group replaces still read from a saved document.
+        for (category, name) in [
+            (ToolCategory::Android, "android"),
+            (ToolCategory::Screen, "screen"),
+        ] {
+            assert_eq!(serde_json::to_value(category).unwrap(), json!(name));
+            assert_eq!(
+                serde_json::from_value::<ToolCategory>(json!(name)).unwrap(),
+                category
+            );
+        }
+        for old in ["ios", "desktop"] {
+            assert_eq!(
+                serde_json::from_value::<ToolCategory>(json!(old)).unwrap(),
+                ToolCategory::Screen,
+                "{old}"
+            );
+        }
+
+        // Every tool asks at the default level (it is reviewed) except the one that only waits
+        // and returns timing: `preview_wait` reads no pixels, so nothing about it needs a person.
+        for tool in &catalog {
+            if is_remote_control_category(tool.category) {
+                assert_eq!(tool.dangerous, tool.name != "preview_wait", "{}", tool.name);
+            }
+        }
+        // `serverId` leads every one of them and is never required: the tool finds the screen.
+        for tool in catalog
+            .iter()
+            .filter(|tool| is_remote_control_category(tool.category))
+        {
+            let first = &tool.parameters[0];
+            assert_eq!((first.name.as_str(), first.required), ("serverId", false), "{}", tool.name);
+        }
+    }
+
+    /// `preview_dialog` answers a phone's alert too, by the label of the button: the catalog lists
+    /// that parameter right after the prompt text, and it is never required.
+    #[test]
+    fn preview_dialog_lists_the_button_of_a_phone_alert() {
+        let catalog = tool_catalog();
+        let dialog = catalog
+            .iter()
+            .find(|tool| tool.name == "preview_dialog")
+            .unwrap();
+        let names = dialog
+            .parameters
+            .iter()
+            .map(|parameter| (parameter.name.as_str(), parameter.required))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                ("serverId", false),
+                ("accept", false),
+                ("prompt_text", false),
+                ("button", false)
+            ]
+        );
+    }
+
+    /// The groups mean nothing without a remote-control screen and cost schema tokens in every
+    /// request, so no conversation starts with them: the built-in preset leaves both out,
+    /// whatever else the document's catalog lists, and mirrors the renderer's
+    /// `seedPresetEnabledTools`.
+    #[test]
+    fn the_builtin_preset_leaves_the_remote_control_groups_off() {
+        let catalog = tool_catalog();
+        let enabled = builtin_preset_enabled_tools(&catalog, None);
+        let remote = catalog
+            .iter()
+            .filter(|tool| is_remote_control_category(tool.category))
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(remote.len(), 8);
+        for name in &remote {
+            assert!(!enabled.iter().any(|enabled| enabled == *name), "{name} is on in the preset");
+        }
+        // The preview tools they sit next to stay on, and so does everything else that was on.
+        for name in ["preview_start", "preview_screenshot", "preview_input", "read", "agent_spawn"] {
+            assert!(enabled.iter().any(|enabled| enabled == name), "{name} fell out of the preset");
+        }
+        assert_eq!(
+            enabled.len(),
+            builtin_preset_enabled_tools(
+                &catalog
+                    .iter()
+                    .filter(|tool| !is_remote_control_category(tool.category))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                None
+            )
+            .len(),
+            "the preset is what it was before the groups existed"
+        );
+        // The preset a document carries is the same list.
+        assert_eq!(
+            builtin_preset(&catalog, None).settings.enabled_tools,
+            enabled
+        );
+    }
+
+    #[test]
+    fn seeded_conversations_start_at_the_most_cautious_security_level() {
+        let document = default_document();
+
+        assert_eq!(document.schema_version, crate::storage::SCHEMA_VERSION);
+        assert_eq!(
+            document.workspaces[0].conversations[0]
+                .settings
+                .security_level,
+            SecurityLevel::default()
+        );
+        // Empty workspace-level settings make new conversations use the global default preset.
+        assert!(document.workspaces.iter().all(|workspace| workspace
+            .default_conversation_preset_id
+            .is_empty()
+            && workspace.last_conversation_settings.is_none()));
+        assert!(!document
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.kind == WorkspaceKind::Unsupported));
+        assert!(document.workspaces.iter().any(|workspace| {
+            workspace.id == "__temporary__" && workspace.kind == WorkspaceKind::Temporary
+        }));
+    }
+}

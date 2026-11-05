@@ -1,0 +1,19 @@
+[package]
+name = "mewrk-client"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "The client side of Mewrk: application state and its link to the host. Everything the renderer's lib/ did."
+
+[dependencies]
+mewrk-host = { path = "../mewrk-host/host" }
+fluent.workspace = true
+# Only for `AppHandle::path()`: where the data folder is, for `ui-state.json`.
+tauri = { path = "../mewrk-host/tauri-shim", package = "mewrk-tauri-shim" }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { workspace = true, features = ["NSData", "NSString"] }
+objc2-pdf-kit = { version = "0.3", features = ["PDFDocument", "PDFPage"] }
+objc2.workspace = true

@@ -1,0 +1,32 @@
+[package]
+name = "mewrk-ui-composer"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "The composer and the cards docked on it."
+
+[dependencies]
+mewrk-client = { path = "../../mewrk-client" }
+mewrk-pane-git = { path = "../../panes/git" }
+mewrk-pane-files = { path = "../../panes/files" }
+fluent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+mewrk-ui-common = { path = "../common" }
+rfd.workspace = true
+arboard = { workspace = true, features = ["image-data"] }
+image.workspace = true
+base64-simd.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+accesskit.workspace = true
+wgpu.workspace = true
+
+[features]
+# So `cargo test` doesn't build the screenshot tool as well as the one test binary: the disk this runs on is small.
+shots = []
+
+[[example]]
+name = "composer_shot"
+required-features = ["shots"]

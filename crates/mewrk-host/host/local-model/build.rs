@@ -1,0 +1,161 @@
+//! With the `mlx` feature on Apple silicon: fetches Apple's prebuilt MLX
+//! (the `mlx-metal` wheel from PyPI, pinned by SHA-256) and builds
+//! `mlx/mewrk_mlx.cpp` against it into `libmewrk_mlx.dylib`, beside
+//! `libmlx.dylib`.
+//!
+//! The wheel comes from PyPI's file host or, when that fails or crawls, from
+//! its mirrors in mainland China, which serve every file at the same path;
+//! `$MEWRK_MLX_MIRROR` (such a host, e.g. `https://pypi.tuna.tsinghua.edu.cn`)
+//! is tried before them all. The SHA-256 is checked whatever the host.
+//!
+//! Prebuilt, because building MLX from source needs the Metal shader compiler,
+//! which only ships with the full Xcode. A dylib the app `dlopen`s, because
+//! MLX needs macOS 14 and the app starts on macOS 13; nothing links against
+//! it at build time.
+//!
+//! Everything lands in one directory, `<repository>/.mlx/<version>/mlx/lib`
+//! (or `$MEWRK_MLX_DIR/mlx/lib`), which every build shares (like `.cef`) and
+//! `scripts/stage-macos-mlx.mjs` copies into the bundle. The runtime kernels
+//! (`mlx.metallib`, 136 MB) come with the MLX model download instead.
+
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Also read by `scripts/stage-macos-mlx.mjs`.
+const MLX_VERSION: &str = "0.32.2";
+/// The wheel's path on a PyPI file host.
+const WHEEL_PATH: &str = "packages/f7/ab/ba1952908c5d2a5070cf1cfbfea0161c4751ea62299e2776819810917483/mlx_metal-0.32.2-py3-none-macosx_14_0_arm64.whl";
+const WHEEL_SHA256: &str = "3825fff379dbc107dd3413e564a06caeaa24819910ec49c0439e454c06a1b9b8";
+/// Tried in turn, after `$MEWRK_MLX_MIRROR`: PyPI's own, then Tsinghua
+/// (TUNA), Aliyun, USTC and Tencent Cloud.
+const WHEEL_HOSTS: &[&str] = &[
+    "https://files.pythonhosted.org",
+    "https://pypi.tuna.tsinghua.edu.cn",
+    "https://mirrors.aliyun.com/pypi",
+    "https://mirrors.ustc.edu.cn/pypi",
+    "https://mirrors.cloud.tencent.com/pypi",
+];
+const MIRROR_ENV: &str = "MEWRK_MLX_MIRROR";
+
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=MEWRK_MLX_DIR");
+    let wanted = env::var_os("CARGO_FEATURE_MLX").is_some()
+        && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+        && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64");
+    if !wanted {
+        return;
+    }
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
+    let root = env::var_os("MEWRK_MLX_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest.join("../../.mlx").join(MLX_VERSION));
+    let lib = root.join("mlx").join("lib");
+    if !lib.join("libmlx.dylib").exists() {
+        fetch(&root);
+    }
+    let source = manifest.join("mlx").join("mewrk_mlx.cpp");
+    let header = manifest.join("mlx").join("mewrk_mlx.h");
+    println!("cargo:rerun-if-changed={}", source.display());
+    println!("cargo:rerun-if-changed={}", header.display());
+    let shim = lib.join("libmewrk_mlx.dylib");
+    build_shim(&source, &root.join("mlx").join("include"), &lib, &shim);
+    println!("cargo:rustc-env=MEWRK_MLX_SHIM={}", shim.display());
+    println!("cargo:rustc-env=MEWRK_MLX_VERSION={MLX_VERSION}");
+}
+
+/// Downloads and verifies the wheel, then unpacks its `mlx/` tree into `root`.
+fn fetch(root: &Path) {
+    let parent = root.parent().expect("mlx dir has a parent");
+    fs::create_dir_all(parent).expect("create .mlx");
+    let wheel = parent.join(format!("mlx_metal-{MLX_VERSION}.whl.part"));
+    let mirror = env::var(MIRROR_ENV).ok().filter(|base| !base.trim().is_empty());
+    let hosts: Vec<&str> = mirror.iter().map(|base| base.trim()).chain(WHEEL_HOSTS.iter().copied()).collect();
+    let mut failures = Vec::new();
+    let fetched = hosts.iter().enumerate().find_map(|(index, host)| {
+        let url = format!("{}/{WHEEL_PATH}", host.trim_end_matches('/'));
+        match download(&url, &wheel, index + 1 == hosts.len()) {
+            Ok(()) => Some(url),
+            Err(error) => {
+                failures.push(format!("{url}: {error}"));
+                None
+            }
+        }
+    });
+    let Some(url) = fetched else {
+        let _ = fs::remove_file(&wheel);
+        panic!(
+            "下载 MLX 运行库失败，每个源都试过了：\n  {}\n\
+             可用 {MIRROR_ENV} 指定一个 PyPI 镜像（按 packages/ 路径提供文件），\
+             或把解开的 mlx-metal {MLX_VERSION} wheel 放进 MEWRK_MLX_DIR。",
+            failures.join("\n  ")
+        );
+    };
+    if !failures.is_empty() {
+        println!("cargo:warning=MLX 运行库改从 {url} 下载；先前失败：{}", failures.join("；"));
+    }
+    let staging = parent.join(format!("{MLX_VERSION}.unpacking"));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging).expect("create staging");
+    let status = Command::new("/usr/bin/unzip")
+        .args(["-q", "-o"])
+        .arg(&wheel)
+        .arg("mlx/*")
+        .arg("-d")
+        .arg(&staging)
+        .status()
+        .expect("run unzip");
+    assert!(status.success(), "解压 MLX 失败");
+    let _ = fs::remove_dir_all(root);
+    fs::rename(&staging, root).expect("place mlx");
+    let _ = fs::remove_file(&wheel);
+}
+
+/// Fetches `url` into `wheel` and checks it against `WHEEL_SHA256`. Unless
+/// it is the `last` host, one that stays under 64 KiB/s for 30 s (over ten
+/// minutes for the 42 MB wheel) gives way to the next.
+fn download(url: &str, wheel: &Path, last: bool) -> Result<(), String> {
+    let _ = fs::remove_file(wheel);
+    let mut curl = Command::new("curl");
+    curl.args(["--fail", "--location", "--silent", "--show-error", "--retry", "1", "--connect-timeout", "15"]);
+    if !last {
+        curl.args(["--speed-limit", "65536", "--speed-time", "30"]);
+    }
+    let output = curl.arg("-o").arg(wheel).arg(url).output().expect("run curl");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = stderr.lines().rev().map(str::trim).find(|line| !line.is_empty());
+        return Err(reason.map_or_else(|| output.status.to_string(), str::to_owned));
+    }
+    let digest = sha256_hex(&fs::read(wheel).map_err(|error| format!("读不到下载的文件: {error}"))?);
+    if digest != WHEEL_SHA256 {
+        return Err(format!("sha256 不符（{digest}）"));
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Always optimized, whatever the profile: debug and release builds share the
+/// output, and the shim is the hot loop.
+fn build_shim(source: &Path, include: &Path, lib: &Path, out: &Path) {
+    let staging = out.with_extension(format!("dylib.{}", std::process::id()));
+    let status = Command::new("/usr/bin/clang++")
+        .args(["-std=c++20", "-O2", "-fPIC", "-dynamiclib", "-arch", "arm64", "-mmacosx-version-min=14.0"])
+        .arg("-I")
+        .arg(include)
+        .arg(source)
+        .arg("-L")
+        .arg(lib)
+        .args(["-lmlx", "-Wl,-rpath,@loader_path", "-install_name", "@rpath/libmewrk_mlx.dylib", "-o"])
+        .arg(&staging)
+        .status()
+        .expect("run clang++");
+    assert!(status.success(), "编译 mewrk_mlx.cpp 失败");
+    fs::rename(&staging, out).expect("place libmewrk_mlx.dylib");
+}
