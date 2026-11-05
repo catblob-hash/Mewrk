@@ -432,6 +432,64 @@ fn a_surface_drawn_after_many_others_still_lies_over_their_text() {
     assert!(surface > text_top, "a layer draws its boxes first, so sharing one puts the text over the surface: {surface} {text_top}");
 }
 
+#[test]
+fn a_dialog_over_a_dialog_that_spent_many_layers_still_lies_over_its_text() {
+    let view = |_: &App| {
+        let many = (0..120).map(|_| div::<App>().absolute().left(0.0).top(0.0).size(100.0, 20.0).child(text("under"))).collect::<Vec<_>>();
+        let lower = dialog(400.0, div().h(300.0).children(many), None);
+        let upper = dialog(200.0, div().h(100.0), None);
+        div::<App>().size(800.0, 600.0).child(lower).child(upper)
+    };
+    let (mut rig, mut app) = (Rig::new(), App::default());
+    rig.frame(&mut app, &view);
+    let text_top = rig.scene.layers.iter().rposition(|layer| !layer.glyphs.is_empty()).expect("text");
+    let surface = rig.scene.layers.iter().rposition(|layer| layer.rects.iter().any(|inst| inst.rect[2] == 200.0)).expect("the upper dialog");
+    assert!(surface > text_top, "{surface} {text_top}");
+}
+
+#[test]
+fn a_flyout_over_many_others_still_lies_over_their_text() {
+    let view = |_: &App| {
+        let many = (0..120).map(|_| div::<App>().absolute().left(0.0).top(0.0).size(100.0, 20.0).child(text("under"))).collect::<Vec<_>>();
+        let lower = flyout_panel::<App>().w(300.0).h(200.0).children(many).popover_at(10.0, 10.0, |_| {});
+        let upper = flyout_panel::<App>().w(150.0).h(100.0).popover_at(10.0, 10.0, |_| {});
+        div::<App>().size(800.0, 600.0).child(lower).child(upper)
+    };
+    let (mut rig, mut app) = (Rig::new(), App::default());
+    rig.frame(&mut app, &view);
+    let text_top = rig.scene.layers.iter().rposition(|layer| !layer.glyphs.is_empty()).expect("text");
+    let surface = rig.scene.layers.iter().rposition(|layer| layer.rects.iter().any(|inst| inst.rect[2] == 150.0)).expect("the upper flyout");
+    assert!(surface > text_top, "{surface} {text_top}");
+}
+
+#[test]
+fn a_fade_and_an_invisible_reach_the_layers_made_after_they_began() {
+    let lid = fluent::Color::rgb(0x123456);
+    let shown = |fade: f32, hide: bool| {
+        move |_: &App| {
+            let faded = div::<App>().opacity(fade).child(div().absolute().left(0.0).top(0.0).size(50.0, 50.0).bg(lid));
+            let hidden = div::<App>().child(div().absolute().left(100.0).top(0.0).size(60.0, 60.0).bg(lid));
+            div::<App>().size(800.0, 600.0).child(faded).child(if hide { hidden.invisible() } else { hidden })
+        }
+    };
+    let drawn = |rig: &Rig, width: f32| rig.scene.layers.iter().flat_map(|layer| &layer.rects).find(|inst| inst.rect[2] == width).map(|inst| inst.fill.a);
+    let (mut rig, mut app) = (Rig::new(), App::default());
+    rig.frame(&mut app, &shown(0.5, true));
+    assert_eq!(drawn(&rig, 50.0), Some(128));
+    assert_eq!(drawn(&rig, 60.0), None);
+    rig.frame(&mut app, &shown(1.0, false));
+    assert_eq!(drawn(&rig, 50.0), Some(255));
+    assert_eq!(drawn(&rig, 60.0), Some(255));
+}
+
+#[test]
+fn what_floats_over_the_page_is_solid_in_either_theme() {
+    for theme in [fluent::Theme::dark(), fluent::Theme::light()] {
+        assert_eq!(theme.flyout.a, 255);
+        assert_eq!(theme.flyout_stroke.a, 255);
+    }
+}
+
 fn button(key: &'static str) -> El<App> {
     div().key(key).w(60.0).h(20.0).on_click(move |app: &mut App| app.clicks.push(key))
 }

@@ -82,9 +82,8 @@ pub fn root(app: &mut App) -> E {
     }
     shell_row = shell_row.child(main);
     if sidebar_open && floating {
-        let t_ = fluent::el::theme();
         shell_row = shell_row.child(crate::glass::plate_over_tiles(app, sidebar_box, sidebar_corners));
-        shell_row = shell_row.child(sidebar(app, sidebar_width).absolute().left(0.0).top(0.0).shadow(24.0, 0.0, t_.shadow));
+        shell_row = shell_row.child(sidebar(app, sidebar_width).absolute().left(0.0).top(0.0));
     }
 
     let mut frame: E = div().key("window-frame").w_full().h_full().bg(if crate::glass::layers().layered() { crate::pane_tiles::solid_gutter() } else { crate::pane_tiles::chat_ground() });
@@ -166,6 +165,6 @@ fn main_pane(app: &mut App, sidebar_open: bool, beside: bool, size: (f32, f32)) 
             repaint();
         }),
     });
-    main = main.child(tiles).child(crate::glass::strip_over_tiles(TOPBAR_HEIGHT));
+    main = main.child(tiles);
     main
 }

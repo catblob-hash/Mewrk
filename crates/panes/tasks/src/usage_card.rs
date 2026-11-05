@@ -351,7 +351,7 @@ fn usage_series_chart(series: &UsageSeries, models: &[ModelUsageRow]) -> E {
         rows.sort_by(|l, r| r.0.cmp(&l.0));
         if !rows.is_empty() {
             let at_end = hovered_now.is_some_and(|h| h * 2 >= last_index);
-            let mut tip = col().key("usage-chart-tip").absolute().top(0.0).min_w(170f32.min(plot_w.max(1.0))).max_w(plot_w.max(170.0)).gap(4.0).py(9.0).px(12.0).radius(10.0).bg(c.flyout).border(c.flyout_stroke).shadow(9.0, 6.0, c.shadow).pass_through();
+            let mut tip = col().key("usage-chart-tip").absolute().top(0.0).min_w(170f32.min(plot_w.max(1.0))).max_w(plot_w.max(170.0)).gap(4.0).py(9.0).px(12.0).radius(10.0).bg(c.flyout).border(c.flyout_stroke).pass_through();
             tip = if at_end { tip.right(0.0) } else { tip.left(0.0) };
             tip = tip.child(text(bucket_title(point.start_ms, series.bucket)).ty(ts(13.0, 18.0, Weight::Semibold)).color(c.text_primary).nowrap());
             for (tokens, index) in rows.iter().take(TOOLTIP_ROWS) {

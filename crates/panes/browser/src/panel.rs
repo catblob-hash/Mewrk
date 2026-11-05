@@ -1267,7 +1267,6 @@ fn menu_view(app: &mut App, session: &str) -> E {
         .bg(t_.flyout)
         .border(t_.flyout_stroke)
         .radius(12.0)
-        .shadow(16.0, 8.0, t_.shadow)
         .role(Role::Menu)
         .aria_label(t("浏览器菜单", "Browser menu"))
         .popover(("browser-menu-trigger", id.clone()), Side::Below, Align::Start, 4.0, {
@@ -1557,7 +1556,6 @@ fn body_view(app: &mut App, session: &str, body_state: &PreviewBodyState) -> E {
                 .radius(9.0)
                 .bg(t_.flyout)
                 .border(t_.flyout_stroke)
-                .shadow(14.0, 4.0, t_.shadow)
                 .child(text(label).ty(BODY_SMALL).flex1().min_w(0.0))
                 .child(card_action(t("继续使用", "Keep using"), pending).on_click(move |app: &mut App| action(app, &keep, "take_control", Value::Null)))
                 .child(accent_button(t("交还给模型", "Give it back")).h(27.0).px(11.0).disabled(pending).on_click(move |app: &mut App| action(app, &give, "handoff_agent", Value::Null))),
@@ -1573,7 +1571,7 @@ fn body_view(app: &mut App, session: &str, body_state: &PreviewBodyState) -> E {
 }
 
 fn strip(key: (&'static str, String), message: String, foreground: Color, background: Color, top: f32) -> E {
-    row().key(key).absolute().top(top).left(4.0).right(4.0).min_h(34.0).items_center().px(9.0).py(6.0).radius(8.0).bg(background).border(theme().card_stroke).shadow(14.0, 4.0, theme().shadow).clip().child(text(message).ty(BODY_SMALL).color(foreground).selectable().flex1().min_w(0.0))
+    row().key(key).absolute().top(top).left(4.0).right(4.0).min_h(34.0).items_center().px(9.0).py(6.0).radius(8.0).bg(background).border(theme().card_stroke).clip().child(text(message).ty(BODY_SMALL).color(foreground).selectable().flex1().min_w(0.0))
 }
 
 /// An alert, confirm or prompt on a page the user is using, answered here rather than left for the model.
@@ -1609,7 +1607,6 @@ fn dialog_card(app: &mut App, session: &str, dialog: BrowserPageDialog, pending:
         .radius(12.0)
         .bg(t_.flyout)
         .border(t_.flyout_stroke)
-        .shadow(20.0, 8.0, t_.shadow)
         .child(text(t("这个页面显示", "This page says")).ty(CAPTION).color(t_.text_secondary));
     if !message.is_empty() {
         card = card.child(col().max_h(240.0).scroll_y().key(("browser-dialog-message", session)).child(text(message).ty(BODY_SMALL).selectable()));

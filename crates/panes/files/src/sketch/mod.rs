@@ -472,7 +472,7 @@ fn toolbar(key: &str, backdrop: Option<Arc<str>>, on_cancel: Rc<dyn Fn(&mut App)
         let mut s = sketch.borrow_mut();
         s.compact = s.full_width > room;
     }
-    let mut pill = row().key(("sketch-pill", key)).shrink0().items_center().gap(4.0).py(4.0).px(8.0).radius(10.0).bg(t_.flyout).border(t_.flyout_stroke).shadow(16.0, 6.0, t_.shadow);
+    let mut pill = row().key(("sketch-pill", key)).shrink0().items_center().gap(4.0).py(4.0).px(8.0).radius(10.0).bg(t_.flyout).border(t_.flyout_stroke);
     let divider = || div().w(1.0).h(16.0).shrink0().bg(t_.divider).role(Role::Splitter).aria_orientation(Orientation::Vertical);
     if compact {
         let tools = SKETCH_TOOLS.iter().map(|&candidate| {

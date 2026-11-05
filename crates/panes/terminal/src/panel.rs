@@ -430,7 +430,7 @@ pub fn terminal_panel(app: &mut App, props: PanelProps<'_>) -> E {
     let key = mount(app, &props);
     let store_ = store(app);
     let Some(panel) = store_.panels.get(&key) else { return div() };
-    let (veiled, settled, label, disabled, closing) = (panel.core.veiled(), panel.core.settled(), panel.core.status_label(), panel.core.input_disabled_reason.is_some(), panel.core.phase == api::TerminalPhase::Closing);
+    let (veiled, settled, label, disabled) = (panel.core.veiled(), panel.core.settled(), panel.core.status_label(), panel.core.input_disabled_reason.is_some());
     let connecting = panel.core.phase == api::TerminalPhase::Connecting;
     let (region, reason) = (panel.core.label.clone(), panel.core.input_disabled_reason.clone());
     let error = panel.core.phase == api::TerminalPhase::Error;
@@ -497,8 +497,8 @@ pub fn terminal_panel(app: &mut App, props: PanelProps<'_>) -> E {
         body = body.child(terminal_context_menu(&key, x, y, selected, accepted));
     }
     if veiled {
-        // While connecting or terminating the body dims behind a centered spinner.
-        body = body.child(row().absolute().inset(0.0).center().pass_through().bg(if closing { t_.layer } else { t_.layer.fade(0.64) }).child(spinner(16.0, None)));
+        // While connecting or terminating a centered spinner stands in for the body.
+        body = body.child(row().absolute().inset(0.0).center().pass_through().bg(t_.mica_base).child(spinner(16.0, None)));
     }
     if settled {
         // A settled session replaces the body with a centered card: the verdict, then the only way back.
@@ -523,7 +523,7 @@ pub fn terminal_panel(app: &mut App, props: PanelProps<'_>) -> E {
                 .inset(0.0)
                 .center()
                 .gap(10.0)
-                .bg(t_.layer)
+                .bg(t_.mica_base)
                 .role(if error { Role::Alert } else { Role::Status })
                 .aria_live(Live::Polite)
                 .child(text(label).ty(CAPTION).color(if error { t_.critical } else { t_.text_secondary }).text_center().max_w(320.0).px(16.0))

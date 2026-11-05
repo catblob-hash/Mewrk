@@ -67,6 +67,64 @@ fn the_appearance_page_has_no_custom_css_and_the_setting_keeps_what_upstream_wro
 }
 
 #[test]
+fn the_glass_sliders_are_there_with_the_glass_and_apply_as_they_move() {
+    use mewrk_client::model::{DEFAULT_GLASS_BLUR, DEFAULT_GLASS_TRANSPARENCY};
+    let (_d, mut app, mut rig) = on_page("glass-sliders", SettingsView::Appearance);
+    rig.settle(&mut app, &view);
+    assert!(rect_of("glass-transparency").is_none() && rect_of("glass-blur").is_none(), "no glass, nothing to set");
+
+    app.doc.global_settings.appearance.liquid_glass = true;
+    app.doc.global_settings.appearance.background = "builtin:desk".to_owned();
+    rig.settle(&mut app, &view);
+    let appearance = |app: &App| (app.doc.global_settings.appearance.glass_transparency, app.doc.global_settings.appearance.glass_blur);
+    assert_eq!(appearance(&app), (DEFAULT_GLASS_TRANSPARENCY, DEFAULT_GLASS_BLUR));
+
+    rig.reveal(&mut app, &view, "glass-transparency");
+    let track = rect_of("glass-transparency").unwrap();
+    rig.input.pointer = Some((track.x + track.w * 0.5, track.y + 10.0));
+    rig.frame(&mut app, &view);
+    rig.input.pressed = true;
+    rig.input.down = true;
+    rig.frame(&mut app, &view);
+    assert_eq!(appearance(&app).0, 50, "the press alone applies, before any release");
+    rig.input.pointer = Some((track.right() + 40.0, track.y + 10.0));
+    rig.frame(&mut app, &view);
+    assert_eq!(appearance(&app).0, 100, "past the end stays at the end");
+    rig.input.pointer = Some((track.x - 40.0, track.y + 10.0));
+    rig.frame(&mut app, &view);
+    assert_eq!(appearance(&app).0, 0);
+    rig.input.down = false;
+    rig.input.released = true;
+    rig.frame(&mut app, &view);
+    rig.settle(&mut app, &view);
+
+    let track = rect_of("glass-blur").unwrap();
+    rig.input.pointer = Some((track.x + track.w * 0.25, track.y + 10.0));
+    rig.frame(&mut app, &view);
+    rig.input.pressed = true;
+    rig.input.down = true;
+    rig.frame(&mut app, &view);
+    rig.input.down = false;
+    rig.input.released = true;
+    rig.frame(&mut app, &view);
+    assert_eq!(appearance(&app).1, 15);
+
+    // A solid ground has nothing to blur: the row stays, and the slider takes no press.
+    app.doc.global_settings.appearance.background = "solid".to_owned();
+    rig.settle(&mut app, &view);
+    let track = rect_of("glass-blur").unwrap();
+    rig.input.pointer = Some((track.right() - 1.0, track.y + 10.0));
+    rig.frame(&mut app, &view);
+    rig.input.pressed = true;
+    rig.input.down = true;
+    rig.frame(&mut app, &view);
+    rig.input.down = false;
+    rig.input.released = true;
+    rig.frame(&mut app, &view);
+    assert_eq!(appearance(&app).1, 15);
+}
+
+#[test]
 fn the_message_font_size_commits_on_release_only() {
     let (_d, mut app, mut rig) = on_page("font", SettingsView::Appearance);
     rig.reveal(&mut app, &view, "font-size-slider");
@@ -178,7 +236,109 @@ fn an_unreadable_picture_says_so_in_the_dialog() {
     appearance::import_background_bytes(&mut app, b"not a picture".to_vec());
     rig.until(&mut app, &view, "the failure", |app| !app.local::<appearance::BackgroundState>().importing);
     let message = app.local::<appearance::BackgroundState>().error.clone().unwrap();
-    assert!(says(&message, "无法读取这张图片", "This picture can't be read"), "{message}");
+    assert!(says(&message, "无法读取这个文件", "This file can't be read"), "{message}");
+}
+
+fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../motion/tests/fixtures").join(name)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_video_goes_in_whole_with_its_first_frame_as_its_picture_and_goes_out_again() {
+    use mewrk_settings_global::effects::{backdrop_media, BackdropMedia};
+    let (_d, mut app, mut rig) = on_page("import-video", SettingsView::Appearance);
+    rig.click(&mut app, &view, "background-open");
+    appearance::import_background_file(&mut app, fixture("counting.mp4"));
+    rig.until(&mut app, &view, "the import", |app| !app.local::<appearance::BackgroundState>().importing);
+    assert_eq!(app.local::<appearance::BackgroundState>().error, None);
+    let background = app.doc.global_settings.appearance.background.clone();
+    assert_eq!(background.len(), 64, "{background}");
+    rig.until(&mut app, &view, "the list to read again", |app| app.local::<appearance::BackgroundState>().imported.as_ref().is_some_and(|l| l.len() == 1));
+    let listed = app.local::<appearance::BackgroundState>().imported.as_ref().unwrap()[0].clone();
+    assert_eq!(listed.motion.as_deref(), Some("video"));
+    assert_eq!((listed.width, listed.height), (64, 36));
+    rig.until(&mut app, &view, "the first frame", |app| backdrop_size(app).is_some());
+    rig.until(&mut app, &view, "to know it moves", |app| matches!(backdrop_media(app), BackdropMedia::Video { .. }));
+
+    // The first real frame takes over from the picture, which the scene on hand can't know, so it asks for a new one. After that it needn't.
+    use mewrk_settings_global::{set_backdrop_covered, set_window_visible, tick_backdrop};
+    use std::time::{Duration, Instant};
+    let next_change = |app: &mut App| {
+        let begun = Instant::now();
+        loop {
+            let tick = tick_backdrop(app, Instant::now());
+            if tick.changed {
+                return tick;
+            }
+            assert!(begun.elapsed() < Duration::from_secs(5), "no frame came");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    assert!(next_change(&mut app).rebuild, "the first frame");
+    assert!(!next_change(&mut app).rebuild, "the next");
+
+    // Out of sight, or under something solid, nothing moves.
+    set_window_visible(&mut app, false);
+    let now = Instant::now();
+    let hidden = tick_backdrop(&mut app, now);
+    assert!(!hidden.changed);
+    assert!(hidden.next.is_some_and(|next| next > now + Duration::from_secs(1)), "it only comes back to give up the decoder: {:?}", hidden.next.map(|next| next - now));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!tick_backdrop(&mut app, Instant::now()).changed);
+    set_window_visible(&mut app, true);
+    next_change(&mut app);
+    assert!(!set_backdrop_covered(&mut app, true));
+    assert!(!tick_backdrop(&mut app, Instant::now()).changed);
+    assert!(set_backdrop_covered(&mut app, false), "uncovered, and with something to catch up on");
+    next_change(&mut app);
+
+    let tile = ("confirm-delete-btn", hash_key(("background-remove", background.as_str())));
+    rig.settle(&mut app, &view);
+    rig.click(&mut app, &view, tile);
+    rig.click(&mut app, &view, tile);
+    rig.until(&mut app, &view, "the removal", |app| app.doc.global_settings.appearance.background == "solid");
+    assert!(matches!(backdrop_media(&mut app), BackdropMedia::Still));
+}
+
+#[test]
+fn an_animated_gif_is_decoded_into_frames_and_a_still_one_stays_a_picture() {
+    use mewrk_settings_global::effects::{backdrop_media, BackdropMedia};
+    let (dir, mut app, mut rig) = on_page("import-gif", SettingsView::Appearance);
+    rig.click(&mut app, &view, "background-open");
+    let animated = dir.0.join("moves.gif");
+    std::fs::write(&animated, mewrk_motion::animated::test_gif(16, 9, &[[255, 0, 0], [0, 255, 0], [0, 0, 255]], 40)).unwrap();
+    appearance::import_background_file(&mut app, animated);
+    rig.until(&mut app, &view, "the import", |app| !app.local::<appearance::BackgroundState>().importing);
+    assert_eq!(app.local::<appearance::BackgroundState>().error, None);
+    rig.until(&mut app, &view, "the frames", |app| matches!(backdrop_media(app), BackdropMedia::Animated { .. }));
+    let BackdropMedia::Animated { book } = backdrop_media(&mut app) else { unreachable!() };
+    assert_eq!(book.count(), 3);
+    assert_eq!(book.duration_us(), 120_000);
+
+    let still = dir.0.join("still.gif");
+    std::fs::write(&still, mewrk_motion::animated::test_gif(16, 9, &[[9, 9, 9]], 40)).unwrap();
+    appearance::import_background_file(&mut app, still);
+    rig.until(&mut app, &view, "the second import", |app| !app.local::<appearance::BackgroundState>().importing);
+    rig.until(&mut app, &view, "to know it holds still", |app| matches!(backdrop_media(app), BackdropMedia::Still));
+    rig.until(&mut app, &view, "the list to read again", |app| app.local::<appearance::BackgroundState>().imported.as_ref().is_some_and(|l| l.len() == 2));
+    let listed = app.local::<appearance::BackgroundState>().imported.clone().unwrap();
+    assert_eq!(listed.iter().filter(|image| image.motion.as_deref() == Some("animated")).count(), 1, "the still GIF is just a picture");
+}
+
+#[test]
+fn what_only_looks_like_a_video_is_refused_and_leaves_nothing_in_the_library() {
+    let (dir, mut app, mut rig) = on_page("import-not-video", SettingsView::Appearance);
+    rig.click(&mut app, &view, "background-open");
+    rig.until(&mut app, &view, "the list", |app| app.local::<appearance::BackgroundState>().imported.is_some());
+    let fake = dir.0.join("fake.mp4");
+    std::fs::write(&fake, b"\0\0\0\x18ftypisom not a video at all").unwrap();
+    appearance::import_background_file(&mut app, fake);
+    rig.until(&mut app, &view, "the failure", |app| !app.local::<appearance::BackgroundState>().importing);
+    let message = app.local::<appearance::BackgroundState>().error.clone().unwrap();
+    assert!(says(&message, "无法读取这个文件", "This file can't be read"), "{message}");
+    assert_eq!(app.doc.global_settings.appearance.background, "solid");
+    assert!(app.local::<appearance::BackgroundState>().imported.as_ref().unwrap().is_empty());
 }
 
 #[test]

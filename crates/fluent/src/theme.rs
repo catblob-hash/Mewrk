@@ -244,8 +244,6 @@ pub struct Theme {
 
     pub flyout: Color,
     pub flyout_stroke: Color,
-    pub shadow: Color,
-    pub smoke: Color,
 
     pub success: Color,
     pub caution: Color,
@@ -304,10 +302,8 @@ impl Theme {
             card_stroke: Color::argb(0x1A000000),
             divider: Color::argb(0x15FFFFFF),
 
-            flyout: Color::rgb(0x2C2C2C).with_alpha(0.96),
-            flyout_stroke: Color::argb(0x33000000),
-            shadow: Color::argb(0x47000000),
-            smoke: Color::argb(0x4D000000),
+            flyout: Color::rgb(0x2C2C2C),
+            flyout_stroke: Color::rgb(0x484848),
 
             success: Color::rgb(0x6CCB5F),
             caution: Color::rgb(0xFCE100),
@@ -364,10 +360,8 @@ impl Theme {
             card_stroke: Color::argb(0x0F000000),
             divider: Color::argb(0x14000000),
 
-            flyout: Color::rgb(0xFCFCFC).with_alpha(0.97),
-            flyout_stroke: Color::argb(0x17000000),
-            shadow: Color::argb(0x24000000),
-            smoke: Color::argb(0x4D000000),
+            flyout: Color::rgb(0xFCFCFC),
+            flyout_stroke: Color::rgb(0xCFCFCF),
 
             success: Color::rgb(0x0F7B0F),
             caution: Color::rgb(0x9D5D00),

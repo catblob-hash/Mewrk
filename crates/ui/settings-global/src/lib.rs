@@ -50,7 +50,7 @@ pub mod web_search_page;
 pub mod widgets;
 pub mod workspace_settings;
 
-pub use effects::{message_type, on_scheme_changed, themed, window_backdrop, window_refocused, zoom};
+pub use effects::{backdrop_media, backdrop_source, message_type, on_scheme_changed, set_backdrop_covered, set_window_visible, themed, tick_backdrop, window_backdrop, window_refocused, zoom, BackdropMedia, BackdropSource};
 pub use machine_dialogs::{machine_settings_dialog, MachineSettingsProps};
 pub use permissions_page::{first_launch, first_launch_dialog};
 pub use shell::{close, current_view, global_settings_body, global_settings_window, is_open, open, select_view, SettingsView};

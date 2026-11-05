@@ -443,7 +443,7 @@ impl ChatPage {
 
         if ui.input.hovered_file {
             let overlay = area.inset(12.0);
-            ui.card(overlay, OVERLAY_RADIUS, t.smoke, t.accent);
+            ui.card(overlay, OVERLAY_RADIUS, t.flyout, t.accent);
             ui.icon(Icon::Attach, overlay.x + overlay.w * 0.5, overlay.y + overlay.h * 0.5 - 24.0, 28.0, t.text_primary);
             ui.label_centered(rect(overlay.x, overlay.y + overlay.h * 0.5, overlay.w, 28.0), "松开以附加图片或视频", &BODY_LARGE, t.text_primary);
         }

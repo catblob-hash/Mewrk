@@ -6,7 +6,7 @@ use mewrk_client::prelude::*;
 use crate::actions::{open_pane, show_tasks_tab};
 use crate::state::{shell, ConfirmationRequest, RemoteWorkspacePicker, SshHostKey, SshPrompt, SshPromptKind};
 
-pub const SCENES: &[&str] = &["landing", "panes", "solo", "solo-glass", "screen", "page", "tasks-history", "search", "confirm", "rewind", "new-project", "edit-project", "ssh-hostkey", "ssh-secret", "ssh-confirm", "remote-picker", "path-choice", "machine", "ssh-machine", "settings", "providers", "glass", "permissions", "first-launch"];
+pub const SCENES: &[&str] = &["landing", "panes", "terminal", "solo", "solo-glass", "screen", "page", "tasks-history", "search", "confirm", "rewind", "new-project", "edit-project", "ssh-hostkey", "ssh-secret", "ssh-confirm", "remote-picker", "path-choice", "machine", "ssh-machine", "settings", "settings-glass", "background-library", "providers", "updates", "glass", "glass-clear", "glass-motion", "permissions", "first-launch"];
 
 /// Conversations to draw, in the document's first project: made through the host, as a stored one would have been.
 fn ensure_demo(app: &mut App) {
@@ -58,6 +58,7 @@ pub fn apply(app: &mut App, name: &str) -> bool {
             open_pane(app, "tasks");
             open_pane(app, "settings");
         }
+        "terminal" => open_pane(app, "terminal"),
         // One pane shown alone over the conversation and the other pane, which stay mounted under it.
         "solo" | "solo-glass" => {
             if name == "solo-glass" {
@@ -132,6 +133,15 @@ pub fn apply(app: &mut App, name: &str) -> bool {
             shell(app).machine_settings = Some(Some(RunTarget::Ssh { machine_id: id }));
         }
         "settings" => crate::actions::open_global_settings(app, "appearance"),
+        "settings-glass" => {
+            app.doc.global_settings.appearance.liquid_glass = true;
+            app.doc.global_settings.appearance.background = "builtin:desk".to_owned();
+            crate::actions::open_global_settings(app, "appearance");
+        }
+        "background-library" => {
+            crate::actions::open_global_settings(app, "appearance");
+            app.local::<mewrk_settings_global::appearance::AppearancePage>().library_open = true;
+        }
         "permissions" => {
             permission_answers(app);
             crate::actions::open_global_settings(app, "permissions");
@@ -142,11 +152,29 @@ pub fn apply(app: &mut App, name: &str) -> bool {
         }
         // Opens on Claude Agent, the seed's first row. `MEWRK_CLAUDE_BIN` picks what its panel finds.
         "providers" => crate::actions::open_global_settings(app, "providers"),
+        "updates" => crate::actions::open_global_settings(app, "updates"),
         "glass" => {
             app.doc.global_settings.appearance.liquid_glass = true;
             app.doc.global_settings.appearance.background = "builtin:desk".to_owned();
             open_pane(app, "tasks");
             open_pane(app, "files");
+        }
+        // The far end of both settings: most of the picture through, hardly blurred.
+        "glass-clear" => {
+            app.doc.global_settings.appearance.liquid_glass = true;
+            app.doc.global_settings.appearance.background = "builtin:desk".to_owned();
+            app.doc.global_settings.appearance.glass_transparency = 70;
+            app.doc.global_settings.appearance.glass_blur = 4;
+            open_pane(app, "tasks");
+        }
+        // A background that moves, from the file `MEWRK_SCENE_BACKGROUND` names. It is imported as if picked, so it shows once that's done.
+        "glass-motion" => {
+            app.doc.global_settings.appearance.liquid_glass = true;
+            app.doc.global_settings.appearance.background = "builtin:desk".to_owned();
+            open_pane(app, "tasks");
+            if let Some(path) = std::env::var_os("MEWRK_SCENE_BACKGROUND") {
+                mewrk_settings_global::appearance::import_background_file(app, path.into());
+            }
         }
         "glass-solid" => {
             app.doc.global_settings.appearance.liquid_glass = true;

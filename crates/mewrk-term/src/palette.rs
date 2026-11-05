@@ -83,8 +83,8 @@ impl Palette {
             ansi: (if t.dark { DARK } else { LIGHT }).map(Color::rgb),
             fg: t.text_primary,
             ground: t.mica_base,
-            cursor: t.accent,
-            cursor_text: t.text_on_accent,
+            cursor: fluent::mark::BRAND_ORANGE,
+            cursor_text: Color::rgb(0x14110F),
             dark: t.dark,
         }
     }

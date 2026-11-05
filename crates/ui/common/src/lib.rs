@@ -1,5 +1,6 @@
 //! Elements more than one surface uses: menus, Markdown.
 
+pub mod brand;
 pub mod page_tabs;
 pub mod popover_menu;
 pub mod context_menu;

@@ -81,7 +81,6 @@ pub struct App {
     pub unloaded: HashSet<String>,
     pub window: WindowRequests,
     pub system_dark: bool,
-    pub fullscreen: bool,
     /// The window's content view, for native child views. Null when headless.
     pub native_view: *mut std::ffi::c_void,
     pub frame_no: u64,
@@ -191,7 +190,6 @@ impl App {
             unloaded,
             window: WindowRequests::default(),
             system_dark: true,
-            fullscreen: false,
             native_view: std::ptr::null_mut(),
             frame_no: 0,
             mailbox,
@@ -242,6 +240,12 @@ impl App {
                 eprintln!("{name}: {e}");
             }
         });
+    }
+
+    /// Where the app keeps its files.
+    pub fn app_data_dir(&self) -> Option<PathBuf> {
+        use tauri::Manager;
+        self.host.app().path().app_data_dir().ok()
     }
 
     /// Runs `f` on a background thread; see [`Task`].

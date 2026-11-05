@@ -1,15 +1,16 @@
 [workspace]
 resolver = "3"
-members = ["crates/ui/common", "crates/ui/composer", "crates/panes/terminal", "crates/panes/git", "crates/panes/files", "crates/panes/tasks", "crates/panes/browser", "crates/ui/settings-global", "crates/ui/settings-conv", "crates/ui/chat", "crates/mewrk-client", "crates/agent-rt", "crates/chaos", "crates/stress", "crates/fluent", "crates/app", "crates/mewrk-core", "crates/mewrk-term", "crates/mewrk-panes", "crates/mewrk", "crates/mewrk-host/tauri-shim", "crates/mewrk-host/tauri-shim/macros", "crates/mewrk-host/tauri-dialog-shim", "crates/mewrk-host/aisdk-rs", "crates/mewrk-host/cef-helper", "crates/mewrk-host/host", "crates/mewrk-host/host/agent-kernel", "crates/mewrk-host/host/workflow-core", "crates/mewrk-host/host/workflow-script", "crates/mewrk-host/host/remote-agent", "crates/mewrk-host/host/local-model"]
+members = ["crates/ui/common", "crates/ui/composer", "crates/panes/terminal", "crates/panes/git", "crates/panes/files", "crates/panes/tasks", "crates/panes/browser", "crates/ui/settings-global", "crates/ui/settings-conv", "crates/ui/chat", "crates/mewrk-client", "crates/agent-rt", "crates/chaos", "crates/stress", "crates/fluent", "crates/motion", "crates/app", "crates/mewrk-core", "crates/mewrk-term", "crates/mewrk-panes", "crates/mewrk", "crates/mewrk-host/tauri-shim", "crates/mewrk-host/tauri-shim/macros", "crates/mewrk-host/tauri-dialog-shim", "crates/mewrk-host/aisdk-rs", "crates/mewrk-host/cef-helper", "crates/mewrk-host/host", "crates/mewrk-host/host/agent-kernel", "crates/mewrk-host/host/workflow-core", "crates/mewrk-host/host/workflow-script", "crates/mewrk-host/host/remote-agent", "crates/mewrk-host/host/local-model"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
 [workspace.dependencies]
 agent-rt = { path = "crates/agent-rt" }
 chaos = { path = "crates/chaos" }
 fluent = { path = "crates/fluent" }
+mewrk-motion = { path = "crates/motion" }
 git-core = { path = "crates/mewrk-host/host/git-core", package = "mewrk-git-core" }
 mewrk-core = { path = "crates/mewrk-core" }
 mewrk-term = { path = "crates/mewrk-term" }

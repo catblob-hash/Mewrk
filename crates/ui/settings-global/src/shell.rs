@@ -134,7 +134,8 @@ pub fn global_settings_body(app: &mut App, view: SettingsView) -> E {
     // A rail page scrolls its own columns; every other page scrolls as one.
     let scrolling = !matches!(view, SettingsView::Providers | SettingsView::SearchProviders);
     let body = if scrolling { col().key(("settings-content", view.key())).flex1().min_w(0.0).min_h(0.0).scroll_y().child(content) } else { col().key(("settings-content", view.key())).flex1().min_w(0.0).min_h(0.0).child(content) };
-    settings_layout(t("全局设置", "Global settings"), navigation(view), body).bg(theme().card_secondary).child(clipboard_pump())
+    let t_ = theme();
+    settings_layout(t("全局设置", "Global settings"), navigation(view), body).bg(t_.flyout.over(t_.card_secondary)).child(clipboard_pump())
 }
 
 /// The whole window: `<Dialog sidebar width="1040px"><GlobalSettings/></Dialog>`. `None` while it's closed.

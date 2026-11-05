@@ -108,7 +108,8 @@ fn dedup(items: Vec<Fetched>) -> Vec<Fetched> {
 struct Discovery<'a> {
     provider: &'a ApiProvider,
     /// Address the request is built on. Usually the provider's own `base_url`;
-    /// the Codex family substitutes its fixed backend when that is empty.
+    /// the Codex family substitutes its fixed backend when that is empty, and the
+    /// OpenCode gateway lists models beside its protocol mounts.
     base_url: String,
     client: Client,
     key: Option<String>,
@@ -456,12 +457,13 @@ fn explicit_vision(raw: &Value) -> Option<bool> {
 fn declares_image_input(raw: &Value) -> bool {
     raw.get("input_modalities")
         .or_else(|| raw.pointer("/architecture/input_modalities"))
+        .or_else(|| raw.pointer("/modalities/input"))
         .and_then(Value::as_array)
         .is_some_and(|items| {
             items
                 .iter()
                 .filter_map(Value::as_str)
-                .any(|item| matches!(item, "image" | "vision"))
+                .any(|item| matches!(item, "image" | "vision") || item.starts_with("image/"))
         })
 }
 
@@ -670,7 +672,8 @@ fn discovery_for(provider: &ApiProvider) -> Result<Discovery<'_>, String> {
     }
     Ok(Discovery {
         provider,
-        base_url: provider.base_url.clone(),
+        base_url: crate::opencode_gateway::catalog_base_url(&provider.base_url)
+            .unwrap_or_else(|| provider.base_url.clone()),
         client,
         key: optional_provider_key(provider),
         extra_headers: BTreeMap::new(),

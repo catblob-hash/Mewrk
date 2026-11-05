@@ -1840,7 +1840,7 @@ fn paint_block(ui: &mut Ui<'_>, laid: &mut Laid, index: u32, ox: f32, oy: f32, t
 
     // The corner of controls and a sideways scrollbar lie over the text, and a layer draws its text over its boxes.
     let saved_layer = ui.layer;
-    ui.layer = (ui.layer + 1).min(fluent::gpu::LAYER_TOOLTIP - 1);
+    ui.layer += 1;
     for (i, region) in laid.regions.iter().enumerate() {
         if region.r.bottom() <= top || region.r.y >= bottom {
             continue;

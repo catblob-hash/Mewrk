@@ -102,6 +102,8 @@ macro_rules! mewrk_app_commands {
             image_attachment_data,
             image_attachment_thumbnail,
             background_image_put,
+            background_image_attach_motion,
+            background_image_motion,
             background_image_commit,
             background_image_data,
             background_image_list,

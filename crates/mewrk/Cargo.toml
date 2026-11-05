@@ -33,6 +33,7 @@ mewrk-ui-common = { path = "../ui/common" }
 mewrk-ui-chat = { path = "../ui/chat" }
 mewrk-ui-composer = { path = "../ui/composer" }
 fluent.workspace = true
+mewrk-motion.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 serde.workspace = true

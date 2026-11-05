@@ -1492,10 +1492,13 @@ pub(crate) struct StepCredential {
 /// from run start. The Codex family re-reads its OAuth session every step: a
 /// token that is about to expire is refreshed here rather than failing
 /// upstream, and a refresh that landed mid-run reaches the next request.
+/// The headers also carry what an upstream asks of every request beside the
+/// credential: the OpenCode gateway's session.
 pub(crate) fn step_credential(
-    provider: &ApiProvider,
+    request: &RunModelRequest,
     key: &Option<String>,
 ) -> Result<StepCredential, String> {
+    let provider = &request.provider;
     if provider.family == ProviderFamily::OpenaiCodex {
         let credentials = crate::codex_oauth::host().credentials(&provider.id)?;
         return Ok(StepCredential {
@@ -1505,7 +1508,10 @@ pub(crate) fn step_credential(
     }
     Ok(StepCredential {
         api_key: key.clone(),
-        headers: std::collections::BTreeMap::new(),
+        headers: crate::opencode_gateway::request_headers(
+            &provider.base_url,
+            crate::native_compaction::cache_key(&request.contexts, &request.conversation_id),
+        ),
     })
 }
 
@@ -3495,7 +3501,7 @@ fn run_model_inner(
                     wire_session.sync(&request.contexts[wire_start.unwrap_or(0)..]);
                     // Re-resolved per step so a Codex access token refreshed
                     // mid-run reaches this request; key families are a no-op.
-                    let credential = step_credential(&request.provider, &key)?;
+                    let credential = step_credential(&request, &key)?;
                     let key = credential.api_key.clone();
                     let (mut step, audit) = crate::aisdk::step::build_step_request_audited(
                         &request,
@@ -5326,8 +5332,7 @@ fn request_native_compaction(
         *last = Instant::now();
         event_sink(ModelStreamEvent::Ping)
     };
-    let credential =
-        step_credential(&request.provider, key).map_err(CompactionFailure::Failed)?;
+    let credential = step_credential(request, key).map_err(CompactionFailure::Failed)?;
     let key = credential.api_key.clone();
     let mut triggered = false;
     let (mut step, audit) = crate::aisdk::step::build_step_request_audited(
@@ -7907,8 +7912,7 @@ fn perform_web_search_request(
             .saturating_add(1)
             .saturating_sub(pause_continuations as u32)
             .max(1);
-        let credential =
-            step_credential(&request.provider, &key).map_err(ModelRequestError::Fatal)?;
+        let credential = step_credential(request, &key).map_err(ModelRequestError::Fatal)?;
         let key = credential.api_key.clone();
         let (mut step, audit) = crate::aisdk::step::build_step_request_audited(
             request,
@@ -8123,8 +8127,7 @@ fn perform_web_fetch_request(
             .saturating_add(1)
             .saturating_sub(pause_continuations as u32)
             .max(1);
-        let credential =
-            step_credential(&request.provider, &key).map_err(ModelRequestError::Fatal)?;
+        let credential = step_credential(request, &key).map_err(ModelRequestError::Fatal)?;
         let key = credential.api_key.clone();
         let (mut step, audit) = crate::aisdk::step::build_step_request_audited(
             request,
@@ -17418,6 +17421,9 @@ mod tests {
     /// Ignored live end-to-end validation for all three DeepSeek API protocols;
     /// run explicitly after `scripts/deepseek-live-e2e.mjs` injects environment.
     mod deepseek_live;
+    /// What reaches the OpenCode gateway: hermetic for the wire, ignored and live
+    /// for its answer. Needs no key.
+    mod opencode_go;
     /// Ignored live check of background results on the ChatGPT Codex backend,
     /// asynchronous (GPT-6 Astra) and not (GPT-5); uses the Codex CLI's sign-in.
     mod codex_async_live;
@@ -23416,7 +23422,9 @@ mod tests {
         let base_url = provider_base_url(&provider).unwrap();
         let error = initial_provider_key(&provider, &base_url).unwrap_err();
         assert!(error.contains("登录"), "{error}");
-        assert!(step_credential(&provider, &None).is_err());
+        let mut request = run_request(ProviderFamily::OpenaiCodex);
+        request.provider = provider.clone();
+        assert!(step_credential(&request, &None).is_err());
         delete_api_key(&provider.id).unwrap();
     }
 

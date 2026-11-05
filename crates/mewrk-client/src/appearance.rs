@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::model::AppearancePreferences;
+use crate::model::{AppearancePreferences, DEFAULT_GLASS_TRANSPARENCY};
 use crate::shortcuts::{concrete_binding, PRIMARY_MODIFIER};
 use crate::App;
 
@@ -16,6 +16,8 @@ pub const UI_FONT_PRESETS: [&str; 8] = ["", "Inter", "Segoe UI", "Microsoft YaHe
 /// Monospace font candidates. The empty first item represents the default.
 pub const MONO_FONT_PRESETS: [&str; 7] = ["", "Cascadia Code", "Cascadia Mono", "Consolas", "JetBrains Mono", "Fira Code", "Sarasa Mono SC"];
 
+pub const MAX_GLASS_TRANSPARENCY: u32 = 100;
+pub const MAX_GLASS_BLUR: u32 = 60;
 pub const MIN_MESSAGE_FONT_SIZE: u32 = 12;
 pub const MAX_MESSAGE_FONT_SIZE: u32 = 22;
 pub const MIN_ZOOM: f64 = 0.5;
@@ -57,6 +59,16 @@ pub fn clamp_zoom(value: f64) -> f64 {
         return 1.0;
     }
     (value.max(MIN_ZOOM).min(MAX_ZOOM) * 10.0).round() / 10.0
+}
+
+/// The alpha of a glass surface's tint, `base` being its alpha at the default transparency: solid at no transparency, gone at all of it.
+pub fn glass_tint_alpha(base: f32, transparency: u32) -> f32 {
+    let (transparency, default) = (transparency.min(MAX_GLASS_TRANSPARENCY) as f32, DEFAULT_GLASS_TRANSPARENCY as f32);
+    if transparency <= default {
+        1.0 - (1.0 - base) * transparency / default
+    } else {
+        base * (MAX_GLASS_TRANSPARENCY as f32 - transparency) / (MAX_GLASS_TRANSPARENCY as f32 - default)
+    }
 }
 
 /// The message font size to apply, in range and whole.
@@ -733,7 +745,7 @@ mod tests {
                 "serifMessages": false, "wideMessages": false, "sendShortcut": ["Enter"], "newlineShortcut": ["Shift", "Enter"],
                 "spellCheck": false, "renderUserMarkdown": false, "confirmMessageDelete": false, "collapseReasoning": true,
                 "codeBlockCollapsible": false, "codeBlockWrappable": false, "singleDollarMath": true, "customCss": "",
-                "liquidGlass": false, "background": "solid", "codeThemeDay": "mewrk-light", "codeThemeNight": "mewrk-dark",
+                "liquidGlass": false, "glassTransparency": 20, "glassBlur": 22, "background": "solid", "codeThemeDay": "mewrk-light", "codeThemeNight": "mewrk-dark",
                 "localModel": {
                     "titles": false, "shellExplanations": false, "errorExplanations": false, "subagents": false,
                     "titlePrompt": "", "shellPrompt": "", "errorPrompt": "",
@@ -960,6 +972,15 @@ mod tests {
         assert_eq!(variables["bg"], theme.background);
         assert_eq!(variables["fg"], theme.foreground);
         assert_eq!(variables["line-number"], theme.line_number);
+    }
+
+    #[test]
+    fn glass_is_solid_at_no_transparency_as_designed_at_the_default_and_gone_at_all_of_it() {
+        assert_eq!(glass_tint_alpha(0.84, 0), 1.0);
+        assert_eq!(glass_tint_alpha(0.84, DEFAULT_GLASS_TRANSPARENCY), 0.84);
+        assert_eq!(glass_tint_alpha(0.84, MAX_GLASS_TRANSPARENCY), 0.0);
+        assert_eq!(glass_tint_alpha(0.84, 500), 0.0, "a stored value past the end stays at the end");
+        assert!(glass_tint_alpha(0.84, 10) > 0.84 && glass_tint_alpha(0.84, 40) < 0.84);
     }
 
     #[test]

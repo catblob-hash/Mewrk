@@ -15,6 +15,12 @@
 //! The images are the user's library of backgrounds: an import stays until the
 //! user removes it, whichever background the settings point at. The pictures
 //! that ship with the app are not here; the renderer bundles them.
+//!
+//! A background that moves is one of these too, its first frame cut into the
+//! same tiers, so everything that shows it still and small works as for any
+//! picture. Its file sits beside them in `motion/`, named for its kind, along
+//! with whatever the client decodes from it. Glass baked from a background lives
+//! in `glass-plates/`, beside this directory, and goes when the image does.
 
 use std::{
     fs,
@@ -23,13 +29,16 @@ use std::{
 };
 
 use base64::Engine as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::content_store::read_regular_file;
 
 const DIRECTORY: &str = "background-images";
 const STAGING_PREFIX: &str = ".staging-";
+const MOTION_DIRECTORY: &str = "motion";
+const FRAMES_FILE: &str = "frames.flip";
+const PLATES_DIRECTORY: &str = "glass-plates";
 /// A 7680-wide JPEG of a noisy photo stays well under this.
 pub const MAX_TIER_BYTES: usize = 24 * 1024 * 1024;
 pub const MAX_TIER_DIMENSION: u32 = 16_384;
@@ -44,6 +53,37 @@ pub struct BackgroundImage {
     /// The largest tier's size, which is the image's own size unless it was over the ladder's top.
     pub width: u32,
     pub height: u32,
+    /// What kind of moving background this is the first frame of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub motion: Option<MotionKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MotionKind {
+    Video,
+    Animated,
+}
+
+impl MotionKind {
+    fn stem(self) -> &'static str {
+        match self {
+            Self::Video => "video",
+            Self::Animated => "animated",
+        }
+    }
+}
+
+/// Where a moving background's file is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundMotion {
+    pub kind: MotionKind,
+    pub source: String,
+    /// Where the frames of an animated picture go once they are decoded.
+    pub frames: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -54,6 +94,9 @@ pub struct BackgroundImageData {
     pub height: u32,
     /// No larger tier exists, so a bigger window has nothing better to ask for.
     pub largest: bool,
+    /// The largest tier's size, whichever this one is.
+    pub full_width: u32,
+    pub full_height: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +179,35 @@ impl BackgroundImageStore {
         Ok(upload_id)
     }
 
+    /// Gives an upload the file that moves. The first frame's tiers go in as for any picture. It is a clone where the disk can do that,
+    /// since a video can be large.
+    pub fn attach_motion(&self, upload_id: &str, path: &Path, kind: MotionKind) -> Result<(), String> {
+        validate_upload_id(upload_id)?;
+        let staging = self.root.join(format!("{STAGING_PREFIX}{upload_id}"));
+        if !staging.is_dir() {
+            return Err("背景上传不存在".into());
+        }
+        let metadata = fs::metadata(path).map_err(|error| format!("无法读取背景文件: {error}"))?;
+        if !metadata.is_file() {
+            return Err("背景只能是一个文件".into());
+        }
+        let extension: String = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("bin")
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(8)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let directory = staging.join(MOTION_DIRECTORY);
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("无法创建背景暂存目录: {error}"))?;
+        fs::copy(path, directory.join(format!("{}.{extension}", kind.stem())))
+            .map_err(|error| format!("无法保存背景文件: {error}"))?;
+        Ok(())
+    }
+
     /// Turns an upload into an image of the library.
     pub fn commit(&self, upload_id: &str) -> Result<BackgroundImage, String> {
         validate_upload_id(upload_id)?;
@@ -160,6 +232,11 @@ impl BackgroundImageStore {
             hasher.update(format!("{}x{}\n", tier.width, tier.height));
             hasher.update(Sha256::digest(&bytes));
         }
+        // The same first frame on a different video is a different background.
+        if let Some((kind, path)) = motion_file(&staging) {
+            hasher.update(kind.stem());
+            hash_file(&mut hasher, &path).map_err(|error| format!("无法读取背景文件: {error}"))?;
+        }
         let id: String = hasher
             .finalize()
             .iter()
@@ -174,11 +251,33 @@ impl BackgroundImageStore {
                 .map_err(|error| format!("无法保存背景图片: {error}"))?;
         }
         self.prune_staging(STALE_STAGING_AGE);
+        let motion = motion_file(&destination).map(|(kind, _)| kind);
         Ok(BackgroundImage {
             id,
             width: largest.width,
             height: largest.height,
+            motion,
         })
+    }
+
+    /// The file that moves behind an image, when there is one.
+    pub fn motion(&self, id: &str) -> Result<Option<BackgroundMotion>, String> {
+        validate_image_id(id)?;
+        let directory = self.root.join(id);
+        let Some((kind, source)) = motion_file(&directory) else {
+            return Ok(None);
+        };
+        let largest = list_tiers(&directory)?
+            .pop()
+            .ok_or_else(|| "背景图片不存在".to_owned())?;
+        let text = |path: &Path| path.to_str().map(str::to_owned).ok_or_else(|| "背景路径不是文本".to_owned());
+        Ok(Some(BackgroundMotion {
+            kind,
+            source: text(&source)?,
+            frames: text(&directory.join(MOTION_DIRECTORY).join(FRAMES_FILE))?,
+            width: largest.width,
+            height: largest.height,
+        }))
     }
 
     /// The smallest tier that covers a `viewport_width`×`viewport_height` device-pixel
@@ -208,6 +307,8 @@ impl BackgroundImageStore {
             width: tier.width,
             height: tier.height,
             largest: chosen + 1 == tiers.len(),
+            full_width: tiers[tiers.len() - 1].width,
+            full_height: tiers[tiers.len() - 1].height,
         })
     }
 
@@ -240,6 +341,7 @@ impl BackgroundImageStore {
                     id: name.to_owned(),
                     width: largest.width,
                     height: largest.height,
+                    motion: motion_file(&entry.path()).map(|(kind, _)| kind),
                 },
             ));
         }
@@ -252,10 +354,27 @@ impl BackgroundImageStore {
     /// Removes an image from the library. One that is already gone is not an error.
     pub fn delete(&self, id: &str) -> Result<(), String> {
         validate_image_id(id)?;
+        self.delete_plates(id);
         match fs::remove_dir_all(self.root.join(id)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("无法删除背景图片: {error}")),
+        }
+    }
+
+    /// The glass baked from an image. It can always be baked again, so what can't be removed now is only left to age out.
+    fn delete_plates(&self, id: &str) {
+        let Some(plates) = self.root.parent().map(|parent| parent.join(PLATES_DIRECTORY)) else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(plates) else {
+            return;
+        };
+        let prefix = format!("{id}-");
+        for entry in entries.flatten() {
+            if entry.file_name().to_str().is_some_and(|name| name.starts_with(&prefix)) {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 
@@ -303,6 +422,31 @@ fn choose_tier(tiers: &[Tier], viewport_width: u32, viewport_height: u32) -> Opt
             .position(|tier| tier.width >= width && tier.height >= height)
             .unwrap_or(tiers.len() - 1),
     )
+}
+
+/// The file that moves in an image's directory, or an upload's.
+fn motion_file(directory: &Path) -> Option<(MotionKind, PathBuf)> {
+    fs::read_dir(directory.join(MOTION_DIRECTORY)).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        let kind = match path.file_stem()?.to_str()? {
+            "video" => MotionKind::Video,
+            "animated" => MotionKind::Animated,
+            _ => return None,
+        };
+        Some((kind, path))
+    })
+}
+
+fn hash_file(hasher: &mut Sha256, path: &Path) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut chunk = vec![0u8; 1 << 20];
+    loop {
+        match file.read(&mut chunk)? {
+            0 => return Ok(()),
+            read => hasher.update(&chunk[..read]),
+        }
+    }
 }
 
 /// Tiers in a directory, smallest first. Files that are not tiers are ignored.
@@ -547,6 +691,54 @@ mod tests {
         let b = store.commit(&second).unwrap();
         assert_eq!(a.id, b.id);
         assert!(store.data(&a.id, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn a_background_that_moves_keeps_its_file_beside_its_tiers_and_loses_it_with_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BackgroundImageStore::new(temp.path());
+        let source = temp.path().join("Clip.MOV");
+        fs::write(&source, b"frames and frames").unwrap();
+
+        let upload = store.put(None, &png(64, 36)).unwrap();
+        store.attach_motion(&upload, &source, MotionKind::Video).unwrap();
+        let image = store.commit(&upload).unwrap();
+        assert_eq!(image.motion, Some(MotionKind::Video));
+        let motion = store.motion(&image.id).unwrap().unwrap();
+        assert_eq!(motion.kind, MotionKind::Video);
+        assert!(motion.source.ends_with("motion/video.mov"), "{}", motion.source);
+        assert_eq!(fs::read(&motion.source).unwrap(), b"frames and frames");
+        assert_eq!((motion.width, motion.height), (64, 36));
+        assert_eq!(store.list().unwrap()[0].motion, Some(MotionKind::Video));
+        assert!(store.data(&image.id, 1, 1).is_ok(), "its first frame is a picture like any other");
+
+        let same_picture = store.put(None, &png(64, 36)).unwrap();
+        let still = store.commit(&same_picture).unwrap();
+        assert_ne!(still.id, image.id, "the same first frame without the video is another background");
+        assert_eq!(still.motion, None);
+        assert_eq!(store.motion(&still.id).unwrap(), None);
+
+        let plates = temp.path().join(PLATES_DIRECTORY);
+        fs::create_dir_all(&plates).unwrap();
+        fs::write(plates.join(format!("{}-v1-3.flip", image.id)), b"glass").unwrap();
+        fs::write(plates.join(format!("{}-v1-3.flip", still.id)), b"glass").unwrap();
+        store.delete(&image.id).unwrap();
+        assert!(!plates.join(format!("{}-v1-3.flip", image.id)).exists(), "its glass goes with it");
+        assert!(plates.join(format!("{}-v1-3.flip", still.id)).exists());
+        assert!(store.motion(&image.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn only_a_real_upload_gets_a_file_that_moves() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BackgroundImageStore::new(temp.path());
+        let source = temp.path().join("clip.mp4");
+        fs::write(&source, b"frames").unwrap();
+        assert!(store.attach_motion("../x", &source, MotionKind::Video).is_err());
+        assert!(store.attach_motion(&"a".repeat(32), &source, MotionKind::Video).is_err(), "no such upload");
+        let upload = store.put(None, &png(4, 4)).unwrap();
+        assert!(store.attach_motion(&upload, temp.path(), MotionKind::Video).is_err(), "a directory");
+        assert!(store.motion("../../etc").is_err());
     }
 
     #[test]

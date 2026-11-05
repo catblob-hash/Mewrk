@@ -426,6 +426,25 @@ fn a_capability_the_upstream_declares_survives_a_catalog_miss() {
         .contains(&ModelCapability::ImageRecognition));
 }
 
+/// The OpenCode gateway's shape: modalities in a nested object, images by MIME type.
+#[test]
+fn image_input_declared_by_mime_type_counts() {
+    let models = parse_openai_compatible(
+        &offline(),
+        &json!({"data":[
+            {"id":"house-brand-chat-v1","modalities":{"input":["text"],"output":["text"]}},
+            {"id":"house-brand-chat-v2","modalities":{"input":["text","image/png"],"output":["text"]}},
+            {"id":"house-brand-chat-v3","modalities":{"input":["text"],"output":["image/png"]}}
+        ]}),
+    )
+    .unwrap();
+    assert!(models[0].capabilities.is_empty());
+    assert!(models[1]
+        .capabilities
+        .contains(&ModelCapability::ImageRecognition));
+    assert!(models[2].capabilities.is_empty(), "an image it outputs is not one it reads");
+}
+
 #[test]
 fn an_id_the_catalog_never_heard_of_falls_back_to_inference() {
     let models = parse_openai_compatible(

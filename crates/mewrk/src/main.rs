@@ -114,6 +114,8 @@ struct Core {
     timings: Vec<(u32, u32, u32, u32)>,
     keep_timings: bool,
     forced_theme: Option<bool>,
+    /// The window's size in the last frame: a scene built for it can be drawn again only at it.
+    last_size: Option<(u32, u32)>,
 }
 
 struct FrameOutcome {
@@ -122,6 +124,8 @@ struct FrameOutcome {
     cursor: CursorKind,
     ime_area: Option<fluent::ui::Rect>,
     submission: wgpu::SubmissionIndex,
+    /// When a background that moves next wants looking at.
+    motion_next: Option<Instant>,
 }
 
 impl Core {
@@ -164,13 +168,38 @@ impl Core {
         let t1 = Instant::now();
 
         self.text.flush_atlases(&self.renderer);
+        self.scene.cull_occluded(self.size_px);
         let submission = self.renderer.render(&self.scene, &theme, target, self.size_px);
+        self.last_size = Some(self.size_px);
+        // Under something solid that covers all of it there is nothing to play for, until that goes.
+        let shows_motion = mewrk_shell::glass::shows_motion(&mut self.app, &self.scene);
+        let uncovered = mewrk_settings_global::set_backdrop_covered(&mut self.app, !shows_motion);
+        let motion_next = if uncovered { Some(Instant::now()) } else { mewrk_shell::glass::frame_tick().next };
         let t2 = Instant::now();
         if self.keep_timings {
             let (_, glyphs) = self.scene.counts();
             self.timings.push((t1.duration_since(t0).as_micros() as u32, t2.duration_since(t1).as_micros() as u32, glyphs as u32, 0));
         }
-        FrameOutcome { animating, wake_in, cursor, ime_area, submission }
+        FrameOutcome { animating, wake_in, cursor, ime_area, submission, motion_next }
+    }
+
+    /// Whether a background that moves has something new, and when to look again. It goes to the GPU from here, so all that is left is
+    /// [`Self::draw_again`].
+    fn tick_motion(&mut self, now: Instant) -> mewrk_motion::Tick {
+        mewrk_shell::glass::tick_motion(&mut self.app, now)
+    }
+
+    /// The last frame's scene again, over whatever has changed on the GPU since: no view, no layout, no text.
+    fn draw_again(&mut self, target: &wgpu::TextureView) -> Option<wgpu::SubmissionIndex> {
+        // None before the first frame, and no scene to draw again.
+        self.last_size.filter(|size| *size == self.size_px)?;
+        let t0 = Instant::now();
+        let submission = self.renderer.render_again(&self.scene, target);
+        if self.keep_timings {
+            let (_, glyphs) = self.scene.counts();
+            self.timings.push((0, t0.elapsed().as_micros() as u32, glyphs as u32, 0));
+        }
+        Some(submission)
     }
 }
 
@@ -192,6 +221,8 @@ fn run_headless(args: &Args) -> Result<(), String> {
     let scale: f32 = args.num("--scale", 2.0)?;
     let frames: u32 = args.num("--frames", 60)?;
     let bench: f32 = args.num("--bench", 0.0)?;
+    // `--motion-only`: past the first frames, draw only as a background that moves asks to, as a window does at rest.
+    let motion_only = args.flag("--motion-only");
 
     let started = start_app(Arc::new(|| {}), Arc::new(|code| std::process::exit(code)), Arc::new(|| {}));
     let mut app = match started {
@@ -228,7 +259,7 @@ fn run_headless(args: &Args) -> Result<(), String> {
     });
     let view = target.create_view(&Default::default());
     let now = Instant::now();
-    let mut core = Core { app, text: TextCtx::new(scale), scene: Scene::default(), mem: UiMemory::default(), input: Input::default(), renderer, started: now, last_frame: now, scale, window_scale: scale, size_px: size, timings: Vec::new(), keep_timings: bench > 0.0, forced_theme: forced_theme(args) };
+    let mut core = Core { app, text: TextCtx::new(scale), scene: Scene::default(), mem: UiMemory::default(), input: Input::default(), renderer, started: now, last_frame: now, scale, window_scale: scale, size_px: size, timings: Vec::new(), keep_timings: bench > 0.0, forced_theme: forced_theme(args), last_size: None };
     let mut clipboard = NoClipboard;
     let vsync = Duration::from_secs_f64(1.0 / 120.0);
     let begun = Instant::now();
@@ -258,7 +289,33 @@ fn run_headless(args: &Args) -> Result<(), String> {
             break;
         }
         let start = Instant::now();
+        // The first seconds go to importing and everything arriving.
+        if motion_only && begun.elapsed().as_secs_f32() > 3.0 {
+            let tick = core.tick_motion(start);
+            if tick.rebuild {
+                let outcome = core.frame(&view, &mut clipboard);
+                let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: Some(outcome.submission), timeout: Some(Duration::from_secs(5)) });
+                core.timings.clear();
+                continue;
+            }
+            if !tick.changed {
+                std::thread::sleep(tick.next.map_or(Duration::from_millis(1), |next| next.saturating_duration_since(start)).min(Duration::from_millis(4)));
+                continue;
+            }
+            if let Some(submission) = core.draw_again(&view) {
+                let submitted = Instant::now();
+                let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: Some(Duration::from_secs(5)) });
+                if let Some(last) = core.timings.last_mut() {
+                    last.3 = submitted.elapsed().as_micros() as u32;
+                }
+            }
+            n += 1;
+            continue;
+        }
         let outcome = core.frame(&view, &mut clipboard);
+        if motion_only {
+            core.timings.clear();
+        }
         let _ = fluent::el::take_a11y_update();
         let submitted = Instant::now();
         let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: Some(outcome.submission), timeout: Some(Duration::from_secs(5)) });
@@ -424,7 +481,6 @@ impl WindowState {
             return;
         }
         self.fullscreen = fullscreen;
-        self.core.app.fullscreen = fullscreen;
         self.config.desired_maximum_frame_latency = frame_latency(fullscreen);
         self.surface_stale = true;
         if !fullscreen {
@@ -541,6 +597,8 @@ struct Shell {
     modifiers: ModifiersState,
     clipboard: SystemClipboard,
     next_wake: Option<Instant>,
+    /// When a background that moves next wants looking at. Not a reason to build a frame.
+    next_motion: Option<Instant>,
     last_click: Option<Instant>,
     /// The press under way is a Control-click, so its release is no click.
     control_click: bool,
@@ -561,6 +619,8 @@ struct Shell {
     /// Paths the OS says are being dragged, gathered until the event loop has told them all.
     drag: FileDrag,
     a11y_probe: Option<A11yProbe>,
+    /// The window was closed in full screen and is on its way out of it.
+    hide_once_windowed: bool,
 }
 
 /// `--a11y-probe`: asks the window what an assistive client would, through AppKit, and writes down what it answers.
@@ -606,6 +666,10 @@ impl Shell {
         place_traffic_lights(&window);
         #[cfg(target_os = "macos")]
         self.install_native();
+        #[cfg(target_os = "macos")]
+        if let Some(native) = &self.native {
+            native.watch_window(content_view(&window));
+        }
         #[cfg(target_os = "macos")]
         if let Err(error) = mewrk_shell::native::drop_bubbled_keys(content_view(&window)) {
             eprintln!("could not guard the window's keys: {error}");
@@ -678,7 +742,7 @@ impl Shell {
         let forced = forced_theme(&self.args);
 
         let now = Instant::now();
-        let core = Core { app, text: TextCtx::new(scale), scene: Scene::default(), mem: UiMemory::default(), input: Input::default(), renderer, started: now, last_frame: now, scale, window_scale: scale, size_px: (config.width, config.height), timings: Vec::new(), keep_timings: false, forced_theme: forced };
+        let core = Core { app, text: TextCtx::new(scale), scene: Scene::default(), mem: UiMemory::default(), input: Input::default(), renderer, started: now, last_frame: now, scale, window_scale: scale, size_px: (config.width, config.height), timings: Vec::new(), keep_timings: false, forced_theme: forced, last_size: None };
         window.focus_window();
         window.request_redraw();
         Ok(Some(WindowState { window, surface, config, core, present_blocked: false, surface_stale: false, fullscreen: false, a11y }))
@@ -702,6 +766,7 @@ impl Shell {
     /// `show_main_window`: reveals the window wherever it is: hidden in the menu bar, minimized, or behind other windows.
     fn show_main_window(&mut self) {
         let Some(state) = self.state.as_mut() else { return };
+        self.hide_once_windowed = false;
         // Back in the Dock first, so the window returns to an app that can take the focus.
         #[cfg(target_os = "macos")]
         mewrk_shell::native::set_in_dock(true);
@@ -716,6 +781,14 @@ impl Shell {
     /// `hide_main_window`: with a menu bar item the window is only a view on the running process; quitting is that item's job.
     fn hide_main_window(&mut self) {
         let Some(state) = self.state.as_mut() else { return };
+        // Hiding a full-screen window leaves the black backdrop AppKit keeps behind it, over the desktop, until the process ends. So it
+        // leaves full screen first, and hides when `LeftFullScreen` says that is done.
+        #[cfg(target_os = "macos")]
+        if self.native.as_ref().is_some_and(|native| native.in_full_screen()) {
+            self.hide_once_windowed = true;
+            state.window.set_fullscreen(None);
+            return;
+        }
         state.window.set_visible(false);
         #[cfg(target_os = "macos")]
         mewrk_shell::native::set_in_dock(false);
@@ -828,6 +901,44 @@ impl Shell {
         }
     }
 
+    /// A background that moves, when nothing else has happened: the new frame goes to the GPU and last frame's scene draws over it, so a
+    /// frame of video costs what the GPU spends on it and nothing for the view, however much the view holds.
+    fn draw_motion(&mut self) {
+        let Some(state) = self.state.as_mut() else { return };
+        let now = Instant::now();
+        let tick = state.core.tick_motion(now);
+        self.next_motion = tick.next;
+        if tick.rebuild {
+            state.window.request_redraw();
+            return;
+        }
+        if !tick.changed || state.present_blocked {
+            return;
+        }
+        let gpu = state.core.renderer.gpu.clone();
+        if std::mem::take(&mut state.surface_stale) {
+            state.surface.configure(&gpu.device, &state.config);
+        }
+        let frame = match state.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                state.surface.configure(&gpu.device, &state.config);
+                return;
+            }
+            // Nothing can be shown right now. The frame stays on the GPU for the next look.
+            _ => return,
+        };
+        let view = frame.texture.create_view(&Default::default());
+        if state.core.draw_again(&view).is_none() {
+            // The window changed size, and a full frame is on its way. Nothing was drawn, so this one isn't shown.
+            drop(frame);
+            state.window.request_redraw();
+            return;
+        }
+        state.window.pre_present_notify();
+        gpu.queue.present(frame);
+    }
+
     fn redraw(&mut self) {
         let Some(state) = self.state.as_mut() else { return };
         let gpu = state.core.renderer.gpu.clone();
@@ -921,6 +1032,7 @@ impl Shell {
             state.window.set_ime_cursor_area(PhysicalPosition::new(area.x as f64 * scale, area.y as f64 * scale), PhysicalSize::new(area.w as f64 * scale, area.h as f64 * scale));
         }
         self.next_wake = outcome.wake_in.map(|s| Instant::now() + Duration::from_secs_f32(s.max(0.001)));
+        self.next_motion = outcome.motion_next;
         if outcome.animating || self.fullscreen_test.is_some() || self.animate_test {
             state.window.request_redraw();
         }
@@ -1043,6 +1155,15 @@ impl ApplicationHandler<UserEvent> for Shell {
             UserEvent::Native(native) => match native {
                 mewrk_shell::native::NativeEvent::Quit => self.request_quit(),
                 mewrk_shell::native::NativeEvent::Show => self.show_main_window(),
+                mewrk_shell::native::NativeEvent::LeftFullScreen => {
+                    if let Some(state) = &self.state {
+                        place_traffic_lights(&state.window);
+                        state.window.request_redraw();
+                    }
+                    if std::mem::take(&mut self.hide_once_windowed) {
+                        self.hide_main_window();
+                    }
+                }
                 mewrk_shell::native::NativeEvent::Settings => {
                     self.show_main_window();
                     if let Some(state) = &mut self.state {
@@ -1099,10 +1220,8 @@ impl ApplicationHandler<UserEvent> for Shell {
                 state.surface_stale = true;
                 state.core.size_px = (state.config.width, state.config.height);
                 state.sync_fullscreen();
-                // AppKit puts the lights back whenever it lays the title bar out again. Full screen has its own.
-                if !state.fullscreen {
-                    place_traffic_lights(&state.window);
-                }
+                // AppKit puts the lights back whenever it lays the title bar out again.
+                place_traffic_lights(&state.window);
                 if self.trace {
                     eprintln!("resize t={:.1} size={:?}", self.launched.elapsed().as_secs_f64() * 1000.0, state.core.size_px);
                 }
@@ -1126,9 +1245,12 @@ impl ApplicationHandler<UserEvent> for Shell {
             WindowEvent::Occluded(occluded) => {
                 if !occluded {
                     state.present_blocked = false;
+                    // A background that moves stopped asking while it couldn't be seen.
+                    state.window.request_redraw();
                 }
                 mewrk_pane_git::git_polling_set_visible(&mut state.core.app, !occluded);
                 mewrk_pane_browser::set_window_visible(&mut state.core.app, !occluded);
+                mewrk_settings_global::set_window_visible(&mut state.core.app, !occluded);
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
@@ -1224,6 +1346,9 @@ impl ApplicationHandler<UserEvent> for Shell {
         if let Some(state) = &mut self.state {
             state.sync_fullscreen();
         }
+        if self.next_motion.is_some_and(|at| at <= Instant::now()) {
+            self.draw_motion();
+        }
         // `--fullscreen-test`: goes in at 3 s and comes back at 7 s, for a trace of the transitions.
         if let Some(when) = self.fullscreen_test
             && Instant::now() >= when
@@ -1244,6 +1369,9 @@ impl ApplicationHandler<UserEvent> for Shell {
             return;
         }
         let mut wake = self.next_wake;
+        if let Some(at) = self.next_motion {
+            wake = Some(wake.map_or(at, |w| w.min(at)));
+        }
         if !self.drag.hovering.is_empty() {
             // AppKit sends no moves while files are dragged, so the zones are told where the pointer is on a clock.
             let next = Instant::now() + DRAG_POLL;
@@ -1259,6 +1387,8 @@ impl ApplicationHandler<UserEvent> for Shell {
             wake = Some(wake.map_or(at, |w| w.min(at)));
         }
         match wake {
+            // Only a look at the clock for a moving background, and that has been seen to above.
+            Some(when) if when <= Instant::now() && self.next_wake.is_none_or(|at| at > Instant::now()) => event_loop.set_control_flow(ControlFlow::Poll),
             Some(when) if when <= Instant::now() => {
                 self.next_wake = None;
                 if let Some(state) = &mut self.state {
@@ -1278,17 +1408,20 @@ impl ApplicationHandler<UserEvent> for Shell {
 }
 
 /// The menu bar's picture: the eared mark, black on clear, which the bar tints for a light, dark or highlighted bar. A status
-/// item's image is 18 pt tall; at 2x that is 36 px with the mark 30 of them, which keeps its 3:5 width a whole 18 px and sits it
-/// at the weight of the system's own menu bar glyphs.
+/// item's image is 18 pt tall; at 2x that is 36 px, and the mark 22 px wide keeps its sides on whole pixels and sits it at the
+/// weight of the system's own menu bar glyphs. `native::install` gives the picture its size in points.
 #[cfg(target_os = "macos")]
 fn tray_template_png() -> Option<Vec<u8>> {
     use resvg::{tiny_skia, usvg};
-    const WIDTH: u32 = 18;
+    use mewrk_shell::chrome::{MARK_HEIGHT, MARK_PATH, MARK_WIDTH};
+    const WIDTH: u32 = 22;
     const HEIGHT: u32 = 36;
-    let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -20 120 240"><path d="{}" fill="black"/></svg>"#, mewrk_shell::chrome::MARK_PATH);
+    // The bar's own height in the mark's units, with the mark centred in it.
+    let room = HEIGHT as f32 * MARK_WIDTH / WIDTH as f32;
+    let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 {} {MARK_WIDTH} {room}"><path d="{MARK_PATH}" fill="black"/></svg>"#, (MARK_HEIGHT - room) / 2.0);
     let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).ok()?;
     let mut pixmap = tiny_skia::Pixmap::new(WIDTH, HEIGHT)?;
-    let k = WIDTH as f32 / 120.0;
+    let k = WIDTH as f32 / MARK_WIDTH;
     resvg::render(&tree, tiny_skia::Transform::from_scale(k, k), &mut pixmap.as_mut());
     let image = image::RgbaImage::from_raw(WIDTH, HEIGHT, pixmap.take())?;
     let mut png = std::io::Cursor::new(Vec::new());
@@ -1306,50 +1439,15 @@ fn content_view(window: &Window) -> *mut std::ffi::c_void {
     }
 }
 
-/// Puts the traffic lights where Mewrk's layout expects them: 16 in from the left, centred in the 44-high top row.
+/// Puts the traffic lights where Mewrk's layout expects them. Full screen has its own, in `native`.
 fn place_traffic_lights(window: &Window) {
-    use objc2::runtime::AnyObject;
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let Ok(handle) = window.window_handle() else { return };
-    let RawWindowHandle::AppKit(handle) = handle.as_raw() else { return };
-    let view: *mut AnyObject = handle.ns_view.as_ptr().cast();
-    // SAFETY: the view comes from a live winit window and this runs on the main thread that owns it. These are
-    // documented NSView, NSWindow and NSButton selectors, with argument types matching their declarations.
-    unsafe {
-        let ns_window: *mut AnyObject = objc2::msg_send![view, window];
-        if ns_window.is_null() {
-            return;
-        }
-        const TOP_ROW: f64 = 44.0;
-        const LEFT: f64 = 16.0;
-        const SPACING: f64 = 20.0;
-        let window_frame: NSRect = objc2::msg_send![ns_window, frame];
-        let first: *mut AnyObject = objc2::msg_send![ns_window, standardWindowButton: 0usize];
-        if first.is_null() {
-            return;
-        }
-        // The buttons live in the title bar's view, in its container. Both clip them unless they are as tall as the row, and
-        // the view's height is not the same from one macOS to the next, so it is set rather than measured.
-        let titlebar: *mut AnyObject = objc2::msg_send![first, superview];
-        if !titlebar.is_null() {
-            let container: *mut AnyObject = objc2::msg_send![titlebar, superview];
-            if !container.is_null() {
-                let frame = NSRect::new(NSPoint::new(0.0, window_frame.size.height - TOP_ROW), NSSize::new(window_frame.size.width, TOP_ROW));
-                let _: () = objc2::msg_send![container, setFrame: frame];
-            }
-            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(window_frame.size.width, TOP_ROW));
-            let _: () = objc2::msg_send![titlebar, setFrame: frame];
-        }
-        for i in 0usize..3 {
-            let button: *mut AnyObject = objc2::msg_send![ns_window, standardWindowButton: i];
-            if button.is_null() {
-                return;
-            }
-            let frame: NSRect = objc2::msg_send![button, frame];
-            let origin = NSPoint::new(LEFT + SPACING * i as f64, (TOP_ROW - frame.size.height) * 0.5);
-            let _: () = objc2::msg_send![button, setFrameOrigin: origin];
-        }
+    let view = content_view(window);
+    if view.is_null() {
+        return;
+    }
+    // SAFETY: winit's content view, retained by its window, on the main thread.
+    if let Some(window) = unsafe { &*(view as *const objc2_app_kit::NSView) }.window() {
+        mewrk_shell::native::place_lights(&window);
     }
 }
 
@@ -1375,6 +1473,7 @@ fn run_windowed(args: Args) -> Result<(), String> {
         modifiers: ModifiersState::empty(),
         clipboard: SystemClipboard(arboard::Clipboard::new().ok()),
         next_wake: None,
+        next_motion: None,
         last_click: None,
         control_click: false,
         exit_after,
@@ -1390,6 +1489,7 @@ fn run_windowed(args: Args) -> Result<(), String> {
         window_theme: None,
         drag: FileDrag::default(),
         a11y_probe,
+        hide_once_windowed: false,
     };
     event_loop.run_app(&mut shell).map_err(|e| e.to_string())?;
     match shell.error {

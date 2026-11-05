@@ -31,7 +31,7 @@ pub fn unsupported_notice(key: impl std::hash::Hash, message: impl Into<Arc<str>
 /// The pill of controls floating over a viewer.
 pub fn toolbar_pill(label: &str, children: Vec<E>) -> E {
     let t_ = theme();
-    let mut pill = row().items_center().gap(2.0).py(3.0).pl(3.0).pr(6.0).radius(8.0).bg(t_.flyout).border(t_.flyout_stroke).shadow(8.0, 2.0, t_.shadow).role(Role::Toolbar).aria_label(label);
+    let mut pill = row().items_center().gap(2.0).py(3.0).pl(3.0).pr(6.0).radius(8.0).bg(t_.flyout).border(t_.flyout_stroke).role(Role::Toolbar).aria_label(label);
     for c in children {
         pill = pill.child(c);
     }

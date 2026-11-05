@@ -489,7 +489,7 @@ fn screen_body(state: &ViewerState, picture_waiting: bool, form: SignInForm, ses
 /// What covers the picture while there is none to use.
 fn cover(state: &ViewerState, form: SignInForm, session_key: &str, reach: Reach) -> Option<E> {
     let t_ = theme();
-    let card = |child: E| col().absolute().inset(0.0).items_center().justify_center().p(18.0).bg(Color::rgb(0x121315).fade(0.72)).child(col().w_full().max_w(340.0).p(16.0).gap(10.0).radius(8.0).bg(t_.flyout).border(t_.card_stroke).shadow(14.0, 4.0, t_.shadow).child(child));
+    let card = |child: E| col().absolute().inset(0.0).items_center().justify_center().p(18.0).bg(Color::rgb(0x121315)).child(col().w_full().max_w(340.0).p(16.0).gap(10.0).radius(8.0).bg(t_.flyout).border(t_.card_stroke).child(child));
     match state.phase {
         SessionPhase::Ready => None,
         SessionPhase::Credentials if state.credentials.is_some() => Some(card(sign_in_form(state, form, session_key, reach))),

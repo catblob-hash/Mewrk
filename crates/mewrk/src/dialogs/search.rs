@@ -165,14 +165,14 @@ pub fn conversation_search(app: &mut App) -> Option<E> {
         list = list.child(result);
     }
 
-    let mut panel: E = col().key("conversation-search").w((window_w - 48.0).min(560.0)).max_h((window_h - 128.0).min(520.0)).bg(t_.flyout).border(t_.flyout_stroke).radius(12.0).shadow(24.0, 12.0, t_.shadow).clip().keep_focus().on_click(|_| {}).role(Role::GenericContainer).child(search_field);
+    let mut panel: E = col().key("conversation-search").w((window_w - 48.0).min(560.0)).max_h((window_h - 128.0).min(520.0)).bg(t_.flyout).border(t_.flyout_stroke).radius(12.0).clip().keep_focus().on_click(|_| {}).role(Role::GenericContainer).child(search_field);
     if results.is_empty() {
         let message = if entries.is_empty() { t("还没有对话", "No conversations yet") } else { t("没有匹配的对话", "No matching conversations") };
         panel = panel.child(text(message).ty(CAPTION).color(t_.text_tertiary).py(18.0).px(16.0));
     } else {
         panel = panel.child(list);
     }
-    Some(col().key("conversation-search-backdrop").aria_label(t("搜索对话", "Search conversations")).items_center().pt(64.0).pb(24.0).px(24.0).bg(t_.smoke).on_click(close).child(panel).modal_layer(Some(Rc::new(close))))
+    Some(col().key("conversation-search-backdrop").aria_label(t("搜索对话", "Search conversations")).items_center().pt(64.0).pb(24.0).px(24.0).on_click(close).child(panel).modal_layer(Some(Rc::new(close))))
 }
 
 const ROW_H: f32 = 32.0;

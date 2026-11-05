@@ -154,6 +154,7 @@ mod token_statistics;
 mod async_tools;
 mod host_append;
 mod native_compaction;
+mod opencode_gateway;
 mod system_append;
 mod system_permissions;
 mod tool_append;
@@ -4530,6 +4531,34 @@ async fn background_image_commit(
     tauri::async_runtime::spawn_blocking(move || background_image_store(&app)?.commit(&upload_id))
         .await
         .map_err(|error| format!("背景图片保存任务失败: {error}"))?
+}
+
+/// Gives a background being imported the file that moves: see `background_images`.
+#[cfg(not(test))]
+#[tauri::command]
+async fn background_image_attach_motion(
+    app: AppHandle,
+    upload_id: String,
+    path: String,
+    kind: background_images::MotionKind,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        background_image_store(&app)?.attach_motion(&upload_id, std::path::Path::new(&path), kind)
+    })
+    .await
+    .map_err(|error| format!("背景文件保存任务失败: {error}"))?
+}
+
+/// Where a background's moving file is, when it has one.
+#[cfg(not(test))]
+#[tauri::command]
+async fn background_image_motion(
+    app: AppHandle,
+    image_id: String,
+) -> Result<Option<background_images::BackgroundMotion>, String> {
+    tauri::async_runtime::spawn_blocking(move || background_image_store(&app)?.motion(&image_id))
+        .await
+        .map_err(|error| format!("背景文件读取任务失败: {error}"))?
 }
 
 /// The imported backgrounds, the most recent first.

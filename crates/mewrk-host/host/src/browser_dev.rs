@@ -1096,6 +1096,18 @@ async fn dispatch(
             )
             .await,
         ),
+        "background_image_attach_motion" => result_value(
+            super::background_image_attach_motion(
+                app.clone(),
+                arg(args, "uploadId")?,
+                arg(args, "path")?,
+                arg(args, "kind")?,
+            )
+            .await,
+        ),
+        "background_image_motion" => result_value(
+            super::background_image_motion(app.clone(), arg(args, "imageId")?).await,
+        ),
         "background_image_commit" => result_value(
             super::background_image_commit(app.clone(), arg(args, "uploadId")?).await,
         ),

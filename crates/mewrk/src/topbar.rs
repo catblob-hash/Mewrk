@@ -223,6 +223,6 @@ pub fn topbar(app: &mut App, sidebar_open: bool) -> E {
         let layout = side_pane_layout_for(app.side_panes(), Some(id)).clone();
         actions = actions.child(pane_toolbar(app, &layout, id));
     }
-    let left = if sidebar_open { 16.0 } else { shell_nav_inset(app) + shell_nav_closed_width() + 14.0 };
+    let left = if sidebar_open { 16.0 } else { shell_nav_inset() + shell_nav_closed_width() + 14.0 };
     drag_region(row().key("topbar").h(TOPBAR_HEIGHT).shrink0().pl(left).pr(12.0).items_center().justify_between().gap(12.0).child(row().flex1().min_w(0.0).items_center().gap(7.0).child(leading)).child(actions))
 }

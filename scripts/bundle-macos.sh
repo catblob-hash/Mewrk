@@ -5,6 +5,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo build --release -p mewrk -p mewrk-cef-helper
+# By itself: built together, the agent's features would reach the host, which links only its client half.
+cargo build --release -p mewrk-remote-agent --bin mewrk-remote
 app=target/release/Mewrk.app
 identity="${1:-${APPLE_SIGNING_IDENTITY:--}}"
 rm -rf "$app"
@@ -14,6 +16,7 @@ cp crates/mewrk/assets/Info.plist "$app/Contents/Info.plist"
 cp crates/mewrk/assets/icon.icns "$app/Contents/Resources/icon.icns"
 # The privacy prompts in both languages, since every program Mewrk starts asks as Mewrk.
 cp -R crates/mewrk/assets/InfoPlist/. "$app/Contents/Resources/"
+cp LICENSE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.md "$app/Contents/Resources/"
 
 # The CEF build the crate compiled against: cef-dll-sys `154.0.0+154.0.23` is CEF 154.0.23.
 cef_version="$(grep -A1 '^name = "cef-dll-sys"$' Cargo.lock | sed -n 's/^version = "[^+]*+\(.*\)"$/\1/p')"
@@ -22,6 +25,11 @@ framework="Chromium Embedded Framework.framework"
 # ditto keeps the framework's symlinks and extended attributes exactly as distributed.
 ditto "$distribution/$framework" "$app/Contents/Frameworks/$framework"
 cp "$distribution/CREDITS.html" "$app/Contents/Resources/CHROMIUM-CREDITS.html"
+# CEF's own BSD notice, which the distribution carries only at the top of its headers.
+{
+    printf 'Chromium Embedded Framework\n\n'
+    sed -n '1,/POSSIBILITY OF SUCH DAMAGE/s#^// \{0,1\}##p' "$distribution/include/cef_app.h"
+} > "$app/Contents/Resources/CEF-LICENSE.txt"
 
 sign() {
     if [ "$identity" = "-" ]; then
@@ -93,6 +101,12 @@ helper " (GPU)" helper.gpu com.apple.security.cs.allow-jit
 helper " (Renderer)" helper.renderer com.apple.security.cs.allow-jit
 helper " (Plugin)" helper.plugin com.apple.security.cs.allow-unsigned-executable-memory com.apple.security.cs.disable-library-validation
 helper " (Alerts)" helper.alerts
+
+# The agent this Mac's sandboxed commands run through. The host finds it beside its executable, by target triple.
+agents="$app/Contents/MacOS/remote-agents/$(rustc -vV | sed -n 's/^host: //p')"
+mkdir -p "$agents"
+cp target/release/mewrk-remote "$agents/mewrk-remote"
+sign "$agents/mewrk-remote"
 
 sign "$app" crates/mewrk/assets/Entitlements.plist
 du -sh "$app"

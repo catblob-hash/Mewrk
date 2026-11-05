@@ -12,14 +12,22 @@
 //! A browser page is a child of the window's content view. A key it leaves unhandled (→ with the caret at the end of a field, a
 //! letter with no field focused) goes up the responder chain to winit's view, which would hand it to whatever field of ours last
 //! had the keyboard. [`drop_bubbled_keys`] stops it there.
+//!
+//! Full screen keeps the traffic lights where they are in a window and has no menu bar to pull down: see [`NativeShell::watch_window`].
 
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Imp, Sel};
 use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventMask, NSEventType, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength, NSView};
-use objc2_foundation::{NSArray, NSData, NSObject, NSObjectProtocol, NSPoint, NSSize, NSString};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationPresentationOptions, NSButton, NSEvent, NSEventMask, NSEventType, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSTrackingArea, NSTrackingAreaOptions, NSVariableStatusItemLength, NSView, NSWindow, NSWindowButton, NSWindowDidExitFullScreenNotification, NSWindowStyleMask, NSWindowWillEnterFullScreenNotification, NSWindowWillExitFullScreenNotification};
+use objc2_foundation::{NSArray, NSData, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
+
+/// The traffic lights' place in a window and in full screen: 16 in from the left, centred in the 44-high top row.
+const LIGHTS_TOP_ROW: f64 = 44.0;
+const LIGHTS_LEFT: f64 = 16.0;
+const LIGHTS_SPACING: f64 = 20.0;
 
 /// What the native side asks of the window driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +38,8 @@ pub enum NativeEvent {
     Settings,
     /// Bring the window back, from the menu bar item or the Dock.
     Show,
+    /// The window is back from full screen, transition over.
+    LeftFullScreen,
 }
 
 type Sink = Box<dyn Fn(NativeEvent) + Send + Sync>;
@@ -152,12 +162,53 @@ define_class!(
                 item.setMenu(None);
             }
         }
+
+        #[unsafe(method(mewrkFullScreenWillEnter:))]
+        fn full_screen_will_enter(&self, _notification: &NSNotification) {
+            let ivars = self.ivars();
+            let Some(window) = ivars.window.get() else { return };
+            let Some(content) = window.contentView() else { return };
+            let lights = FullScreenLights::new(window, self.mtm());
+            content.addSubview(&lights);
+            // AppKit moves the window's own about on the way in and out, somewhere else than these, so only one set shows at a time.
+            set_lights_hidden(window, true);
+            if let Some(previous) = ivars.lights.replace(Some(lights)) {
+                previous.removeFromSuperview();
+            }
+        }
+
+        #[unsafe(method(mewrkFullScreenWillExit:))]
+        fn full_screen_will_exit(&self, _notification: &NSNotification) {
+            let ivars = self.ivars();
+            ivars.leaving_full_screen.set(true);
+            // They stand in for the window's own until the transition ends, so they look it from here on: a window can be minimized.
+            if let Some(lights) = &*ivars.lights.borrow() {
+                lights.enable_buttons();
+            }
+        }
+
+        #[unsafe(method(mewrkFullScreenDidExit:))]
+        fn full_screen_did_exit(&self, _notification: &NSNotification) {
+            let ivars = self.ivars();
+            ivars.leaving_full_screen.set(false);
+            if let Some(window) = ivars.window.get() {
+                place_lights(window);
+                set_lights_hidden(window, false);
+            }
+            if let Some(lights) = ivars.lights.take() {
+                lights.removeFromSuperview();
+            }
+            post(NativeEvent::LeftFullScreen);
+        }
     }
 );
 
 struct TargetIvars {
     status_item: OnceLock2<Retained<NSStatusItem>>,
     status_menu: OnceLock2<Retained<NSMenu>>,
+    window: OnceLock2<Retained<NSWindow>>,
+    lights: RefCell<Option<Retained<FullScreenLights>>>,
+    leaving_full_screen: Cell<bool>,
 }
 
 /// A slot set once on the main thread. The class's ivars must be `'static`, and these are never touched elsewhere.
@@ -179,7 +230,7 @@ impl<T> OnceLock2<T> {
 
 impl MenuTarget {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(TargetIvars { status_item: OnceLock2::new(), status_menu: OnceLock2::new() });
+        let this = Self::alloc(mtm).set_ivars(TargetIvars { status_item: OnceLock2::new(), status_menu: OnceLock2::new(), window: OnceLock2::new(), lights: RefCell::new(None), leaving_full_screen: Cell::new(false) });
         // SAFETY: `NSObject`'s `init`.
         unsafe { msg_send![super(this), init] }
     }
@@ -302,7 +353,7 @@ pub fn install(events: impl Fn(NativeEvent) + Send + Sync + 'static, chinese: bo
                 if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
                     // A template image is what the bar tints for a light, dark or highlighted bar.
                     image.setTemplate(true);
-                    image.setSize(NSSize::new(9.0, 18.0));
+                    image.setSize(NSSize::new(11.0, 18.0));
                     button.setImage(Some(&image));
                 }
                 button.setToolTip(Some(&NSString::from_str("Mewrk")));
@@ -355,10 +406,173 @@ fn install_reopen_handler(application: &NSApplication) {
     let _ = std::mem::size_of::<ClassBuilder>();
 }
 
+define_class!(
+    // The traffic lights in full screen. AppKit moves a window's own to a strip of their own that only ever shows with the menu bar, so
+    // these are the system's buttons again, sitting where the window's were. They are made afresh and thrown away, which leaves AppKit's
+    // title bar as it expects to find it on the way back.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "MewrkFullScreenLights"]
+    #[ivars = Cell<bool>]
+    struct FullScreenLights;
+
+    impl FullScreenLights {
+        /// What a window button asks its parent before drawing its symbol: all three show theirs with the pointer on any of them.
+        #[unsafe(method(_mouseInGroup:))]
+        fn mouse_in_group(&self, _button: Option<&AnyObject>) -> bool {
+            self.ivars().get()
+        }
+
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            self.set_hovered(true);
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            self.set_hovered(false);
+        }
+
+        /// The gaps between the buttons are the top row's, as they are in a window.
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
+            // SAFETY: `NSView`'s own `hitTest:`.
+            let hit: Option<Retained<NSView>> = unsafe { msg_send![super(self), hitTest: point] };
+            hit.filter(|hit| !std::ptr::eq(Retained::as_ptr(hit).cast::<AnyObject>(), std::ptr::from_ref(self).cast()))
+        }
+    }
+);
+
+impl FullScreenLights {
+    fn new(window: &NSWindow, mtm: MainThreadMarker) -> Retained<Self> {
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(LIGHTS_LEFT + LIGHTS_SPACING * 3.0, LIGHTS_TOP_ROW));
+        let this = Self::alloc(mtm).set_ivars(Cell::new(false));
+        // SAFETY: `NSView`'s `initWithFrame:`.
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable | NSWindowStyleMask::Resizable;
+        // Yellow is off because a full-screen window can't be minimized, as it is in the strip AppKit draws.
+        let buttons = [(NSWindowButton::CloseButton, sel!(performClose:), true), (NSWindowButton::MiniaturizeButton, sel!(performMiniaturize:), false), (NSWindowButton::ZoomButton, sel!(toggleFullScreen:), true)];
+        for (i, (kind, action, enabled)) in buttons.into_iter().enumerate() {
+            let Some(button) = NSWindow::standardWindowButton_forStyleMask(kind, style, mtm) else { continue };
+            let any_window: &AnyObject = window.as_ref();
+            // SAFETY: the window outlives its own content view's children, and these are `NSWindow` actions.
+            unsafe {
+                button.setTarget(Some(any_window));
+                button.setAction(Some(action));
+            }
+            button.setEnabled(enabled);
+            button.setFrameOrigin(NSPoint::new(LIGHTS_LEFT + LIGHTS_SPACING * i as f64, (LIGHTS_TOP_ROW - button.frame().size.height) * 0.5));
+            this.addSubview(&button);
+        }
+        // SAFETY: the view owns the area, and the area's owner is the view.
+        unsafe {
+            let any: &AnyObject = this.as_ref();
+            let options = NSTrackingAreaOptions::MouseEnteredAndExited | NSTrackingAreaOptions::ActiveAlways | NSTrackingAreaOptions::InVisibleRect;
+            let area = NSTrackingArea::initWithRect_options_owner_userInfo(NSTrackingArea::alloc(), this.bounds(), options, Some(any), None);
+            this.addTrackingArea(&area);
+        }
+        this
+    }
+
+    fn enable_buttons(&self) {
+        for view in self.subviews().to_vec() {
+            if let Some(button) = view.downcast_ref::<NSButton>() {
+                button.setEnabled(true);
+            }
+        }
+    }
+
+    /// The buttons look at their parent's answer only when told it changed, which AppKit's own title bar does with this selector. A macOS
+    /// without it leaves the symbols out and nothing else.
+    fn set_hovered(&self, hovered: bool) {
+        self.ivars().set(hovered);
+        for button in self.subviews().to_vec() {
+            // SAFETY: asked first, and it takes nothing and answers nothing.
+            unsafe {
+                if msg_send![&*button, respondsToSelector: sel!(mouseEnteredOrExited)] {
+                    let _: () = msg_send![&*button, mouseEnteredOrExited];
+                }
+            }
+        }
+    }
+}
+
+const LIGHTS: [NSWindowButton; 3] = [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton];
+
+fn set_lights_hidden(window: &NSWindow, hidden: bool) {
+    for kind in LIGHTS {
+        if let Some(button) = window.standardWindowButton(kind) {
+            button.setHidden(hidden);
+        }
+    }
+}
+
+/// Puts a window's traffic lights where Mewrk's layout expects them: `LIGHTS_LEFT` in, centred in the top row. AppKit puts them back whenever
+/// it lays the title bar out again.
+pub fn place_lights(window: &NSWindow) {
+    if window.styleMask().contains(NSWindowStyleMask::FullScreen) {
+        return;
+    }
+    let size = window.frame().size;
+    let Some(first) = window.standardWindowButton(NSWindowButton::CloseButton) else { return };
+    // The buttons live in the title bar's view, in its container. Both clip them unless they are as tall as the row, and the view's height
+    // is not the same from one macOS to the next, so it is set rather than measured.
+    // SAFETY: plain reads of the view tree, on the main thread.
+    if let Some(titlebar) = unsafe { first.superview() } {
+        if let Some(container) = unsafe { titlebar.superview() } {
+            container.setFrame(NSRect::new(NSPoint::new(0.0, size.height - LIGHTS_TOP_ROW), NSSize::new(size.width, LIGHTS_TOP_ROW)));
+        }
+        titlebar.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(size.width, LIGHTS_TOP_ROW)));
+    }
+    for (i, kind) in LIGHTS.into_iter().enumerate() {
+        let Some(button) = window.standardWindowButton(kind) else { return };
+        button.setFrameOrigin(NSPoint::new(LIGHTS_LEFT + LIGHTS_SPACING * i as f64, (LIGHTS_TOP_ROW - button.frame().size.height) * 0.5));
+    }
+}
+
+extern "C-unwind" fn full_screen_presentation(_this: &AnyObject, _cmd: Sel, _window: &AnyObject, _proposed: NSApplicationPresentationOptions) -> NSApplicationPresentationOptions {
+    NSApplicationPresentationOptions::FullScreen | NSApplicationPresentationOptions::HideDock | NSApplicationPresentationOptions::HideMenuBar
+}
+
 impl NativeShell {
     /// Whether the menu bar item is there: without one the window's close has to quit, or the process would be unreachable.
     pub fn tray_installed(&self) -> bool {
         self.tray_installed
+    }
+
+    /// Sets the window's full screen up: no menu bar to pull down, which macOS only allows without the Dock as well, and traffic lights that stay.
+    pub fn watch_window(&self, view: *mut std::ffi::c_void) {
+        if view.is_null() {
+            return;
+        }
+        // SAFETY: winit's content view, retained by its window, on the main thread.
+        let Some(window) = (unsafe { &*(view as *const NSView) }).window() else { return };
+        if let Some(delegate) = window.delegate() {
+            let object: &AnyObject = delegate.as_ref();
+            let imp: extern "C-unwind" fn(&AnyObject, Sel, &AnyObject, NSApplicationPresentationOptions) -> NSApplicationPresentationOptions = full_screen_presentation;
+            // SAFETY: the encoding is the delegate method's, an NSUInteger from an id and an NSUInteger. winit's answers what it was proposed
+            // for this kind of full screen, so nothing it relies on is lost.
+            unsafe {
+                let imp: Imp = std::mem::transmute(imp);
+                objc2::ffi::class_replaceMethod(std::ptr::from_ref(object.class()).cast_mut(), sel!(window:willUseFullScreenPresentationOptions:), imp, c"Q@:@Q".as_ptr());
+            }
+        }
+        let center = NSNotificationCenter::defaultCenter();
+        let any_target: &AnyObject = self.target.as_ref();
+        let any_window: &AnyObject = window.as_ref();
+        // SAFETY: the target lives as long as the app and has these methods, which take the notification.
+        unsafe {
+            center.addObserver_selector_name_object(any_target, sel!(mewrkFullScreenWillEnter:), Some(NSWindowWillEnterFullScreenNotification), Some(any_window));
+            center.addObserver_selector_name_object(any_target, sel!(mewrkFullScreenWillExit:), Some(NSWindowWillExitFullScreenNotification), Some(any_window));
+            center.addObserver_selector_name_object(any_target, sel!(mewrkFullScreenDidExit:), Some(NSWindowDidExitFullScreenNotification), Some(any_window));
+        }
+        self.target.ivars().window.set(window);
+    }
+
+    /// Whether the window is full screen or on its way out of it, when hiding it would still leave its backdrop behind.
+    pub fn in_full_screen(&self) -> bool {
+        let ivars = self.target.ivars();
+        ivars.leaving_full_screen.get() || ivars.window.get().is_some_and(|window| window.styleMask().contains(NSWindowStyleMask::FullScreen))
     }
 
     /// Relabels everything in place when the language changes.

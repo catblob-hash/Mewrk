@@ -19,7 +19,7 @@ const SCHEMA_VERSION: u32 = 6;
 pub const WIN: (f32, f32) = (1400.0, 900.0);
 
 /// One test at a time: the language and `HOME` are process-wide, and the host keeps statics of its own.
-static SERIAL: Mutex<()> = Mutex::new(());
+pub static SERIAL: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 pub struct MemClipboard(pub Option<String>);
@@ -41,7 +41,7 @@ pub struct Rig {
     /// The data folders `restart` started on.
     copies: Vec<PathBuf>,
     pub win: (f32, f32),
-    scene: Scene,
+    pub scene: Scene,
     text: TextCtx,
     mem: UiMemory,
     pub input: Input,

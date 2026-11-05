@@ -190,23 +190,15 @@ impl RowPaint {
         }
     }
 
-    /// Draws the row's text, leaving out the cell at `skip`: under a block cursor it is drawn in another colour,
-    /// and drawing both would leave a fringe of the first around the second.
-    pub fn paint_text(&self, ui: &mut Ui<'_>, x: f32, y: f32, cw: f32, skip: Option<usize>) {
+    /// Draws the row's text.
+    pub fn paint_text(&self, ui: &mut Ui<'_>, x: f32, y: f32, cw: f32) {
         for run in &self.runs {
             let (face, text) = (run.face(), self.run_text(run));
             let at = x + run.col as f32 * cw;
-            match skip.filter(|c| run.covers(*c)) {
-                Some(_) if run.cluster => {}
-                Some(c) => {
-                    let k = c - run.col as usize;
-                    ui.label(at, y, &text[..k], &face, run.color);
-                    ui.label(at + (k + 1) as f32 * cw, y, &text[k + 1..], &face, run.color);
-                }
-                None if run.cluster => paint_cluster(ui, at, y, run.cells as f32 * cw, text, &face, run.color),
-                None => {
-                    ui.label(at, y, text, &face, run.color);
-                }
+            if run.cluster {
+                paint_cluster(ui, at, y, run.cells as f32 * cw, text, &face, run.color);
+            } else {
+                ui.label(at, y, text, &face, run.color);
             }
         }
     }

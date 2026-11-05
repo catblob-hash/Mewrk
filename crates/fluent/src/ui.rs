@@ -282,7 +282,7 @@ impl<'a> Ui<'a> {
     // ------------------------------------------------------------ drawing
 
     #[allow(clippy::too_many_arguments)]
-    fn push_rect(&mut self, r: Rect, radii: [f32; 4], fill: Color, fill2: Color, border: Color, border2: Color, bw: f32, sigma: f32, kind: f32) {
+    fn push_rect(&mut self, r: Rect, radii: [f32; 4], fill: Color, fill2: Color, border: Color, border2: Color, bw: f32, kind: f32) {
         let (x0, y0) = (self.px(r.x), self.px(r.y));
         let (x1, y1) = (self.px(r.right()), self.px(r.bottom()));
         let inst = RectInst {
@@ -293,57 +293,50 @@ impl<'a> Ui<'a> {
             fill2,
             border,
             border2,
-            params: [(bw * self.scale).max(if bw > 0.0 { 1.0 } else { 0.0 }), sigma * self.scale, kind, 0.0],
+            params: [(bw * self.scale).max(if bw > 0.0 { 1.0 } else { 0.0 }), 0.0, kind, 0.0],
         };
         self.scene.layers[self.layer].rects.push(inst);
     }
 
     /// Notes how much has been drawn, for [`Self::fade_since`] or [`Self::discard_since`] to close. Marks nest: the last taken is closed first.
     pub fn paint_mark(&mut self) -> usize {
-        let Scene { layers, marks } = &mut *self.scene;
-        let mark = marks.len();
-        marks.extend(layers.iter().map(|layer| (layer.rects.len(), layer.glyphs.len(), layer.images.len())));
-        mark
+        self.scene.mark()
     }
 
     /// Fades whatever was drawn since `mark` was taken, as if it were one picture.
     pub fn fade_since(&mut self, mark: usize, opacity: f32) {
-        let Scene { layers, marks } = &mut *self.scene;
-        for (layer, (r, g, i)) in layers.iter_mut().zip(marks[mark..].iter()) {
-            for inst in &mut layer.rects[*r..] {
+        self.scene.close_mark(mark, |layer, (r, g, i)| {
+            for inst in &mut layer.rects[r..] {
                 inst.fill = inst.fill.fade(opacity);
                 inst.fill2 = inst.fill2.fade(opacity);
                 inst.border = inst.border.fade(opacity);
                 inst.border2 = inst.border2.fade(opacity);
             }
-            for inst in &mut layer.glyphs[*g..] {
+            for inst in &mut layer.glyphs[g..] {
                 inst.color = inst.color.fade(opacity);
             }
-            for draw in &mut layer.images[*i..] {
+            for draw in &mut layer.images[i..] {
                 draw.inst.opacity[0] *= opacity;
             }
-        }
-        marks.truncate(mark);
+        });
     }
 
     /// Takes back whatever was drawn since `mark` was taken.
     pub fn discard_since(&mut self, mark: usize) {
-        let Scene { layers, marks } = &mut *self.scene;
-        for (layer, (r, g, i)) in layers.iter_mut().zip(marks[mark..].iter()) {
-            layer.rects.truncate(*r);
-            layer.glyphs.truncate(*g);
-            layer.images.truncate(*i);
-        }
-        marks.truncate(mark);
+        self.scene.close_mark(mark, |layer, (r, g, i)| {
+            layer.rects.truncate(r);
+            layer.glyphs.truncate(g);
+            layer.images.truncate(i);
+        });
     }
 
     pub fn fill(&mut self, r: Rect, radius: f32, color: Color) {
-        self.push_rect(r, [radius; 4], color, color, Color::TRANSPARENT, Color::TRANSPARENT, 0.0, 0.0, KIND_RECT);
+        self.push_rect(r, [radius; 4], color, color, Color::TRANSPARENT, Color::TRANSPARENT, 0.0, KIND_RECT);
     }
 
     /// A vertical gradient.
     pub fn fill_gradient(&mut self, r: Rect, radii: [f32; 4], top: Color, bottom: Color) {
-        self.push_rect(r, radii, top, bottom, Color::TRANSPARENT, Color::TRANSPARENT, 0.0, 0.0, KIND_RECT);
+        self.push_rect(r, radii, top, bottom, Color::TRANSPARENT, Color::TRANSPARENT, 0.0, KIND_RECT);
     }
 
     /// A Lucide icon by the name Mewrk's components import it under, centred on (cx, cy).
@@ -370,34 +363,25 @@ impl<'a> Ui<'a> {
     }
 
     pub fn fill_radii(&mut self, r: Rect, radii: [f32; 4], color: Color) {
-        self.push_rect(r, radii, color, color, Color::TRANSPARENT, Color::TRANSPARENT, 0.0, 0.0, KIND_RECT);
+        self.push_rect(r, radii, color, color, Color::TRANSPARENT, Color::TRANSPARENT, 0.0, KIND_RECT);
     }
 
     /// A card with its own corners: `[top-left, top-right, bottom-right, bottom-left]`.
     pub fn card_radii(&mut self, r: Rect, radii: [f32; 4], fill: Color, stroke: Color) {
-        self.push_rect(r, radii, fill, fill, stroke, stroke, if stroke.a > 0 { 1.0 } else { 0.0 }, 0.0, KIND_RECT);
+        self.push_rect(r, radii, fill, fill, stroke, stroke, if stroke.a > 0 { 1.0 } else { 0.0 }, KIND_RECT);
     }
 
     pub fn card(&mut self, r: Rect, radius: f32, fill: Color, stroke: Color) {
-        self.push_rect(r, [radius; 4], fill, fill, stroke, stroke, 1.0, 0.0, KIND_RECT);
+        self.push_rect(r, [radius; 4], fill, fill, stroke, stroke, 1.0, KIND_RECT);
     }
 
     /// A control surface with Fluent's elevation stroke: lit at the top, weighted at the bottom edge.
     pub fn control(&mut self, r: Rect, radius: f32, fill: Color, stroke: Color, stroke_bottom: Color) {
-        self.push_rect(r, [radius; 4], fill, fill, stroke, stroke_bottom, 1.0, 0.0, KIND_RECT);
+        self.push_rect(r, [radius; 4], fill, fill, stroke, stroke_bottom, 1.0, KIND_RECT);
     }
 
     pub fn acrylic(&mut self, r: Rect, radius: f32, fill: Color, stroke: Color) {
-        self.push_rect(r, [radius; 4], fill, fill, stroke, stroke, 1.0, 0.0, KIND_ACRYLIC);
-    }
-
-    pub fn shadow(&mut self, r: Rect, radius: f32, sigma: f32, y: f32, color: Color) {
-        self.push_rect(rect(r.x, r.y + y, r.w, r.h), [radius; 4], color, color, Color::TRANSPARENT, Color::TRANSPARENT, 0.0, sigma, KIND_SHADOW);
-        // The shader cuts the hole where the surface is, which sits this far above the shadow.
-        let offset = self.px(r.y + y) - self.px(r.y);
-        if let Some(inst) = self.scene.layers[self.layer].rects.last_mut() {
-            inst.params[3] = offset;
-        }
+        self.push_rect(r, [radius; 4], fill, fill, stroke, stroke, 1.0, KIND_ACRYLIC);
     }
 
     pub fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Color) {
@@ -449,8 +433,16 @@ impl<'a> Ui<'a> {
                 radii: [radius * s; 4],
                 opacity: [opacity, 0.0, 0.0, 0.0],
             },
+            opaque: false,
         };
         self.scene.layers[self.layer].images.push(draw);
+    }
+
+    /// Says of the image just drawn that all its pixels are solid, so nothing under it need be drawn.
+    pub fn image_is_opaque(&mut self) {
+        if let Some(draw) = self.scene.layers[self.layer].images.last_mut() {
+            draw.opaque = true;
+        }
     }
 
     /// An image scaled to cover `r` without distortion, cropping whichever dimension overflows.
@@ -626,7 +618,7 @@ impl<'a> Ui<'a> {
         self.input.pressed && self.mem.active == 0
     }
 
-    /// Dims the window and returns a centred dialog box. Draw into it with `ui.layer` set to `LAYER_MODAL`.
+    /// Returns a centred dialog box, which takes the window's input. Draw into it with `ui.layer` set to `LAYER_MODAL`.
     pub fn modal(&mut self, w: f32, h: f32) -> Rect {
         let (w, h) = (w.min(self.size.0 - 32.0), h.min(self.size.1 - 32.0));
         self.modal_at((self.size.1 - h) * 0.42, w, h)
@@ -638,11 +630,9 @@ impl<'a> Ui<'a> {
         let (ww, wh) = self.size;
         self.clip = rect(0.0, 0.0, ww, wh);
         let t = self.theme;
-        self.fill(rect(0.0, 0.0, ww, wh), 0.0, t.smoke);
         self.register_popup(rect(0.0, 0.0, ww, wh));
         let (w, h) = (w.min(ww - 32.0), h.min(wh - y - 16.0));
         let r = rect((ww - w) * 0.5, y, w, h);
-        self.shadow(r, OVERLAY_RADIUS, 24.0, 12.0, t.shadow);
         self.acrylic(r, OVERLAY_RADIUS, t.flyout, t.flyout_stroke);
         r
     }
@@ -681,7 +671,6 @@ impl<'a> Ui<'a> {
         self.layer = LAYER_POPUP;
         self.clip = rect(0.0, 0.0, ww, wh);
         self.register_popup(box_);
-        self.shadow(box_, OVERLAY_RADIUS, 16.0, 8.0, t.shadow.fade(open_t));
         self.acrylic(box_, OVERLAY_RADIUS, t.flyout.fade(open_t), t.flyout_stroke.fade(open_t));
         let mut choice = None;
         let mut row_y = box_.y + PAD;
@@ -747,7 +736,7 @@ impl<'a> Ui<'a> {
         let t = self.theme;
         // Fluent's double ring: a contrasting outer stroke with a separating inner one.
         let outer = rect(r.x - 3.0, r.y - 3.0, r.w + 6.0, r.h + 6.0);
-        self.push_rect(outer, [radius + 3.0; 4], Color::TRANSPARENT, Color::TRANSPARENT, t.text_primary, t.text_primary, 2.0, 0.0, KIND_RECT);
+        self.push_rect(outer, [radius + 3.0; 4], Color::TRANSPARENT, Color::TRANSPARENT, t.text_primary, t.text_primary, 2.0, KIND_RECT);
     }
 
     pub fn button(&mut self, id: u64, r: Rect, text: &str) -> Response {
@@ -892,7 +881,6 @@ impl<'a> Ui<'a> {
         self.layer = LAYER_POPUP;
         self.clip = rect(0.0, 0.0, self.size.0, self.size.1);
         self.register_popup(menu);
-        self.shadow(menu, OVERLAY_RADIUS, 16.0, 8.0, t.shadow.fade(open_t));
         self.acrylic(menu, OVERLAY_RADIUS, t.flyout.fade(open_t), t.flyout_stroke.fade(open_t));
         let mut choice = None;
         for (i, option) in options.iter().enumerate() {
@@ -984,7 +972,7 @@ impl<'a> Ui<'a> {
             Icon::Grid => {
                 for (x, y) in [(-6.5, -6.5), (1.5, -6.5), (-6.5, 1.5), (1.5, 1.5)] {
                     let (a, b) = p(x, y);
-                    self.push_rect(rect(a, b, 5.0 * s, 5.0 * s), [1.0 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, 0.0, KIND_RECT);
+                    self.push_rect(rect(a, b, 5.0 * s, 5.0 * s), [1.0 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, KIND_RECT);
                 }
             }
             Icon::Settings => {
@@ -1010,13 +998,13 @@ impl<'a> Ui<'a> {
             }
             Icon::Image => {
                 let (a, b) = p(-7.0, -6.0);
-                self.push_rect(rect(a, b, 14.0 * s, 12.0 * s), [1.5 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, 0.0, KIND_RECT);
+                self.push_rect(rect(a, b, 14.0 * s, 12.0 * s), [1.5 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, KIND_RECT);
                 seg!(-6.5, 4.0, -2.0, 0.0; -2.0, 0.0, 1.0, 3.0; 1.0, 3.0, 3.0, 1.0; 3.0, 1.0, 6.5, 4.0);
                 self.arc(cx + 3.0 * s, cy - 2.5 * s, 1.0 * s + w * 0.5, w, 0.0, tau, color);
             }
             Icon::Video => {
                 let (a, b) = p(-7.5, -5.0);
-                self.push_rect(rect(a, b, 10.0 * s, 10.0 * s), [1.5 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, 0.0, KIND_RECT);
+                self.push_rect(rect(a, b, 10.0 * s, 10.0 * s), [1.5 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, KIND_RECT);
                 seg!(2.5, -1.5, 7.5, -4.0; 7.5, -4.0, 7.5, 4.0; 7.5, 4.0, 2.5, 1.5);
             }
             Icon::Close => {
@@ -1033,7 +1021,7 @@ impl<'a> Ui<'a> {
             }
             Icon::Copy => {
                 let (a, b) = p(-3.5, -7.0);
-                self.push_rect(rect(a, b, 10.5 * s, 11.0 * s), [1.5 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, 0.0, KIND_RECT);
+                self.push_rect(rect(a, b, 10.5 * s, 11.0 * s), [1.5 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, KIND_RECT);
                 seg!(-6.5, -3.5, -6.5, 6.0; -6.5, 7.0, 2.5, 7.0);
             }
             Icon::Tool => {
@@ -1048,7 +1036,7 @@ impl<'a> Ui<'a> {
             }
             Icon::SidebarToggle => {
                 let (a, b) = p(-7.0, -6.0);
-                self.push_rect(rect(a, b, 14.0 * s, 12.0 * s), [2.0 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, 0.0, KIND_RECT);
+                self.push_rect(rect(a, b, 14.0 * s, 12.0 * s), [2.0 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, KIND_RECT);
                 seg!(-2.5, -5.5, -2.5, 5.5);
             }
             Icon::ArrowLeft => {
@@ -1078,7 +1066,7 @@ impl<'a> Ui<'a> {
             }
             Icon::Terminal => {
                 let (a, b) = p(-7.0, -6.0);
-                self.push_rect(rect(a, b, 14.0 * s, 12.0 * s), [2.0 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, 0.0, KIND_RECT);
+                self.push_rect(rect(a, b, 14.0 * s, 12.0 * s), [2.0 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, KIND_RECT);
                 seg!(-4.0, -2.5, -1.5, 0.0; -1.5, 0.0, -4.0, 2.5; 0.5, 2.5, 4.0, 2.5);
             }
             Icon::GitCompare => {
@@ -1140,9 +1128,9 @@ impl<'a> Ui<'a> {
             }
             Icon::Agents => {
                 let (a, b) = p(-6.5, -6.5);
-                self.push_rect(rect(a, b, 5.0 * s, 5.0 * s), [1.0 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, 0.0, KIND_RECT);
+                self.push_rect(rect(a, b, 5.0 * s, 5.0 * s), [1.0 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, KIND_RECT);
                 let (a, b) = p(1.5, 1.5);
-                self.push_rect(rect(a, b, 5.0 * s, 5.0 * s), [1.0 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, 0.0, KIND_RECT);
+                self.push_rect(rect(a, b, 5.0 * s, 5.0 * s), [1.0 * s; 4], Color::TRANSPARENT, Color::TRANSPARENT, color, color, w, KIND_RECT);
                 seg!(-4.0, -1.5, -4.0, 4.0; -4.0, 4.0, 1.5, 4.0);
             }
             Icon::Branch => {

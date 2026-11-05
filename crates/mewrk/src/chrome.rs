@@ -12,10 +12,9 @@ const NAV_GAP: f32 = 2.0;
 /// `--tile-radius`.
 pub const TILE_RADIUS: f32 = 10.0;
 
-/// `--shell-nav-inset`: where `ShellNav` starts: past the traffic lights on macOS, and at the gutter in full screen,
-/// which takes the lights away and the room kept for them with it.
-pub fn shell_nav_inset(app: &App) -> f32 {
-    if cfg!(target_os = "macos") && !app.fullscreen { 84.0 } else { 10.0 }
+/// `--shell-nav-inset`: where `ShellNav` starts: past the traffic lights on macOS, which stay in full screen as well.
+pub fn shell_nav_inset() -> f32 {
+    if cfg!(target_os = "macos") { 84.0 } else { 10.0 }
 }
 
 /// `--shell-nav-closed-width`.
@@ -54,7 +53,7 @@ pub fn drag_region(element: E) -> E {
 /// search. One cluster whichever way the sidebar is: it stays put while the sidebar comes and goes under it, so the
 /// drawer button never moves out from under the pointer that just pressed it.
 pub fn shell_nav(app: &mut App, sidebar_open: bool, sidebar_width: f32) -> E {
-    let inset = shell_nav_inset(app);
+    let inset = shell_nav_inset();
     let can_back = app.conversation_history_target(-1).is_some();
     let can_forward = app.conversation_history_target(1).is_some();
     let width = if sidebar_open { sidebar_width - inset - 12.0 } else { shell_nav_closed_width() };
@@ -75,8 +74,7 @@ pub fn shell_nav(app: &mut App, sidebar_open: bool, sidebar_width: f32) -> E {
     drag_region(row().key("shell-nav").absolute().top(0.0).left(inset).w(width).h(TOPBAR_HEIGHT).items_center().gap(NAV_GAP).child(drawer).child(back).child(forward).child(search))
 }
 
-/// `MARK_PATH`: one monospace cell whose two top corners rise into ears, in a box of 120 × 200.
-pub const MARK_PATH: &str = "M0 190V12Q0 0 8.5 8.5L45.8 45.8Q50 50 56 50H64Q70 50 74.2 45.8L111.5 8.5Q120 0 120 12V190A10 10 0 0 1 110 200H10A10 10 0 0 1 0 190Z";
+pub use mewrk_ui_common::brand::{BRAND_ORANGE, MARK_HEIGHT, MARK_PATH, MARK_WIDTH};
 
 fn hex_of(c: Color) -> String {
     format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
@@ -84,23 +82,18 @@ fn hex_of(c: Color) -> String {
 
 /// `MewrkMark`: the mark alone, in a colour of the caller's. `hollow` draws its outline, as an idle status does.
 pub fn mewrk_mark(height: f32, color: Color, hollow: bool) -> E {
-    let width = height * 0.6;
+    let width = height * MARK_WIDTH / MARK_HEIGHT;
     let hex = hex_of(color);
     let key = format!("mewrk-mark-{hex}-{hollow}");
     // The stroke is scaled against the box so it stays a little over a pixel whatever the size, as `non-scaling-stroke` did.
-    let paint = if hollow { format!(r#"fill="none" stroke="{hex}" stroke-width="{}""#, 1.15 * 200.0 / height) } else { format!(r#"fill="{hex}""#) };
-    let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="-44 -4 208 208"><path d="{MARK_PATH}" {paint}/></svg>"#);
-    let side = height * 208.0 / 200.0;
+    let paint = if hollow { format!(r#"fill="none" stroke="{hex}" stroke-width="{}""#, 1.15 * MARK_HEIGHT / height) } else { format!(r#"fill="{hex}""#) };
+    let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="-26 -12 156 156"><path d="{MARK_PATH}" {paint}/></svg>"#);
+    let side = height * 156.0 / MARK_HEIGHT;
     custom::<App>(move |_, ui: &mut Ui<'_>, r| ui.svg_icon(&key, &svg, r.x + r.w * 0.5, r.y + r.h * 0.5, side)).size(width, height).shrink0().pass_through()
-}
-
-/// `MewrkIcon` with its plate: the application icon as the Dock shows it.
-pub fn mewrk_icon(size: f32) -> E {
-    row().size(size, size).center().radius(size * 0.23).bg(Color::rgb(0x1E1E1C)).border(Color::WHITE.with_alpha(0.07)).child(mewrk_mark(size * 0.38, Color::rgb(0xC98A1B), false))
 }
 
 /// `app-loading`: the window before there is a document.
 pub fn app_loading() -> E {
     let t_ = theme();
-    col().flex1().center().gap(10.0).child(mewrk_mark(34.0, Color::rgb(0xC98A1B), false)).child(text(t("正在打开 Mewrk…", "Opening Mewrk…")).ty(FINE).color(t_.text_secondary))
+    col().flex1().center().gap(10.0).child(mewrk_mark(30.0, BRAND_ORANGE, false)).child(text(t("正在打开 Mewrk…", "Opening Mewrk…")).ty(FINE).color(t_.text_secondary))
 }

@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::effects::{resolved_scheme, Picture};
 use crate::logic::background::{parse_background, solid_background, Background, BackgroundScheme, BuiltinPicture, BUILTIN_PICTURES, THEME_SOLID};
-use crate::logic::background_image::{base64_encode, build_background_tiers, decode, decode_data_url, read_picture};
+use crate::logic::background_image::{base64_encode, build_background_tiers, decode, decode_data_url, read_picture, tiers_of, EncodedTier};
 use crate::logic::store;
 use crate::widgets::*;
 
@@ -22,6 +22,9 @@ pub struct BackgroundImage {
     pub id: String,
     pub width: u32,
     pub height: u32,
+    /// `video` or `animated`, for one that moves.
+    #[serde(default)]
+    pub motion: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -180,10 +183,38 @@ fn import_failed(app: &mut App, reason: String) {
     let s = state(app);
     s.importing = false;
     s.error = Some(if reason == "unreadable" {
-        t("无法读取这张图片，请换一张 PNG、JPEG、WebP 或 HEIC 图片。", "This picture can't be read. Try a PNG, JPEG, WebP or HEIC file.").to_owned()
+        if mewrk_motion::VIDEO_EXTENSIONS.is_empty() {
+            t("无法读取这个文件，请换一张 PNG、JPEG、WebP 或 HEIC 图片，或一张 GIF 动图。", "This file can't be read. Try a PNG, JPEG, WebP, HEIC or GIF file.").to_owned()
+        } else {
+            t("无法读取这个文件，请换一张 PNG、JPEG、WebP 或 HEIC 图片，一张 GIF 动图，或一段 MP4、MOV 视频。", "This file can't be read. Try a PNG, JPEG, WebP, HEIC or GIF file, or an MP4 or MOV video.").to_owned()
+        }
     } else {
-        tf("背景图片导入失败：{reason}", "Couldn't import the picture: {reason}", &[("reason", &reason)])
+        tf("背景导入失败：{reason}", "Couldn't import the background: {reason}", &[("reason", &reason)])
     });
+}
+
+/// Hands the host a picture's tiers, one call each, and answers with the upload they went into.
+fn upload_tiers(task: &Task, tiers: &[EncodedTier]) -> Result<String, String> {
+    let mut upload: Option<String> = None;
+    for tier in tiers {
+        let id: String = task.invoke("background_image_put", json!({ "uploadId": upload, "data": base64_encode(&tier.bytes) }))?;
+        upload = Some(id);
+    }
+    upload.ok_or_else(|| "empty upload".to_owned())
+}
+
+fn imported(app: &mut App, generation: u64, result: Result<BackgroundImage, String>) {
+    if state(app).generation != generation {
+        return;
+    }
+    match result {
+        Ok(image) => {
+            state(app).importing = false;
+            library_changed(app);
+            set_background(app, image.id);
+        }
+        Err(reason) => import_failed(app, reason),
+    }
 }
 
 /// Cuts a picture into its ladder and stores it, on a background thread: the top rung can be 8K. Choosing it applies it.
@@ -194,45 +225,51 @@ pub fn import_background_bytes(app: &mut App, bytes: Vec<u8>) {
     let generation = s.generation;
     app.spawn(move |task| {
         let result = (|| {
-            let tiers = build_background_tiers(&bytes)?;
-            let mut upload: Option<String> = None;
-            for tier in &tiers {
-                let id: String = task.invoke("background_image_put", json!({ "uploadId": upload, "data": base64_encode(&tier.bytes) }))?;
-                upload = Some(id);
-            }
-            let upload = upload.ok_or_else(|| "empty upload".to_owned())?;
+            let upload = upload_tiers(&task, &build_background_tiers(&bytes)?)?;
             task.invoke::<BackgroundImage>("background_image_commit", json!({ "uploadId": upload }))
         })();
-        task.post(move |app| {
-            if state(app).generation != generation {
-                return;
+        task.post(move |app| imported(app, generation, result));
+    });
+}
+
+/// The same from a file on disk, whatever it is. A video or an animated picture also goes in whole, with its first frame as the picture
+/// that everything showing it still and small reads. That frame comes out or the file is refused, so what can't be played never gets in.
+pub fn import_background_file(app: &mut App, path: PathBuf) {
+    use mewrk_motion::FileKind;
+    let s = state(app);
+    s.importing = true;
+    s.error = None;
+    let generation = s.generation;
+    app.spawn(move |task| {
+        let result = (|| {
+            let kind = mewrk_motion::classify(&path)?;
+            let (poster, motion) = match kind {
+                FileKind::Picture => (build_background_tiers(&read_picture(&path)?)?, None),
+                FileKind::Animated => (tiers_of(mewrk_motion::animated::first_frame(&path)?)?, Some("animated")),
+                FileKind::Video => (tiers_of(mewrk_motion::video::poster(&path)?)?, Some("video")),
+            };
+            let upload = upload_tiers(&task, &poster)?;
+            if let Some(motion) = motion {
+                task.invoke::<Value>("background_image_attach_motion", json!({ "uploadId": upload, "path": path, "kind": motion }))?;
             }
-            match result {
-                Ok(image) => {
-                    state(app).importing = false;
-                    library_changed(app);
-                    set_background(app, image.id);
-                }
-                Err(reason) => import_failed(app, reason),
-            }
-        });
+            task.invoke::<BackgroundImage>("background_image_commit", json!({ "uploadId": upload }))
+        })();
+        task.post(move |app| imported(app, generation, result));
     });
 }
 
 /// `<input type="file" accept="image/*">`, on a thread since the dialog blocks whoever opens it until it's answered.
 fn pick_and_import(app: &mut App) {
     let generation = state(app).generation;
+    let filter = t("图片和视频", "Pictures and videos");
     app.spawn(move |task| {
-        let picked: Option<PathBuf> = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "webp", "heic", "heif", "avif", "tif", "tiff", "gif", "bmp"]).pick_file();
+        let mut extensions = vec!["png", "jpg", "jpeg", "webp", "heic", "heif", "avif", "tif", "tiff", "gif", "bmp"];
+        extensions.extend_from_slice(mewrk_motion::VIDEO_EXTENSIONS);
+        let picked: Option<PathBuf> = rfd::FileDialog::new().add_filter(filter, &extensions).pick_file();
         let Some(path) = picked else { return };
-        let bytes = read_picture(&path);
         task.post(move |app| {
-            if state(app).generation != generation {
-                return;
-            }
-            match bytes {
-                Ok(bytes) => import_background_bytes(app, bytes),
-                Err(e) => import_failed(app, e),
+            if state(app).generation == generation {
+                import_background_file(app, path);
             }
         });
     });
@@ -254,7 +291,7 @@ fn remove_picture(app: &mut App, image_id: String) {
                     set_background(app, THEME_SOLID.to_owned());
                 }
             }
-            Err(e) => state(app).error = Some(tf("无法移除这张图片：{reason}", "Couldn't remove the picture: {reason}", &[("reason", &e)])),
+            Err(e) => state(app).error = Some(tf("无法移除这个背景：{reason}", "Couldn't remove the background: {reason}", &[("reason", &e)])),
         }
     });
 }
@@ -326,15 +363,21 @@ pub fn background_library_dialog(app: &mut App, value: &str, on_close: impl Fn(&
     let s = state(app);
     let (importing, imported, list_error, error) = (s.importing, s.imported.clone(), s.list_error.clone(), s.error.clone());
     let glyph = if importing { spinner(18.0) } else { icon("ImagePlus", 18.0).color(t_.text_secondary) };
-    let add = col().key("background-add").w(TILE_WIDTH).gap(6.0).pt(5.0).px(5.0).pb(6.0).radius(10.0).border(t_.card_stroke).hover_bg(t_.subtle_hover).disabled(importing).aria_busy(importing).on_click(pick_and_import).child(row().size(SURFACE_WIDTH, SURFACE_HEIGHT).center().radius(CONTROL_RADIUS).bg(t_.subtle_hover).border(t_.control_stroke).child(glyph)).child(text(if importing { t("正在导入…", "Importing…") } else { t("添加图片…", "Add picture…") }).ty(CAPTION_STRONG).color(t_.text_secondary).ellipsis());
+    let add = col().key("background-add").w(TILE_WIDTH).gap(6.0).pt(5.0).px(5.0).pb(6.0).radius(10.0).border(t_.card_stroke).hover_bg(t_.subtle_hover).disabled(importing).aria_busy(importing).on_click(pick_and_import).child(row().size(SURFACE_WIDTH, SURFACE_HEIGHT).center().radius(CONTROL_RADIUS).bg(t_.subtle_hover).border(t_.control_stroke).child(glyph)).child(text(if importing { t("正在导入…", "Importing…") } else { t("添加图片或视频…", "Add picture or video…") }).ty(CAPTION_STRONG).color(t_.text_secondary).ellipsis());
     let mut mine = row().wrap().gap(10.0).child(add);
     for image in imported.iter().flatten() {
         let size = format!("{} × {}", image.width, image.height);
         let (choose_id, remove_id) = (image.id.clone(), image.id.clone());
         let surface_el = surface(app, &image.id, SURFACE_WIDTH, SURFACE_HEIGHT);
-        let delete = confirm_delete(("background-remove", image.id.as_str()), t("移除这张图片", "Remove this picture").to_owned(), t("确认移除这张图片", "Confirm removing this picture").to_owned(), false, move |app| remove_picture(app, remove_id.clone()));
+        // Its first frame looks like any picture, so a mark in the corner says it isn't one.
+        let surface_el = surface_el.when(image.motion.is_some(), |surface_el| surface_el.child(row().absolute().left(4.0).bottom(4.0).size(18.0, 18.0).center().radius(9.0).bg(t_.flyout).pass_through().child(icon("Play", 11.0).color(t_.text_secondary))));
+        let delete = confirm_delete(("background-remove", image.id.as_str()), t("移除这个背景", "Remove this background").to_owned(), t("确认移除这个背景", "Confirm removing this background").to_owned(), false, move |app| remove_picture(app, remove_id.clone()));
         // Over the picture's corner, shown while the tile is pointed at. An armed button stays, so the second press can land: leaving it disarms it anyway.
-        let tile_name = tf("导入的图片 {size}", "Imported picture {size}", &[("size", &size)]);
+        let tile_name = match image.motion.as_deref() {
+            Some("video") => tf("导入的视频 {size}", "Imported video {size}", &[("size", &size)]),
+            Some(_) => tf("导入的动图 {size}", "Imported animated picture {size}", &[("size", &size)]),
+            None => tf("导入的图片 {size}", "Imported picture {size}", &[("size", &size)]),
+        };
         mine = mine.child(col().key(("background-tile", image.id.as_str())).child(tile(("background-imported", image.id.as_str()), value == image.id, surface_el, size, move |app| set_background(app, choose_id.clone())).aria_label(tile_name)).child(delete.absolute().top(9.0).right(9.0).bg(t_.flyout).reveal_on_parent_hover()));
     }
     let heading = |s: &'static str| text(s).ty(CAPTION_STRONG).color(t_.text_secondary).mb(8.0).nowrap().role(Role::Heading).aria_level(3);
@@ -344,11 +387,11 @@ pub fn background_library_dialog(app: &mut App, value: &str, on_close: impl Fn(&
         .child(
             col()
                 .role(Role::Region)
-                .aria_label(t("我的图片", "My pictures"))
-                .child(heading(t("我的图片", "My pictures")))
+                .aria_label(t("我的背景", "My backgrounds"))
+                .child(heading(t("我的背景", "My backgrounds")))
                 .child(mine)
                 .child(help(t("按窗口比例裁切，不拉伸。", "Cropped to the window's shape, never stretched.")).mt(10.0))
-                .child(list_error.map(|e| error_line(tf("无法读取导入的图片：{reason}", "Couldn't read the imported pictures: {reason}", &[("reason", &e)])).mt(6.0)))
+                .child(list_error.map(|e| error_line(tf("无法读取导入的背景：{reason}", "Couldn't read the imported backgrounds: {reason}", &[("reason", &e)])).mt(6.0)))
                 .child(error.map(|e| error_line(e).mt(6.0))),
         );
     let close: Rc<dyn Fn(&mut App)> = Rc::new(on_close);

@@ -339,7 +339,6 @@ pub fn drawer(key: impl Hash + Clone, title: &str, subtitle: Option<String>, wid
         .bg(t_.flyout)
         .border(t_.flyout_stroke)
         .radius(OVERLAY_RADIUS)
-        .shadow(24.0, 12.0, t_.shadow)
         .clip()
         .on_click(|_| {})
         .role(Role::GenericContainer)
@@ -348,7 +347,7 @@ pub fn drawer(key: impl Hash + Clone, title: &str, subtitle: Option<String>, wid
         )
         .child(col().key(("drawer-body", hkey)).flex1().min_h(0.0).scroll_y().py(14.0).px(16.0).child(body))
         .child(footer.map(|f| row().min_h(50.0).py(9.0).pl(16.0).pr(12.0).gap(7.0).justify_end().items_center().border_top(t_.divider).child(f)));
-    row().justify_end().items_stretch().bg(t_.smoke).on_click(move |a: &mut App| close_backdrop(a)).child(panel).modal_layer(Some(close_esc)).aria_label(title)
+    row().justify_end().items_stretch().on_click(move |a: &mut App| close_backdrop(a)).child(panel).modal_layer(Some(close_esc)).aria_label(title)
 }
 
 // ---------------------------------------------------------------- the rail

@@ -116,7 +116,7 @@ fn dimensions_of(image: &ImageAttachment) -> String {
 
 fn remove_button(key: u64, label: String, on_remove: Rc<dyn Fn(&mut App)>) -> E {
     say(&label);
-    row().key(key).absolute().top(4.0).right(4.0).center().size(18.0, 18.0).radius(9.0).bg(Color::argb(0xCC202020)).hover_bg(Color::BLACK).tooltip(label).on_click(move |app: &mut App| on_remove(app)).child(icon("X", 12.0).color(Color::WHITE))
+    row().key(key).absolute().top(4.0).right(4.0).center().size(18.0, 18.0).radius(9.0).bg(Color::rgb(0x202020)).hover_bg(Color::BLACK).tooltip(label).on_click(move |app: &mut App| on_remove(app)).child(icon("X", 12.0).color(Color::WHITE))
 }
 
 fn image_thumbnail(app: &mut App, strip: &str, image: &ImageAttachment, compact: bool, on_remove: Option<Rc<dyn Fn(&mut App)>>, viewer: &Local<Option<ImageAttachment>>) -> E {
@@ -281,7 +281,7 @@ fn image_viewer(app: &mut App, image: &ImageAttachment, on_close: Rc<dyn Fn(&mut
         .on_click(move |app: &mut App| backdrop(app))
         .child(picture)
         .child(caption)
-        .child(row().key("image-viewer-close").absolute().top(24.0).right(24.0).center().size(34.0, 34.0).radius(17.0).bg(Color::WHITE.fade(0.1)).hover_bg(Color::WHITE.fade(0.34)).tooltip(close_label).on_click(move |app: &mut App| close(app)).child(icon("X", 19.0).color(Color::WHITE)))
+        .child(row().key("image-viewer-close").absolute().top(24.0).right(24.0).center().size(34.0, 34.0).radius(17.0).bg(Color::rgb(0x363636)).hover_bg(Color::rgb(0x626262)).tooltip(close_label).on_click(move |app: &mut App| close(app)).child(icon("X", 19.0).color(Color::WHITE)))
         .modal_layer(Some(on_close))
 }
 

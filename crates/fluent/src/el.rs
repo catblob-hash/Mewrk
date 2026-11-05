@@ -290,7 +290,6 @@ struct Visual {
     border: Option<Color>,
     /// Top, right, bottom, left.
     sides: [Option<Color>; 4],
-    shadow: Option<(f32, f32, Color)>,
     opacity: Option<f32>,
 }
 
@@ -974,12 +973,6 @@ impl<A: 'static> El<A> {
 
     pub fn border_left(mut self, c: Color) -> Self {
         self.vis.sides[3] = Some(c);
-        self
-    }
-
-    /// Blur, drop and colour.
-    pub fn shadow(mut self, sigma: f32, y: f32, c: Color) -> Self {
-        self.vis.shadow = Some((sigma, y, c));
         self
     }
 
@@ -1822,7 +1815,6 @@ fn paint_hover_text(ui: &mut Ui<'_>, id: u64, anchor: Rect, words: Arc<str>) {
     ui.layer = LAYER_TOOLTIP;
     ui.clip = rect(0.0, 0.0, ui.size.0, ui.size.1);
     let r = rect(x, y, w, h);
-    ui.shadow(r, OVERLAY_RADIUS, 6.0, 2.0, theme.shadow);
     ui.acrylic(r, CONTROL_RADIUS, theme.flyout, theme.flyout_stroke);
     paint_text(ui, id, rect(x + 8.0, y + 5.0, size.width, size.height), &spans, TextFlow::Wrap, TextAlign::Start, false, 0.0, false);
     ui.layer = layer;
@@ -2283,8 +2275,8 @@ pub fn render<A: 'static>(root: El<A>, app: &mut A, ui: &mut Ui<'_>) -> bool {
         // A layer draws its boxes before its text, so one surface over another needs a layer of its own, or the text at
         // the top of the one below shows through the box of the one above: a drawer over a dialog with a close button.
         match portal {
-            Some(true) if std::mem::replace(&mut modal_seen, true) => *layer_of = (*layer_of + 1).min(LAYER_POPUP - 1),
-            Some(false) if std::mem::replace(&mut popup_seen, true) => *layer_of = (*layer_of + 1).min(LAYER_TOOLTIP - 1),
+            Some(true) if std::mem::replace(&mut modal_seen, true) => *layer_of += 1,
+            Some(false) if std::mem::replace(&mut popup_seen, true) => *layer_of += 1,
             _ => {}
         }
         ui.layer = *layer_of;
@@ -2513,7 +2505,7 @@ fn paint<A: 'static>(frame: &mut Frame<A>, idx: usize, app: &mut A, ui: &mut Ui<
     let culled = !clip.intersects(&r) && !frame.nodes[idx].children.iter().any(|_| !frame.nodes[idx].clip);
 
     if frame.nodes[idx].overlay {
-        **layer = (**layer + 1).min(if ui.layer >= LAYER_POPUP { LAYER_TOOLTIP - 1 } else if ui.layer >= LAYER_MODAL { LAYER_POPUP - 1 } else { LAYER_MODAL - 1 });
+        **layer += 1;
         ui.layer = **layer;
     }
 
@@ -2557,9 +2549,6 @@ fn paint<A: 'static>(frame: &mut Frame<A>, idx: usize, app: &mut A, ui: &mut Ui<
             && let Some(p) = vis.press_bg {
                 fill = on_base(p, 1.0);
             }
-    }
-    if let Some((sigma, y, c)) = vis.shadow {
-        ui.shadow(r, vis.radii[0], sigma, y, c);
     }
     let bottom_fill = vis.bg2.unwrap_or(fill);
     if fill.a > 0 || bottom_fill.a > 0 || vis.border.is_some() {
@@ -2646,7 +2635,7 @@ fn paint<A: 'static>(frame: &mut Frame<A>, idx: usize, app: &mut A, ui: &mut Ui<
     if frame.nodes[idx].scroll.is_some() {
         ui.clip = clip;
         let saved_layer = ui.layer;
-        **layer = (**layer + 1).min(if ui.layer >= LAYER_POPUP { LAYER_TOOLTIP - 1 } else if ui.layer >= LAYER_MODAL { LAYER_POPUP - 1 } else { LAYER_MODAL - 1 });
+        **layer += 1;
         ui.layer = **layer;
         if let Some(mut s) = with_rt(|rt| rt.scrolls.remove(&id)) {
             s.scrollbar(ui, id ^ 0x5C5C, r);
@@ -3057,7 +3046,7 @@ pub fn family_text<A: 'static>(label: Arc<str>, family: Arc<str>, ty: TypeStyle,
 /// The surface a flyout stands on.
 pub fn flyout_panel<A>() -> El<A> {
     let t = theme();
-    div().bg(t.flyout).border(t.flyout_stroke).radius(OVERLAY_RADIUS).shadow(12.0, 4.0, t.shadow).clip()
+    div().bg(t.flyout).border(t.flyout_stroke).radius(OVERLAY_RADIUS).clip()
 }
 
 /// A dropdown: `options` as a menu under a button showing the selected one.
@@ -3114,13 +3103,12 @@ pub fn select_in_fonts<A: 'static>(key: impl Hash + Clone, options: Vec<Arc<str>
     trigger
 }
 
-/// The dialog surface with its smoke behind it. `on_backdrop` runs on a press outside the box.
+/// The dialog surface, centred over the window. `on_backdrop` runs on a press outside the box.
 pub fn dialog<A: 'static>(width: f32, body: El<A>, on_backdrop: Option<Handler<A>>) -> El<A> {
     let t = theme();
     let backdrop = on_backdrop.clone();
     row()
         .center()
-        .bg(t.smoke)
         .when(backdrop.is_some(), move |e| {
             let f = backdrop.expect("checked");
             e.on_click(move |a| f(a))
@@ -3132,7 +3120,6 @@ pub fn dialog<A: 'static>(width: f32, body: El<A>, on_backdrop: Option<Handler<A
                 .bg(t.flyout)
                 .border(t.flyout_stroke)
                 .radius(OVERLAY_RADIUS)
-                .shadow(24.0, 12.0, t.shadow)
                 .clip()
                 // Clicks on the box stay on the box.
                 .on_click(|_| {})

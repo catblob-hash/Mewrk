@@ -8,7 +8,7 @@ Mewrk is a desktop coding agent that lets you steer what the model sees and does
 
 This repository is the rewrite in Rust. The interface, the host and the model layer run in one native process, with no web renderer and no Node sidecar. It matches the features and structure of Mewrk 1.0, and its styling is Fluent.
 
-**Status: not released.** There are no downloads and no update channel, so the only way to run it is to build it yourself. It has only been run on macOS on Apple silicon, and only against local mock providers. It has not been tested against real model APIs, Windows or Linux. [crates/mewrk/README.md](crates/mewrk/README.md) (in Chinese) lists what has been verified and what hasn't.
+**Status: 1.0.0, the rewrite's first release.** [Download the DMG](https://github.com/catblob-hash/Mewrk/releases/tag/v1.0.0) for Apple silicon and macOS 13 or later; it is signed and notarized. There is no update channel yet, so the app won't tell you about newer versions. It has only been run on macOS on Apple silicon, and only against local mock providers. It has not been tested against real model APIs, Windows or Linux. [crates/mewrk/README.md](crates/mewrk/README.md) (in Chinese) lists what has been verified and what hasn't.
 
 ![The Mewrk window with a finished task, a terminal, the file browser and the review pane open](docs/img/mewrk-window.png)
 
@@ -21,7 +21,7 @@ You need macOS on Apple silicon, stable Rust, the Xcode Command Line Tools, `cma
 open target/release/Mewrk.app
 ```
 
-The first build downloads the Chromium Embedded Framework (about 460 MB unpacked) into `.cef`. The script signs with `$APPLE_SIGNING_IDENTITY` if it is set, and ad hoc if not.
+The first build downloads the Chromium Embedded Framework (about 460 MB unpacked) into `.cef`. The script signs with `$APPLE_SIGNING_IDENTITY` if it is set, and ad hoc if not. `./scripts/release-macos.sh` builds the notarized DMG in `target/dist`, for any Apple silicon Mac rather than only the one building it.
 
 Add a provider under **Settings → Providers → Model providers**. Data is kept in `~/Library/Application Support/dev.mewrk.native`, in the same format as Mewrk 1.0.
 
@@ -52,4 +52,4 @@ The Tauri version (React, Rust and a Node sidecar) is discontinued. Its code and
 
 ## License
 
-[GPL-3.0-or-later](LICENSE). Third-party components and their licenses are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+[GPL-3.0-or-later](LICENSE). Third-party components and their licenses are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) and [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).

@@ -891,7 +891,7 @@ pub fn timeline_notice_view(app: &mut App, conversation_id: &str) -> Option<E> {
         return None;
     }
     let ty_ = TypeStyle { size: 12.0, line: 16.0, weight: Weight::Regular, mono: false, italic: false, serif: false };
-    let mut view = row().key(("timeline-notice", notice.id.as_str())).h(26.0).px(10.0).items_center().gap(8.0).radius(13.0).bg(t_.flyout).border(t_.flyout_stroke).shadow(8.0, 2.0, t_.shadow).child(text(notice.message.clone()).ty(ty_).color(t_.text_primary).ellipsis());
+    let mut view = row().key(("timeline-notice", notice.id.as_str())).h(26.0).px(10.0).items_center().gap(8.0).radius(13.0).bg(t_.flyout).border(t_.flyout_stroke).child(text(notice.message.clone()).ty(ty_).color(t_.text_primary).ellipsis());
     if let Some((keys, action)) = notice.hint {
         view = view
             .child(row().px(5.0).py(2.0).radius(4.0).border(t_.card_stroke).bg(t_.subtle_hover).child(text(keys).ty(TypeStyle { size: 11.0, line: 11.0, weight: Weight::Semibold, mono: false, italic: false, serif: false }).color(t_.text_primary).nowrap()))

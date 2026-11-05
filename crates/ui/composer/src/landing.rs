@@ -3,13 +3,13 @@
 //! what a new task can start from: the project's tasks by recency, which the sidebar keeps in the user's own order instead, and the
 //! keys that work here, read from the user's bindings so a rebound key shows as bound.
 
-use crate::art;
 use chrono::{DateTime, Datelike, Duration, Local as LocalTime, TimeZone};
 use mewrk_client::model::ShortcutPreference;
 use mewrk_client::prelude::*;
 use mewrk_client::runs::ConversationStatus;
 use mewrk_client::selection::{DraftLandingTask, DRAFT_LANDING_TASK_LIMIT};
 use mewrk_client::shortcuts::{resolve_shortcut, shortcut_command, shortcut_key_caps};
+use mewrk_ui_common::brand::{mewrk_icon_bare, BRAND_ORANGE, MARK_PATH};
 use mewrk_ui_common::popover_menu::probe::say;
 use std::collections::BTreeMap;
 
@@ -123,21 +123,13 @@ pub(crate) fn svg_paint(color: Color) -> (String, f32) {
     (format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b), color.a as f32 / 255.0)
 }
 
-/// `MewrkIcon plate={false}`: the prompt in the page's colour and the mark in amber, so both follow day and night.
-pub fn mewrk_icon(size: f32) -> E {
-    let t_ = theme();
-    let (prompt, _) = svg_paint(t_.text_primary);
-    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{size}\" height=\"{size}\" viewBox=\"{}\"><path d=\"{}\" fill=\"none\" stroke=\"{prompt}\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"{}\" transform=\"{}\" fill=\"{}\"/></svg>", art::ICON_BARE_VIEWBOX, art::ICON_PROMPT_PATH, art::MARK_PATH, art::ICON_MARK_TRANSFORM, art::BRAND_AMBER);
-    svg_mark(format!("mewrk-icon:{prompt}"), svg, size)
-}
-
 /// `ConversationStatusMark`: the brand mark, filled in a status's colour; idle is its outline.
 /// TODO(sidebar): use the sidebar's own once `crates/mewrk` publishes it.
 pub fn conversation_status_mark(status: ConversationStatus) -> E {
     let t_ = theme();
     let (color, label) = match status {
         ConversationStatus::Running => (svg_paint(t_.text_primary), Some(t("正在进行", "In progress"))),
-        ConversationStatus::Blocked => (("#c98a1b".to_owned(), 1.0), Some(t("等待你处理", "Waiting for you"))),
+        ConversationStatus::Blocked => (svg_paint(BRAND_ORANGE), Some(t("等待你处理", "Waiting for you"))),
         ConversationStatus::Completed => (("#3769bb".to_owned(), 1.0), Some(t("已完成", "Finished"))),
         ConversationStatus::Idle => (svg_paint(t_.text_tertiary), None),
     };
@@ -145,8 +137,8 @@ pub fn conversation_status_mark(status: ConversationStatus) -> E {
     if let Some(label) = label {
         say(label);
     }
-    let paint = if status == ConversationStatus::Idle { format!("fill=\"none\" stroke=\"{color}\" stroke-opacity=\"{opacity}\" stroke-width=\"12\"") } else { format!("fill=\"{color}\" fill-opacity=\"{opacity}\"") };
-    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"14\" height=\"14\" viewBox=\"-40 0 200 200\"><path d=\"{}\" {paint}/></svg>", art::MARK_PATH);
+    let paint = if status == ConversationStatus::Idle { format!("fill=\"none\" stroke=\"{color}\" stroke-opacity=\"{opacity}\" stroke-width=\"10\"") } else { format!("fill=\"{color}\" fill-opacity=\"{opacity}\"") };
+    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"14\" height=\"14\" viewBox=\"-28 -14 160 160\"><path d=\"{MARK_PATH}\" {paint}/></svg>");
     let mark = svg_mark(format!("status-mark:{color}:{opacity}:{}", status == ConversationStatus::Idle), svg, 14.0);
     match label {
         // On the mark, so a row it stands in counts it among its words.
@@ -177,7 +169,7 @@ pub fn draft_landing_view(props: DraftLandingProps) -> E {
     let lede = if props.can_insert { t("在下方说说要做什么，或右键手写上下文。", "Say what to do below, or right-click to hand-write context.") } else { t("在下方说说要做的事。", "Say what to do below.") };
     say(title);
     say(lede);
-    let hero: E = col().items_center().child(mewrk_icon(46.0)).child(text(title).role(Role::Heading).aria_level(2).ty(SUBTITLE).color(t_.text_primary).mt(16.0)).child(text(lede).ty(CAPTION).color(t_.text_secondary).max_w(440.0).mt(6.0).text_center());
+    let hero: E = col().items_center().child(mewrk_icon_bare(46.0)).child(text(title).role(Role::Heading).aria_level(2).ty(SUBTITLE).color(t_.text_primary).mt(16.0)).child(text(lede).ty(CAPTION).color(t_.text_secondary).max_w(440.0).mt(6.0).text_center());
 
     let tasks: Vec<&DraftLandingTask> = props.recent_tasks.iter().take(DRAFT_LANDING_TASK_LIMIT).collect();
     let now = props.now.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());

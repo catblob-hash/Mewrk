@@ -10,7 +10,7 @@ use mewrk_client::runs::ConversationStatus;
 use mewrk_client::ui_store::{SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
 use mewrk_client::workspaces::{is_reserved_workspace, is_temporary_workspace, registered_project_workspaces, workspace_location_title};
 
-use crate::chrome::{drag_region, mewrk_mark, TILE_RADIUS, TOPBAR_HEIGHT};
+use crate::chrome::{drag_region, mewrk_mark, BRAND_ORANGE, MARK_HEIGHT, MARK_WIDTH, TILE_RADIUS, TOPBAR_HEIGHT};
 use crate::menu::{MenuItem, MenuSection, PopoverMenu};
 use crate::state::shell;
 use crate::widgets::{confirm_delete_button, tool_button, tool_button_disabled};
@@ -162,8 +162,11 @@ fn list_geometry(app: &App) -> Option<ListGeometry> {
     Some(ListGeometry { list, groups })
 }
 
+/// How tall the status light stands in its row.
+const STATUS_MARK_HEIGHT: f32 = 11.0;
+
 /// `ConversationStatusMark`: the brand mark as a status light: an outline while idle, a blinking cursor while working,
-/// amber while it waits on the user and blue once a run finished unseen.
+/// orange while it waits on the user and blue once a run finished unseen.
 pub fn conversation_status_mark(status: ConversationStatus) -> E {
     let t_ = theme();
     let label = match status {
@@ -173,14 +176,14 @@ pub fn conversation_status_mark(status: ConversationStatus) -> E {
         ConversationStatus::Idle => None,
     };
     let mark = match status {
-        ConversationStatus::Idle => mewrk_mark(12.0, t_.text_tertiary, true),
+        ConversationStatus::Idle => mewrk_mark(STATUS_MARK_HEIGHT, t_.text_tertiary, true),
         ConversationStatus::Running => {
             // `conversation-status-blink`: 1.06 s, on for the first half. The mark holds its box while off, so nothing shifts.
             let shown = status_blink_on();
-            if shown { mewrk_mark(12.0, t_.text_primary, false) } else { div().size(7.2, 12.0).shrink0() }
+            if shown { mewrk_mark(STATUS_MARK_HEIGHT, t_.text_primary, false) } else { div().size(STATUS_MARK_HEIGHT * MARK_WIDTH / MARK_HEIGHT, STATUS_MARK_HEIGHT).shrink0() }
         }
-        ConversationStatus::Blocked => mewrk_mark(12.0, Color::rgb(0xC98A1B), false),
-        ConversationStatus::Completed => mewrk_mark(12.0, Color::rgb(0x3769BB), false),
+        ConversationStatus::Blocked => mewrk_mark(STATUS_MARK_HEIGHT, BRAND_ORANGE, false),
+        ConversationStatus::Completed => mewrk_mark(STATUS_MARK_HEIGHT, Color::rgb(0x3769BB), false),
     };
     let mut holder: E = row().size(14.0, 12.0).center().shrink0().child(mark);
     if let Some(label) = label {

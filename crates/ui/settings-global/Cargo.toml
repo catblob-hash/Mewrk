@@ -9,6 +9,7 @@ description = "Global settings, upstream's GlobalSettings and its pages."
 mewrk-client = { path = "../../mewrk-client" }
 mewrk-ui-common = { path = "../common" }
 fluent.workspace = true
+mewrk-motion.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 image.workspace = true

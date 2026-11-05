@@ -612,7 +612,7 @@ pub fn waiting_indicator(f: &Frame<'_>, key: &str) -> E {
 
 /// The stock empty notice.
 pub fn stock_empty_state(mutation_read_only: bool) -> E {
-    crate::kit::empty_state(Some(mewrk_ui_composer::landing::mewrk_icon(44.0)), t("这段对话还没有消息", "This conversation has no messages yet"), (!mutation_read_only).then_some(t("在上下文之间右键，可精确插入新内容", "Right-click between contexts to insert content precisely")))
+    crate::kit::empty_state(Some(mewrk_ui_common::brand::mewrk_icon_bare(44.0)), t("这段对话还没有消息", "This conversation has no messages yet"), (!mutation_read_only).then_some(t("在上下文之间右键，可精确插入新内容", "Right-click between contexts to insert content precisely")))
 }
 
 /// `.insertion-line`.

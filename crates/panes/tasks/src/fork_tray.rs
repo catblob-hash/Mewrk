@@ -142,7 +142,7 @@ pub fn fork_request_tray(requests: &[PendingForkRequest], caption_height: f32, o
             let (on_decide, id) = (on_decide.clone(), request.fork_id.clone());
             move |app: &mut App| on_decide(app, &id, approved)
         };
-        let mut card = col().key(("fork-card", id)).py(12.0).px(14.0).radius(12.0).bg(c.flyout).border(c.flyout_stroke).shadow(14.0, 6.0, c.shadow).on_click(|_| {}).role(Role::GenericContainer).cursor(CursorKind::Default)
+        let mut card = col().key(("fork-card", id)).py(12.0).px(14.0).radius(12.0).bg(c.flyout).border(c.flyout_stroke).on_click(|_| {}).role(Role::GenericContainer).cursor(CursorKind::Default)
             .child(row().items_center().gap(6.0).child(icon("GitFork", 13.0).color(c.text_primary)).child(text(t("模型请求分叉会话", "The model wants to fork this conversation")).ty(CAPTION_STRONG).ellipsis()))
             .child(div().mt(4.0).child(source))
             .child(prompt);

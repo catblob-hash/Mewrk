@@ -13,7 +13,6 @@ pub const MASK_ATLAS_SIZE: u32 = 4096;
 pub const COLOR_ATLAS_SIZE: u32 = 2048;
 
 pub const KIND_RECT: f32 = 0.0;
-pub const KIND_SHADOW: f32 = 1.0;
 pub const KIND_ARC: f32 = 2.0;
 pub const KIND_LINE: f32 = 3.0;
 pub const KIND_ACRYLIC: f32 = 4.0;
@@ -59,6 +58,8 @@ pub struct ImageInst {
 pub struct ImageDraw {
     pub image: ImageId,
     pub inst: ImageInst,
+    /// Every pixel of the image is known to be solid, so it hides whatever lies under it, within its corners.
+    pub opaque: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -75,9 +76,39 @@ struct ImageQueue {
     uploads: Vec<(u32, Vec<u8>, u32, u32)>,
     /// Textures a live image gets, with nothing in them yet.
     blanks: Vec<(u32, u32, u32)>,
+    /// Textures a live pass can draw into, as well as have pixels written to.
+    targets: Vec<(u32, u32, u32)>,
     writes: Vec<ImageWrite>,
+    #[cfg(target_os = "macos")]
+    surfaces: Vec<(u32, SurfaceFrame)>,
+    plates: Vec<PlatePass>,
     releases: Vec<u32>,
 }
+
+/// One go at working out the glass on the GPU: see [`blur_into`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlatePass {
+    pub source: ImageId,
+    pub target: ImageId,
+    /// In the target's pixels.
+    pub sigma: f32,
+    pub saturate: f32,
+}
+
+/// A decoded picture in memory the GPU can read as it is: no copy on the way, whatever its size.
+#[cfg(target_os = "macos")]
+pub struct SurfaceFrame {
+    /// An `IOSurfaceRef`, BGRA, kept alive by `keep`.
+    pub surface: *mut std::ffi::c_void,
+    pub width: u32,
+    pub height: u32,
+    /// What holds the memory. It goes once the GPU is done with the last frame that sampled it, and only then can the decoder reuse it.
+    pub keep: Box<dyn Send>,
+}
+
+// SAFETY: an IOSurface may be used from any thread, and `keep` is `Send`.
+#[cfg(target_os = "macos")]
+unsafe impl Send for SurfaceFrame {}
 
 /// Pixels going into part of an image that is already on the GPU.
 struct ImageWrite {
@@ -109,6 +140,45 @@ pub fn queue_live_image(width: u32, height: u32) -> ImageId {
     ImageId(id)
 }
 
+/// The same with a texture that a live pass can draw into too: [`blur_into`]. Callable from any thread.
+pub fn queue_target_image(width: u32, height: u32) -> ImageId {
+    let mut queue = IMAGE_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+    let queue = queue.get_or_insert_with(ImageQueue::default);
+    let id = QUEUED_IMAGE_BASE + queue.next;
+    queue.next += 1;
+    queue.targets.push((id, width, height));
+    ImageId(id)
+}
+
+/// An image with no texture of its own, showing whichever surface [`show_surface`] was last given. Nothing draws until the first.
+#[cfg(target_os = "macos")]
+pub fn queue_surface_image() -> ImageId {
+    let mut queue = IMAGE_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+    let queue = queue.get_or_insert_with(ImageQueue::default);
+    let id = QUEUED_IMAGE_BASE + queue.next;
+    queue.next += 1;
+    ImageId(id)
+}
+
+/// Shows a surface in an image from the next frame on.
+#[cfg(target_os = "macos")]
+pub fn show_surface(id: ImageId, frame: SurfaceFrame) {
+    let mut queue = IMAGE_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+    let queue = queue.get_or_insert_with(ImageQueue::default);
+    // One not drawn yet never will be. Letting go of it gives the decoder its memory back.
+    queue.surfaces.retain(|(queued, _)| *queued != id.0);
+    queue.surfaces.push((id.0, frame));
+}
+
+/// Fills `target`, a [`queue_target_image`], with `source` shrunk, blurred and saturated, on the GPU, before the next frame draws. For a
+/// target asked for more than once before that frame, the last request stands.
+pub fn blur_into(pass: PlatePass) {
+    let mut queue = IMAGE_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+    let queue = queue.get_or_insert_with(ImageQueue::default);
+    queue.plates.retain(|queued| queued.target != pass.target);
+    queue.plates.push(pass);
+}
+
 /// Replaces a rectangle of an image with tightly packed RGBA at the next frame, without touching the rest. It costs what
 /// the rectangle costs, so a small change to a large picture stays small.
 pub fn write_image(id: ImageId, x: u32, y: u32, width: u32, height: u32, rgba: impl AsRef<[u8]> + Send + 'static) {
@@ -137,41 +207,122 @@ impl Layer {
     }
 }
 
+/// The page, then what floats over it, each in a band of its own that draws wholly over the one before. An element tree spends a layer per
+/// overlay and per scroller, and a layer draws its boxes before its text, so two surfaces that shared one would let the lower one's text
+/// through the upper one's box. So a band never runs out: it holds as many layers as are asked of it, and only those cost anything.
 pub const LAYER_BASE: usize = 0;
-/// Layers from here up are for overlays inside the page; an element tree spends one per overlay and one per scroller. A layer draws its
-/// boxes before its text, so once a band runs out, what is drawn next shares its last layer and the text under a surface comes through it.
-/// Four panes beside a long conversation went through 39, so the page's band leaves room for far more than that.
-pub const LAYER_MODAL: usize = 240;
-pub const LAYER_POPUP: usize = 272;
-/// The top of the popup band, and where hover text is drawn: a cut line's whole words, and why something is disabled.
-pub const LAYER_TOOLTIP: usize = 288;
-pub const LAYERS: usize = 296;
+const BAND_SHIFT: u32 = 16;
+const BAND_SLOTS: usize = (1 << BAND_SHIFT) - 1;
+pub const LAYER_MODAL: usize = 1 << BAND_SHIFT;
+pub const LAYER_POPUP: usize = 2 << BAND_SHIFT;
+/// Where hover text is drawn: a cut line's whole words, and why something is disabled.
+pub const LAYER_TOOLTIP: usize = 3 << BAND_SHIFT;
+const BANDS: usize = 4;
+
+static NO_LAYER: Layer = Layer { rects: Vec::new(), images: Vec::new(), glyphs: Vec::new() };
+
+/// A frame's layers, addressed as `LAYER_POPUP + n`. Reading one nothing has drawn in finds it empty; writing to one makes it.
+#[derive(Default)]
+pub struct Layers {
+    bands: [Vec<Layer>; BANDS],
+}
+
+impl Layers {
+    /// In the order they draw.
+    pub fn iter(&self) -> std::vec::IntoIter<&Layer> {
+        self.drawn().collect::<Vec<_>>().into_iter()
+    }
+
+    pub(crate) fn drawn(&self) -> impl Iterator<Item = &Layer> {
+        self.bands.iter().flatten()
+    }
+
+    pub(crate) fn drawn_mut(&mut self) -> impl Iterator<Item = &mut Layer> {
+        self.bands.iter_mut().flatten()
+    }
+
+    /// Those above the page, in the order they draw.
+    pub fn over_the_page(&self) -> impl Iterator<Item = &Layer> {
+        self.bands[1..].iter().flatten()
+    }
+}
+
+impl std::ops::Index<usize> for Layers {
+    type Output = Layer;
+
+    fn index(&self, layer: usize) -> &Layer {
+        self.bands[layer >> BAND_SHIFT].get(layer & BAND_SLOTS).unwrap_or(&NO_LAYER)
+    }
+}
+
+impl std::ops::IndexMut<usize> for Layers {
+    fn index_mut(&mut self, layer: usize) -> &mut Layer {
+        let (band, slot) = (&mut self.bands[layer >> BAND_SHIFT], layer & BAND_SLOTS);
+        if slot >= band.len() {
+            band.resize_with(slot + 1, Layer::default);
+        }
+        &mut band[slot]
+    }
+}
+
+/// What a layer held when a mark was taken: boxes, glyphs, images.
+type Held = (usize, usize, usize);
 
 /// One frame's worth of geometry. Its buffers are kept between frames, so that a steady scene allocates
 /// nothing at all.
+#[derive(Default)]
 pub struct Scene {
-    pub layers: [Layer; LAYERS],
+    pub layers: Layers,
     /// The counts of every open `Ui::paint_mark`. Here rather than on the stack because the element tree paints by recursion, and it outlives the `Ui` so that it allocates once.
-    pub(crate) marks: Vec<(usize, usize, usize)>,
-}
-
-impl Default for Scene {
-    fn default() -> Self {
-        Self { layers: std::array::from_fn(|_| Layer::default()), marks: Vec::new() }
-    }
+    marks: Vec<Held>,
+    /// Something solid covers the whole window, so the ground under everything has nothing to show.
+    pub ground_covered: bool,
+    /// [`Self::cull_occluded`]'s working space, kept so that a steady frame allocates nothing.
+    pub(crate) surfaces: Vec<crate::occlusion::Surface>,
+    pub(crate) extra_rects: Vec<(usize, RectInst)>,
 }
 
 impl Scene {
     pub fn clear(&mut self) {
-        for l in &mut self.layers {
+        for l in self.layers.drawn_mut() {
             l.clear();
         }
         self.marks.clear();
+        self.ground_covered = false;
+    }
+
+    /// Notes how much every layer holds, band by band, each band's count first since a band may have grown by the time the mark is closed.
+    pub(crate) fn mark(&mut self) -> usize {
+        let mark = self.marks.len();
+        for band in &self.layers.bands {
+            self.marks.push((band.len(), 0, 0));
+            self.marks.extend(band.iter().map(|layer| (layer.rects.len(), layer.glyphs.len(), layer.images.len())));
+        }
+        mark
+    }
+
+    /// Closes a mark, handing over every layer with what it held then: nothing, for one made since.
+    pub(crate) fn close_mark(&mut self, mark: usize, mut each: impl FnMut(&mut Layer, Held)) {
+        let mut at = mark;
+        for band in &mut self.layers.bands {
+            let known = self.marks[at].0;
+            at += 1;
+            for (slot, layer) in band.iter_mut().enumerate() {
+                each(layer, if slot < known { self.marks[at + slot] } else { (0, 0, 0) });
+            }
+            at += known;
+        }
+        self.marks.truncate(mark);
+    }
+
+    /// Whether anything of an image is drawn this frame.
+    pub fn draws_image(&self, image: ImageId) -> bool {
+        self.layers.drawn().any(|layer| layer.images.iter().any(|draw| draw.image == image))
     }
 
     pub fn counts(&self) -> (usize, usize) {
-        let rects = self.layers.iter().map(|l| l.rects.len()).sum();
-        let glyphs = self.layers.iter().map(|l| l.glyphs.len()).sum();
+        let rects = self.layers.drawn().map(|l| l.rects.len()).sum();
+        let glyphs = self.layers.drawn().map(|l| l.glyphs.len()).sum();
         (rects, glyphs)
     }
 }
@@ -215,6 +366,48 @@ struct GpuImage {
     bind_group: wgpu::BindGroup,
 }
 
+/// What a live pass of the glass draws with: its pipelines, and the textures between the source and the plate.
+struct PlateRenderer {
+    shrink: wgpu::RenderPipeline,
+    blur: wgpu::RenderPipeline,
+    finish: wgpu::RenderPipeline,
+    uniforms: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    /// How far apart a pass's values lie in `uniforms`.
+    stride: u32,
+    scratch: Vec<GpuImage>,
+    /// When a pass last ran, so that its textures don't outlive the need for them.
+    last_used: Option<std::time::Instant>,
+}
+
+/// Enough for an 8K source, halved down to a few pixels, then two passes for the blur.
+const PLATE_PASSES: u32 = 16;
+/// How long the textures between source and plate stay after their last use. Baked glass needs none, and they cost memory.
+const PLATE_SCRATCH_KEEPS: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PlateUniform {
+    step: [f32; 2],
+    sigma: f32,
+    saturate: f32,
+}
+
+/// The sizes a source goes through on its way to the target: halved for as long as that doesn't go below it, then the target's own.
+fn shrink_sizes(source: (u32, u32), target: (u32, u32)) -> Vec<(u32, u32)> {
+    let mut sizes = Vec::new();
+    let (mut width, mut height) = source;
+    while width / 2 >= target.0 && height / 2 >= target.1 {
+        width /= 2;
+        height /= 2;
+        sizes.push((width, height));
+    }
+    if sizes.last().copied().unwrap_or(source) != target || sizes.is_empty() {
+        sizes.push(target);
+    }
+    sizes
+}
+
 pub struct Gpu {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -246,6 +439,8 @@ impl Gpu {
 
 pub struct Renderer {
     pub gpu: Arc<Gpu>,
+    /// Each layer's boxes and glyphs in this frame's buffers. Kept so that a steady frame allocates nothing.
+    ranges: Vec<(Range<u32>, Range<u32>)>,
     rect_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     image_pipeline: wgpu::RenderPipeline,
@@ -261,6 +456,10 @@ pub struct Renderer {
     image_buf: GrowBuffer,
     images: Vec<Option<GpuImage>>,
     queued_images: std::collections::HashMap<u32, GpuImage>,
+    /// What holds each surface image's memory, for as long as it is the one showing.
+    #[cfg(target_os = "macos")]
+    surface_keeps: std::collections::HashMap<u32, Box<dyn Send>>,
+    plate: PlateRenderer,
 }
 
 pub struct AtlasUpload<'a> {
@@ -377,10 +576,46 @@ impl Renderer {
         });
         let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
 
+        let plate = {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("plate"), source: wgpu::ShaderSource::Wgsl(include_str!("plate.wgsl").into()) });
+            let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("plate pass"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: wgpu::BufferSize::new(size_of::<PlateUniform>() as u64) },
+                    count: None,
+                }],
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("plate"), bind_group_layouts: &[Some(&uniform_layout), Some(&image_layout)], immediate_size: 0 });
+            let make = |label: &str, fragment: &str| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState { module: &shader, entry_point: Some("plate_vs"), compilation_options: Default::default(), buffers: &[] },
+                    primitive: Default::default(),
+                    depth_stencil: None,
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(fragment), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+            let stride = device.limits().min_uniform_buffer_offset_alignment.max(size_of::<PlateUniform>() as u32);
+            let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("plate pass"), size: u64::from(stride * PLATE_PASSES), usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("plate pass"),
+                layout: &uniform_layout,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &uniforms, offset: 0, size: wgpu::BufferSize::new(size_of::<PlateUniform>() as u64) }) }],
+            });
+            PlateRenderer { shrink: make("plate shrink", "shrink_fs"), blur: make("plate blur", "blur_fs"), finish: make("plate finish", "finish_fs"), uniforms, bind_group, stride, scratch: Vec::new(), last_used: None }
+        };
+
         let rect_buf = GrowBuffer::new(device, "rects", 1 << 20);
         let glyph_buf = GrowBuffer::new(device, "glyphs", 4 << 20);
         let image_buf = GrowBuffer::new(device, "images", 1 << 14);
         Self {
+            ranges: Vec::new(),
             rect_pipeline,
             glyph_pipeline,
             image_pipeline,
@@ -396,6 +631,9 @@ impl Renderer {
             image_buf,
             images: Vec::new(),
             queued_images: std::collections::HashMap::new(),
+            #[cfg(target_os = "macos")]
+            surface_keeps: std::collections::HashMap::new(),
+            plate,
             gpu,
         }
     }
@@ -412,12 +650,16 @@ impl Renderer {
         }
     }
 
-    /// Brings in what views queued since the last frame.
-    fn drain_image_queue(&mut self) {
-        let (uploads, blanks, writes, releases) = {
+    /// Brings in what views queued since the last frame, and hands back the live passes asked for, to run before it draws.
+    fn drain_image_queue(&mut self) -> Vec<PlatePass> {
+        let (uploads, blanks, targets, writes, plates, releases) = {
             let mut queue = IMAGE_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(queue) = queue.as_mut() else { return };
-            (std::mem::take(&mut queue.uploads), std::mem::take(&mut queue.blanks), std::mem::take(&mut queue.writes), std::mem::take(&mut queue.releases))
+            let Some(queue) = queue.as_mut() else { return Vec::new() };
+            #[cfg(target_os = "macos")]
+            for (id, frame) in std::mem::take(&mut queue.surfaces) {
+                self.show_surface(id, frame);
+            }
+            (std::mem::take(&mut queue.uploads), std::mem::take(&mut queue.blanks), std::mem::take(&mut queue.targets), std::mem::take(&mut queue.writes), std::mem::take(&mut queue.plates), std::mem::take(&mut queue.releases))
         };
         for (id, rgba, width, height) in uploads {
             let slot = self.make_image(&rgba, width, height);
@@ -425,6 +667,10 @@ impl Renderer {
         }
         for (id, width, height) in blanks {
             let slot = self.blank_image(width, height);
+            self.queued_images.insert(id, slot);
+        }
+        for (id, width, height) in targets {
+            let slot = self.target_image(width, height);
             self.queued_images.insert(id, slot);
         }
         for write in writes {
@@ -446,6 +692,47 @@ impl Renderer {
         }
         for id in releases {
             self.queued_images.remove(&id);
+            #[cfg(target_os = "macos")]
+            if let Some(keep) = self.surface_keeps.remove(&id) {
+                self.gpu.queue.on_submitted_work_done(move || drop(keep));
+            }
+        }
+        plates
+    }
+
+    /// Wraps the surface in a texture, there being no pixels to move, and shows that. The one before it may still be drawing, so what
+    /// holds its memory goes when the work already sent is done.
+    #[cfg(target_os = "macos")]
+    fn show_surface(&mut self, id: u32, frame: SurfaceFrame) {
+        use objc2_metal::{MTLDevice, MTLPixelFormat, MTLResourceOptions, MTLStorageMode, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage};
+        use wgpu::hal::api::Metal;
+        let SurfaceFrame { surface, width, height, keep } = frame;
+        let device = &self.gpu.device;
+        // SAFETY: the raw device isn't kept past this call. The descriptor is what `newTextureWithDescriptor:iosurface:plane:` asks for
+        // of plane 0 of a BGRA surface, which `keep` holds alive for as long as the texture can be drawn.
+        let raw = unsafe {
+            let Some(hal) = device.as_hal::<Metal>() else { return };
+            let descriptor = MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(MTLPixelFormat::BGRA8Unorm, width as usize, height as usize, false);
+            descriptor.setUsage(MTLTextureUsage::ShaderRead);
+            descriptor.setStorageMode(MTLStorageMode::Shared);
+            descriptor.setResourceOptions(MTLResourceOptions::StorageModeShared);
+            hal.raw_device().newTextureWithDescriptor_iosurface_plane(&descriptor, &*surface.cast::<objc2_io_surface::IOSurfaceRef>(), 0)
+        };
+        let Some(raw) = raw else { return };
+        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+        // SAFETY: `raw` is a 2D texture of this format and size, made on this device just now.
+        let texture = unsafe {
+            let hal = wgpu::hal::metal::Device::texture_from_raw(raw, wgpu::TextureFormat::Bgra8Unorm, MTLTextureType::Type2D, 1, 1, wgpu::hal::CopyExtent { width, height, depth: 1 }, None);
+            device.create_texture_from_hal::<Metal>(
+                hal,
+                &wgpu::TextureDescriptor { label: Some("surface"), size, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Bgra8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] },
+                wgpu::TextureUses::RESOURCE,
+            )
+        };
+        let image = self.image_of(texture);
+        self.queued_images.insert(id, image);
+        if let Some(old) = self.surface_keeps.insert(id, keep) {
+            self.gpu.queue.on_submitted_work_done(move || drop(old));
         }
     }
 
@@ -461,17 +748,29 @@ impl Renderer {
     }
 
     fn blank_image(&self, width: u32, height: u32) -> GpuImage {
-        let device = &self.gpu.device;
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        self.texture_image(width, height, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST)
+    }
+
+    fn target_image(&self, width: u32, height: u32) -> GpuImage {
+        self.texture_image(width, height, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT)
+    }
+
+    fn texture_image(&self, width: u32, height: u32, usage: wgpu::TextureUsages) -> GpuImage {
+        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("image"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage,
             view_formats: &[],
         });
+        self.image_of(texture)
+    }
+
+    fn image_of(&self, texture: wgpu::Texture) -> GpuImage {
+        let device = &self.gpu.device;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("image"),
             layout: &self.image_layout,
@@ -481,6 +780,100 @@ impl Renderer {
             ],
         });
         GpuImage { texture, bind_group }
+    }
+
+    /// Works the glass out on the GPU: the source down to the plate's size in halves, then a blur each way.
+    fn run_plate_passes(&mut self, passes: &[PlatePass], encoder: &mut wgpu::CommandEncoder) {
+        if passes.is_empty() {
+            if self.plate.last_used.is_some_and(|at| at.elapsed() > PLATE_SCRATCH_KEEPS) {
+                self.plate.scratch.clear();
+                self.plate.last_used = None;
+            }
+            return;
+        }
+        self.plate.last_used = Some(std::time::Instant::now());
+        // A step is a texture to draw into, a texture to read and what the shader is told.
+        for &PlatePass { source, target, sigma, saturate } in passes {
+            let sized = |image: &GpuImage| {
+                let size = image.texture.size();
+                (size.width, size.height)
+            };
+            let image_at = |id: ImageId| if id.0 >= QUEUED_IMAGE_BASE { self.queued_images.get(&id.0) } else { self.images.get(id.0 as usize).and_then(Option::as_ref) };
+            let (Some(source_image), Some(target_image)) = (image_at(source), image_at(target)) else { continue };
+            let target_size = sized(target_image);
+            let sizes = shrink_sizes(sized(source_image), target_size);
+            let mut needed: Vec<(u32, u32)> = sizes.clone();
+            needed.push(target_size);
+            self.keep_scratch(&needed);
+            let image_at = |id: ImageId| if id.0 >= QUEUED_IMAGE_BASE { self.queued_images.get(&id.0) } else { self.images.get(id.0 as usize).and_then(Option::as_ref) };
+            let (Some(source_image), Some(target_image)) = (image_at(source), image_at(target)) else { continue };
+
+            let stride = self.plate.stride;
+            let mut uniforms = vec![0u8; (stride * PLATE_PASSES) as usize];
+            let mut steps: Vec<(&wgpu::RenderPipeline, &GpuImage, &GpuImage)> = Vec::new();
+            let mut used = vec![false; self.plate.scratch.len()];
+            let mut take = |size: (u32, u32), scratch: &'_ [GpuImage]| -> Option<usize> {
+                let at = (0..scratch.len()).find(|&at| !used[at] && sized(&scratch[at]) == size)?;
+                used[at] = true;
+                Some(at)
+            };
+            let mut write = |at: usize, value: PlateUniform| uniforms[at * stride as usize..at * stride as usize + size_of::<PlateUniform>()].copy_from_slice(bytemuck::bytes_of(&value));
+            let mut last = source_image;
+            let mut complete = true;
+            for &size in &sizes {
+                let Some(at) = take(size, &self.plate.scratch) else {
+                    complete = false;
+                    break;
+                };
+                // One output pixel's width in the source's coordinates, divided among the samples.
+                write(steps.len(), PlateUniform { step: [0.5 / size.0.max(1) as f32, 0.5 / size.1.max(1) as f32], sigma: 0.0, saturate: 1.0 });
+                steps.push((&self.plate.shrink, last, &self.plate.scratch[at]));
+                last = &self.plate.scratch[at];
+            }
+            let Some(across) = take(target_size, &self.plate.scratch).filter(|_| complete) else { continue };
+            let across = &self.plate.scratch[across];
+            write(steps.len(), PlateUniform { step: [1.0 / target_size.0.max(1) as f32, 0.0], sigma, saturate: 1.0 });
+            steps.push((&self.plate.blur, last, across));
+            write(steps.len(), PlateUniform { step: [0.0, 1.0 / target_size.1.max(1) as f32], sigma, saturate });
+            steps.push((&self.plate.finish, across, target_image));
+            if steps.len() > PLATE_PASSES as usize {
+                continue;
+            }
+            self.gpu.queue.write_buffer(&self.plate.uniforms, 0, &uniforms[..steps.len() * stride as usize]);
+            for (index, (pipeline, read, draw)) in steps.into_iter().enumerate() {
+                let view = draw.texture.create_view(&Default::default());
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("plate"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.plate.bind_group, &[index as u32 * stride]);
+                pass.set_bind_group(1, &read.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+    }
+
+    /// Makes sure there is a texture for every size in `needed`, as many of each as it appears, and that nothing else is kept.
+    fn keep_scratch(&mut self, needed: &[(u32, u32)]) {
+        let mut wanted = needed.to_vec();
+        let mut kept = Vec::with_capacity(needed.len());
+        for image in std::mem::take(&mut self.plate.scratch) {
+            let size = image.texture.size();
+            if let Some(at) = wanted.iter().position(|want| *want == (size.width, size.height)) {
+                wanted.swap_remove(at);
+                kept.push(image);
+            }
+        }
+        for (width, height) in wanted {
+            let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT;
+            kept.push(self.texture_image(width, height, usage));
+        }
+        self.plate.scratch = kept;
     }
 
     pub fn remove_image(&mut self, id: ImageId) {
@@ -514,7 +907,19 @@ impl Renderer {
 
     /// Records and submits one frame into `target`.
     pub fn render(&mut self, scene: &Scene, theme: &Theme, target: &wgpu::TextureView, size: (u32, u32)) -> wgpu::SubmissionIndex {
-        self.drain_image_queue();
+        let plate_passes = self.drain_image_queue();
+        self.upload_scene(scene, theme, size);
+        self.draw_scene(scene, plate_passes, target)
+    }
+
+    /// The scene last given to [`Self::render`] once more, over whatever has changed in its images since. Its boxes and text are on the
+    /// GPU already, so nothing about them is sent again. `scene` has to be that one, as it was.
+    pub fn render_again(&mut self, scene: &Scene, target: &wgpu::TextureView) -> wgpu::SubmissionIndex {
+        let plate_passes = self.drain_image_queue();
+        self.draw_scene(scene, plate_passes, target)
+    }
+
+    fn upload_scene(&mut self, scene: &Scene, theme: &Theme, size: (u32, u32)) {
         let gpu = self.gpu.clone();
         let (device, queue) = (&gpu.device, &gpu.queue);
 
@@ -532,15 +937,15 @@ impl Renderer {
         let glyph_size = size_of::<GlyphInst>() as u64;
         let image_size = size_of::<ImageInst>() as u64;
         let (total_rects, total_glyphs) = scene.counts();
-        let total_images: usize = scene.layers.iter().map(|l| l.images.len()).sum();
+        let total_images: usize = scene.layers.drawn().map(|l| l.images.len()).sum();
         self.rect_buf.ensure(device, total_rects as u64 * rect_size);
         self.glyph_buf.ensure(device, total_glyphs as u64 * glyph_size);
         self.image_buf.ensure(device, total_images as u64 * image_size);
 
         // Each layer's array is copied straight into its range of one GPU buffer, with no intermediate.
-        let mut ranges: [(Range<u32>, Range<u32>); LAYERS] = std::array::from_fn(|_| (0..0, 0..0));
+        self.ranges.clear();
         let (mut r, mut g, mut im) = (0u32, 0u32, 0u32);
-        for (i, layer) in scene.layers.iter().enumerate() {
+        for layer in scene.layers.drawn() {
             if !layer.rects.is_empty() {
                 queue.write_buffer(&self.rect_buf.buffer, r as u64 * rect_size, bytemuck::cast_slice(&layer.rects));
             }
@@ -551,12 +956,17 @@ impl Renderer {
                 queue.write_buffer(&self.image_buf.buffer, im as u64 * image_size, bytemuck::bytes_of(&draw.inst));
                 im += 1;
             }
-            ranges[i] = (r..r + layer.rects.len() as u32, g..g + layer.glyphs.len() as u32);
+            self.ranges.push((r..r + layer.rects.len() as u32, g..g + layer.glyphs.len() as u32));
             r += layer.rects.len() as u32;
             g += layer.glyphs.len() as u32;
         }
+    }
 
+    fn draw_scene(&mut self, scene: &Scene, plate_passes: Vec<PlatePass>, target: &wgpu::TextureView) -> wgpu::SubmissionIndex {
+        let gpu = self.gpu.clone();
+        let (device, queue) = (&gpu.device, &gpu.queue);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        self.run_plate_passes(&plate_passes, &mut encoder);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
@@ -564,7 +974,7 @@ impl Renderer {
                     view: target,
                     depth_slice: None,
                     resolve_target: None,
-                    // The Mica pass covers every pixel, so the previous contents never need loading.
+                    // The Mica pass or a surface as large as the window covers every pixel, so the previous contents never need loading.
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
@@ -573,12 +983,14 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_pipeline(&self.mica_pipeline);
-            pass.draw(0..3, 0..1);
+            if !scene.ground_covered {
+                pass.set_pipeline(&self.mica_pipeline);
+                pass.draw(0..3, 0..1);
+            }
 
             let mut image_base = 0u32;
-            for (i, layer) in scene.layers.iter().enumerate() {
-                let (rects, glyphs) = ranges[i].clone();
+            for (i, layer) in scene.layers.drawn().enumerate() {
+                let (rects, glyphs) = self.ranges[i].clone();
                 if !rects.is_empty() {
                     pass.set_pipeline(&self.rect_pipeline);
                     pass.set_vertex_buffer(0, self.rect_buf.buffer.slice(..));

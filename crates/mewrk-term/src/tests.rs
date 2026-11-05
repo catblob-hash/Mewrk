@@ -749,13 +749,15 @@ fn the_cursor_blinks_on_schedule_and_then_rests() {
     rig.focus(&mut term);
     let wake = rig.frame(&mut term).wake_in.expect("a focused cursor blinks");
     assert!(wake > 0.0 && wake <= BLINK);
-    let lit = rig.scene.counts().0;
+    // The cursor is the eared mark, and nothing else in a terminal is a coloured picture.
+    let marks = |rig: &Rig| rig.scene.layers.iter().flat_map(|layer| &layer.glyphs).filter(|glyph| glyph.flags & fluent::gpu::GLYPH_COLOR != 0).count();
+    assert_eq!(marks(&rig), 1);
     rig.time += BLINK;
     rig.frame(&mut term);
-    assert_eq!(rig.scene.counts().0, lit - 1, "half the time the block is gone");
+    assert_eq!(marks(&rig), 0, "half the time the block is gone");
     rig.time += BLINK_FOR;
     assert!(rig.frame(&mut term).wake_in.is_none(), "an unused cursor stops asking for frames");
-    assert_eq!(rig.scene.counts().0, lit, "and rests lit");
+    assert_eq!(marks(&rig), 1, "and rests lit");
 }
 
 #[test]
@@ -767,13 +769,36 @@ fn losing_focus_turns_the_block_into_an_outline() {
     wait("the job to start", || term.is_busy());
     thread::sleep(Duration::from_millis(100));
     rig.frame(&mut term);
-    let outline = *rig.scene.layers[0].rects.last().unwrap();
-    assert_eq!(outline.fill.a, 0);
-    assert!(outline.border.a > 0);
+    let picture = |rig: &Rig| rig.scene.layers[0].glyphs.iter().find(|glyph| glyph.flags & fluent::gpu::GLYPH_COLOR != 0).unwrap().uv;
+    let outline = picture(&rig);
     rig.focus(&mut term);
     rig.frame(&mut term);
-    let block = *rig.scene.layers[0].rects.last().unwrap();
-    assert_eq!(block.fill, Theme::dark().accent);
+    assert_ne!(picture(&rig), outline, "the filled mark is another picture from its outline");
+    assert_eq!(rig.scene.layers[0].rects.iter().filter(|rect| rect.fill == fluent::mark::BRAND_ORANGE).count(), 0, "and neither is a box");
+}
+
+#[test]
+fn the_block_cursor_stands_level_with_the_text_and_leaves_a_descender_showing() {
+    let (mut term, _) = spawn_sh();
+    let mut rig = Rig::new();
+    rig.frame(&mut term);
+    run_to(&mut term, "clear; printf 'Hg\\033[D'; sleep 60", "Hg");
+    wait("the job to start", || term.is_busy());
+    thread::sleep(Duration::from_millis(100));
+    rig.focus(&mut term);
+    rig.frame(&mut term);
+    let glyphs = &rig.scene.layers[0].glyphs;
+    let mark = glyphs.iter().position(|glyph| glyph.flags & fluent::gpu::GLYPH_COLOR != 0).expect("a block cursor");
+    let capital = glyphs.iter().find(|glyph| glyph.color == Theme::dark().text_primary).expect("the H");
+    assert_eq!(glyphs[mark].pos[1], capital.pos[1], "the ears reach the top of a capital");
+    assert_eq!(glyphs[mark].pos[1] + glyphs[mark].size[1] as f32, capital.pos[1] + capital.size[1] as f32, "and the mark stops at its foot");
+    // The g in its own colour under the mark, and again over it in the cursor's, cut off at the baseline.
+    let under = glyphs[..mark].iter().filter(|glyph| glyph.color == Theme::dark().text_primary).count();
+    assert_eq!(under, 2, "the H and the g");
+    let over = &glyphs[mark + 1..];
+    assert_eq!(over.len(), 1);
+    assert_eq!(over[0].color, Color::rgb(0x14110F));
+    assert!(over[0].clip[3] < over[0].pos[1] as i16 + over[0].size[1] as i16, "the descender is left to the g underneath");
 }
 
 #[test]
@@ -785,10 +810,11 @@ fn theme_changes_recolour_the_screen() {
     wait("the job to start", || term.is_busy());
     thread::sleep(Duration::from_millis(100));
     rig.frame(&mut term);
-    assert!(rig.scene.layers[0].glyphs.iter().all(|g| g.color == Theme::dark().text_primary));
+    let text_is = |rig: &Rig, color| rig.scene.layers[0].glyphs.iter().filter(|g| g.flags & fluent::gpu::GLYPH_COLOR == 0).all(|g| g.color == color);
+    assert!(text_is(&rig, Theme::dark().text_primary));
     rig.theme = Theme::light();
     rig.frame(&mut term);
-    assert!(rig.scene.layers[0].glyphs.iter().all(|g| g.color == Theme::light().text_primary));
+    assert!(text_is(&rig, Theme::light().text_primary));
 }
 
 fn peak_rss() -> usize {

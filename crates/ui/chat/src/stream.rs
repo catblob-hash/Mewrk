@@ -1491,8 +1491,8 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
             for entry in &session.ghost {
                 let ((x, y, height), fade) = entry.frame(now);
                 let cancel = cancel_drag.clone();
-                let foot = entry.clipped.then(|| div().absolute().left(0.0).right(0.0).bottom(0.0).h(30.0).gradient(t_.layer.fade(0.0), t_.layer).pass_through());
-                layers.push(col().w(session.piece_boxes[entry.piece].width).h(height.max(1.0)).clip().radius(10.0).opacity(fade.unwrap_or(0.84)).bg(t_.layer).shadow(10.0, 3.0, t_.shadow).inert().aria_hidden(true).child(piece_view(&copies, session, entry.piece)).child(foot).popover_at(stack_x + x, stack_y + y, move |app| cancel(app)));
+                let foot = entry.clipped.then(|| div().absolute().left(0.0).right(0.0).bottom(0.0).h(30.0).gradient(t_.flyout.fade(0.0), t_.flyout).pass_through());
+                layers.push(col().w(session.piece_boxes[entry.piece].width).h(height.max(1.0)).clip().radius(10.0).when(fade.is_some(), |e| e.opacity(fade.unwrap_or(1.0))).bg(t_.flyout).border(t_.flyout_stroke).inert().aria_hidden(true).child(piece_view(&copies, session, entry.piece)).child(foot).popover_at(stack_x + x, stack_y + y, move |app| cancel(app)));
             }
             if session.ghost_more > 0
                 && let Some(last_entry) = session.ghost.last()
@@ -1843,7 +1843,7 @@ fn finish_stream(props: &Rc<ConversationViewProps>, shared: &Shared, scroller: u
     root = root.child(scroll);
     if let Some(r) = marquee_box {
         // `.timeline-marquee`: fixed to the window, and never in the way of the pointer.
-        root = root.child(div().absolute().left(0.0).top(0.0).size(r.w, r.h).bg(t_.accent.fade(0.14)).border(t_.accent.fade(0.35)).radius(3.0).pass_through().popover_at(r.x, r.y, |_| {}));
+        root = root.child(div().absolute().left(0.0).top(0.0).size(r.w, r.h).border(t_.accent).radius(3.0).pass_through().popover_at(r.x, r.y, |_| {}));
     }
     root = root.children(ghost.unwrap_or_default());
     if !mutation_read_only && let Some(menu) = menu {

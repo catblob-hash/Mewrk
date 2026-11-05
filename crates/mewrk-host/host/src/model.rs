@@ -530,6 +530,12 @@ pub struct AppearancePreferences {
     /// dark glass follows `GlobalSettings::theme`.
     #[serde(default)]
     pub liquid_glass: bool,
+    /// How much of the background liquid glass lets through, in percent.
+    #[serde(default = "default_glass_transparency")]
+    pub glass_transparency: u32,
+    /// How far liquid glass blurs the background: the blur's standard deviation in the window's pixels.
+    #[serde(default = "default_glass_blur")]
+    pub glass_blur: u32,
     /// The window's background: `solid` (the theme's own ground, following the theme),
     /// `solid:day` / `solid:night` (one theme's ground, kept until the theme changes),
     /// `builtin:<name>` (a picture the renderer bundles), or an image id in `background_images`.
@@ -612,6 +618,8 @@ impl Default for AppearancePreferences {
             single_dollar_math: true,
             custom_css: String::new(),
             liquid_glass: false,
+            glass_transparency: default_glass_transparency(),
+            glass_blur: default_glass_blur(),
             background: default_background(),
             code_theme_day: default_code_theme_day(),
             code_theme_night: default_code_theme_night(),
@@ -4606,6 +4614,17 @@ fn default_true() -> bool {
 
 fn default_background() -> String {
     "solid".into()
+}
+
+pub const DEFAULT_GLASS_TRANSPARENCY: u32 = 20;
+pub const DEFAULT_GLASS_BLUR: u32 = 22;
+
+fn default_glass_transparency() -> u32 {
+    DEFAULT_GLASS_TRANSPARENCY
+}
+
+fn default_glass_blur() -> u32 {
+    DEFAULT_GLASS_BLUR
 }
 
 fn default_code_theme_day() -> String {

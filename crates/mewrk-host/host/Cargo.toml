@@ -1,6 +1,6 @@
 [package]
 name = "mewrk-host"
-version = "1.0.3"
+version = "1.0.0"
 description = "Mewrk — Mew. Work."
 authors = ["Mewrk contributors"]
 license = "GPL-3.0-or-later"

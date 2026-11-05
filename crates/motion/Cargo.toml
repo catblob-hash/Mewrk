@@ -1,0 +1,22 @@
+[package]
+name = "mewrk-motion"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "Backgrounds that move: reading videos and animated pictures, and the frame files they and their baked glass live in."
+
+[dependencies]
+fluent.workspace = true
+image.workspace = true
+libc.workspace = true
+memmap2.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+block2 = "0.6"
+
+[dev-dependencies]
+fastrand.workspace = true
+wgpu.workspace = true
+pollster.workspace = true

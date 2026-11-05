@@ -29,10 +29,16 @@ pub(crate) fn chip_type() -> TypeStyle {
     if crate::narrow_window() { TypeStyle { size: 9.5, ..FINE } } else { FINE }
 }
 
+/// What a chip stands on: they float over the timeline, so nothing shows through them.
+fn chip_ground(open: bool) -> Color {
+    let t_ = theme();
+    if open { t_.flyout.over(t_.subtle_hover) } else { t_.flyout }
+}
+
 /// `.composer-chip`: its look, told whether its menu is open.
 fn chip_box(open: bool, disabled: bool, path: bool) -> E {
     let t_ = theme();
-    let chip: E = row().max_w(chip_max_width(path)).min_w(0.0).h(25.0).items_center().gap(5.0).px(7.0).radius(7.0).border(t_.card_stroke).bg(if open { t_.subtle_hover } else { t_.layer });
+    let chip: E = row().max_w(chip_max_width(path)).min_w(0.0).h(25.0).items_center().gap(5.0).px(7.0).radius(7.0).border(t_.card_stroke).bg(chip_ground(open));
     if disabled { chip } else { chip.hover_bg(t_.subtle_hover) }
 }
 
@@ -322,7 +328,7 @@ fn attach_button(app: &mut App, ssh: Vec<SshMachineConfig>, running: bool, props
     let distros = app.local::<MachineMenu>().distros.clone().unwrap_or_default();
     let browse = props.on_browse_machine.clone();
     PopoverMenu::new(ATTACH_MENU, t("附加工作区", "Attach a workspace"), move |open| {
-        row().center().size(25.0, 25.0).radius(7.0).border(t_.card_stroke).bg(if open { t_.subtle_hover } else { t_.layer }).when(!running, |e| e.hover_bg(t_.subtle_hover)).child(icon("FolderPlus", 13.0).color(if running { t_.text_disabled } else { t_.text_secondary }))
+        row().center().size(25.0, 25.0).radius(7.0).border(t_.card_stroke).bg(chip_ground(open)).when(!running, |e| e.hover_bg(t_.subtle_hover)).child(icon("FolderPlus", 13.0).color(if running { t_.text_disabled } else { t_.text_secondary }))
     })
     .disabled(running)
     .menu_label(t("在哪台机器上选目录", "Which machine to pick a directory on"))
@@ -556,7 +562,7 @@ pub(crate) fn composer_context(app: &mut App, active: &Active, props: &ComposerP
                 }) as Rc<dyn Fn(&mut App, bool)>
             }),
         };
-        chips = chips.child(row().h(25.0).items_center().radius(7.0).border(t_.card_stroke).bg(t_.layer).child(git::branch_chips(app, git::BranchChipProps { key: active.id.clone(), conversation_id: conversation, member, target: state.target.clone(), branch_label, disabled, has_worktree: active.worktree.is_some(), worktree_checked, offers_worktree: active.workspace_kind == Some(WorkspaceKind::Directory), is_draft: active.is_draft, hooks })));
+        chips = chips.child(row().h(25.0).items_center().radius(7.0).border(t_.card_stroke).bg(chip_ground(false)).child(git::branch_chips(app, git::BranchChipProps { key: active.id.clone(), conversation_id: conversation, member, target: state.target.clone(), branch_label, disabled, has_worktree: active.worktree.is_some(), worktree_checked, offers_worktree: active.workspace_kind == Some(WorkspaceKind::Directory), is_draft: active.is_draft, hooks })));
     }
 
     for workspace in &active.attached_workspaces {
@@ -583,7 +589,7 @@ pub(crate) fn composer_context(app: &mut App, active: &Active, props: &ComposerP
     let mut wrapper: E = row().key("composer-context").absolute().left(0.0).right(0.0).bottom_pct(1.0).mb(8.0).px(crate::wrap_padding()).justify_center().pass_through().child(chips);
     if let Some(notice) = notice {
         say(&notice.message);
-        let mut line: E = row().key(("timeline-notice", notice.id.as_str())).role(Role::Status).absolute().bottom_pct(1.0).mb(8.0).h(26.0).px(10.0).items_center().gap(8.0).radius(7.0).border(t_.flyout_stroke).bg(t_.flyout).shadow(8.0, 3.0, t_.shadow).pass_through().child(text(notice.message.clone()).ty(CAPTION).color(t_.text_secondary).nowrap());
+        let mut line: E = row().key(("timeline-notice", notice.id.as_str())).role(Role::Status).absolute().bottom_pct(1.0).mb(8.0).h(26.0).px(10.0).items_center().gap(8.0).radius(7.0).border(t_.flyout_stroke).bg(t_.flyout).pass_through().child(text(notice.message.clone()).ty(CAPTION).color(t_.text_secondary).nowrap());
         if let Some((keys, action)) = &notice.hint {
             say(keys);
             say(action);

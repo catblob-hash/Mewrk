@@ -206,7 +206,7 @@ fn remove_button(key: impl Hash, label: String, on_remove: impl Fn(&mut App) + '
         .center()
         .size(22.0, 22.0)
         .radius(11.0)
-        .bg(Color::argb(0xCC202020))
+        .bg(Color::rgb(0x202020))
         .hover_bg(Color::BLACK)
         .tooltip(label)
         .on_click(on_remove)
@@ -442,8 +442,8 @@ fn image_viewer(strip: u64, image: &ImageAttachment, close: Handler<App>) -> E {
             .center()
             .size(34.0, 34.0)
             .radius(17.0)
-            .bg(Color::WHITE.fade(0.1))
-            .hover_bg(Color::WHITE.fade(0.34))
+            .bg(Color::rgb(0x363636))
+            .hover_bg(Color::rgb(0x626262))
             .tooltip(close_label)
             .on_click(move |app: &mut App| on_close(app))
             .child(icon("X", 19.0).color(Color::WHITE)),
@@ -453,7 +453,7 @@ fn image_viewer(strip: u64, image: &ImageAttachment, close: Handler<App>) -> E {
     div()
         .key(("image-viewer", strip))
         .p(if window_w <= 640.0 { 12.0 } else { 24.0 })
-        .bg(Color::argb(0xEB202020))
+        .bg(Color::rgb(0x202020))
         .on_click(move |app: &mut App| on_backdrop(app))
         .on_key_global(move |app: &mut App, press: &KeyPress| {
             if press.key == Key::Escape {

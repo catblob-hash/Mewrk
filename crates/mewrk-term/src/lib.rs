@@ -893,11 +893,9 @@ impl Terminal {
             ui.wake_after(BLINK - elapsed % BLINK);
         }
         let lit = !blinking || ((elapsed / BLINK) as u32).is_multiple_of(2);
-        let block = focused && lit && shape == CursorShape::Block;
 
         for (i, row) in v.rows.iter().enumerate() {
-            let skip = (block && i as i32 == line).then_some(col);
-            row.paint_text(ui, g.x, y_of(i), g.cw, skip);
+            row.paint_text(ui, g.x, y_of(i), g.cw);
         }
 
         let cursor_row = line.clamp(0, v.rows.len().saturating_sub(1) as i32) as usize;
@@ -907,12 +905,15 @@ impl Terminal {
             let cell = rect(x, y, if wide { g.cw * 2.0 } else { g.cw }, g.ch);
             let color = self.palette.slot(NamedColor::Cursor as usize, &v.colors);
             if !focused || shape == CursorShape::HollowBlock {
-                ui.card(cell, 0.0, Color::TRANSPARENT, color);
+                let band = text_band(ui, cell);
+                paint_cursor_mark(ui, band, color, true);
             } else if lit {
                 match shape {
                     CursorShape::Block => {
-                        ui.fill(cell, 0.0, color);
-                        v.rows[cursor_row].paint_at(ui, g.x, y, g.cw, col, self.palette.cursor_text);
+                        // Over the character's own colour, which still shows where it leaves the mark, as a descender does.
+                        let band = text_band(ui, cell);
+                        paint_cursor_mark(ui, band, color, false);
+                        ui.with_clip(band, |ui| v.rows[cursor_row].paint_at(ui, g.x, y, g.cw, col, self.palette.cursor_text));
                     }
                     CursorShape::Underline => ui.fill(rect(x, y + g.ch - 2.0, cell.w, 2.0), 0.0, color),
                     CursorShape::Beam => ui.fill(rect(x, y, 1.5, g.ch), 0.0, color),
@@ -955,6 +956,32 @@ impl Terminal {
         ui.fill(rect(x, y + g.ch - 2.0, w, 1.0), 0.0, color);
         ui.layer = saved;
     }
+}
+
+/// The part of a cell the text stands in: from the top of a capital down to the baseline, on whole pixels so that its edges meet the
+/// text's. The block cursor stands exactly there, level with the characters on either side of it.
+fn text_band(ui: &mut Ui<'_>, cell: Rect) -> Rect {
+    let run = ui.text.line("H", &FONT, Color::WHITE);
+    let baseline = run.baseline();
+    let above = run.ink().map_or(FONT.size * 0.72 * ui.scale, |ink| ink[1]).round();
+    let snap = |value: f32| (value * ui.scale).round() / ui.scale;
+    rect(snap(cell.x), snap(cell.y) + (baseline - above) / ui.scale, snap(cell.w), above / ui.scale)
+}
+
+/// The block cursor: the brand's mark cut to `band`, or its outline while the keyboard is elsewhere. It goes in with the glyphs, in
+/// their order: it covers the text drawn before it, and what is drawn after it lands on top.
+fn paint_cursor_mark(ui: &mut Ui<'_>, band: Rect, color: Color, hollow: bool) {
+    let Color { r, g, b, .. } = color;
+    let hex = format!("#{r:02x}{g:02x}{b:02x}");
+    // An outline's line is centred on the path, so the path comes in by half of it to keep the line inside the band.
+    let inset = if hollow { 0.5 } else { 0.0 };
+    let path = fluent::mark::cell_path(band.w - inset * 2.0, band.h - inset * 2.0);
+    let paint = if hollow { format!(r#"fill="none" stroke="{hex}" stroke-width="1""#) } else { format!(r#"fill="{hex}""#) };
+    // A picture is square and placed by its centre, so the mark starts at its corner and keeps the band's whole pixels.
+    let side = band.w.max(band.h);
+    let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {side} {side}"><path d="{path}" transform="translate({inset} {inset})" {paint}/></svg>"#);
+    let key = format!("term-cursor:{}x{}:{hex}:{hollow}", band.w, band.h);
+    ui.svg_icon(&key, &svg, band.x + side * 0.5, band.y + side * 0.5, side);
 }
 
 impl Drop for Terminal {

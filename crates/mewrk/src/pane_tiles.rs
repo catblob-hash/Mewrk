@@ -417,7 +417,7 @@ pub fn pane_tiles(p: PaneTilesProps) -> E {
     if solo.is_none() {
         crate::glass::surface(in_window(chat_rect), chat_corners);
     }
-    field_el = field_el.child(col().key("pane-tiles-chat").when(solo.is_some(), |chat_tile| chat_tile.invisible()).absolute().left(chat_rect.x).top(chat_rect.y).size(chat_rect.w, chat_rect.h).radii(chat_corners).bg(chat_ground()).when(crate::glass::layers().glass, |chat_tile| chat_tile.border(crate::glass::glass_edge()).shadow(10.0, 15.0, t_.shadow)).clip().child(chat));
+    field_el = field_el.child(col().key("pane-tiles-chat").when(solo.is_some(), |chat_tile| chat_tile.invisible()).absolute().left(chat_rect.x).top(chat_rect.y).size(chat_rect.w, chat_rect.h).radii(chat_corners).bg(chat_ground()).when(crate::glass::layers().glass, |chat_tile| chat_tile.border(crate::glass::glass_edge())).clip().child(chat));
 
     if any_visible && solo.is_none() {
         let first = layout.arranged[0].panes[0].clone();
@@ -445,9 +445,6 @@ pub fn pane_tiles(p: PaneTilesProps) -> E {
             crate::glass::surface(in_window(r), radii);
         }
         let mut tile: E = col().key(("pane-tile", pane.as_str())).absolute().left(r.x).top(r.y).size(r.w, r.h).radii(radii).bg(pane_ground()).border(if crate::glass::layers().glass { crate::glass::glass_edge() } else { t_.card_stroke }).clip().child(node);
-        if solo.is_none() {
-            tile = tile.shadow(8.0, 3.0, t_.shadow);
-        }
         if is_solo {
             solo_tile = Some(tile);
         } else if solo.is_none() {

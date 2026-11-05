@@ -32,7 +32,6 @@ fn noise(p: vec2f) -> f32 {
 // ------------------------------------------------------------------------------- shapes
 
 const KIND_RECT: f32 = 0.0;
-const KIND_SHADOW: f32 = 1.0;
 const KIND_ARC: f32 = 2.0;
 const KIND_LINE: f32 = 3.0;
 const KIND_ACRYLIC: f32 = 4.0;
@@ -46,7 +45,7 @@ struct RectIn {
     @location(4) fill2: vec4f,
     @location(5) border: vec4f,
     @location(6) border2: vec4f,
-    @location(7) params: vec4f, // border width or stroke width, blur sigma, kind, how far a shadow sits below its surface
+    @location(7) params: vec4f, // border width or stroke width, unused, kind, unused
 };
 
 struct RectOut {
@@ -64,12 +63,8 @@ struct RectOut {
 
 @vertex
 fn rect_vs(in: RectIn) -> RectOut {
-    let kind = in.params.z;
-    // Grow the quad so that antialiasing and shadow falloff have pixels to land on.
-    var grow = 1.0;
-    if kind == KIND_SHADOW {
-        grow = in.params.y * 3.0 + 1.0;
-    }
+    // Grow the quad so that antialiasing has pixels to land on.
+    let grow = 1.0;
     let half_size = in.rect.zw * 0.5;
     let center = in.rect.xy + half_size;
     let c = corner(in.vi) * 2.0 - 1.0;
@@ -143,17 +138,6 @@ fn rect_fs(in: RectOut) -> @location(0) vec4f {
     }
 
     let d = sd_round_rect(in.local, in.half_size, in.radii);
-
-    if kind == KIND_SHADOW {
-        // Close enough to a blurred box for soft elevation, and a fraction of the cost of the real thing.
-        let sigma = max(in.params.y, 0.5);
-        let x = clamp(d / (sigma * 2.2), -1.0, 1.0);
-        var alpha = 0.5 - x * (0.75 - 0.25 * x * x);
-        // Translucent surfaces must not show their own shadow through them.
-        let surface = sd_round_rect(in.local + vec2f(0.0, in.params.w), in.half_size, in.radii);
-        alpha *= clamp(surface + 0.5, 0.0, 1.0);
-        return premul(in.fill) * alpha;
-    }
 
     let v = clamp((in.local.y + in.half_size.y) / max(in.half_size.y * 2.0, 1.0), 0.0, 1.0);
     var fill = mix(in.fill, in.fill2, v);

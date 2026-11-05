@@ -43,7 +43,7 @@ open target/release/Mewrk.app
 - **拼写检查只在 macOS 上有。** 其他平台没有检查器，设置项没有效果。macOS 上用 `NSSpellChecker`：写完的词下面画波浪线，右键菜单最上面是建议、忽略和学习。
 - **玻璃的小地方。** 模糊是烘好的一张小图，和原版一样，放在侧栏和面板下面。没有做的：表面左上角的那层高光；输入框上方芯片底下的玻璃；设置页主题卡片里的磨砂预览。
 - **PDF 附件。** 用系统的 PDFKit 取文字，所以只有 macOS 能用，其他平台会拒收。
-- **版本更新。** 这个版本没有发布过，原版的更新源指向的是原版的安装包，所以这一页把检查关了（`UpdatesPage::release_channel`），等有自己的发布再打开。这一页也没有原版的 AI SDK 组件卡片：模型层在进程内，没有要安装的组件。
+- **版本更新。** 这个版本从 1.0.0 开始有发布，但还没有自己的更新清单：GitHub 连不上时，退回的 `dl.mewrk.dev/latest.json` 写的是原版的 1.0.3，比它高，还指向原版的安装包。所以这一页把检查关了（`UpdatesPage::release_channel`），等有自己的清单再打开。这一页也没有原版的 AI SDK 组件卡片：模型层在进程内，没有要安装的组件。
 - **公式。** 自写的 TeX 排版，不是 MathJax，字形也来自系统的数学字体。原版加载的 29 个宏包定义的 1564 个名字，`crates/ui/common/tests/suite/math_packages.rs` 逐条核对过都有含义，`\ce` 和 `\pu` 是 `mhchemParser` 的移植；`textmacros` 里的 `\href`、`\style`、`\class`、`\data`、`\cssId` 和原版一样标红。还差：`flalign`、`xalignat` 不撑满整列；`p{...}` 列和 `\parbox` 只占宽度，不会自动折行；`\hfill` 和 `\breakAlign` 不起作用；`\shortvdotswithin` 不收紧行距；`\Newextarrow` 的箭头不拉伸字形，只画一条线加箭头。
 
 **Vertex。** 外部账号的 `certificate` 凭据来源不支持，它需要双向 TLS。其余凭据类型都支持，但只对过假服务器。

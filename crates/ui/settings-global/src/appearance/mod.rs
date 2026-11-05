@@ -11,7 +11,7 @@ use mewrk_client::model::{AppLanguage, AppearancePreferences, ThemePreference};
 use mewrk_client::prelude::*;
 use mewrk_client::shortcuts::{bindings_conflict, shortcut_key_caps};
 
-pub use background::{background_library_dialog, background_picture, background_preview, import_background_bytes, thumbnails_in, BackgroundState};
+pub use background::{background_library_dialog, background_picture, background_preview, import_background_bytes, import_background_file, thumbnails_in, BackgroundState};
 pub use local_model::{local_model_settings, local_model_status, LocalModelPage};
 
 use crate::effects::{hex, palette_of, resolved_scheme, Picture};
@@ -81,9 +81,9 @@ fn part(left: f32, top: f32, width: f32, height: f32, color: Color) -> E {
 
 /// A miniature of the window, in one scheme's colours: sidebar, top bar, the conversation tile with its composer, and a side pane. `picture`
 /// lies behind it where its ground shows, in place of the scheme's solid one; with `glass`, the sidebar and tiles let it through.
-fn theme_sample(tokens: FluentTheme, picture: Option<Picture>, glass: bool) -> E {
+fn theme_sample(tokens: FluentTheme, picture: Option<Picture>, glass: Option<u32>) -> E {
     let t = tokens;
-    let thin = |c: Color, alpha: f32| if glass { c.with_alpha(alpha) } else { c };
+    let thin = |c: Color, alpha: f32| glass.map_or(c, |transparency| c.with_alpha(glass_tint_alpha(alpha, transparency)));
     let (tile_alpha, pane_alpha) = if t.dark { (0.84, 0.86) } else { (0.78, 0.8) };
     let bar = |left: f32, top: f32, width: f32, color: Color| part(left, top, width, 0.04, color).radius(1.5);
     let sidebar = part(0.0, 0.0, 0.24, 1.0, thin(t.layer, tile_alpha))
@@ -109,7 +109,7 @@ fn theme_sample(tokens: FluentTheme, picture: Option<Picture>, glass: bool) -> E
         .child(composer);
     let task = |top: f32| part(0.1, top, 0.8, 0.11, t.subtle_hover).radius(2.0);
     let pane = div().flex_grow(1.0).basis(0.0).min_w(0.0).radius(3.0).bg(thin(t.layer, pane_alpha)).border(t.card_stroke).child(bar(0.1, 0.08, 0.42, t.text_secondary.with_alpha(0.8))).child(task(0.21).child(div().absolute().left(0.0).top(0.0).h_full().w(2.0).bg(t.accent))).child(task(0.36)).child(task(0.51));
-    let tiles = row().absolute().left_pct(0.24).bottom_pct(0.0).w_pct(76.0).h_pct(88.0).p(2.0).gap(3.0).when(picture.is_none() && !glass, |e| e.bg(t.card_secondary)).child(chat).child(pane);
+    let tiles = row().absolute().left_pct(0.24).bottom_pct(0.0).w_pct(76.0).h_pct(88.0).p(2.0).gap(3.0).when(picture.is_none() && glass.is_none(), |e| e.bg(t.card_secondary)).child(chat).child(pane);
     div()
         .w_full()
         .h_full()
@@ -122,7 +122,7 @@ fn theme_sample(tokens: FluentTheme, picture: Option<Picture>, glass: bool) -> E
         .child(tiles)
 }
 
-fn theme_card(app: &mut App, value: ThemePreference, label: &str, picture: Option<Picture>, glass: bool, selected: bool, stacked: bool) -> E {
+fn theme_card(app: &mut App, value: ThemePreference, label: &str, picture: Option<Picture>, glass: Option<u32>, selected: bool, stacked: bool) -> E {
     let t_ = theme();
     let accent = normalize_hex_color(&app.doc.global_settings.appearance.theme_color).filter(|c| !c.is_empty());
     let tokens = |dark: bool| {
@@ -338,6 +338,50 @@ fn shortcut_select(key: &'static str, label: &str, value: &[String], choices: Ve
 }
 
 /// A horizontal slider. A range input commits on release, as persisting every pixel of a drag would be wasteful.
+/// How wide a glass slider's track is. Its number stands beside it, so that the row reads the same at every value.
+const GLASS_SLIDER_WIDTH: f32 = 180.0;
+
+/// A slider over whole numbers from zero. It applies as it moves: what it changes is the window around the dialog.
+fn glass_slider(key: &'static str, label: &'static str, value: u32, max: u32, unit: &'static str, disabled: Option<&'static str>, write: fn(&mut AppearancePreferences, u32)) -> E {
+    let t_ = theme();
+    let value = value.min(max);
+    let fraction = value as f32 / max as f32;
+    let from_x = move |e: &PointerEvent| (((e.x - e.rect.x) / e.rect.w.max(1.0)).clamp(0.0, 1.0) * max as f32).round() as u32;
+    let track = row()
+        .key(key)
+        .h(22.0)
+        .w(GLASS_SLIDER_WIDTH)
+        .items_center()
+        .cursor(CursorKind::Hand)
+        .aria_label(label)
+        .aria_value(f64::from(value), 0.0, f64::from(max))
+        .child(div().h(4.0).flex1().radius(2.0).bg(t_.subtle_pressed).child(div().h_full().w_pct(fraction * 100.0).radius(2.0).bg(t_.accent)))
+        .child(div().absolute().left(0.0).right(0.0).h(22.0).top(0.0).pass_through().child(div().absolute().left_pct(fraction).size(14.0, 14.0).top(4.0).ml(-7.0).radius(7.0).bg(t_.accent)));
+    let number = text(format!("{value}{unit}")).ty(MONO_SMALL).color(t_.text_secondary).w(48.0).text_center().nowrap();
+    let slider = row().gap(10.0).items_center();
+    if disabled.is_some() {
+        return slider.child(track).child(number).opacity(0.5).disabled(true).maybe_disabled_reason(disabled);
+    }
+    let track = track
+        .on_pointer(move |app: &mut App, e: PointerEvent| {
+            let next = from_x(&e);
+            if next != value {
+                set(app, move |a| write(a, next));
+            }
+        })
+        .on_key(move |app: &mut App, k: &KeyPress| {
+            let delta: i64 = match k.key {
+                Key::Left | Key::Down => -1,
+                Key::Right | Key::Up => 1,
+                _ => return false,
+            };
+            let next = (i64::from(value) + delta).clamp(0, i64::from(max)) as u32;
+            set(app, move |a| write(a, next));
+            true
+        });
+    slider.child(track).child(number)
+}
+
 fn font_size_slider(value: u32, committed: u32) -> E {
     let t_ = theme();
     let span = (MAX_MESSAGE_FONT_SIZE - MIN_MESSAGE_FONT_SIZE) as f32;
@@ -385,7 +429,8 @@ pub fn appearance_settings(app: &mut App) -> E {
     let language = app.doc.global_settings.app_language;
     // The theme cards draw the window as it would look: a solid ground is each theme's own.
     let picture = if matches!(parse_background(&appearance.background), Background::Solid(_)) { None } else { background_picture(app, &appearance.background) };
-    let glass = appearance.liquid_glass;
+    let glass = appearance.liquid_glass.then_some(appearance.glass_transparency);
+    let has_picture = !matches!(parse_background(&appearance.background), Background::Solid(_));
     let p = page_state(app);
     let library_open = p.library_open;
     let (ui_custom, mono_custom, font_draft) = (p.ui_custom, p.mono_custom, p.font_size_draft);
@@ -408,6 +453,8 @@ pub fn appearance_settings(app: &mut App) -> E {
         .aria_label(t("主题", "Theme"))
         .child(first_row(setting_row(t("主题", "Theme"), None, themes, true)))
         .child(setting_row(t("液态玻璃", "Liquid glass"), Some(help(t("侧栏和面板变成半透明玻璃。", "Translucent glass sidebar and panes."))), toggle("glass", t("液态玻璃", "Liquid glass"), appearance.liquid_glass, |a, v| a.liquid_glass = v), false))
+        .child(appearance.liquid_glass.then(|| setting_row(t("透明度", "Transparency"), None, glass_slider("glass-transparency", t("透明度", "Transparency"), appearance.glass_transparency, MAX_GLASS_TRANSPARENCY, "%", None, |a, v| a.glass_transparency = v), false)))
+        .child(appearance.liquid_glass.then(|| setting_row(t("模糊度", "Blur"), None, glass_slider("glass-blur", t("模糊度", "Blur"), appearance.glass_blur, MAX_GLASS_BLUR, " px", (!has_picture).then(|| t("纯色背景没有可模糊的图片", "A solid background has no picture to blur")), |a, v| a.glass_blur = v), false)))
         .child(setting_row(t("自定义背景", "Custom background"), Some(help(t("纯色随主题切换，图片不变。", "A solid color follows the theme; a picture stays."))), background_row, false))
         .child(setting_row(t("主色", "Accent color"), None, accent, true));
 

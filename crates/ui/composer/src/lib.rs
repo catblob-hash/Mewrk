@@ -563,15 +563,11 @@ pub fn composer(app: &mut App, props: ComposerProps) -> E {
     } else {
         t_.card_stroke
     };
-    let composer_box: E = col().key(composer_box_key()).w_full().max_w(820.0).mx_auto().px(12.0).py(8.0).radius(14.0).bg(t_.card).border(edge).shadow(9.0, 4.0, t_.shadow).children(box_children);
+    let composer_box: E = col().key(composer_box_key()).w_full().max_w(820.0).mx_auto().px(12.0).py(8.0).radius(14.0).bg(t_.card).border(edge).children(box_children);
 
     let footer = footer::composer_footer(app, &active, chosen.as_ref());
 
-    // The floating context row scrolls timeline cards behind it, so a scrim rising from the composer fades them out under the chips;
-    // the pointer stays with the timeline underneath.
-    let scrim: E = div().key("composer-scrim").absolute().left(0.0).right(0.0).top(-46.0).h(46.0).gradient(t_.layer.fade(0.0), t_.layer).pass_through();
-
-    let mut wrap: E = col().key("composer-wrap").w_full().shrink0().px(wrap_padding()).pb(12.0).bg(t_.layer).child(scrim).child(approval).child(question).child(queued).child(context_row);
+    let mut wrap: E = col().key("composer-wrap").w_full().shrink0().px(wrap_padding()).pb(12.0).child(approval).child(question).child(queued).child(context_row);
     for element in above {
         wrap = wrap.child(element);
     }

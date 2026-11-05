@@ -5,11 +5,11 @@
 //! The AI SDK card is about a Node sidecar fetched from a download mirror at startup. The model layer here is compiled into the app, so there
 //! is no component with a version or a download of its own: the version card already says all there is to say.
 //!
-//! The update check asks GitHub for the latest release of `catblob-hash/Mewrk`, and the mirror's `latest.json` when GitHub can't answer. This
-//! repository has no releases yet, and the mirror's manifest still names the last Tauri release, now in `catblob-hash/Mewrk-previous`. That is
-//! not an update of this build: its 0.x would compare below it, and the page would say "new version" for ever and send people to a different
-//! application's .dmg. Until it has releases and a manifest of its own, `UpdatesPage::release_channel` stays off and the page asks nothing of
-//! GitHub. The pipeline stays, tested, for the day it does.
+//! The update check asks GitHub for the latest release of `catblob-hash/Mewrk`, and the mirror's `latest.json` when GitHub can't answer. The
+//! mirror's manifest still names the last Tauri release, 1.0.3, now in `catblob-hash/Mewrk-previous`. That is not an update of this build: 1.0.0
+//! would compare below it, and whenever GitHub couldn't answer the page would say "new version" and send people to a different application's
+//! .dmg. Until it has a manifest of its own, `UpdatesPage::release_channel` stays off and the page asks nothing of GitHub. The pipeline stays,
+//! tested, for the day it does.
 
 use mewrk_client::prelude::*;
 use serde::Deserialize;
@@ -17,9 +17,6 @@ use serde::Deserialize;
 use crate::logic::app_update::{AppUpdateCheck, AppUpdateController, AppUpdateDownload, AppUpdateDownloadEvent, AppUpdateState};
 use crate::logic::usage::{format_iso_date, format_iso_datetime, now_ms};
 use crate::widgets::*;
-
-/// `MewrkMark`'s outline.
-const MARK_PATH: &str = "M0 190V12Q0 0 8.5 8.5L45.8 45.8Q50 50 56 50H64Q70 50 74.2 45.8L111.5 8.5Q120 0 120 12V190A10 10 0 0 1 110 200H10A10 10 0 0 1 0 190Z";
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -204,15 +201,7 @@ fn version_card(info: Option<&AppVersionInfo>, info_error: Option<&str>, release
         // A Store install comes from the Store, and this build has no releases of its own: neither points at other downloads.
         col().gap(2.0).items_end().shrink0().child(link("update-source", t("源代码", "Source"), i.repository_url.clone())).child((release_channel && checks_for_updates(Some(i))).then(|| link("update-releases", t("全部发布", "All releases"), i.releases_url.clone())))
     });
-    card(None).child(row().gap(12.0).items_start().child(mark_plate(44.0)).child(copy).child(links))
-}
-
-/// `MewrkIcon`: the application's mark on its plate, as the Dock shows it.
-fn mark_plate(size: f32) -> E {
-    let height = size * 0.38;
-    let svg = format!(r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="-44 -4 208 208"><path d="{MARK_PATH}" fill="#C98A1B"/></svg>"##);
-    let side = height * 208.0 / 200.0;
-    row().size(size, size).center().shrink0().radius(size * 0.23).bg(Color::rgb(0x1E1E1C)).border(Color::WHITE.with_alpha(0.07)).child(custom::<App>(move |_, ui, r| ui.svg_icon("update-mewrk-mark", &svg, r.x + r.w * 0.5, r.y + r.h * 0.5, side)).size(height * 0.6, height).shrink0().pass_through())
+    card(None).child(row().gap(12.0).items_start().child(mewrk_ui_common::brand::mewrk_icon(44.0)).child(copy).child(links))
 }
 
 /// `update-settings__status-icon`: the glyph on a plate of its tone.
