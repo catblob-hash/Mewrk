@@ -44,6 +44,30 @@ fn shape_of(items: &[Item<'_>], breaks: &HashSet<usize>, views: &dyn Fn(&str) ->
         .collect()
 }
 
+// ---------------------------------------------------------------- Resolved
+
+#[test]
+fn draws_a_background_task_overlay_over_its_card_in_place_where_a_run_projection_is_appended() {
+    use mewrk_client::runs::{SubagentLiveState, SubagentLiveStatus};
+    use mewrk_ui_chat::frame::Resolved;
+    let persisted = vec![user("u", "dispatch a scout"), tool("spawn", "agent_spawn", json!({ "task": "map the repo" }), "started"), assistant("a", "turn over")];
+    let mut card = streaming(persisted[1].clone(), Some(StreamingToolPhase::Completed));
+    card.live = Some(std::sync::Arc::new(SubagentLiveState { status: Some(SubagentLiveStatus::Running), ..SubagentLiveState::default() }));
+    let live = vec![card];
+    let ids = |resolved: &Resolved<'_>| (0..resolved.count()).map(|index| resolved.get(index).id().to_owned()).collect::<Vec<_>>();
+
+    let in_place = Resolved { persisted: &persisted, live: &live, map: Rc::new(Resolved::map_in_place(&persisted, &live)) };
+    assert_eq!(ids(&in_place), ["u", "spawn", "a"]);
+    let spawn = in_place.get(1);
+    assert!(spawn.streaming);
+    assert_eq!(spawn.live.and_then(|live| live.status), Some(SubagentLiveStatus::Running));
+    assert!(in_place.get(0).live.is_none() && !in_place.get(2).streaming);
+
+    // A run's projection is the run's own tail, so it follows what is persisted.
+    let appended = Resolved { persisted: &persisted, live: &live, map: Rc::new(Resolved::map_of(&persisted, &live)) };
+    assert_eq!(ids(&appended), ["u", "a", "spawn"]);
+}
+
 // ---------------------------------------------------------------- buildContextRenderNodes
 
 #[test]

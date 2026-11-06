@@ -124,6 +124,22 @@ pub enum AppPushEvent {
     /// tasks never trigger a wake.
     #[serde(rename_all = "camelCase")]
     TaskSettled { conversation_id: String },
+    /// A background task's stream event (a child agent's `SubagentEvent` /
+    /// `SubagentDelta`, a workflow's `WorkflowProgress`) for a conversation
+    /// with no unsettled run to carry it.
+    ///
+    /// Tasks outlive the turn that spawned them, and while their conversation
+    /// sits idle this is the only way their spawn card can keep moving. The
+    /// renderer overlays it on the persisted card for display only; the card
+    /// itself is still completed by the wake run's fold and records.
+    ///
+    /// Live only: never kept in the backlog. A token stream would evict the
+    /// edge events the backlog exists for, and a late replay of it is worthless.
+    #[serde(rename_all = "camelCase")]
+    TaskStreamEvent {
+        conversation_id: String,
+        event: crate::model::ModelStreamEvent,
+    },
     /// The macOS application menu's Settings… was chosen: the renderer opens
     /// settings as its own shortcut would.
     OpenSettings,
@@ -257,6 +273,9 @@ impl AppPushEvent {
                 Some(&task.conversation_id)
             }
             AppPushEvent::TaskSettled { conversation_id }
+            | AppPushEvent::TaskStreamEvent {
+                conversation_id, ..
+            }
             | AppPushEvent::ShellTaskEvicted {
                 conversation_id, ..
             }
@@ -347,6 +366,16 @@ impl AppEventHub {
     /// One event coalesces instead of queueing twice: see the body.
     pub fn publish(&self, event: AppPushEvent) {
         let mut inner = self.lock();
+        if matches!(event, AppPushEvent::TaskStreamEvent { .. }) {
+            // Live only (see the variant): nothing keeps it for a later
+            // subscriber, so it is not cloned for one either.
+            if let Some(channel) = &inner.subscriber {
+                if channel.send(event).is_err() {
+                    inner.subscriber = None;
+                }
+            }
+            return;
+        }
         if let Some(channel) = &inner.subscriber {
             if channel.send(event.clone()).is_ok() {
                 return;
@@ -463,6 +492,61 @@ mod tests {
 
     fn dead_channel() -> Channel<AppPushEvent> {
         Channel::new(|_| Err(tauri::Error::Io(std::io::Error::other("channel closed"))))
+    }
+
+    fn task_stream_event(conversation_id: &str, delta: &str) -> AppPushEvent {
+        AppPushEvent::TaskStreamEvent {
+            conversation_id: conversation_id.into(),
+            event: crate::model::ModelStreamEvent::SubagentDelta {
+                round: 1,
+                call_id: "call_spawn".into(),
+                channel: crate::model::SubagentChannel::Text,
+                delta: delta.into(),
+            },
+        }
+    }
+
+    /// A child that outlives its turn streams through here; the renderer reads
+    /// the run-channel shape of the event under `event`.
+    #[test]
+    fn a_task_stream_event_reaches_a_live_subscriber_in_the_run_channel_shape() {
+        let hub = AppEventHub::default();
+        let (channel, received) = collecting_channel();
+        hub.subscribe(channel);
+
+        hub.publish(task_stream_event("conv", "partial"));
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["type"], "taskStreamEvent");
+        assert_eq!(received[0]["conversationId"], "conv");
+        assert_eq!(received[0]["event"]["type"], "subagent_delta");
+        assert_eq!(received[0]["event"]["callId"], "call_spawn");
+        assert_eq!(received[0]["event"]["delta"], "partial");
+    }
+
+    /// Without a subscriber a child's token stream is dropped, not queued: a
+    /// queue of deltas would evict the wakes and approval cards the backlog is
+    /// for, and arrive too late to mean anything.
+    #[test]
+    fn task_stream_events_never_enter_the_backlog() {
+        let hub = AppEventHub::default();
+        hub.publish(AppPushEvent::TaskSettled {
+            conversation_id: "conv".into(),
+        });
+        for index in 0..(BACKLOG_LIMIT * 2) {
+            hub.publish(task_stream_event("conv", &index.to_string()));
+        }
+        // A subscriber that went away mid-stream does not start a backlog either.
+        hub.subscribe(dead_channel());
+        hub.publish(task_stream_event("conv", "after a dead channel"));
+
+        let (channel, received) = collecting_channel();
+        hub.subscribe(channel);
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1, "{received:?}");
+        assert_eq!(received[0]["type"], "taskSettled");
     }
 
     #[test]

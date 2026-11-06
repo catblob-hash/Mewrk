@@ -672,7 +672,7 @@ fn keep_native_surface(app: &mut App, conversation: Option<&str>) {
 // ---------------------------------------------------------------- subagents
 
 struct SubagentMemo {
-    key: (String, usize, String, u64),
+    key: (String, usize, String, u64, u64),
     contexts: StdRc<Vec<Ctx>>,
     revision: u64,
     views: Vec<Rc<SubagentView>>,
@@ -684,12 +684,14 @@ struct SubagentCache(Option<SubagentMemo>);
 /// The rendered timeline and what `deriveSubagentViews` makes of it, for the conversation on screen. The derivation walks
 /// whole transcripts, so it runs when the contexts change rather than on every frame.
 pub fn active_subagents(app: &mut App, conversation_id: &str) -> (StdRc<Vec<Ctx>>, u64, Vec<Rc<SubagentView>>) {
-    let run_revision = app.run_view(conversation_id).map_or(0, |run| run.revision);
+    let run_revision = app.run_view(conversation_id).map(|run| run.revision);
+    // With no run, what the conversation's background tasks streamed since the last one.
+    let overlay_revision = if run_revision.is_none() { app.task_overlay(conversation_id).map_or(0, |overlay| overlay.revision) } else { 0 };
     let (len, stamp) = match app.conversation(conversation_id) {
         Some(conversation) => (conversation.contexts.len(), conversation.updated_at.clone()),
         None => (0, String::new()),
     };
-    let key = (conversation_id.to_owned(), len, stamp, run_revision);
+    let key = (conversation_id.to_owned(), len, stamp, run_revision.unwrap_or(0), overlay_revision);
     if let Some(memo) = &app.local::<SubagentCache>().0
         && memo.key == key
     {

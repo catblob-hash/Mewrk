@@ -57,6 +57,8 @@ fn progress_entries(entries: &[mewrk_client::runs::WorkflowProgressEntry]) -> Ve
 pub fn streamed_conversation_view(app: &mut App, mut props: ConversationViewProps) -> E {
     let Some(id) = props.conversation_id.clone() else { return conversation_view(app, props) };
     let run: Option<Arc<RunView>> = app.run_view(&id);
+    // A workflow that outlived the last run reports through the conversation's task overlay until the next one starts.
+    let overlay = if run.is_none() { app.task_overlay(&id) } else { None };
     props.timeline_id = Some(id.clone());
     props.streaming = run.is_some();
     props.thinking = run.as_ref().and_then(|run| run.thinking.clone());
@@ -74,11 +76,12 @@ pub fn streamed_conversation_view(app: &mut App, mut props: ConversationViewProp
 
     // Folded progress views for every workflow call streaming here, keyed on the run's progress entries, not on the run: the
     // run is new on every flush, and its entries only when a workflow reports.
-    let progress_at = run.as_ref().map_or(0, |run| Arc::as_ptr(&run.workflow_progress_by_call) as usize);
+    let progress_by_call = run.as_ref().map(|run| &run.workflow_progress_by_call).or(overlay.as_ref().map(|overlay| &overlay.workflow_progress_by_call));
+    let progress_at = progress_by_call.map_or(0, |progress| Arc::as_ptr(progress) as usize);
     if cached.progress_at != progress_at {
         cached.progress_at = progress_at;
         let messages = workflow_progress_messages();
-        cached.progress = Rc::new(run.iter().flat_map(|run| run.workflow_progress_by_call.iter()).map(|(call, entries)| (call.clone(), Rc::new(derive_workflow_progress(&progress_entries(entries), &messages)))).collect());
+        cached.progress = Rc::new(progress_by_call.into_iter().flat_map(|progress| progress.iter()).map(|(call, entries)| (call.clone(), Rc::new(derive_workflow_progress(&progress_entries(entries), &messages)))).collect());
     }
 
     // A running workflow's card shows its own and its steps' elapsed time, and nothing else re-derives it while a step sits in one long call.

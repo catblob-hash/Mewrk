@@ -140,7 +140,9 @@ def main():
     out += ["", "## License texts"]
     for text, identities in sorted(by_text.items(), key=lambda item: item[1][0]):
         out += ["", f"### {', '.join(identities)}", "", "````text", text, "````"]
-    (ROOT / "THIRD-PARTY-LICENSES.md").write_text("\n".join(out) + "\n", encoding="utf-8", newline="\n")
+    # Through open(), since write_text() only takes newline from Python 3.10 and macOS ships 3.9.
+    with open(ROOT / "THIRD-PARTY-LICENSES.md", "w", encoding="utf-8", newline="\n") as file:
+        file.write("\n".join(out) + "\n")
     print(f"THIRD-PARTY-LICENSES.md: {len(packages)} crates, {len(by_text)} texts, {len(without_text)} crates with no license file")
 
 

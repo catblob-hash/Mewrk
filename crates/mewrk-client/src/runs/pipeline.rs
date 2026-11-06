@@ -247,6 +247,8 @@ pub(super) fn answer_question_blocking(cx: &Cx, conversation_id: &str, prompt_id
 
 /// `registerRunState`: registers a run in the controller using the shared shape for started and adopted runs.
 fn register_run_state(app: &mut App, workspace_id: &str, conversation_id: &str, request_id: &str, request: Arc<ModelRunRequest>, started_at: String) {
+    // From here the run's own stream carries the conversation's tasks.
+    app.forget_task_overlay(conversation_id);
     runs(app).controller.insert(conversation_id, ModelRunState::new(workspace_id, request_id, request, started_at));
 }
 

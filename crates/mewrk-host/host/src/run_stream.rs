@@ -253,12 +253,23 @@ impl RunStreamHub {
     /// be appended after `RunConcluded`, because replay would place them after the
     /// conclusion marker. Returns whether an event was published.
     pub fn publish_live(&self, conversation_id: &str, event: ModelStreamEvent) -> bool {
+        self.try_publish_live(conversation_id, event).is_none()
+    }
+
+    /// [`Self::publish_live`] that hands the event back when there is no
+    /// unsettled run to carry it, so the caller can route it elsewhere without
+    /// cloning every event up front.
+    pub fn try_publish_live(
+        &self,
+        conversation_id: &str,
+        event: ModelStreamEvent,
+    ) -> Option<ModelStreamEvent> {
         let mut streams = self.lock();
         let Some(stream) = streams.get_mut(conversation_id) else {
-            return false;
+            return Some(event);
         };
         if stream.settlement.is_some() {
-            return false;
+            return Some(event);
         }
         if buffer_worthy(&event) {
             stream.buffer.push(event.clone());
@@ -268,7 +279,7 @@ impl RunStreamHub {
                 stream.subscriber = None;
             }
         }
-        true
+        None
     }
 
     /// Record a settlement and publish [`ModelStreamEvent::RunConcluded`]. The
@@ -493,6 +504,30 @@ mod tests {
             AttachOutcome::Running { .. }
         ));
         assert!(replay.try_recv().is_err());
+    }
+
+    /// What a task surface relies on to tell "the run carried it" from "route it
+    /// elsewhere": the event comes back, untouched, exactly when no unsettled
+    /// run exists — none ever begun, or one that already settled.
+    #[test]
+    fn try_publish_live_returns_the_event_only_without_an_unsettled_run() {
+        let hub = RunStreamHub::default();
+        let event = text(1, "child");
+        assert_eq!(hub.try_publish_live("c1", event.clone()), Some(event.clone()));
+
+        let (subscriber, receiver) = channel_subscriber();
+        hub.begin("c1", "r1", sample_request(), subscriber);
+        assert_eq!(hub.try_publish_live("c1", event.clone()), None);
+        assert_eq!(receiver.try_recv().unwrap(), event);
+
+        hub.settle(
+            "c1",
+            "r1",
+            RunSettlement::Completed(Box::new(sample_response())),
+        );
+        let _marker = receiver.try_recv().unwrap();
+        assert_eq!(hub.try_publish_live("c1", event.clone()), Some(event));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

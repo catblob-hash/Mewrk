@@ -43,6 +43,14 @@ pub(super) fn handle_push_event(app: &mut App, event: &Value) {
             }
         }
         Some("toolApprovalResolved") => close_tool_prompt(app, &conversation_id, &text(event, "promptId")),
+        // A background task that outlived its run, streaming with no run stream to carry it. The overlay commits and
+        // repaints on its own cadence, and a token is no reason to reconcile.
+        Some("taskStreamEvent") => {
+            if let Some(stream_event) = event.get("event").cloned().and_then(|value| serde_json::from_value::<crate::model::ModelStreamEvent>(value).ok()) {
+                super::task_overlay::receive_task_stream_event(app, &conversation_id, stream_event);
+            }
+            return;
+        }
         Some("conversationTitleChanged") => {
             // The host wrote it (placeholder, then the local helper model's title);
             // mirrored without writing back.

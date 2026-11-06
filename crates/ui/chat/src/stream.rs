@@ -12,7 +12,7 @@ use std::time::Instant;
 use mewrk_client::model::{ContextItem, ToolCategory, ToolDescriptor};
 use mewrk_client::prelude::*;
 use mewrk_client::runs::timeline_history::{timeline_clipboard_key, timeline_clipboard_shortcut, timeline_history_key, TimelineClipboardAction, TimelineKeyPress, IS_APPLE_PLATFORM};
-use mewrk_client::runs::{ConversationTurnStatus, LiveContext, RunView, TimelineHistoryAction};
+use mewrk_client::runs::{ConversationTurnStatus, LiveContext, RunView, TaskOverlayView, TimelineHistoryAction};
 use mewrk_client::task_tools::is_preview_tool_name;
 use mewrk_ui_common::context_menu::{context_menu, ContextMenuAnchor, ContextMenuItem, ContextMenuProps, ContextMenuSection};
 use mewrk_ui_common::markdown::{clear_text_selection, estimate_markdown_height, has_text_selection};
@@ -917,6 +917,26 @@ fn dock_view(f: &Frame<'_>, session: &DragSession, key: u64, top: f32) -> E {
     dock
 }
 
+/// What is drawn over a conversation's persisted contexts: its run's projection, else what its background tasks streamed
+/// since that run settled (drawn in place, [`Resolved::map_in_place`]); the props' own contexts on a timeline that is not a
+/// conversation's.
+fn live_contexts<'a>(conversation: Option<&str>, run: Option<&'a RunView>, overlay: Option<&'a TaskOverlayView>, props: &'a ConversationViewProps) -> &'a [LiveContext] {
+    match (conversation, run, overlay) {
+        (None, _, _) => props.contexts.as_slice(),
+        (Some(_), Some(run), _) => run.contexts.as_slice(),
+        (Some(_), None, Some(overlay)) => overlay.contexts.as_slice(),
+        (Some(_), None, None) => &[],
+    }
+}
+
+/// The overlay of a conversation with no run: a run's own stream carries its tasks.
+fn task_overlay_of(app: &mut App, conversation: Option<&str>, run: Option<&RunView>) -> Option<Arc<TaskOverlayView>> {
+    if run.is_some() {
+        return None;
+    }
+    conversation.and_then(|id| app.task_overlay(id))
+}
+
 /// The timeline itself.
 pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
     let t_ = theme();
@@ -936,6 +956,7 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
     // ---- what to read the contexts from, once for the model and once for the rows, with `&mut app` free in between.
     let conversation = props.conversation_id.clone();
     let run: Option<Arc<RunView>> = conversation.as_deref().and_then(|id| app.run_view(id));
+    let overlay: Option<Arc<TaskOverlayView>> = task_overlay_of(app, conversation.as_deref(), run.as_deref());
     let draft: Option<Vec<ContextItem>> = conversation.as_deref().filter(|id| mewrk_client::drafts::is_draft_conversation_id(id)).map(|id| app.timeline_contexts_of(id));
 
     let frame_view = rect_of(scroller);
@@ -972,17 +993,17 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
             (None, Some(id)) => app.conversation(id).map_or(&[][..], |conversation| conversation.contexts.as_slice()),
             _ => &[],
         };
-        let live: &[LiveContext] = if conversation.is_some() { run.as_ref().map_or(&[][..], |run| run.contexts.as_slice()) } else { props.contexts.as_slice() };
+        let live: &[LiveContext] = live_contexts(conversation.as_deref(), run.as_deref(), overlay.as_deref(), &props);
         let updated = conversation.as_deref().and_then(|id| app.conversation(id)).map(|conversation| conversation.updated_at.as_str());
         let mut workflow_keys: Vec<&str> = props.workflow_run_by_call.keys().map(String::as_str).collect();
         workflow_keys.sort_unstable();
-        let fingerprint = hash_key((persisted.as_ptr() as usize, persisted.len(), updated, run.as_ref().map(|run| run.revision), (!props.contexts.is_empty()).then(|| Rc::as_ptr(&props.contexts) as usize), (!props.turns.is_empty()).then(|| Rc::as_ptr(&props.turns) as usize), props.turns.len(), &workflow_keys, props.change_spans.as_ref().map(|spans| Rc::as_ptr(spans) as usize), props.streaming, mewrk_client::i18n::is_english()));
+        let fingerprint = hash_key((persisted.as_ptr() as usize, persisted.len(), updated, run.as_ref().map(|run| run.revision), overlay.as_ref().map(|overlay| overlay.revision), (!props.contexts.is_empty()).then(|| Rc::as_ptr(&props.contexts) as usize), (!props.turns.is_empty()).then(|| Rc::as_ptr(&props.turns) as usize), props.turns.len(), &workflow_keys, props.change_spans.as_ref().map(|spans| Rc::as_ptr(spans) as usize), props.streaming, mewrk_client::i18n::is_english()));
         let mut guard = shared.borrow_mut();
         let state = &mut *guard;
         state.turns = props.turns.clone();
         if state.fingerprint != fingerprint || state.map.is_empty() != (persisted.is_empty() && live.is_empty()) {
             state.fingerprint = fingerprint;
-            state.map = Rc::new(Resolved::map_of(persisted, live));
+            state.map = Rc::new(if overlay.is_some() { Resolved::map_in_place(persisted, live) } else { Resolved::map_of(persisted, live) });
             let contexts = Resolved { persisted, live, map: state.map.clone() };
             let before_order = state.node_keys.clone();
             let anchor_key = state.anchor_key;
@@ -1256,7 +1277,7 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
                 (None, Some(id)) => app.conversation(id).map_or(&[][..], |conversation| conversation.contexts.as_slice()),
                 _ => &[],
             };
-            let live: &[LiveContext] = if conversation.is_some() { run.as_ref().map_or(&[][..], |run| run.contexts.as_slice()) } else { props.contexts.as_slice() };
+            let live: &[LiveContext] = live_contexts(conversation.as_deref(), run.as_deref(), overlay.as_deref(), &props);
             let contexts = Resolved { persisted, live, map: state.map.clone() };
             state.nodes[first..last]
                 .iter()
@@ -1280,7 +1301,7 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
         (None, Some(id)) => app.conversation(id).map_or(&[][..], |conversation| conversation.contexts.as_slice()),
         _ => &[],
     };
-    let live: &[LiveContext] = if conversation.is_some() { run.as_ref().map_or(&[][..], |run| run.contexts.as_slice()) } else { props.contexts.as_slice() };
+    let live: &[LiveContext] = live_contexts(conversation.as_deref(), run.as_deref(), overlay.as_deref(), &props);
     let (map, selection, menu, marquee_box, drag_target) = {
         let state = shared.borrow();
         (state.map.clone(), state.selection.clone(), state.menu.clone(), state.marquee_box, state.drag_target)
@@ -1660,12 +1681,13 @@ fn finish_stream(props: &Rc<ConversationViewProps>, shared: &Shared, scroller: u
             let conversation = props.conversation_id.clone();
             let draft = conversation.as_deref().filter(|id| mewrk_client::drafts::is_draft_conversation_id(id)).map(|id| app.timeline_contexts_of(id));
             let run = conversation.as_deref().and_then(|id| app.run_view(id));
+            let overlay = task_overlay_of(app, conversation.as_deref(), run.as_deref());
             persisted = match (&draft, conversation.as_deref()) {
                 (Some(draft), _) => draft.as_slice(),
                 (None, Some(id)) => app.conversation(id).map_or(&[][..], |conversation| conversation.contexts.as_slice()),
                 _ => &[],
             };
-            let live: &[LiveContext] = if conversation.is_some() { run.as_ref().map_or(&[][..], |run| run.contexts.as_slice()) } else { props.contexts.as_slice() };
+            let live: &[LiveContext] = live_contexts(conversation.as_deref(), run.as_deref(), overlay.as_deref(), &props);
             let mut state = shared.borrow_mut();
             contexts_snapshot = Resolved { persisted, live, map: state.map.clone() };
             let (offset, _, _) = scroll_state(scroller).unwrap_or((0.0, 0.0, 0.0));

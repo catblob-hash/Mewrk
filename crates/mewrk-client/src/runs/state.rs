@@ -7,6 +7,7 @@ use super::composer::{ComposerState, Deferred};
 use super::conversation_turns::{drop_empty_turns, load_conversation_turns, ConversationTurn, ConversationTurns, CONVERSATION_TURNS_STORAGE_KEY};
 use super::model_run_controller::ModelRunController;
 use super::model_stream::ModelStreamCoalescer;
+use super::task_overlay::TaskOverlay;
 use super::timeline_history::TimelineHistory;
 use super::types::{ContextUsage, ForkDecisionRecord, ModelRunErrorState, PendingForkRequest, PendingForkStart, PendingToolPrompt, QuestionResponse, ToolApprovalGrant};
 use super::util::now_ms;
@@ -67,6 +68,9 @@ pub struct RunsState {
     pub(super) adoption_started: bool,
     pub(super) adoptions_in_flight: HashSet<String>,
     pub(super) streams: HashMap<String, StreamBuffer>,
+    /// What background tasks stream while their conversation has no run, by conversation. Display only; see
+    /// [`super::task_overlay`].
+    pub(super) task_overlays: HashMap<String, TaskOverlay>,
     /// Conversations whose run finished while another one was open. Their mark turns blue until they are opened;
     /// this is the renderer's own notice, so a restart forgets it.
     pub unseen_completions: HashSet<String>,

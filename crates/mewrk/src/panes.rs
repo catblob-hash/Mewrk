@@ -591,10 +591,14 @@ fn tasks_pane_view(app: &mut App, cx: &PaneContext, pane: &str) -> E {
     side_pane(frame, body)
 }
 
-/// `workflowProgressByRun` and `workflowRunIdsByRun`.
+/// `workflowProgressByRun` and `workflowRunIdsByRun`: from the run, or with no run from what a workflow that outlived the last
+/// one has streamed since.
 fn workflow_tables(app: &mut App, conversation: &str, agents: &[Rc<mewrk_pane_tasks::subagents::SubagentView>]) -> (HashMap<String, mewrk_pane_tasks::workflow_progress::WorkflowProgressView>, HashMap<String, String>) {
-    match app.run_view(conversation) {
-        Some(run) => (workflow_progress_by_run(agents, run.workflow_progress_by_call.as_ref()), workflow_run_ids_by_run(agents, &run.workflow_run_id_by_call)),
+    if let Some(run) = app.run_view(conversation) {
+        return (workflow_progress_by_run(agents, run.workflow_progress_by_call.as_ref()), workflow_run_ids_by_run(agents, &run.workflow_run_id_by_call));
+    }
+    match app.task_overlay(conversation) {
+        Some(overlay) => (workflow_progress_by_run(agents, overlay.workflow_progress_by_call.as_ref()), workflow_run_ids_by_run(agents, &overlay.workflow_run_id_by_call)),
         None => (HashMap::new(), HashMap::new()),
     }
 }

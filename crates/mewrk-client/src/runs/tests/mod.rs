@@ -10,4 +10,5 @@ mod model_run_controller;
 mod model_stream;
 pub(super) mod rig;
 mod run_contexts;
+mod task_overlay;
 mod timeline_history;

@@ -3687,9 +3687,7 @@ async fn run_model(
         Arc::new(move |event: ModelStreamEvent| {
             let event =
                 api::stamp_announced_context_id(event, &sink_conversation_id, &sink_run_scope);
-            sink_state
-                .run_streams()
-                .publish_live(&sink_conversation_id, event);
+            api::publish_task_surface_event(&sink_state, &sink_conversation_id, event);
             Ok(())
         })
     };

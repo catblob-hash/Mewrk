@@ -815,6 +815,7 @@ impl App {
         runs.composer.drafts.remove(conversation_id);
         runs.composer.pasted_texts.remove(conversation_id);
         runs.model_run_errors.remove(conversation_id);
+        self.forget_task_overlay(conversation_id);
         self.forget_selection_of(conversation_id);
         let hooks = self.store().hooks.conversation_forgotten.clone();
         for forget in hooks {

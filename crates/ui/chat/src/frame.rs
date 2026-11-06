@@ -49,6 +49,13 @@ impl<'a> Resolved<'a> {
         map.extend((0..live.len() as u32).map(|at| at | LIVE_BIT));
         map
     }
+
+    /// A map for the persisted contexts with each live one drawn in the place of the persisted context it stands for, and
+    /// none added: what a background task's overlay is, as against a run's projection.
+    pub fn map_in_place(persisted: &[ContextItem], live: &[LiveContext]) -> Vec<u32> {
+        let over: HashMap<&str, u32> = live.iter().enumerate().map(|(at, context)| (context.id(), at as u32)).collect();
+        persisted.iter().enumerate().map(|(at, item)| over.get(item.id()).map_or(at as u32, |live| live | LIVE_BIT)).collect()
+    }
 }
 
 impl<'a> Contexts<'a> for &Resolved<'a> {

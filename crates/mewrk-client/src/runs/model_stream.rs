@@ -488,7 +488,7 @@ pub fn settle_subagent_contexts(contexts: &mut Vec<LiveContext>) {
 /// Applies one parent-facing lifecycle/progress fragment to a single live
 /// child. The same reducer is used at every nesting level so a dispatcher,
 /// executor, and page reader retain identical streaming semantics.
-fn apply_subagent_channel_delta(live: &mut SubagentLiveState, parent_tool_id: &str, channel: SubagentChannel, delta: &str, event_at: &str) {
+pub(super) fn apply_subagent_channel_delta(live: &mut SubagentLiveState, parent_tool_id: &str, channel: SubagentChannel, delta: &str, event_at: &str) {
     match channel {
         SubagentChannel::Text => {
             apply_nested_subagent_event(live, parent_tool_id, &ModelStreamEvent::TextDelta { round: 0, delta: delta.to_owned() }, event_at);
@@ -616,7 +616,7 @@ fn hook_label() -> &'static str {
 
 /// Projects a normalized nested model event into the same context stream
 /// consumed by the primary conversation renderer.
-fn apply_nested_subagent_event(live: &mut SubagentLiveState, parent_tool_id: &str, event: &ModelStreamEvent, event_at: &str) {
+pub(super) fn apply_nested_subagent_event(live: &mut SubagentLiveState, parent_tool_id: &str, event: &ModelStreamEvent, event_at: &str) {
     if let ModelStreamEvent::StreamRetryScheduled { round, .. } = event {
         live.retry_round = Some(*round);
         return;
@@ -953,7 +953,12 @@ fn hook_status_label(status: StreamingHookStatus) -> &'static str {
 /// the front of it can delete every trace of a step that finished early. That
 /// step would vanish from the card mid-run, and the totals with it.
 fn apply_workflow_progress(run: &mut ModelRunState, call_id: &str, run_id: &str, entry: WorkflowProgressEntry) {
-    let entries = Arc::make_mut(&mut run.workflow_progress_by_call).entry(call_id.to_owned()).or_default();
+    push_workflow_progress(&mut run.workflow_progress_by_call, &mut run.workflow_run_id_by_call, call_id, run_id, entry);
+}
+
+/// [`apply_workflow_progress`] on the two maps alone, for whoever keeps them outside a run.
+pub(super) fn push_workflow_progress(progress_by_call: &mut Arc<BTreeMap<String, Vec<WorkflowProgressEntry>>>, run_id_by_call: &mut BTreeMap<String, String>, call_id: &str, run_id: &str, entry: WorkflowProgressEntry) {
+    let entries = Arc::make_mut(progress_by_call).entry(call_id.to_owned()).or_default();
     entries.push(entry);
     if entries.len() > WORKFLOW_PROGRESS_ENTRY_LIMIT {
         let mut excess = entries.len() - WORKFLOW_PROGRESS_ENTRY_LIMIT;
@@ -968,7 +973,7 @@ fn apply_workflow_progress(run: &mut ModelRunState, call_id: &str, run_id: &str,
     // Last writer wins, and there is only ever one: the host mints a run id per
     // workflow call and reuses it for every transition of that run, including
     // across a resume.
-    run.workflow_run_id_by_call.insert(call_id.to_owned(), run_id.to_owned());
+    run_id_by_call.insert(call_id.to_owned(), run_id.to_owned());
 }
 
 /// Total live transcript rows the renderer keeps across every background child

@@ -215,11 +215,15 @@ pub fn ensure_external_step_body(app: &mut App, conversation_id: &str, contexts:
     });
 }
 
-/// `useRenderedContexts`: the conversation's contexts with the active run's stream merged in, and the revision that says
-/// when they changed. `persisted_revision` is whatever the shell bumps when `persisted` changes.
+/// `useRenderedContexts`: the conversation's contexts with the active run's stream merged in — or, with no run, what its
+/// background tasks streamed since the last one, over their cards in place — and the revision that says when they changed.
+/// `persisted_revision` is whatever the shell bumps when `persisted` changes.
 pub fn rendered_contexts(app: &mut App, conversation_id: &str, persisted: &[mewrk_client::model::ContextItem], persisted_revision: u64) -> (Vec<Ctx>, u64) {
-    match app.run_view(conversation_id) {
-        Some(run) => (run.rendered_contexts(persisted).map(Ctx::from).collect(), persisted_revision.wrapping_mul(1 << 20).wrapping_add(run.revision)),
+    if let Some(run) = app.run_view(conversation_id) {
+        return (run.rendered_contexts(persisted).map(Ctx::from).collect(), persisted_revision.wrapping_mul(1 << 20).wrapping_add(run.revision));
+    }
+    match app.task_overlay(conversation_id) {
+        Some(overlay) => (overlay.rendered_contexts(persisted).map(Ctx::from).collect(), persisted_revision.wrapping_mul(1 << 20).wrapping_add(overlay.revision)),
         None => (persisted.iter().cloned().map(Ctx::from).collect(), persisted_revision.wrapping_mul(1 << 20)),
     }
 }

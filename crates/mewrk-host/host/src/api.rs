@@ -16732,6 +16732,34 @@ fn tool_context_for_turn(
     }
 }
 
+/// Delivers one event from a conversation's task surface: a background task
+/// (child agent, workflow) speaking for a card in that conversation.
+///
+/// While the conversation has an unsettled run, the event rides that run's
+/// stream as it always has. Without one, tasks that outlived their turn would
+/// go silent until a wake run folds their result, so the event goes out on the
+/// app push channel instead, live only, and the renderer overlays it on the
+/// persisted spawn card. A bare `Ping` is a child's request heartbeat: it has
+/// nothing to draw and is not pushed.
+pub(crate) fn publish_task_surface_event(
+    state: &AppState,
+    conversation_id: &str,
+    event: ModelStreamEvent,
+) {
+    let Some(event) = state.run_streams().try_publish_live(conversation_id, event) else {
+        return;
+    };
+    if matches!(event, ModelStreamEvent::Ping) {
+        return;
+    }
+    state
+        .push_events
+        .publish(crate::push_events::AppPushEvent::TaskStreamEvent {
+            conversation_id: conversation_id.to_owned(),
+            event,
+        });
+}
+
 /// Fills in the timeline id on an announcement, which the stream parsers emit
 /// empty because they do not know the conversation.
 ///
@@ -42148,6 +42176,65 @@ mod tests {
             .capabilities
             .insert(crate::model::ModelCapability::AsyncTools);
         request
+    }
+
+    /// A child that outlives the turn that spawned it keeps its card moving.
+    /// While its conversation has an unsettled run, its events ride that run's
+    /// stream; once the run settled they go out on the push channel, where the
+    /// renderer overlays them on the spawn card. A heartbeat goes nowhere.
+    #[test]
+    fn task_surface_events_reach_the_push_channel_once_the_run_settled() {
+        let state = AppState::default();
+        let (run_tx, run_rx) = std::sync::mpsc::channel::<ModelStreamEvent>();
+        state.run_streams().begin(
+            "conv-surface",
+            "run-1",
+            json!({}),
+            Box::new(move |event| run_tx.send(event).map_err(|error| error.to_string())),
+        );
+        let pushed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = std::sync::Arc::clone(&pushed);
+        state
+            .push_events
+            .subscribe(tauri::ipc::Channel::new(move |body| {
+                let value = match body {
+                    tauri::ipc::InvokeResponseBody::Json(json) => serde_json::from_str(&json)?,
+                    tauri::ipc::InvokeResponseBody::Raw(bytes) => serde_json::to_value(bytes)?,
+                };
+                sink.lock().unwrap().push(value);
+                Ok(())
+            }));
+        let delta = |text: &str| ModelStreamEvent::SubagentDelta {
+            round: 1,
+            call_id: "call_spawn".into(),
+            channel: SubagentChannel::Text,
+            delta: text.into(),
+        };
+
+        publish_task_surface_event(&state, "conv-surface", delta("during the run"));
+        assert_eq!(run_rx.try_recv().unwrap(), delta("during the run"));
+        assert!(pushed.lock().unwrap().is_empty());
+
+        state.run_streams().settle(
+            "conv-surface",
+            "run-1",
+            crate::run_stream::RunSettlement::Failed("ended".into()),
+        );
+        assert!(matches!(
+            run_rx.try_recv().unwrap(),
+            ModelStreamEvent::RunConcluded { .. }
+        ));
+        publish_task_surface_event(&state, "conv-surface", ModelStreamEvent::Ping);
+        publish_task_surface_event(&state, "conv-surface", delta("after it"));
+
+        assert!(run_rx.try_recv().is_err(), "a settled run carries nothing more");
+        let pushed = pushed.lock().unwrap();
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
+        assert_eq!(pushed[0]["type"], "taskStreamEvent");
+        assert_eq!(pushed[0]["conversationId"], "conv-surface");
+        assert_eq!(pushed[0]["event"]["type"], "subagent_delta");
+        assert_eq!(pushed[0]["event"]["callId"], "call_spawn");
+        assert_eq!(pushed[0]["event"]["delta"], "after it");
     }
 
     fn register_quiet_task_surface(state: &AppState, conversation_id: &str) {
