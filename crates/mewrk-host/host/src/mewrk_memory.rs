@@ -19,10 +19,13 @@
 //! run whether memory is on or not, and only by the instruction loader
 //! ([`crate::project_memory`]), so it reaches the model exactly once.
 //!
-//! `MEMORY.md` is deliberately **not** reachable by any tool. The host owns it
+//! `MEMORY.md` is deliberately **not** writable by any tool. The host owns it
 //! and rewrites it from the index descriptions supplied to the create/edit
 //! tools, so the model can never desynchronize the index from the documents it
 //! describes, and a write can never silently change what the next run loads.
+//! The read tool answers its name with the index as the context carries it:
+//! a model that finds no memory block (an empty tier has none) reaches for
+//! `MEMORY.md` first, and the answer it needs is that list, not a refusal.
 
 use crate::{
     memory_archive_file::{read_bounded_nofollow, write_all_nofollow},
@@ -180,11 +183,20 @@ pub(crate) fn remote_project_root(place: crate::remote_memory::RemoteMemoryPlace
 pub fn normalize_document_name(raw: &str) -> Result<String, String> {
     let normalized = normalize_named_document(raw, "Memory document")?;
     if normalized.eq_ignore_ascii_case(INDEX_NAME) {
+        // Only writes reach this with the index's name: the read tool answers
+        // it before asking for a document (`read_for_tool`).
         return Err(format!(
-            "{INDEX_NAME} is the host-managed memory index and cannot be read or written directly; provide its description when creating or editing memory"
+            "{INDEX_NAME} is the memory index, which Mewrk keeps itself, so it cannot be created or edited; each document's entry there is the description given when that document is created or edited"
         ));
     }
     Ok(normalized)
+}
+
+/// Whether `raw` names the index under any spelling a document name accepts:
+/// `MEMORY.md`, `memory`, `Memory.MD`.
+fn names_index(raw: &str) -> bool {
+    normalize_named_document(raw, "Memory document")
+        .is_ok_and(|name| name.eq_ignore_ascii_case(INDEX_NAME))
 }
 
 /// The rules of [`normalize_document_name`] for any directory of named Markdown
@@ -498,12 +510,7 @@ pub struct MemoryDocument {
 /// Reads one topic document by name.
 pub fn read_document(root: &MemoryRoot, raw_name: &str) -> Result<MemoryDocument, String> {
     let name = normalize_document_name(raw_name)?;
-    let missing = || {
-        format!(
-            "No memory document named {name} exists in {}",
-            root.tier().label()
-        )
-    };
+    let missing = || no_such_document(root, &name);
     let bytes = match root.remote() {
         Some(place) => {
             crate::remote_memory::read(place, &name, MAX_DOCUMENT_BYTES)?
@@ -520,6 +527,39 @@ pub fn read_document(root: &MemoryRoot, raw_name: &str) -> Result<MemoryDocument
         name,
         content,
     })
+}
+
+/// What the read tool answers for `raw_name`: the document's text, or for the
+/// index's own name the index as the context carries it — including on an
+/// empty tier, which the context leaves out, so the model learns it is empty.
+fn read_for_tool(root: &MemoryRoot, raw_name: &str) -> Result<String, String> {
+    if names_index(raw_name) {
+        return Ok(render_index(root.tier(), &read_index(root)));
+    }
+    read_document(root, raw_name).map(|document| document.content)
+}
+
+/// The error for a document `name` the tier does not have, naming the ones it
+/// has, so a guessed name is answered with the names to choose from.
+fn no_such_document(root: &MemoryRoot, name: &str) -> String {
+    let entries = read_index(root);
+    let tier = root.tier().label();
+    if entries.is_empty() {
+        return format!("No memory document named {name} exists in {tier}; it has no documents yet");
+    }
+    let others = entries
+        .into_iter()
+        .map(|entry| entry.name)
+        .filter(|other| other != name)
+        .collect::<Vec<_>>();
+    if others.is_empty() {
+        format!("No memory document named {name} exists in {tier}; it has no other documents")
+    } else {
+        format!(
+            "No memory document named {name} exists in {tier}; its documents are: {}",
+            others.join(", ")
+        )
+    }
 }
 
 /// Creates a new document and records its index description.
@@ -801,10 +841,11 @@ fn edit_remote_document(
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let (fingerprint, bytes) = crate::remote_memory::read(place, &name, MAX_DOCUMENT_BYTES)?
         .ok_or_else(|| {
-            format!(
-                "No memory document named {name} exists in {}",
-                tier.label()
-            )
+            let root = MemoryRoot {
+                tier,
+                place: MemoryPlace::Remote(place.clone()),
+            };
+            no_such_document(&root, &name)
         })?;
     let existing = String::from_utf8(bytes)
         .map_err(|_| format!("Memory document {name} is not valid UTF-8 text"))?;
@@ -1170,8 +1211,7 @@ pub fn execute_tool(
 
     match tool_name {
         "read_global_memory" | "read_project_memory" => {
-            let document = read_document(root, &required_text(input, "name")?)?;
-            Ok(document.content)
+            read_for_tool(root, &required_text(input, "name")?)
         }
         "create_global_memory" | "create_project_memory" => {
             let document = create_document(
@@ -1319,13 +1359,17 @@ mod tests {
 
     #[test]
     fn the_index_is_never_addressable_as_a_document() {
-        // The host owns MEMORY.md. No tool may name it under any casing or
+        // The host owns MEMORY.md. No write may name it under any casing or
         // with the suffix omitted, so the model cannot rewrite the index out
         // of step with the documents it points at.
         for spelling in ["MEMORY.md", "memory.md", "MEMORY", "Memory.MD", " memory "] {
             let error = normalize_document_name(spelling).unwrap_err();
             assert!(error.contains(INDEX_NAME), "{spelling:?}: {error}");
+            assert!(error.contains("cannot be created or edited"), "{spelling:?}: {error}");
+            assert!(names_index(spelling), "{spelling:?}");
         }
+        assert!(!names_index("memory-notes"));
+        assert!(!names_index("../MEMORY.md"));
     }
 
     #[test]
@@ -1934,8 +1978,73 @@ mod tests {
         assert!(execute_tool(&roots, "memory_upsert", &input(&[]), &profile).is_err());
     }
 
+    /// A model that sees no memory block reads `MEMORY.md` first. An empty
+    /// tier answers that it has nothing, and a missing name is answered with
+    /// the names there are — never with the write tools' rules.
     #[test]
-    fn no_tool_can_address_the_host_owned_index() {
+    fn reading_the_index_or_a_missing_name_says_what_the_tier_holds() {
+        let tree = TempTree::new("index-read");
+        let roots = MemoryRoots::resolve_enabled(
+            None,
+            Some(&tree.root.join("workspace")),
+            MemoryTierAccess::ALL,
+        );
+        let profile = PromptProfile::builtin();
+        let read = |name: &str| {
+            execute_tool(&roots, "read_project_memory", &input(&[("name", name)]), &profile)
+        };
+
+        // Nothing stored yet: not even the memory directory exists.
+        let empty = read("MEMORY.md").unwrap();
+        assert!(empty.contains("(no memory documents yet)"), "{empty}");
+        let missing = read("notes").unwrap_err();
+        assert_eq!(
+            missing,
+            "No memory document named notes.md exists in project memory; it has no documents yet"
+        );
+
+        for (name, description) in [("build", "How to build"), ("style", "Code style")] {
+            execute_tool(
+                &roots,
+                "create_project_memory",
+                &input(&[("name", name), ("content", "body"), ("description", description)]),
+                &profile,
+            )
+            .unwrap();
+        }
+        for spelling in ["MEMORY.md", "memory", "Memory.MD"] {
+            let index = read(spelling).unwrap();
+            assert!(index.contains("- [build.md](build.md) — How to build"), "{index}");
+            assert!(index.contains("- [style.md](style.md) — Code style"), "{index}");
+        }
+        // Exactly what the memory block carries.
+        assert_eq!(
+            read("MEMORY.md").unwrap(),
+            read_index_context(roots.project().unwrap()).unwrap()
+        );
+        let missing = read("notes").unwrap_err();
+        assert_eq!(
+            missing,
+            "No memory document named notes.md exists in project memory; its documents are: build.md, style.md"
+        );
+        // An edit of a missing document names them too.
+        let missing_edit = execute_tool(
+            &roots,
+            "edit_project_memory",
+            &input(&[
+                ("name", "notes"),
+                ("old_text", "a"),
+                ("new_text", "b"),
+                ("description", "d"),
+            ]),
+            &profile,
+        )
+        .unwrap_err();
+        assert!(missing_edit.ends_with("its documents are: build.md, style.md"), "{missing_edit}");
+    }
+
+    #[test]
+    fn no_tool_can_write_the_host_owned_index() {
         let tree = TempTree::new("index-guard");
         let roots = MemoryRoots::resolve_enabled(
             Some(&tree.root.join("home")),
@@ -1957,13 +2066,15 @@ mod tests {
         let index_before = fs::read_to_string(roots.global.as_ref().unwrap().index_path()).unwrap();
 
         for spelling in ["MEMORY.md", "memory", "Memory.MD"] {
-            assert!(execute_tool(
+            // Reading it is answered with the index, not with the file.
+            let read = execute_tool(
                 &roots,
                 "read_global_memory",
                 &input(&[("name", spelling)]),
                 &profile,
             )
-            .is_err());
+            .unwrap();
+            assert!(read.contains("- [real.md](real.md) — description"), "{read}");
             assert!(execute_tool(
                 &roots,
                 "create_global_memory",

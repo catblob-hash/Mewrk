@@ -66,6 +66,9 @@ pub(crate) struct LoadedDocument {
     pub refs: crate::attachment_refs::AttachmentRefs,
     /// Conversations whose main timeline ends in a user message.
     unanswered: Vec<String>,
+    /// Whether the file held another build's tool catalog, which this load
+    /// replaced with this build's ([`adopt_tool_catalog`]).
+    catalog_adopted: bool,
 }
 
 impl LoadedDocument {
@@ -339,7 +342,7 @@ fn load_or_recover_with(path: &Path, bodies: Bodies) -> Result<LoadedDocument, S
                     false
                 }
             };
-            if lifted || installed {
+            if lifted || installed || loaded.catalog_adopted {
                 if let Err(error) = save_unchecked(path, &loaded.document) {
                     eprintln!("启动时对文档的更新未能落盘，下次保存时写入：{error}");
                 }
@@ -853,6 +856,44 @@ fn drop_retired_enabled_tools(canonical: &mut AppDocument) {
                 .retain(|name| tool_names.contains(name));
         }
     }
+}
+
+/// Puts this build's tool catalog in place of the one the file holds, and takes
+/// the names this build does not have out of the enabled lists the anchor
+/// keeps: the presets', and each workspace's remembered settings and unsent
+/// draft. Returns whether anything changed.
+///
+/// The file only keeps a copy of the catalog, and nothing else brings a build's
+/// own into it, so whichever build wrote the folder last decides what it says:
+/// an older or newer Mewrk, or another app built from this code that was
+/// pointed at this folder. Left as it is, the tools such a build named show
+/// here while this build's own are gone, and so are the conversations that
+/// enable them, which fail the load check (`validate_loaded_conversation`)
+/// against a list without their tools. [`assemble_layout`] runs this before
+/// any conversation is read, so each is checked against the adopted catalog.
+fn adopt_tool_catalog(document: &mut AppDocument) -> bool {
+    let catalog = crate::catalog::tool_catalog();
+    if document.tools == catalog {
+        return false;
+    }
+    let known = catalog
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<HashSet<_>>();
+    document.tools = catalog;
+    let keep = |names: &mut Vec<String>| names.retain(|name| known.contains(name));
+    for preset in &mut document.presets.conversation_presets {
+        keep(&mut preset.settings.enabled_tools);
+    }
+    for workspace in &mut document.workspaces {
+        if let Some(settings) = workspace.last_conversation_settings.as_mut() {
+            keep(&mut settings.enabled_tools);
+        }
+        if let Some(draft) = workspace.draft_conversation.as_mut() {
+            keep(&mut draft.settings.enabled_tools);
+        }
+    }
+    true
 }
 
 /// Replaces each unattestable tool card with a visible local marker so the rest
@@ -1708,6 +1749,9 @@ fn assemble_layout(
         tools: anchor.tools,
         capabilities: anchor.capabilities,
     };
+    // Before anything is checked against it: the conversations below are read
+    // against this build's tools, not the ones the file names.
+    let catalog_adopted = adopt_tool_catalog(&mut document);
 
     // Where each conversation goes: every workspace's own, in sidebar order,
     // then the ones whose workspace is gone.
@@ -1782,6 +1826,7 @@ fn assemble_layout(
         document,
         refs,
         unanswered,
+        catalog_adopted,
     })
 }
 
@@ -4449,6 +4494,88 @@ mod tests {
             .expect("校验不过的草稿直接丢掉，文档照常保存")
             .document;
         assert!(canonical.workspaces[0].draft_conversation.is_none());
+    }
+
+    /// A folder another build wrote holds that build's tool catalog: here one
+    /// without `read` and with a tool of its own, as an app built from this
+    /// code leaves it when pointed at this folder. A start puts this build's
+    /// catalog back, so the conversation that enables `read` loads again; the
+    /// foreign name leaves the presets and the remembered settings, the
+    /// built-in preset is drawn again from the whole catalog, and the file is
+    /// rewritten, so the next start has nothing to adopt.
+    #[test]
+    fn a_start_adopts_this_builds_tool_catalog_over_another_builds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.v1.json");
+        let foreign = "market_quote";
+        let catalog = crate::catalog::tool_catalog();
+
+        let mut document = default_document();
+        let conversation_id = document.workspaces[0].conversations[0].id.clone();
+        assert!(
+            document.workspaces[0].conversations[0]
+                .settings
+                .enabled_tools
+                .iter()
+                .any(|name| name == "read"),
+            "前提：这段对话启用了 read"
+        );
+        let mut other = catalog[0].clone();
+        other.name = foreign.into();
+        document.tools.retain(|tool| tool.name != "read");
+        document.tools.push(other);
+        let mut own = crate::catalog::builtin_preset(&document.tools, None);
+        own.id = "preset_own".into();
+        own.settings.enabled_tools = vec!["ls".into(), foreign.into()];
+        document.presets.conversation_presets.push(own);
+        let mut remembered = document.workspaces[0].conversations[0].settings.clone();
+        remembered.enabled_tools = vec![foreign.into(), "grep".into()];
+        document.workspaces[0].last_conversation_settings = Some(remembered);
+        save_all(&path, &document).unwrap();
+
+        let loaded = load_or_recover(&path).unwrap();
+        assert_eq!(loaded.tools, catalog);
+        assert!(
+            loaded
+                .workspaces
+                .iter()
+                .flat_map(|workspace| workspace.conversations.iter())
+                .any(|conversation| conversation.id == conversation_id),
+            "启用 read 的对话必须重新装配"
+        );
+        let own = loaded
+            .presets
+            .conversation_presets
+            .iter()
+            .find(|preset| preset.id == "preset_own")
+            .unwrap();
+        assert_eq!(own.settings.enabled_tools, vec!["ls".to_owned()]);
+        assert_eq!(
+            loaded.workspaces[0]
+                .last_conversation_settings
+                .as_ref()
+                .unwrap()
+                .enabled_tools,
+            vec!["grep".to_owned()]
+        );
+        assert!(builtin_preset_of(&loaded)
+            .settings
+            .enabled_tools
+            .iter()
+            .any(|name| name == "read"));
+
+        let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let names = on_disk["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            catalog.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>()
+        );
+        assert!(!read_document_with(&path, Bodies::Keep).unwrap().catalog_adopted);
     }
 
     /// A conversation write keeps a role selection whose provider is gone, and
