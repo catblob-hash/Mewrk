@@ -44,8 +44,8 @@ use crate::{
     tool_executor::{
         apply_edit, edit_receipt, edit_replace_all, optional_string, optional_u64,
         parse_read_range, read_text, required_string, truncate_chars, unified_diff,
-        write_receipt_note, EditSpec, FileGuardContext, FileTouch, EDIT_FIND_EQUALS_REPLACE,
-        FILE_MODIFIED_SINCE_READ, FILE_NOT_READ, MAX_PATH_CHARS, MAX_TEXT_FILE, MAX_WRITE_BYTES,
+        check_write_gate, write_receipt_note, FileGuardContext, FileTouch, EDIT_FIND_EQUALS_REPLACE,
+        FILE_MODIFIED_SINCE_READ, MAX_PATH_CHARS, MAX_TEXT_FILE, MAX_WRITE_BYTES,
     },
     workspace_set::ResolvedWorkspace,
 };
@@ -2096,37 +2096,6 @@ fn cas_write(
     Ok(seconds_to_ms(&lines[0]))
 }
 
-/// The read gate of `write` and `edit`, against a record taken on the same
-/// machine. Mirrors the host leg's `check_write_gate`, including the stale
-/// recovery that lets an edit through when it would still apply — its search
-/// text found once, or at least once under `replace_all` — or finds it already
-/// applied, so the edit says there is nothing to change.
-fn check_write_gate(
-    guard: &FileGuardContext<'_>,
-    key: &Path,
-    disk_ms: Option<i64>,
-    disk_content: &str,
-    edit: Option<EditSpec<'_>>,
-) -> Result<(Option<FileReadRecord>, bool), String> {
-    let Some(record) = guard.registry.get(guard.scope, key) else {
-        return Err(FILE_NOT_READ.into());
-    };
-    let Some(disk_ms) = disk_ms else {
-        return Ok((Some(record), false));
-    };
-    if disk_ms <= record.modified_ms {
-        return Ok((Some(record), false));
-    }
-    let normalized = file_read_state::normalize_text(disk_content);
-    if record.matches(&normalized) {
-        return Ok((Some(record), false));
-    }
-    if edit.is_some_and(|edit| edit.applies_to(disk_content)) {
-        return Ok((Some(record), true));
-    }
-    Err(FILE_MODIFIED_SINCE_READ.into())
-}
-
 fn write_with(
     shell: &dyn RemoteShell,
     target: &RemoteWorkspace<'_>,
@@ -2158,17 +2127,17 @@ fn write_with(
             .map(|text| (text, false)),
     };
     let key = file_read_state::remote_key(&target.machine_key, &probe.header.canonical);
+    // The host leg's gate, against a record taken on the same machine.
     let mut note = String::new();
     if let Some(guard) = file_guard {
-        let existing = match &before {
-            Some((existing, false)) => Some(existing.as_str()),
-            Some((_, true)) => None,
-            None => Some(""),
-        };
-        if let Some(existing) = existing {
-            check_write_gate(&guard, &key, Some(probe.modified_ms), existing, None)?;
+        if !matches!(before, Some((_, true))) {
+            check_write_gate(
+                guard.registry.get(guard.scope, &key),
+                Some(probe.modified_ms),
+                before.as_ref().map(|(existing, _)| existing.as_str()),
+            )?;
         }
-        note = write_receipt_note(target.profile, false);
+        note = write_receipt_note(target.profile);
     }
     let written_ms = cas_write(
         shell,
@@ -2225,11 +2194,6 @@ fn edit_with(
     if find == replace {
         return Err(EDIT_FIND_EQUALS_REPLACE.into());
     }
-    let spec = EditSpec {
-        find: &find,
-        replace: &replace,
-        replace_all,
-    };
     let wording = ExitWording::new(&path).wrong_kind(format!("edit target is not a file: {path}"));
     let probe = probe_file(shell, target, &path, &wording)?;
     match probe.state {
@@ -2246,12 +2210,13 @@ fn edit_with(
     let content = String::from_utf8(body.clone())
         .map_err(|error| format!("Failed to read text file as UTF-8: {error}"))?;
     let key = file_read_state::remote_key(&target.machine_key, &probe.header.canonical);
-    let (previous, stale_recovered) = match file_guard {
-        Some(guard) => {
-            check_write_gate(&guard, &key, Some(probe.modified_ms), &content, Some(spec))?
-        }
-        None => (None, false),
-    };
+    if let Some(guard) = file_guard {
+        check_write_gate(
+            guard.registry.get(guard.scope, &key),
+            Some(probe.modified_ms),
+            Some(&content),
+        )?;
+    }
     let applied = apply_edit(&content, &find, &replace, replace_all)?;
     let next = applied.text;
     if next.len() > MAX_WRITE_BYTES {
@@ -2271,22 +2236,14 @@ fn edit_with(
     )?;
     let mut note = String::new();
     if let Some(guard) = file_guard {
-        // After an edit the model knows the file only if it knew it before: a
-        // full read it has seen, and no other changes applied on top.
-        let in_model_context = !stale_recovered
-            && previous
-                .as_ref()
-                .is_some_and(|record| record.full && record.in_model_context);
+        // The gate passed and the model made this change itself, so its copy
+        // is still the current one.
         guard.registry.record(
             guard.scope,
             key.clone(),
-            FileReadRecord::written(
-                written_ms,
-                file_read_state::normalize_text(&next),
-                in_model_context,
-            ),
+            FileReadRecord::written(written_ms, file_read_state::normalize_text(&next), true),
         );
-        note = write_receipt_note(target.profile, stale_recovered);
+        note = write_receipt_note(target.profile);
     }
     let touch = Some(FileTouch {
         path: key.clone(),
@@ -3931,7 +3888,7 @@ pub(crate) mod tests {
             Some(guard),
         )
         .refusal();
-        assert_eq!(refused, FILE_NOT_READ);
+        assert_eq!(refused, crate::tool_executor::FILE_NOT_READ);
 
         read_with(
             &fixture.shell,
@@ -4081,8 +4038,10 @@ pub(crate) mod tests {
         );
     }
 
+    /// As on the host leg: a file changed behind the model is refused whatever
+    /// the edit would make of it, until the model reads it again.
     #[test]
-    fn a_file_changed_behind_the_guard_is_refused_unless_the_search_text_still_matches() {
+    fn a_file_changed_behind_the_guard_is_refused_until_it_is_read_again() {
         let Some(fixture) = fixture() else { return };
         write_fixture_file(&fixture, "drift.txt", b"one\ntwo\n");
         write_fixture_file(&fixture, "rescue.txt", b"keep\nanchor\n");
@@ -4119,48 +4078,59 @@ pub(crate) mod tests {
         write_fixture_file(&fixture, "rescue.txt", b"rewritten\nanchor\n");
         write_fixture_file(&fixture, "settled.txt", "say “hi”\n".as_bytes());
 
-        let refused = edit_with(
+        // The search text gone, still there, or the edit already made: all stale.
+        for (name, find, replace) in [
+            ("drift.txt", "two", "three"),
+            ("rescue.txt", "anchor", "moored"),
+            ("settled.txt", "say \"hi\"", "say “hi”"),
+        ] {
+            let refused = edit_with(
+                &fixture.shell,
+                &target,
+                &input(json!({"path": name, "find": find, "replace": replace})),
+                Some(guard),
+            )
+            .refusal();
+            assert_eq!(refused, FILE_MODIFIED_SINCE_READ, "{name}");
+        }
+        let overwrite = write_with(
             &fixture.shell,
             &target,
-            &input(json!({"path": "drift.txt", "find": "two", "replace": "three"})),
+            &input(json!({"path": "rescue.txt", "content": "blind\n"})),
             Some(guard),
         )
         .refusal();
-        assert_eq!(refused, FILE_MODIFIED_SINCE_READ);
+        assert_eq!(overwrite, FILE_MODIFIED_SINCE_READ);
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&fixture.workspace).join("rescue.txt")).unwrap(),
+            b"rewritten\nanchor\n"
+        );
 
-        // A change that already made the edit: nothing to change, not stale.
-        let settled = edit_with(
+        // A fresh read lets the edit through, and the model's copy is current.
+        let touch = read_with(
             &fixture.shell,
             &target,
-            &input(json!({"path": "settled.txt", "find": "say \"hi\"", "replace": "say “hi”"})),
+            &input(json!({ "path": "rescue.txt" })),
+            None,
             Some(guard),
         )
-        .refusal();
-        assert_eq!(settled, crate::tool_executor::EDIT_LEAVES_FILE_UNCHANGED);
-
-        let recovered = edit_with(
+        .unwrap()
+        .file_touch
+        .expect("a guarded read hands back a record");
+        registry.record(guard.scope, touch.path, touch.read.expect("record"));
+        edit_with(
             &fixture.shell,
             &target,
             &input(json!({"path": "rescue.txt", "find": "anchor", "replace": "moored"})),
             Some(guard),
         )
         .unwrap();
-        assert!(
-            recovered
-                .output
-                .contains(harness.profile.text(PromptKey::ToolEditStaleRecovered)),
-            "{}",
-            recovered.output
-        );
         let key = record_key(
             &target.machine_key,
             &format!("{}/rescue.txt", fixture.posix_root),
         );
         let record = registry.get(guard.scope, &key).expect("the edit recorded");
-        assert!(
-            !record.in_model_context,
-            "a stale-recovered edit leaves the model holding a copy that is not current"
-        );
+        assert!(record.in_model_context);
     }
 
     #[test]

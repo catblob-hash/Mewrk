@@ -2432,7 +2432,7 @@ mod tests {
             .as_str()
             .expect("script description");
         assert!(
-            description.contains("no role is available to this conversation"),
+            description.contains("no roles: any value throws"),
             "没有角色时要说清楚，而不是继续描述一个用不了的选项：{description}"
         );
     }
@@ -3024,7 +3024,7 @@ mod tests {
                 assert_eq!(
                     server_id["description"],
                     json!(format!(
-                        "Server ID of the {screen}. Defaults to the one the preview pane shows, else the only one connected."
+                        "Default: the {screen} the preview pane shows, else the only one connected."
                     )),
                     "{name}"
                 );
@@ -3058,7 +3058,7 @@ mod tests {
         let device = description("screen_device");
         assert!(
             device.contains(
-                "location with latitude and longitude, and clear_location (both iPhone or iPad only, iOS 16.4 and later: a simulated location; an Android device refuses them)"
+                "location with latitude and longitude and clear_location (iPhone/iPad, iOS 16.4+)"
             ),
             "{device}"
         );
@@ -3086,7 +3086,7 @@ mod tests {
 
         let dialog = description("preview_dialog");
         assert!(
-            dialog.contains("prompt_text without accept only types into the alert's field (iPhone or iPad; an Android dialog's field is filled like any field"),
+            dialog.contains("prompt_text alone only types into the alert's field (iPhone/iPad"),
             "{dialog}"
         );
         let input = json!({"prompt_text": "x", "button": "OK"});
@@ -3096,9 +3096,7 @@ mod tests {
 
         let input = description("preview_input");
         assert!(
-            input.contains(
-                "an iPhone or iPad takes no modifier chords, so a key with ctrl, cmd or mod is refused there"
-            ),
+            input.contains("iPhone/iPad refuse ctrl, cmd and mod chords"),
             "{input}"
         );
     }
@@ -3402,20 +3400,20 @@ mod tests {
         }
     }
 
-    /// The launch.json template and its prose are one text, owned by
-    /// `preview_launch_config`. `preview_start`'s description quotes them, and the
-    /// built-in profile must quote the same bytes — a paraphrase there would teach the
-    /// model a file format the parser rejects.
+    /// The launch.json template is owned by `preview_launch_config`.
+    /// `preview_start`'s description quotes it, and the built-in profile must
+    /// quote the same bytes — a paraphrase there would teach the model a file
+    /// format the parser rejects. The prose around it is the description's own.
     #[test]
     fn preview_start_descriptions_quote_the_launch_json_format_verbatim() {
-        let english = format!(
-            "Start a dev server by name from .mewrk/launch.json. If .mewrk/launch.json doesn't exist, create it first with this format:\n{}\n{} Reuses the server if already running.",
-            crate::preview_launch_config::LAUNCH_JSON_FORMAT,
-            crate::preview_launch_config::LAUNCH_JSON_FORMAT_NOTES
-        );
-        assert_eq!(
-            PromptProfile::builtin().text(PromptKey::ToolPreviewStartDescription),
-            english
+        let profile = PromptProfile::builtin();
+        let text = profile.text(PromptKey::ToolPreviewStartDescription);
+        assert!(
+            text.contains(&format!(
+                ":\n{}\n",
+                crate::preview_launch_config::LAUNCH_JSON_FORMAT
+            )),
+            "{text}"
         );
     }
 

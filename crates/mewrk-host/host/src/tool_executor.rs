@@ -2504,53 +2504,48 @@ fn modified_ms_after_write(path: &Path) -> i64 {
     file_read_state::modified_ms(path).unwrap_or(0)
 }
 
-/// The read-gate half of `write` and `edit`: whether an existing file may be
-/// overwritten given what this conversation remembers reading.
+/// The read gate `write` and `edit` share, on either machine: an existing file
+/// may be changed only while the model's copy of it is the current one.
 ///
-/// Returns the record the file had, so the caller can decide what the model
-/// still knows after the write. `edit` is the edit's own arguments; with them,
-/// a stale file the edit would still apply to — its search text found once, or
-/// at least once under `replace_all`, by the same rules `apply_edit` uses — is
-/// let through as Claude Code's stale recovery, and the caller is told so. So
-/// is one the edit finds already applied, for `apply_edit` to answer that there
-/// is nothing to change.
-fn check_write_gate(
-    guard: &FileGuardContext<'_>,
-    path: &Path,
-    disk_content: &str,
-    edit: Option<EditSpec<'_>>,
-) -> Result<(Option<FileReadRecord>, bool), String> {
-    let Some(record) = guard.get(path) else {
+/// That copy is current when the conversation read the file or wrote it, and
+/// nothing changed on disk since that the model was not shown: a change the
+/// host announced with all of its changed regions keeps it current
+/// (`api::scan_changed_files`, the hook re-sync), one announced without them
+/// does not ([`FileReadRecord::in_model_context`]). A file whose time moved
+/// but whose text is the one remembered — a save with no change, a checkout of
+/// the same text — is not stale. A ranged read counts: what it showed is
+/// current, though it vouches for nothing it did not show, so any later change
+/// to the file is stale.
+///
+/// `disk_ms` is the file's modification time now (`None` when it cannot be
+/// stat'ed, which passes), `disk_text` its text when it reads as such.
+pub(crate) fn check_write_gate(
+    record: Option<FileReadRecord>,
+    disk_ms: Option<i64>,
+    disk_text: Option<&str>,
+) -> Result<(), String> {
+    let Some(record) = record else {
         return Err(FILE_NOT_READ.into());
     };
-    let Some(disk_ms) = file_read_state::modified_ms(path) else {
-        return Ok((Some(record), false));
+    if !record.in_model_context {
+        return Err(FILE_MODIFIED_SINCE_READ.into());
+    }
+    let Some(disk_ms) = disk_ms else {
+        return Ok(());
     };
-    if disk_ms <= record.modified_ms {
-        return Ok((Some(record), false));
-    }
-    let normalized = file_read_state::normalize_text(disk_content);
-    // A touched-but-identical file — a save with no change, a checkout of the
-    // same text — is not stale: the model's copy is still the current one.
-    if record.matches(&normalized) {
-        return Ok((Some(record), false));
-    }
-    if edit.is_some_and(|edit| edit.applies_to(disk_content)) {
-        return Ok((Some(record), true));
+    if disk_ms <= record.modified_ms
+        || disk_text.is_some_and(|text| record.matches(&file_read_state::normalize_text(text)))
+    {
+        return Ok(());
     }
     Err(FILE_MODIFIED_SINCE_READ.into())
 }
 
-/// The note a writer appends to its receipt. Claude Code adds "(file state is
-/// current in your context — no need to Read it back)" after every write so
-/// the model does not re-read what it just wrote; the stale-recovery variant
-/// instead warns that the file holds changes the model has not seen.
-pub(crate) fn write_receipt_note(profile: &PromptProfile, stale_recovered: bool) -> String {
-    if stale_recovered {
-        profile.text(PromptKey::ToolEditStaleRecovered).to_owned()
-    } else {
-        profile.text(PromptKey::ToolFileStateCurrent).to_owned()
-    }
+/// The note a writer appends to its receipt under the guards. Claude Code adds
+/// "(file state is current in your context — no need to Read it back)" after
+/// every write so the model does not re-read what it just wrote.
+pub(crate) fn write_receipt_note(profile: &PromptProfile) -> String {
+    profile.text(PromptKey::ToolFileStateCurrent).to_owned()
 }
 
 /// [`run_write_checkpointed`] with no checkpoint to file the old content in, as
@@ -2603,15 +2598,14 @@ fn run_write_checkpointed(
     // text is gated on its time alone: there is no text to rescue it by.
     let mut note = String::new();
     if let Some(guard) = file_guard {
-        let existing = match &before {
-            Some((existing, false)) => Some(existing.as_str()),
-            Some((_, true)) => None,
-            None => Some(""),
-        };
-        if let Some(existing) = existing {
-            check_write_gate(&guard, &file_path, existing, None)?;
+        if !matches!(before, Some((_, true))) {
+            check_write_gate(
+                guard.get(&file_path),
+                file_read_state::modified_ms(&file_path),
+                before.as_ref().map(|(existing, _)| existing.as_str()),
+            )?;
         }
-        note = write_receipt_note(profile, false);
+        note = write_receipt_note(profile);
     }
     // Every gate has passed, so this call is going to change the file. Its bytes
     // are read afresh: `before` above is text, and only when the file decodes.
@@ -2682,11 +2676,6 @@ fn run_edit_checkpointed(
     if find == replace {
         return Err(EDIT_FIND_EQUALS_REPLACE.into());
     }
-    let spec = EditSpec {
-        find: &find,
-        replace: &replace,
-        replace_all,
-    };
     let file_path = resolve_existing_with_scope(workspace, &path, scope)?;
     if let Some(sandbox) = sandbox {
         sandbox.check_write(&file_path)?;
@@ -2698,10 +2687,13 @@ fn run_edit_checkpointed(
         ));
     }
     let content = read_tool_text(&file_path, sandbox)?;
-    let (previous, stale_recovered) = match file_guard {
-        Some(guard) => check_write_gate(&guard, &file_path, &content, Some(spec))?,
-        None => (None, false),
-    };
+    if let Some(guard) = file_guard {
+        check_write_gate(
+            guard.get(&file_path),
+            file_read_state::modified_ms(&file_path),
+            Some(&content),
+        )?;
+    }
     let applied = apply_edit(&content, &find, &replace, replace_all)?;
     let next = applied.text;
     if next.len() > MAX_WRITE_BYTES {
@@ -2715,23 +2707,17 @@ fn run_edit_checkpointed(
     write_tool_file(&file_path, next.as_bytes(), sandbox)?;
     let mut note = String::new();
     if let Some(guard) = file_guard {
-        // After an edit the model knows the file only if it knew it before:
-        // a full read it has seen, and no other changes applied on top. A
-        // stale-recovered edit or a file never read leaves it holding a copy
-        // that is not the current one.
-        let in_model_context = !stale_recovered
-            && previous
-                .as_ref()
-                .is_some_and(|record| record.full && record.in_model_context);
+        // The gate passed, so the model's copy was current, and it made this
+        // change itself: its copy still is.
         guard.record(
             file_path.clone(),
             FileReadRecord::written(
                 modified_ms_after_write(&file_path),
                 file_read_state::normalize_text(&next),
-                in_model_context,
+                true,
             ),
         );
-        note = write_receipt_note(profile, stale_recovered);
+        note = write_receipt_note(profile);
     }
     let touch = Some(FileTouch {
         path: file_path.clone(),
@@ -2772,27 +2758,6 @@ pub(crate) const EDIT_FIND_EQUALS_REPLACE: &str =
 pub(crate) const EDIT_LEAVES_FILE_UNCHANGED: &str =
     "No changes to make: the edit leaves the file unchanged.";
 const EDIT_NOT_FOUND: &str = "The exact text to replace was not found";
-
-/// An `edit` call's own arguments, for the read gate's stale recovery.
-#[derive(Clone, Copy)]
-pub(crate) struct EditSpec<'a> {
-    pub find: &'a str,
-    pub replace: &'a str,
-    pub replace_all: bool,
-}
-
-impl EditSpec<'_> {
-    /// Whether this edit would apply to `content`, or finds it already
-    /// applied — the test the stale recovery uses, so it lets through what the
-    /// edit itself accepts, and an edit someone else already made goes on to
-    /// say there is nothing to change rather than that the file is stale.
-    pub(crate) fn applies_to(&self, content: &str) -> bool {
-        match apply_edit(content, self.find, self.replace, self.replace_all) {
-            Ok(_) => true,
-            Err(error) => error == EDIT_LEAVES_FILE_UNCHANGED,
-        }
-    }
-}
 
 /// `replace_all` of an `edit` call: a boolean, or the string `"true"` or
 /// `"false"`, which Claude Code also accepts for its own `replace_all` — a
@@ -10345,8 +10310,13 @@ mod tests {
         );
     }
 
+    /// `write` and `edit` follow one rule: through only while the model's copy
+    /// is the current one. A file whose time moved but whose text is the one
+    /// remembered is current; any other change on disk — even one the edit
+    /// would still apply to — is refused until the model reads it again, and
+    /// so is a copy a change notice marked out of date.
     #[test]
-    fn a_stale_edit_is_refused_unless_the_text_is_unchanged_or_the_find_text_still_applies() {
+    fn write_and_edit_go_through_only_while_the_models_copy_is_current() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("a.txt");
         fs::write(&path, "one\ntwo\nthree\n").unwrap();
@@ -10370,37 +10340,54 @@ mod tests {
         let edited = run_edit(directory.path(), &edit, &scope, &profile, Some(guard), None).unwrap();
         assert!(edited.output.ends_with(profile.text(PromptKey::ToolFileStateCurrent)));
         assert_eq!(fs::read_to_string(&path).unwrap(), "one\n2\nthree\n");
+        assert!(guard.get(&canonical).unwrap().in_model_context);
 
-        // Someone else changed the file, but the find text still matches once:
-        // Claude Code's stale recovery applies the edit and says so.
+        // Someone else changed the file, and the find text still matches once:
+        // the model has not seen the change, so neither writer goes through.
         let now = guard.get(&canonical).unwrap();
         guard.record(
             canonical.clone(),
             FileReadRecord::full_read(now.modified_ms - 1_000, "one\n2\nthree\nold\n".into()),
         );
         let edit = object(json!({ "path": "a.txt", "find": "three", "replace": "3" }));
-        let edited = run_edit(directory.path(), &edit, &scope, &profile, Some(guard), None).unwrap();
-        assert!(edited.output.ends_with(profile.text(PromptKey::ToolEditStaleRecovered)));
-        assert!(!guard.get(&canonical).unwrap().in_model_context);
-
-        // Changed on disk and the find text is gone: read it again.
-        let now = guard.get(&canonical).unwrap();
-        guard.record(
-            canonical.clone(),
-            FileReadRecord::full_read(now.modified_ms - 1_000, "something else\n".into()),
-        );
-        let edit = object(json!({ "path": "a.txt", "find": "missing", "replace": "x" }));
         assert_eq!(
             run_edit(directory.path(), &edit, &scope, &profile, Some(guard), None).err().unwrap(),
             FILE_MODIFIED_SINCE_READ
         );
-        // `write` has no recovery: a changed file is always refused.
         let overwrite = object(json!({ "path": "a.txt", "content": "anything\n" }));
         assert_eq!(
             run_write(directory.path(), &overwrite, &scope, &profile, Some(guard), None).err().unwrap(),
             FILE_MODIFIED_SINCE_READ
         );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "one\n2\n3\n");
+
+        // A copy marked out of date is refused even though the times agree.
+        let now = guard.get(&canonical).unwrap();
+        guard.record(
+            canonical.clone(),
+            FileReadRecord {
+                in_model_context: false,
+                ..FileReadRecord::full_read(
+                    file_read_state::modified_ms(&canonical).unwrap(),
+                    "one\n2\nthree\n".into(),
+                )
+            },
+        );
+        assert!(now.modified_ms <= file_read_state::modified_ms(&canonical).unwrap());
+        assert_eq!(
+            run_edit(directory.path(), &edit, &scope, &profile, Some(guard), None).err().unwrap(),
+            FILE_MODIFIED_SINCE_READ
+        );
+        assert_eq!(
+            run_write(directory.path(), &overwrite, &scope, &profile, Some(guard), None).err().unwrap(),
+            FILE_MODIFIED_SINCE_READ
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "one\n2\nthree\n");
+
+        // Reading it again lets both through.
+        read_and_commit(directory.path(), "a.txt", guard);
+        run_edit(directory.path(), &edit, &scope, &profile, Some(guard), None).unwrap();
+        run_write(directory.path(), &overwrite, &scope, &profile, Some(guard), None).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "anything\n");
     }
 
     #[test]
@@ -10786,11 +10773,15 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "z = 1\nz = 2\n");
     }
 
+    /// A stale file is refused whatever the edit would make of it: one that
+    /// would apply under replace_all, one the file already holds, one whose
+    /// text is gone. There is no stale recovery: the model's copy is not the
+    /// current one in any of them.
     #[test]
-    fn a_stale_file_is_recovered_by_replace_all_but_not_by_an_ambiguous_edit() {
+    fn a_stale_file_is_refused_whatever_the_edit_would_do() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("a.txt");
-        fs::write(&path, "x = 1\nx = 2\ny = 3\n").unwrap();
+        fs::write(&path, "x = 1\nx = 2\nsay “hi”\n").unwrap();
         let registry = FileReadRegistry::default();
         let guard = guard(&registry);
         let scope = ExecutionScope::workspace_only(directory.path());
@@ -10803,57 +10794,19 @@ mod tests {
             canonical.clone(),
             FileReadRecord::full_read(fresh.modified_ms - 1_000, "older\n".into()),
         );
-
-        // Two hits without replace_all would not apply, so the file is simply stale.
-        let ambiguous = object(json!({ "path": "a.txt", "find": "x = ", "replace": "x := " }));
-        assert_eq!(
-            run_edit(directory.path(), &ambiguous, &scope, &profile, Some(guard), None).err().unwrap(),
-            FILE_MODIFIED_SINCE_READ
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "x = 1\nx = 2\ny = 3\n");
-
-        // Three hits under replace_all do apply: stale recovery, and it says so.
-        let all = object(json!({ "path": "a.txt", "find": " = ", "replace": " := ", "replace_all": true }));
-        let edited = run_edit(directory.path(), &all, &scope, &profile, Some(guard), None).unwrap();
-        assert_eq!(
-            edited.output,
-            format!(
-                "ok — occurrences replaced: 3{}",
-                profile.text(PromptKey::ToolEditStaleRecovered)
-            )
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "x := 1\nx := 2\ny := 3\n");
-        assert!(!guard.get(&canonical).unwrap().in_model_context);
-    }
-
-    #[test]
-    fn a_stale_file_that_already_holds_the_edit_says_there_is_nothing_to_change() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("a.txt");
-        fs::write(&path, "say “hi”\n").unwrap();
-        let registry = FileReadRegistry::default();
-        let guard = guard(&registry);
-        let scope = ExecutionScope::workspace_only(directory.path());
-        let profile = PromptProfile::builtin();
-        read_and_commit(directory.path(), "a.txt", guard);
-        let canonical = fs::canonicalize(&path).unwrap();
-        let fresh = guard.get(&canonical).unwrap();
-        guard.record(
-            canonical.clone(),
-            FileReadRecord::full_read(fresh.modified_ms - 1_000, "older\n".into()),
-        );
-        let settled = object(json!({ "path": "a.txt", "find": "say \"hi\"", "replace": "say “hi”" }));
-        assert_eq!(
-            run_edit(directory.path(), &settled, &scope, &profile, Some(guard), None).err().unwrap(),
-            EDIT_LEAVES_FILE_UNCHANGED
-        );
-        // Text that is not there at all still finds the file stale.
-        let absent = object(json!({ "path": "a.txt", "find": "bye", "replace": "ciao" }));
-        assert_eq!(
-            run_edit(directory.path(), &absent, &scope, &profile, Some(guard), None).err().unwrap(),
-            FILE_MODIFIED_SINCE_READ
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "say “hi”\n");
+        for edit in [
+            json!({ "path": "a.txt", "find": " = ", "replace": " := ", "replace_all": true }),
+            json!({ "path": "a.txt", "find": "say \"hi\"", "replace": "say “hi”" }),
+            json!({ "path": "a.txt", "find": "bye", "replace": "ciao" }),
+        ] {
+            assert_eq!(
+                run_edit(directory.path(), &object(edit), &scope, &profile, Some(guard), None)
+                    .err()
+                    .unwrap(),
+                FILE_MODIFIED_SINCE_READ
+            );
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), "x = 1\nx = 2\nsay “hi”\n");
     }
 
     #[test]
@@ -10948,7 +10901,7 @@ mod tests {
         assert!(hint.starts_with("[This command modified 7 file(s)"), "{hint}");
         assert!(hint.contains("a.txt, b.txt, c.txt, d.txt, e.txt and 2 more"), "{hint}");
         assert!(!hint.contains("untouched"), "{hint}");
-        assert!(hint.ends_with("Read them again before editing.]"), "{hint}");
+        assert!(hint.ends_with("and 2 more.]"), "{hint}");
         assert!(
             stale_read_hint(Some(guard), workspace, "cargo test", started, &profile).is_none(),
             "only formatter-looking commands hint"

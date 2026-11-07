@@ -51,9 +51,12 @@ pub struct FileReadRecord {
     /// the line cap. Only a full record can rescue a stale check by content,
     /// and only a full record is scanned for external changes.
     pub full: bool,
-    /// Whether the model has seen `content`. False after a hook re-sync or a
-    /// stale-recovered edit: the file on disk is known, but the model's copy
-    /// of it is not the current one.
+    /// Whether the model's copy of the file is the current one: it read or
+    /// wrote the file, and every change on disk since was shown to it whole.
+    /// False after a change notice that could not show the change (too large,
+    /// no earlier text to diff, the snippet budget spent): the host knows the
+    /// file, the model does not, so `write` and `edit` refuse it until the
+    /// model reads it again. A ranged read is current for what it showed.
     pub in_model_context: bool,
 }
 

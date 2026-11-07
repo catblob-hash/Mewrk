@@ -7358,26 +7358,29 @@ mod prompt_tests {
     /// arriving beside it would leave the model reading both.
     #[test]
     fn trusted_tool_descriptions_replace_the_model_visible_description() {
+        // A tool whose built-in description says something: the file and
+        // shell tools say nothing, so they could not show it being replaced.
         let canonical = crate::catalog::tool_catalog()
             .into_iter()
-            .find(|tool| tool.name == "read")
+            .find(|tool| tool.name == "web_fetch")
             .unwrap();
         let entries = [ToolDescriptionEntry {
-            tool_name: " read ".into(),
+            tool_name: " web_fetch ".into(),
             variant: String::new(),
             description: "CUSTOM MODEL DESCRIPTION".into(),
         }];
         let profile = profile_with(entries.to_vec(), crate::model::ResolvedLanguage::ZhCn);
         let tools = crate::catalog::tool_catalog_for_language(profile.language);
-        let overridden = tools.iter().find(|tool| tool.name == "read").unwrap();
+        let overridden = tools.iter().find(|tool| tool.name == "web_fetch").unwrap();
 
         assert_eq!(
-            wire_description(&profile, "read"),
+            wire_description(&profile, "web_fetch"),
             "CUSTOM MODEL DESCRIPTION"
         );
         // The built-in wording is gone, not merely preceded by the override.
-        assert!(!wire_description(&profile, "read")
-            .contains(&wire_description(&PromptProfile::builtin(), "read")));
+        let builtin = wire_description(&PromptProfile::builtin(), "web_fetch");
+        assert!(!builtin.is_empty());
+        assert!(!wire_description(&profile, "web_fetch").contains(&builtin));
         // The descriptor's own description stays empty: the override lives in
         // the schema root alone.
         assert_eq!(overridden.description, "");

@@ -1,5 +1,5 @@
 {
-  "keyCount": 513,
+  "keyCount": 511,
   "keys": [
     {
       "description": "Frame of the environment block at the head of the host system prompt: the heading and the sentence introducing the fact list. `{facts}` is the list, one ` - ` item per `system.environment.*` line. Emptying this key removes the whole block, facts included.",
@@ -2810,12 +2810,7 @@
       "placeholders": []
     },
     {
-      "description": "Suffix on an `edit` result that applied to a file changed on disk since the model read it, because the find text still matched once (or, with replace_all, at least once). Only the file write guards decide staleness, so it is never sent with them off.",
-      "id": "tool.edit_stale_recovered",
-      "placeholders": []
-    },
-    {
-      "description": "Round-start notice that a file the model read changed on disk, with the changed regions rendered with line numbers. Part of the file write guards: never sent with them off.",
+      "description": "Notice that a file the model read or wrote changed on disk — behind its back between rounds, or by a PostToolUse hook right after its `write`/`edit` — with every changed region rendered with line numbers. The model's copy then counts as current, so its next `write`/`edit` of the file goes through; a text that leaves out {snippet} shows it nothing and gets the omitted notice instead. Part of the file write guards: never sent with them off.",
       "id": "tool.file_changed_notice",
       "placeholders": [
         "path",
@@ -2823,15 +2818,8 @@
       ]
     },
     {
-      "description": "The same notice when earlier files in the round already used up the snippet budget.",
+      "description": "The same notice when the changes cannot all be shown (too large, the round's snippet budget spent, or the earlier text no longer remembered). The model's copy is then out of date, so its next `write`/`edit` of the file is refused until it reads the file again.",
       "id": "tool.file_changed_omitted",
-      "placeholders": [
-        "path"
-      ]
-    },
-    {
-      "description": "Notice that a PostToolUse hook rewrote the file `write`/`edit` just wrote and the host re-read it. Part of the file write guards: never sent with them off.",
-      "id": "tool.hook_file_resynced",
       "placeholders": [
         "path"
       ]

@@ -1143,14 +1143,10 @@ prompt_keys! {
         "`edit` result with replace_all: how many occurrences were replaced. The default leaves out the file; the value stays available to a profile that wants to name it."),
     ToolFileStateCurrent => ("tool.file_state_current", [],
         "Suffix on a `write`/`edit` result while the conversation's file write guards are on: the model need not read the file back. Never sent with the guards off."),
-    ToolEditStaleRecovered => ("tool.edit_stale_recovered", [],
-        "Suffix on an `edit` result that applied to a file changed on disk since the model read it, because the find text still matched once (or, with replace_all, at least once). Only the file write guards decide staleness, so it is never sent with them off."),
     ToolFileChangedNotice => ("tool.file_changed_notice", ["path", "snippet"],
-        "Round-start notice that a file the model read changed on disk, with the changed regions rendered with line numbers. Part of the file write guards: never sent with them off."),
+        "Notice that a file the model read or wrote changed on disk — behind its back between rounds, or by a PostToolUse hook right after its `write`/`edit` — with every changed region rendered with line numbers. The model's copy then counts as current, so its next `write`/`edit` of the file goes through; a text that leaves out {snippet} shows it nothing and gets the omitted notice instead. Part of the file write guards: never sent with them off."),
     ToolFileChangedOmitted => ("tool.file_changed_omitted", ["path"],
-        "The same notice when earlier files in the round already used up the snippet budget."),
-    ToolHookFileResynced => ("tool.hook_file_resynced", ["path"],
-        "Notice that a PostToolUse hook rewrote the file `write`/`edit` just wrote and the host re-read it. Part of the file write guards: never sent with them off."),
+        "The same notice when the changes cannot all be shown (too large, the round's snippet budget spent, or the earlier text no longer remembered). The model's copy is then out of date, so its next `write`/`edit` of the file is refused until it reads the file again."),
     ToolShellStaleReadHint => ("tool.shell_stale_read_hint", ["count", "files"],
         "Suffix on a shell result after a formatter-looking command changed files the model had read. Part of the file write guards: never sent with them off."),
     ToolShellStaleReadMore => ("tool.shell_stale_read_more", ["count"],
@@ -1920,9 +1916,9 @@ mod tests {
     /// The expected texts are literals, never derived from the registry.
     #[test]
     fn without_send_message_the_agent_spawn_texts_are_unchanged() {
-        const SPAWN: &str = r#"Start a background child agent; the call returns once it is dispatched. Delegate self-contained, checkable work and run independent children in parallel; keep judgement that spans the whole task here. The child sees only what you give it and has this conversation's tools (or its role's), except spawning agents and asking the user. Nothing can be sent to it after dispatch, so the prompt must be complete: the goal, relevant paths and constraints, and what to return. Children outlive the turn: one finishing while the conversation is idle starts a new turn to deliver its result. Collect progress and results with task_wait; until a result arrives you know nothing of what the child found, and what it reports is a claim to check."#;
-        const SPAWN_ASYNC: &str = r#"Start a background child agent. Asynchronous: the call returns nothing at first and the child's result arrives later as this call's own output; call task_wait when your next step needs it. Delegate self-contained, checkable work and run independent children in parallel; keep judgement that spans the whole task here. The child sees only what you give it and has this conversation's tools (or its role's), except spawning agents and asking the user. Nothing can be sent to it after dispatch, so the prompt must be complete: the goal, relevant paths and constraints, and what to return. Children outlive the turn: one finishing while the conversation is idle starts a new turn to deliver its result. Until a result arrives you know nothing of what the child found; never invent one, and treat what it reports as a claim to check."#;
-        const NAME: &str = r#"The child's address for task_wait and its task title. Reserved across this conversation's branch tree, workflow runs included: a name already used is rejected."#;
+        const SPAWN: &str = r#"Background child agent; returns once dispatched. It sees only the prompt and your tools, minus agent_spawn and ask_user. Nothing can be sent after dispatch: make the prompt complete. The result arrives via task_wait or on its own, starting a turn if idle. What it reports is a claim to check."#;
+        const SPAWN_ASYNC: &str = r#"Background child agent. Asynchronous: returns nothing at first; the result arrives later as this call's output (task_wait when you need it). It sees only the prompt and your tools, minus agent_spawn and ask_user. Nothing can be sent after dispatch: make the prompt complete. Never invent a result; what it reports is a claim to check."#;
+        const NAME: &str = r#"Address for task_wait. Unique across this conversation (workflow runs included); a used name is rejected."#;
         // Every tool a conversation that can spawn offers except the new one,
         // and the bare minimum a text could be resolved against.
         let without_catalog = crate::tool_mentions::OfferedTools::from_names(
@@ -1954,29 +1950,17 @@ mod tests {
             (PromptKey::ToolAgentSpawnAsyncDescription, SPAWN_ASYNC),
         ] {
             let said = crate::tool_mentions::resolve(key.builtin_text(), &with).into_owned();
-            assert!(
-                !said.contains("Nothing can be sent to it after dispatch"),
-                "{said}"
-            );
-            assert!(
-                said.contains("send_message reaches the child later by its name"),
-                "{said}"
-            );
-            assert!(
-                said.contains("A new agent_spawn always starts a fresh child with no memory"),
-                "{said}"
-            );
+            assert!(!said.contains("Nothing can be sent after dispatch"), "{said}");
+            assert!(said.contains("send_message reaches it by name"), "{said}");
+            assert!(said.contains("a new agent_spawn starts fresh"), "{said}");
             // Everything around the one sentence is still there.
-            let head = old
-                .split("Nothing can be sent to it after dispatch")
-                .next()
-                .unwrap();
-            let tail = old.split("what to return.").nth(1).unwrap();
+            let head = old.split("Nothing can be sent after dispatch").next().unwrap();
+            let tail = old.split("make the prompt complete.").nth(1).unwrap();
             assert!(said.starts_with(head) && said.ends_with(tail), "{said}");
         }
         assert_eq!(
             crate::tool_mentions::resolve(PromptKey::ToolAgentSpawnParamName.builtin_text(), &with),
-            NAME.replace("task_wait and its", "task_wait, send_message and its")
+            NAME.replace("task_wait.", "task_wait, send_message.")
         );
     }
 
@@ -2015,18 +1999,20 @@ mod tests {
         assert_eq!(crate::tool_surface::variants_of("send_message").len(), 1);
     }
 
-    /// Each PowerShell edition describes its own language: 7's operators are
-    /// offered by `pwsh` and refused by `powershell`, and only 5.1 warns about
-    /// the ANSI default.
+    /// The file and shell tools carry no description in any variant: their
+    /// names say what they are. A profile can still give them one.
     #[test]
-    fn each_powershell_edition_says_only_what_is_true_of_it() {
-        let pwsh = PromptKey::ToolPwshDescription.builtin_text();
-        let windows = PromptKey::ToolPowershellDescription.builtin_text();
-        assert!(pwsh.contains("PowerShell 7"), "{pwsh}");
-        assert!(!pwsh.contains("ANSI"), "{pwsh}");
-        assert!(windows.contains("5.1"), "{windows}");
-        assert!(windows.contains("ANSI"), "{windows}");
-        assert!(windows.contains("if ($?)"), "{windows}");
+    fn file_and_shell_tools_carry_no_description() {
+        for tool in [
+            "ls", "grep", "find", "read", "write", "edit", "pwsh", "powershell", "bash", "zsh",
+            "sh",
+        ] {
+            for variant in crate::tool_surface::variants_of(tool).iter().copied() {
+                let key = PromptKey::for_tool_description(tool, variant)
+                    .unwrap_or_else(|| panic!("{tool} has a description key"));
+                assert_eq!(key.builtin_text(), "", "{}", key.id());
+            }
+        }
     }
 
     /// A `tools[]` entry overrides the description of the one variant it

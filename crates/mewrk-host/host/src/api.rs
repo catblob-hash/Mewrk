@@ -14378,6 +14378,11 @@ fn push_file_change_block(request: &mut RunModelRequest, content: String) {
 /// Claude Code's `changed_files` scan: every full record whose file changed on
 /// disk since is re-read, its record refreshed, and the model told what moved.
 /// A file that disappeared is forgotten without a word, as the source does.
+///
+/// The notice is what keeps the model's copy current: one that shows every
+/// changed region leaves the next `write`/`edit` free to go through; one that
+/// cannot (`file_change_notice`) marks the copy out of date, and the read gate
+/// then asks for a fresh read.
 fn inject_file_change_notices(request: &mut RunModelRequest, state: &AppState) {
     let notices = {
         let Some(guard) = file_guard_context(request, state) else {
@@ -14435,28 +14440,61 @@ fn scan_changed_files(
             );
             continue;
         }
-        let snippet = record
-            .content
-            .as_deref()
-            .map(|before| changed_region_snippet(before, &normalized))
-            .unwrap_or_default();
+        let display = tool_executor::display_recorded_path(workspace, &path);
+        let (notice, shown) = file_change_notice(
+            profile,
+            &display,
+            record.content.as_deref(),
+            &normalized,
+            &mut budget,
+        );
         guard.registry.record(
             guard.scope,
-            path.clone(),
-            crate::file_read_state::FileReadRecord::full_read(disk_ms, normalized),
+            path,
+            crate::file_read_state::FileReadRecord {
+                // Current only if it was before and the notice showed it all.
+                in_model_context: record.in_model_context && shown,
+                ..crate::file_read_state::FileReadRecord::full_read(disk_ms, normalized)
+            },
         );
-        let display = tool_executor::display_recorded_path(workspace, &path);
-        if snippet.is_empty() || snippet.len() > budget {
-            notices.push(profile.render(PromptKey::ToolFileChangedOmitted, &[("path", &display)]));
-            continue;
-        }
-        budget -= snippet.len();
-        notices.push(profile.render(
-            PromptKey::ToolFileChangedNotice,
-            &[("path", &display), ("snippet", &snippet)],
-        ));
+        notices.push(notice);
     }
     notices
+}
+
+/// The notice that `path` (as `display` names it) changed from `before` to
+/// `after`, and whether it showed the model every changed region.
+///
+/// Only then does the model's copy stay current. The change is left out —
+/// and the omitted notice tells the model to read the file again — when there
+/// is no earlier text to diff against (a record restored after a restart, or
+/// one whose text the scope's budget evicted), when the changed regions do not
+/// fit one notice, when they would overrun `budget` (what is left of this
+/// scan's), or when the profile's notice text leaves the snippet out.
+fn file_change_notice(
+    profile: &PromptProfile,
+    display: &str,
+    before: Option<&str>,
+    after: &str,
+    budget: &mut usize,
+) -> (String, bool) {
+    if let Some(snippet) = before
+        .and_then(|before| changed_region_snippet(before, after))
+        .filter(|snippet| !snippet.is_empty() && snippet.len() <= *budget)
+    {
+        let notice = profile.render(
+            PromptKey::ToolFileChangedNotice,
+            &[("path", display), ("snippet", &snippet)],
+        );
+        if notice.contains(&snippet) {
+            *budget -= snippet.len();
+            return (notice, true);
+        }
+    }
+    (
+        profile.render(PromptKey::ToolFileChangedOmitted, &[("path", display)]),
+        false,
+    )
 }
 
 /// The text of a recorded file, when it is small enough to diff.
@@ -14485,8 +14523,10 @@ fn read_text_bounded(path: &Path) -> Option<String> {
 
 /// The changed regions between two texts, each line numbered the way `cat -n`
 /// would show it — the source's `wZt`: context around every hunk, hunks
-/// separated by `...`, cut at the per-file cap with a note of what was left out.
-fn changed_region_snippet(before: &str, after: &str) -> String {
+/// separated by `...`. `None` when they do not fit the per-file cap: where the
+/// source cuts the snippet short, a partial change is not shown at all, since
+/// it would leave the model's copy out of date anyway.
+fn changed_region_snippet(before: &str, after: &str) -> Option<String> {
     let diff = similar::TextDiff::from_lines(before, after);
     let mut lines = Vec::new();
     for (index, group) in diff.grouped_ops(FILE_CHANGE_DIFF_CONTEXT).iter().enumerate() {
@@ -14509,25 +14549,8 @@ fn changed_region_snippet(before: &str, after: &str) -> String {
             }
         }
     }
-    let mut rendered = String::new();
-    let mut shown = 0usize;
-    for line in &lines {
-        if rendered.len() + line.len() + 1 > FILE_CHANGE_SNIPPET_CHARS {
-            break;
-        }
-        if !rendered.is_empty() {
-            rendered.push('\n');
-        }
-        rendered.push_str(line);
-        shown += 1;
-    }
-    if shown < lines.len() {
-        rendered.push_str(&format!(
-            "\n... [{} lines truncated] ...",
-            lines.len() - shown
-        ));
-    }
-    rendered
+    let rendered = lines.join("\n");
+    (rendered.len() <= FILE_CHANGE_SNIPPET_CHARS).then_some(rendered)
 }
 
 /// Commits what a guarded file tool reported once the call's result is final.
@@ -14578,6 +14601,10 @@ fn settle_file_guard_touch(
 /// Re-reads a just-written file whose time moved after the PostToolUse hooks
 /// ran. Returns the notice for the model when the text actually changed; a
 /// hook that only touched the time refreshes the record silently.
+///
+/// The notice is the change notice of the between-rounds scan: with every
+/// region the hook changed, the model's copy stays current and its next edit
+/// goes through; without them it must read the file again first.
 fn resync_written_file(
     guard: &tool_executor::FileGuardContext<'_>,
     path: &Path,
@@ -14602,16 +14629,24 @@ fn resync_written_file(
         );
         return None;
     }
-    // The disk is known again, but the model's copy is the pre-hook text.
+    let mut budget = FILE_CHANGE_SNIPPET_BUDGET;
+    let (notice, shown) = file_change_notice(
+        profile,
+        &tool_executor::display_recorded_path(workspace, path),
+        record.content.as_deref(),
+        &normalized,
+        &mut budget,
+    );
     guard.registry.record(
         guard.scope,
         path.to_path_buf(),
-        crate::file_read_state::FileReadRecord::written(disk_ms, normalized, false),
+        crate::file_read_state::FileReadRecord::written(
+            disk_ms,
+            normalized,
+            record.in_model_context && shown,
+        ),
     );
-    Some(profile.render(
-        PromptKey::ToolHookFileResynced,
-        &[("path", &tool_executor::display_recorded_path(workspace, path))],
-    ))
+    Some(notice)
 }
 
 /// What a `write` or `edit` that succeeded means for the language servers, as
@@ -17749,9 +17784,8 @@ mod tests {
     /// an absent `grep`, and a guarded `edit` without `read` says what it can
     /// still change rather than sending the model to a tool it lacks.
     ///
-    /// The built-in `find` says nothing at all, so a profile marks it the way a
-    /// tool-description file may; `edit` keeps the built-in text, which marks
-    /// its read-first rule itself.
+    /// The built-in file tools say nothing at all, so a profile marks them the
+    /// way a tool-description file may.
     #[test]
     fn a_wire_schema_names_only_the_siblings_its_request_offers() {
         let mut request = run_request(ProviderFamily::OpenaiResponses);
@@ -17760,10 +17794,16 @@ mod tests {
             "marked".into(),
             "Marked".into(),
             crate::model::ResolvedLanguage::EnUs,
-            [(
-                PromptKey::ToolFindDescription,
-                "Find paths by glob. {?grep}Unlike grep, this{/}{!grep}This{/} includes paths Git ignores.".to_owned(),
-            )]
+            [
+                (
+                    PromptKey::ToolFindDescription,
+                    "Find paths by glob. {?grep}Unlike grep, this{/}{!grep}This{/} includes paths Git ignores.".to_owned(),
+                ),
+                (
+                    PromptKey::ToolEditDescription,
+                    "{?read}The file must have been read in this conversation first, or the call fails.{/}{!read}Only a file this conversation wrote can be edited; any other fails.{/}".to_owned(),
+                ),
+            ]
             .into(),
             Vec::new(),
         ));
@@ -36449,9 +36489,7 @@ mod tests {
         );
         assert_eq!(
             schema["description"],
-            json!(
-                "Send one short progress note to the parent agent; the final conclusion still has to be in the last reply."
-            )
+            json!("Progress note to the parent; the conclusion still goes in your final reply.")
         );
         assert_eq!(schema["properties"]["message"]["maxLength"], json!(4000));
         assert_eq!(update.parameters.len(), 1);
@@ -46982,10 +47020,10 @@ mod tests {
     }
 
     #[test]
-    fn changed_region_snippets_number_lines_and_cut_at_the_cap() {
+    fn changed_region_snippets_number_lines_and_are_whole_or_none() {
         let before = (1..=40).map(|n| format!("line {n}\n")).collect::<String>();
         let after = before.replace("line 20\n", "line twenty\n");
-        let snippet = changed_region_snippet(&before, &after);
+        let snippet = changed_region_snippet(&before, &after).unwrap();
         assert!(snippet.contains("-    20\tline 20"), "{snippet}");
         assert!(snippet.contains("+    20\tline twenty"), "{snippet}");
         assert!(snippet.contains("     12\tline 12"), "{snippet}");
@@ -46993,16 +47031,11 @@ mod tests {
             !snippet.contains("line 3\n"),
             "eight lines of context, not the whole file"
         );
+        // A change past the cap is not cut short: it is not shown at all.
         let huge_after = (1..=3_000)
             .map(|n| format!("changed {n}\n"))
             .collect::<String>();
-        let capped = changed_region_snippet(&before, &huge_after);
-        assert!(
-            capped.len() <= FILE_CHANGE_SNIPPET_CHARS + 40,
-            "{}",
-            capped.len()
-        );
-        assert!(capped.contains("lines truncated] ..."), "{capped}");
+        assert!(changed_region_snippet(&before, &huge_after).is_none());
     }
 
     #[test]
@@ -47022,16 +47055,24 @@ mod tests {
         let notices = scan_changed_files(&guard, workspace.path(), &profile);
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(
-            notices[0].starts_with("Note: changed.txt changed on disk since you last read it."),
+            notices[0].starts_with("Note: changed.txt changed on disk since you last read or wrote it."),
             "{}",
             notices[0]
         );
         assert!(notices[0].contains("-     2\t2"), "{}", notices[0]);
         assert!(notices[0].contains("+     2\ttwo"), "{}", notices[0]);
-        // The record now holds the disk text at the disk time, so the next scan
-        // is silent and an edit goes straight through.
+        // The record now holds the disk text at the disk time, and the model
+        // was shown the whole change, so the next scan is silent and an edit
+        // goes straight through.
         let refreshed = registry.get(guard.scope, &changed).unwrap();
         assert!(refreshed.matches("one\ntwo\nthree\n"));
+        assert!(refreshed.in_model_context);
+        tool_executor::check_write_gate(
+            Some(refreshed.clone()),
+            crate::file_read_state::modified_ms(&changed),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             refreshed.modified_ms,
             crate::file_read_state::modified_ms(&changed).unwrap()
@@ -47046,6 +47087,30 @@ mod tests {
             "a deleted file is forgotten"
         );
         assert!(scan_changed_files(&guard, workspace.path(), &profile).is_empty());
+    }
+
+    /// A change the notice cannot show leaves the model's copy out of date:
+    /// the next `write`/`edit` is refused until the model reads the file again.
+    fn assert_out_of_date(
+        guard: &tool_executor::FileGuardContext<'_>,
+        path: &Path,
+    ) {
+        let record = guard.registry.get(guard.scope, path).unwrap();
+        assert!(!record.in_model_context);
+        assert_eq!(
+            record.modified_ms,
+            crate::file_read_state::modified_ms(path).unwrap(),
+            "the record follows the disk, so the same change is announced once"
+        );
+        assert_eq!(
+            tool_executor::check_write_gate(
+                Some(record),
+                crate::file_read_state::modified_ms(path),
+                None
+            )
+            .unwrap_err(),
+            tool_executor::FILE_MODIFIED_SINCE_READ
+        );
     }
 
     #[test]
@@ -47075,6 +47140,67 @@ mod tests {
             notices[0],
             profile.render(PromptKey::ToolFileChangedOmitted, &[("path", "big.txt")])
         );
+        assert_out_of_date(&guard, &path);
+        assert!(scan_changed_files(&guard, workspace.path(), &profile).is_empty());
+    }
+
+    /// A change too large for one notice is announced without its diff, where
+    /// Claude Code would cut the snippet short, and the model's copy is out of
+    /// date until it reads the file again.
+    #[test]
+    fn the_scan_marks_a_change_too_large_to_show_as_out_of_date() {
+        let workspace = tempfile::tempdir().unwrap();
+        let before = (1..=40).map(|n| format!("line {n}\n")).collect::<String>();
+        let huge = (1..=3_000).map(|n| format!("changed {n}\n")).collect::<String>();
+        let large = canonical_file(workspace.path(), "large.txt", &huge);
+        let registry = crate::file_read_state::FileReadRegistry::default();
+        let guard = file_guard_for(&registry);
+        record_full_read(&guard, &large, &before, 1_000);
+        let profile = PromptProfile::builtin();
+        let notices = scan_changed_files(&guard, workspace.path(), &profile);
+        assert_eq!(
+            notices,
+            vec![profile.render(PromptKey::ToolFileChangedOmitted, &[("path", "large.txt")])]
+        );
+        assert_out_of_date(&guard, &large);
+    }
+
+    /// The budget: changes that fit a notice each but not all together. Those
+    /// shown stay current; the one past the budget does not.
+    #[test]
+    fn the_scan_shows_changes_until_the_budget_runs_out() {
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = crate::file_read_state::FileReadRegistry::default();
+        let guard = file_guard_for(&registry);
+        // About 7,000 characters of snippet each, under the 8 KiB per notice:
+        // two fit the 16 KiB budget, the third does not.
+        let text = |tag: &str| {
+            (1..=100)
+                .map(|n| format!("{tag} {n:03} {}\n", "y".repeat(18)))
+                .collect::<String>()
+        };
+        assert!(
+            changed_region_snippet(&text("old"), &text("new"))
+                .is_some_and(|snippet| snippet.len() > FILE_CHANGE_SNIPPET_BUDGET / 3),
+            "the fixture's change fits one notice but not three in one budget"
+        );
+        let paths = ["a.txt", "b.txt", "c.txt"].map(|name| {
+            let path = canonical_file(workspace.path(), name, &text("new"));
+            record_full_read(&guard, &path, &text("old"), 1_000);
+            path
+        });
+        let profile = PromptProfile::builtin();
+        let notices = scan_changed_files(&guard, workspace.path(), &profile);
+        assert_eq!(notices.len(), 3);
+        for (notice, path) in notices.iter().zip(&paths[..2]) {
+            assert!(notice.contains("Changes (with line numbers):"), "{notice}");
+            assert!(guard.registry.get(guard.scope, path).unwrap().in_model_context);
+        }
+        assert_eq!(
+            notices[2],
+            profile.render(PromptKey::ToolFileChangedOmitted, &[("path", "c.txt")])
+        );
+        assert_out_of_date(&guard, &paths[2]);
     }
 
     /// A file-change notice is queued, then delivered once as a reminder card
@@ -47512,7 +47638,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_rewrite_resyncs_the_record_and_tells_the_model() {
+    fn a_hook_rewrite_resyncs_the_record_and_shows_the_model_the_change() {
         let workspace = tempfile::tempdir().unwrap();
         let path = canonical_file(workspace.path(), "fmt.rs", "fn main() {}\n");
         let registry = crate::file_read_state::FileReadRegistry::default();
@@ -47523,17 +47649,30 @@ mod tests {
         record_full_read(&guard, &path, "fn main(){}\n", 1_000);
         let notice = resync_written_file(&guard, &path, workspace.path(), &profile)
             .expect("a changed file produces a notice");
-        assert_eq!(
-            notice,
-            profile.render(PromptKey::ToolHookFileResynced, &[("path", "fmt.rs")])
+        assert!(
+            notice.starts_with("Note: fmt.rs changed on disk since you last read or wrote it."),
+            "{notice}"
         );
+        assert!(notice.contains("-     1\tfn main(){}"), "{notice}");
+        assert!(notice.contains("+     1\tfn main() {}"), "{notice}");
+        // Shown the whole change, the model's copy is current again.
         let record = registry.get(guard.scope, &path).unwrap();
         assert!(record.matches("fn main() {}\n"));
-        assert!(!record.in_model_context);
+        assert!(record.in_model_context);
         assert_eq!(
             record.modified_ms,
             crate::file_read_state::modified_ms(&path).unwrap()
         );
+        // A rewrite too large to show leaves it out of date instead.
+        let huge = (1..=3_000).map(|n| format!("// {n}\n")).collect::<String>();
+        std::fs::write(&path, &huge).unwrap();
+        record_full_read(&guard, &path, "fn main() {}\n", 1_000);
+        assert_eq!(
+            resync_written_file(&guard, &path, workspace.path(), &profile).unwrap(),
+            profile.render(PromptKey::ToolFileChangedOmitted, &[("path", "fmt.rs")])
+        );
+        assert_out_of_date(&guard, &path);
+        std::fs::write(&path, "fn main() {}\n").unwrap();
         // A hook that only touched the time is silent.
         record_full_read(&guard, &path, "fn main() {}\n", 1_000);
         assert!(resync_written_file(&guard, &path, workspace.path(), &profile).is_none());
@@ -47552,6 +47691,20 @@ mod tests {
             .filter(|tool| matches!(tool.name.as_str(), "read" | "edit" | "write"))
             .collect();
         request.enabled_tools = vec!["read".into(), "edit".into(), "write".into()];
+        // The built-in says nothing for either variant of the file tools, so a
+        // profile that words each one apart shows which variant was offered.
+        request.prompt_profile = std::sync::Arc::new(PromptProfile::from_file(
+            "variants".into(),
+            "Variants".into(),
+            crate::model::ResolvedLanguage::EnUs,
+            HashMap::from([
+                (PromptKey::ToolEditDescription, "guarded edit".to_owned()),
+                (PromptKey::ToolEditUnguardedDescription, "unguarded edit".to_owned()),
+                (PromptKey::ToolWriteDescription, "guarded write".to_owned()),
+                (PromptKey::ToolWriteUnguardedDescription, "unguarded write".to_owned()),
+            ]),
+            Vec::new(),
+        ));
         let description = |step: &Value, name: &str| -> String {
             step["tools"]
                 .as_array()
@@ -47573,16 +47726,12 @@ mod tests {
         };
 
         // With the guards on, the writers are the guarded tools, described by
-        // their standard keys — the read-first rule is part of that text, not a
-        // sentence appended to it.
+        // their standard keys alone: nothing is appended to that text.
         assert!(request.file_guard.enabled);
         let on = step_json(&request);
         assert_eq!(description(&on, "edit"), said(PromptKey::ToolEditDescription, &request));
         assert_eq!(description(&on, "write"), said(PromptKey::ToolWriteDescription, &request));
-        assert!(
-            description(&on, "edit").contains("must have been read in this conversation first"),
-            "the guarded edit says to read first"
-        );
+        assert_eq!(description(&on, "edit"), "guarded edit");
 
         // Off, they are the unguarded tools, and `read` does not change.
         request.file_guard.enabled = false;

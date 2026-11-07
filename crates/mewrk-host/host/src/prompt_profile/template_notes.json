@@ -3456,14 +3456,9 @@
       "zh": "文件写入保护开启时，附在 `write`/`edit` 结果后的后缀，告知模型无需回读文件。",
       "placeholders": {}
     },
-    "tool.edit_stale_recovered": {
-      "en": "Suffix on an `edit` result applied to a file that changed since the model read it, as the find text still matched.",
-      "zh": "`edit` 作用于读取后已被改动的文件、且查找文本仍能匹配时，附在结果后的后缀。",
-      "placeholders": {}
-    },
     "tool.file_changed_notice": {
-      "en": "Notice at turn start that a file the model read has since changed on disk, with the changed regions numbered.",
-      "zh": "回合开始时的通知：模型读过的文件已在磁盘上变化，并附带带行号的变更片段。",
+      "en": "Notice that a file the model read or wrote changed on disk (between rounds, or by a PostToolUse hook), with every changed region numbered; the model may then write to it without reading it again.",
+      "zh": "模型读过或写过的文件在磁盘上变化时（两轮之间，或 PostToolUse 钩子改写后）的通知，附带全部带行号的变更片段；之后模型无需重读即可写入该文件。",
       "placeholders": {
         "path": {
           "en": "the changed file's path",
@@ -3476,22 +3471,12 @@
       }
     },
     "tool.file_changed_omitted": {
-      "en": "The same notice when earlier files in the turn already used up the snippet budget, so the diff is omitted.",
-      "zh": "同一通知的省略版：本回合前面的文件已用完片段额度，故不附变更内容。",
+      "en": "The same notice when the changes cannot all be shown; the model's next write to the file is refused until it reads it again.",
+      "zh": "同一通知的省略版：变更无法完整附上；模型须重新读取该文件后才能再写入。",
       "placeholders": {
         "path": {
           "en": "the changed file's path",
           "zh": "已变化文件的路径"
-        }
-      }
-    },
-    "tool.hook_file_resynced": {
-      "en": "Notice that a PostToolUse hook rewrote the file `write`/`edit` just wrote, and Mewrk re-read it.",
-      "zh": "PostToolUse 钩子改写了 `write`/`edit` 刚写入的文件，Mewrk 已重新读取时的通知。",
-      "placeholders": {
-        "path": {
-          "en": "the rewritten file's path",
-          "zh": "被改写文件的路径"
         }
       }
     },
