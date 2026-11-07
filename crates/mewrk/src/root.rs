@@ -61,6 +61,7 @@ pub const SIDEBAR_FLOATS_AT: f32 = 860.0;
 pub fn root(app: &mut App) -> E {
     effects::frame(app);
     crate::glass::begin_frame(app);
+    mewrk_ui_common::markdown::begin_frame(app);
     let (window_w, window_h) = window_size();
     let sidebar_open = !shell(app).sidebar_closed;
     let sidebar_width = app.sidebar_width() as f32;
@@ -122,7 +123,7 @@ fn main_pane(app: &mut App, sidebar_open: bool, beside: bool, size: (f32, f32)) 
     // A workspace is optional for entering a draft; sending uses the temporary workspace. Panes that need a real workspace
     // remain individually guarded.
     let Some(cx) = PaneContext::of(app) else { return main };
-    if app.active_conversation_view().is_none() {
+    if !app.with_active_conversation(|_, conversation| conversation.is_some()) {
         return main;
     }
     let mut terminal = Some(keep_terminal_mounted(app, &cx));

@@ -36,6 +36,7 @@ pub struct SubagentView {
     pub contexts: Vec<Ctx>,
     pub updates: Vec<SubagentUpdate>,
     pub live: Option<LiveState>,
+    /// The context ids of the tool cards this view folds — not provider call ids. Workflow progress is keyed by these.
     pub call_ids: Vec<String>,
     pub parent_id: Option<String>,
     pub depth: usize,

@@ -64,6 +64,8 @@ struct Rig {
     theme: Theme,
     time: f32,
     animating: bool,
+    /// Something asked to be painted again with nothing else run ([`Ui::repaint_after`]).
+    repainting: bool,
     wake_in: Option<f32>,
     cursor: fluent::ui::CursorKind,
     renderer: Option<fluent::gpu::Renderer>,
@@ -87,7 +89,7 @@ impl Rig {
         })
         .map_err(|e| format!("{e:?}"))
         .expect("the host starts");
-        Self { app, scene: Scene::default(), text: TextCtx::new(1.0), mem: UiMemory::default(), input: Input::default(), clipboard: TestClipboard::default(), size: (800.0, 600.0), scale: 1.0, theme: Theme::dark(), time: 1.0, animating: false, wake_in: None, cursor: Default::default(), renderer: None, _data: data }
+        Self { app, scene: Scene::default(), text: TextCtx::new(1.0), mem: UiMemory::default(), input: Input::default(), clipboard: TestClipboard::default(), size: (800.0, 600.0), scale: 1.0, theme: Theme::dark(), time: 1.0, animating: false, repainting: false, wake_in: None, cursor: Default::default(), renderer: None, _data: data }
     }
 
     fn frame(&mut self, view: &dyn Fn(&mut App) -> E) {
@@ -100,6 +102,7 @@ impl Rig {
         let mut ui = Ui::new(&mut self.scene, &mut self.text, self.theme, &self.input, &mut self.mem, &mut self.clipboard, self.scale, self.size, 0.016, self.time);
         render(root, &mut self.app, &mut ui);
         self.animating = ui.animating;
+        self.repainting = ui.paint_wake_in.is_some();
         self.wake_in = ui.wake_in;
         self.cursor = ui.cursor;
         self.input.end_frame();
@@ -2051,6 +2054,9 @@ fn a_fragment_finds_the_heading_inside_its_own_message() {
 
 // ---------------------------------------------------------------- streaming reveal
 
+/// How long one commit's text takes to sweep in, in seconds.
+const REVEAL: f32 = mewrk_client::runs::stream_reveal::STREAM_REVEAL_MS as f32 / 1000.0;
+
 #[test]
 fn sweeps_only_the_newly_arrived_text_and_stops_marking_settled_text() {
     let mut rig = Rig::new();
@@ -2061,13 +2067,13 @@ fn sweeps_only_the_newly_arrived_text_and_stops_marking_settled_text() {
         move |_: &mut App| col().w_full().child(markdown_content("stream", &content.borrow(), MarkdownOptions { streaming: streaming.get(), ..Default::default() }))
     };
     rig.frame(&view);
-    // Nothing was on screen yet, so all of it is new.
+    // Nothing was on screen yet, so all of it is new. Only its painting moves, so it asks for frames that only paint.
     assert_eq!(probe::fresh_text("stream"), ["前半段"]);
-    assert!(rig.animating);
+    assert!(rig.repainting && !rig.animating);
     assert!(rig.faded_glyphs() > 0);
 
     // Only the continuation moves.
-    rig.time += 0.3;
+    rig.time += REVEAL;
     rig.frame(&view);
     assert!(probe::fresh_text("stream").is_empty());
     assert_eq!(rig.faded_glyphs(), 0);
@@ -2081,17 +2087,52 @@ fn sweeps_only_the_newly_arrived_text_and_stops_marking_settled_text() {
     rig.frame(&view);
     assert_eq!(probe::fresh_text("stream"), ["，加上后半段"]);
 
-    // Settled text carries no reveal at all.
+    // The stream ending leaves the fade in flight to finish rather than snap, and then nothing is marked.
     streaming.set(false);
-    *content.borrow_mut() = "前半段，加上后半段".to_owned();
+    rig.frame(&view);
+    assert_eq!(probe::fresh_text("stream"), ["，加上后半段"]);
+    rig.time += REVEAL;
     rig.frame(&view);
     assert!(probe::fresh_text("stream").is_empty());
     assert_eq!(rig.faded_glyphs(), 0);
-    assert!(!rig.animating);
+    assert!(!rig.animating && !rig.repainting);
 }
 
 #[test]
-fn sweeps_text_by_what_renders_across_blocks_and_leaves_code_alone() {
+fn the_text_a_stream_ends_with_fades_in_like_every_commit() {
+    let mut rig = Rig::new();
+    let content = Rc::new(RefCell::new("流到这里".to_owned()));
+    let streaming = Rc::new(Cell::new(true));
+    let view = {
+        let (content, streaming) = (content.clone(), streaming.clone());
+        move |_: &mut App| col().w_full().child(markdown_content("ending", &content.borrow(), MarkdownOptions { streaming: streaming.get(), ..Default::default() }))
+    };
+    rig.frame(&view);
+    rig.time += REVEAL;
+    rig.frame(&view);
+    // The last commit and the end of the stream arrive together.
+    streaming.set(false);
+    *content.borrow_mut() = "流到这里，最后一段".to_owned();
+    rig.frame(&view);
+    assert_eq!(probe::fresh_text("ending"), ["，最后一段"]);
+    assert!(rig.faded_glyphs() > 0 && rig.repainting);
+    rig.time += REVEAL;
+    rig.frame(&view);
+    assert_eq!(rig.faded_glyphs(), 0);
+    // Text that changes after that, an edit say, is not a stream's, and lands at once.
+    *content.borrow_mut() = "流到这里，最后一段，改过".to_owned();
+    rig.frame(&view);
+    assert!(probe::fresh_text("ending").is_empty());
+    assert_eq!(rig.faded_glyphs(), 0);
+    // Nor does a message that never streamed fade.
+    let settled = move |_: &mut App| col().w_full().child(markdown_content("settled", "从来没有流过", MarkdownOptions::default()));
+    rig.frame(&settled);
+    assert_eq!(rig.faded_glyphs(), 0);
+    assert!(!rig.repainting);
+}
+
+#[test]
+fn sweeps_text_by_what_renders_across_blocks_code_included() {
     let mut rig = Rig::new();
     let content = Rc::new(RefCell::new("先看 **bo".to_owned()));
     let view = {
@@ -2099,12 +2140,49 @@ fn sweeps_text_by_what_renders_across_blocks_and_leaves_code_alone() {
         move |_: &mut App| col().w_full().child(markdown_content("across", &content.borrow(), MarkdownOptions { streaming: true, ..Default::default() }))
     };
     rig.frame(&view);
-    rig.time += 0.3;
+    rig.time += REVEAL;
     rig.frame(&view);
-    // `**bo` was literal text; closed, it renders as bold `bo` plus the rest, and it is the rendered text that is new.
+    // `**bo` was literal text; closed, it renders as bold `bo` plus the rest, and it is the rendered text that is new. Code sweeps in
+    // too: arriving whole, it would stand a commit ahead of the text before it.
     *content.borrow_mut() = "先看 **bold** 然后\n\n第二段\n\n```ts\nconst x = 1;\n```".to_owned();
     rig.frame(&view);
-    assert_eq!(probe::fresh_text("across"), ["bold 然后", "第二段"]);
+    assert_eq!(probe::fresh_text("across"), ["bold 然后", "第二段", "const x = 1;"]);
+}
+
+/// The boxes a code block paints, as how wide each is: a code block's is the column's width.
+fn wide_boxes(rig: &Rig) -> usize {
+    rig.scene.layers[0].rects.iter().filter(|r| r.rect[2] > 300.0 && r.rect[3] > 20.0).count()
+}
+
+#[test]
+fn nothing_drawn_whole_shows_ahead_of_the_sweep() {
+    let mut rig = Rig::new();
+    let content = Rc::new(RefCell::new("开头".to_owned()));
+    let view = {
+        let content = content.clone();
+        move |_: &mut App| col().w_full().child(markdown_content("hold", &content.borrow(), MarkdownOptions { streaming: true, ..Default::default() }))
+    };
+    rig.frame(&view);
+    rig.time += REVEAL;
+    rig.frame(&view);
+    assert_eq!(wide_boxes(&rig), 0);
+    // One commit: a long paragraph, then a code block. The block's box waits for the paragraph to have swept in.
+    let code: String = (0..10).map(|i| format!("let x{i} = {i};\n")).collect();
+    *content.borrow_mut() = format!("开头{}\n\n```rust\n{code}```", "，接着是一段很长的文字".repeat(12));
+    rig.frame(&view);
+    assert_eq!(wide_boxes(&rig), 0, "the code block is not out ahead of the text before it");
+    rig.time += REVEAL * 0.3;
+    rig.frame(&view);
+    assert_eq!(wide_boxes(&rig), 0, "nor a third of the way through");
+    // The code's turn comes about three quarters of the way through: its box is there while its text sweeps in.
+    rig.time += REVEAL * 0.55;
+    rig.frame(&view);
+    assert_eq!(wide_boxes(&rig), 1, "the box arrives with its turn");
+    assert!(rig.faded_glyphs() > 0, "while the code is still sweeping in");
+    rig.time += REVEAL;
+    rig.frame(&view);
+    assert_eq!(wide_boxes(&rig), 1, "and is there once the sweep has reached it");
+    assert_eq!(rig.faded_glyphs(), 0);
 }
 
 /// Opacity by where a glyph is, a line at a time and left to right. A glyph's own box starts where its ink does, so its middle says which line it is on.
@@ -2134,13 +2212,13 @@ fn the_sweep_uncovers_new_text_from_its_left_edge_in_one_commit() {
         move |_: &mut App| col().w_full().child(markdown_content("sweep", &content.borrow(), MarkdownOptions { streaming: true, ..Default::default() }))
     };
     rig.frame(&view);
-    rig.time += 0.3;
+    rig.time += REVEAL;
     rig.frame(&view);
     let settled = rig.scene.layers[0].glyphs.len();
     *content.borrow_mut() = "已在屏幕上的文字后面又来了一段新的文字它正在从左向右被写出来".to_owned();
     rig.frame(&view);
     // Halfway through its one commit.
-    rig.time += mewrk_client::runs::stream_reveal::STREAM_REVEAL_MS as f32 / 2000.0 - 0.016;
+    rig.time += REVEAL / 2.0 - 0.016;
     rig.frame(&view);
     let alphas = glyph_alphas(&rig);
     assert!(alphas[..settled].iter().all(|a| *a >= 250), "what was on screen stays: {alphas:?}");
@@ -2150,10 +2228,10 @@ fn the_sweep_uncovers_new_text_from_its_left_edge_in_one_commit() {
     assert!(fresh.windows(2).all(|pair| pair[0] >= pair[1]), "the edge runs one way: {fresh:?}");
     assert!(fresh.iter().any(|a| *a > 0 && *a < 250), "and it is a gradient: {fresh:?}");
     // One commit later it has all landed, and nothing asks for frames over it.
-    rig.time += 0.1;
+    rig.time += REVEAL / 2.0;
     rig.frame(&view);
     assert_eq!(rig.faded_glyphs(), 0);
-    assert!(!rig.animating);
+    assert!(!rig.animating && !rig.repainting);
 }
 
 #[test]
@@ -2168,7 +2246,7 @@ fn the_sweep_follows_the_text_onto_the_next_line_and_across_a_paragraph_in_one_s
     *content.borrow_mut() = format!("{}\n\n{}", "第一段的文字足够长所以会折成好几行才能放得下".repeat(2), "第二段");
     rig.frame(&view);
     // A little way in: the first line is going, and every line after it has yet to start.
-    rig.time += 0.004;
+    rig.time += REVEAL * 0.2 - 0.016;
     rig.frame(&view);
     let shown = glyph_lines(&rig);
     assert!(shown.len() >= 4, "{shown:?}");
@@ -2176,15 +2254,92 @@ fn the_sweep_follows_the_text_onto_the_next_line_and_across_a_paragraph_in_one_s
     assert!(shown[1].iter().all(|a| *a == 0), "the next line waits for the edge to reach it: {shown:?}");
     assert!(shown[shown.len() - 1].iter().all(|a| *a == 0), "and the second paragraph for its turn: {shown:?}");
     // Most of the way: the lines above are done while the last is still to come.
-    rig.time += 0.05;
+    rig.time += REVEAL * 0.66 - 0.016;
     rig.frame(&view);
     let shown = glyph_lines(&rig);
     assert!(shown[0].iter().all(|a| *a >= 250), "{shown:?}");
     assert!(shown[shown.len() - 1].iter().any(|a| *a < 250), "{shown:?}");
 }
 
+/// The bullets a list's items paint, as how opaque each is.
+fn bullet_alphas(rig: &Rig) -> Vec<u8> {
+    rig.scene.layers[0].rects.iter().filter(|r| (r.rect[2] - 5.0).abs() < 0.01 && (r.rect[3] - 5.0).abs() < 0.01 && r.radii[0] > 2.0).map(|r| r.fill.a).collect()
+}
+
 #[test]
-fn a_later_commit_leaves_what_the_last_was_still_sweeping_in_settled() {
+fn a_list_items_bullet_waits_for_the_sweep_to_reach_its_text() {
+    let mut rig = Rig::new();
+    let content = Rc::new(RefCell::new("- 第一项".to_owned()));
+    let view = {
+        let content = content.clone();
+        move |_: &mut App| col().w_full().child(markdown_content("bullets", &content.borrow(), MarkdownOptions { streaming: true, ..Default::default() }))
+    };
+    rig.frame(&view);
+    rig.time += REVEAL;
+    rig.frame(&view);
+    assert_eq!(bullet_alphas(&rig), [255]);
+    // A commit that brings a long stretch of text and then a new item: the new item's turn comes at the end of the sweep.
+    *content.borrow_mut() = format!("- 第一项{}
+- 第二项", "，还有很长的一段文字".repeat(6));
+    rig.frame(&view);
+    assert_eq!(bullet_alphas(&rig), [255], "the second bullet is not out ahead of its text");
+    rig.time += REVEAL;
+    rig.frame(&view);
+    assert_eq!(bullet_alphas(&rig), [255, 255], "and is there once its text is");
+}
+
+#[test]
+fn a_bullet_fades_in_as_its_item_begins() {
+    let mut rig = Rig::new();
+    let content = Rc::new(RefCell::new("开头".to_owned()));
+    let view = {
+        let content = content.clone();
+        move |_: &mut App| col().w_full().child(markdown_content("bullet-fade", &content.borrow(), MarkdownOptions { streaming: true, ..Default::default() }))
+    };
+    rig.frame(&view);
+    rig.time += REVEAL;
+    rig.frame(&view);
+    *content.borrow_mut() = "开头\n\n- 新的一项".to_owned();
+    rig.frame(&view);
+    assert!(bullet_alphas(&rig).is_empty(), "not before its turn");
+    rig.frame(&view);
+    let alphas = bullet_alphas(&rig);
+    assert!(alphas.len() == 1 && alphas[0] > 0 && alphas[0] < 255, "on its way in: {alphas:?}");
+    rig.time += REVEAL;
+    rig.frame(&view);
+    assert_eq!(bullet_alphas(&rig), [255]);
+}
+
+#[test]
+fn the_commit_that_ends_a_stream_takes_over_the_sweep_in_flight_rather_than_landing_it() {
+    let mut rig = Rig::new();
+    let content = Rc::new(RefCell::new("开始".to_owned()));
+    let streaming = Rc::new(Cell::new(true));
+    let view = {
+        let (content, streaming) = (content.clone(), streaming.clone());
+        move |_: &mut App| col().w_full().child(markdown_content("takeover", &content.borrow(), MarkdownOptions { streaming: streaming.get(), ..Default::default() }))
+    };
+    rig.frame(&view);
+    rig.time += REVEAL;
+    rig.frame(&view);
+    *content.borrow_mut() = format!("开始{}", "甲".repeat(40));
+    rig.frame(&view);
+    // Halfway through that sweep the stream ends, off the beat, with a little more.
+    rig.time += REVEAL / 2.0 - 0.016;
+    streaming.set(false);
+    *content.borrow_mut() = format!("开始{}{}", "甲".repeat(40), "乙".repeat(10));
+    rig.frame(&view);
+    let alphas = glyph_alphas(&rig);
+    assert!(alphas[..2].iter().all(|a| *a >= 250), "{alphas:?}");
+    assert!(alphas[2 + 10] >= 250, "what the edge had passed stays: {alphas:?}");
+    assert!(alphas[2 + 30] < 250, "what it had not reached yet sweeps in again rather than landing: {alphas:?}");
+    rig.time += REVEAL;
+    rig.frame(&view);
+    assert_eq!(rig.faded_glyphs(), 0);
+}
+
+#[test]
+fn a_later_commit_leaves_what_the_last_swept_in_settled_and_takes_over_what_it_had_not() {
     let mut rig = Rig::new();
     let content = Rc::new(RefCell::new("第一批文字".to_owned()));
     let view = {
@@ -2194,11 +2349,17 @@ fn a_later_commit_leaves_what_the_last_was_still_sweeping_in_settled() {
     rig.frame(&view);
     assert!(rig.faded_glyphs() > 0);
     let first = rig.scene.layers[0].glyphs.len();
+    // On the beat: the first batch has swept in, and only the second moves.
+    rig.time += REVEAL;
     *content.borrow_mut() = "第一批文字和第二批文字".to_owned();
     rig.frame(&view);
     assert_eq!(probe::fresh_text("next"), ["和第二批文字"]);
     let alphas = glyph_alphas(&rig);
     assert!(alphas[..first].iter().all(|a| *a >= 250), "{alphas:?}");
+    // Ahead of the beat: what the edge had not reached yet sweeps in with the new text instead of landing at once.
+    *content.borrow_mut() = "第一批文字和第二批文字，第三批".to_owned();
+    rig.frame(&view);
+    assert_eq!(probe::fresh_text("next"), ["和第二批文字，第三批"]);
 }
 
 /// Flips a process-wide switch, so it runs on its own: `cargo test -p mewrk-ui-common --test suite -- --ignored --exact the_reveal_is_off_with_motion_reduced`.

@@ -210,6 +210,9 @@ pub struct Ui<'a> {
     pub animating: bool,
     /// When something scheduled (a caret blink, say) next needs a frame, in seconds from now.
     pub wake_in: Option<f32>,
+    /// When something whose painting alone changes with time (a fade, a spinner) next needs painting, in seconds from now: a frame
+    /// that paints the last tree again will do for it, without running the views or laying anything out. [`Self::repaint_after`].
+    pub paint_wake_in: Option<f32>,
     pub cursor: CursorKind,
     pub ime_area: Option<Rect>,
     /// The whole of a line the leaf being painted just cut.
@@ -246,6 +249,7 @@ impl<'a> Ui<'a> {
             clip: rect(0.0, 0.0, size.0, size.1),
             animating: false,
             wake_in: None,
+            paint_wake_in: None,
             cursor: CursorKind::Default,
             ime_area: None,
             cut_line: None,
@@ -254,6 +258,13 @@ impl<'a> Ui<'a> {
 
     pub fn wake_after(&mut self, secs: f32) {
         self.wake_in = Some(self.wake_in.map_or(secs, |w| w.min(secs)));
+    }
+
+    /// Asks for this leaf to be painted again `secs` from now, for something that changes only in how it is painted: nothing it
+    /// or any view decides depends on the time, so the frame may paint the last frame's tree again (`fluent::el::render_scrolled`)
+    /// rather than run the views. Anything else in that frame that needs the views still gets them. `0.0` is the next frame.
+    pub fn repaint_after(&mut self, secs: f32) {
+        self.paint_wake_in = Some(self.paint_wake_in.map_or(secs, |w| w.min(secs)));
     }
 
     #[inline]
@@ -1286,12 +1297,27 @@ pub struct Scroll {
     pub viewport: f32,
     pub stick: bool,
     drag: Option<(f32, f32)>,
+    /// Gliding down to the end: the spring's rate and its velocity, in pixels a second downward ([`Self::glide_to_end`]).
+    glide: Option<(f32, f32)>,
 }
 
 impl Default for Scroll {
     fn default() -> Self {
-        Self { offset: 0.0, target: 0.0, content: 0.0, viewport: 0.0, stick: true, drag: None }
+        Self { offset: 0.0, target: 0.0, content: 0.0, viewport: 0.0, stick: true, drag: None, glide: None }
     }
+}
+
+/// The longest step a glide takes in one frame: a frame late after a stall moves it no further than this would.
+const MAX_GLIDE_STEP: f32 = 0.05;
+
+/// One step of a critically damped spring pulling `offset` (from where it is going) to zero, `seconds` long: the offset and the
+/// velocity it leaves, or `None` once it has come to rest. It never overshoots.
+pub fn glide_step(offset: f32, velocity: f32, rate: f32, seconds: f32) -> Option<(f32, f32)> {
+    let decay = (-rate * seconds).exp();
+    let drive = velocity + rate * offset;
+    let next = (offset + drive * seconds) * decay;
+    let velocity = (velocity - rate * drive * seconds) * decay;
+    (next.abs() >= 0.5 || velocity.abs() >= 20.0).then_some((next, velocity))
 }
 
 impl Scroll {
@@ -1306,7 +1332,24 @@ impl Scroll {
 
     pub fn scroll_to_end(&mut self) {
         self.stick = true;
+        self.glide = None;
         self.target = self.max_offset();
+    }
+
+    /// Glides down to the end from where it is, at `rate`, carrying on at the speed of a glide already under way: a timeline
+    /// following what a stream adds. The end is wherever each frame's layout puts it, and a frame that only scrolls moves it on
+    /// as well as one that runs the views. It stops at the end, or when the wheel, the scrollbar or a request to go somewhere else
+    /// takes over.
+    pub fn glide_to_end(&mut self, rate: f32) {
+        self.glide = Some((rate, self.glide.map_or(0.0, |(_, velocity)| velocity)));
+    }
+
+    pub fn stop_glide(&mut self) {
+        self.glide = None;
+    }
+
+    pub fn gliding(&self) -> bool {
+        self.glide.is_some()
     }
 
     /// Jumps by `delta` with no easing. Content that grew above the viewport stays put on screen this way.
@@ -1325,6 +1368,7 @@ impl Scroll {
     /// Puts the viewport's top at `offset`, easing there.
     pub fn scroll_to(&mut self, offset: f32) {
         self.stick = false;
+        self.glide = None;
         self.target = offset.clamp(0.0, self.max_offset());
     }
 
@@ -1340,6 +1384,11 @@ impl Scroll {
         self.advance_by(ui, r, content, delta);
     }
 
+    /// Still easing towards where it was sent, or gliding.
+    pub fn moving(&self) -> bool {
+        self.glide.is_some() || (self.target - self.offset).abs() > 0.5
+    }
+
     /// How far the wheel can still move this: up for a positive `delta`, down for a negative one.
     pub fn wheel_room(&self, delta: f32) -> f32 {
         if delta > 0.0 { self.target } else { self.max_offset() - self.target }
@@ -1351,12 +1400,30 @@ impl Scroll {
         self.viewport = r.h;
         let max = self.max_offset();
         if delta != 0.0 {
+            // The reader has taken over.
+            self.glide = None;
             self.target = (self.target - delta).clamp(0.0, max);
             if ui.input.scroll_is_pixels {
                 // Trackpads already deliver momentum, and smoothing it again would only add latency.
                 self.offset = self.target;
             }
             self.stick = self.target >= max - 1.0;
+        }
+        if let Some((rate, velocity)) = self.glide {
+            match glide_step(self.offset - max, velocity, rate, ui.dt.clamp(0.0, MAX_GLIDE_STEP)) {
+                // Never back up, and never past the end: an end that moved up above it is where it lands, at once.
+                Some((next, velocity)) => {
+                    self.offset = max.min(self.offset.max(max + next));
+                    self.glide = Some((rate, velocity));
+                    ui.animating = true;
+                }
+                None => {
+                    self.offset = max;
+                    self.glide = None;
+                }
+            }
+            self.target = self.offset;
+            return;
         }
         if self.stick {
             self.target = max;
@@ -1393,6 +1460,7 @@ impl Scroll {
             let py = ui.input.pointer.map_or(0.0, |p| p.1);
             let (start_y, start_target) = *self.drag.get_or_insert((py, self.target));
             let per_px = max / (track.h - thumb_h).max(1.0);
+            self.glide = None;
             self.target = (start_target + (py - start_y) * per_px).clamp(0.0, max);
             self.offset = self.target;
             self.stick = self.target >= max - 1.0;

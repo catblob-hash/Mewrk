@@ -8,9 +8,13 @@ use bytemuck::{Pod, Zeroable};
 use crate::theme::{Color, Theme};
 
 pub const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
-/// At 2x, each distinct glyph takes up to four subpixel variants, and CJK text has thousands of distinct glyphs.
+/// At 2x, each distinct glyph takes up to four subpixel variants, and CJK text has thousands of distinct glyphs: what the atlases may grow
+/// to. Each starts a quarter of that a side and doubles as it fills, so what it takes here and on the GPU follows what has been shown. At
+/// full size the two took 32 MiB on the GPU from the first frame, and their copies here up to as much again, for a few hundred glyphs.
 pub const MASK_ATLAS_SIZE: u32 = 4096;
 pub const COLOR_ATLAS_SIZE: u32 = 2048;
+pub const MASK_ATLAS_START: u32 = MASK_ATLAS_SIZE / 4;
+pub const COLOR_ATLAS_START: u32 = COLOR_ATLAS_SIZE / 4;
 
 pub const KIND_RECT: f32 = 0.0;
 pub const KIND_ARC: f32 = 2.0;
@@ -446,11 +450,11 @@ pub struct Renderer {
     image_pipeline: wgpu::RenderPipeline,
     mica_pipeline: wgpu::RenderPipeline,
     globals: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    globals_layout: wgpu::BindGroupLayout,
+    /// Behind a lock because an atlas grows while the text is flushed, which only has the renderer to read.
+    atlases: std::sync::Mutex<GlyphAtlases>,
     image_layout: wgpu::BindGroupLayout,
     image_sampler: wgpu::Sampler,
-    mask_atlas: wgpu::Texture,
-    color_atlas: wgpu::Texture,
     rect_buf: GrowBuffer,
     glyph_buf: GrowBuffer,
     image_buf: GrowBuffer,
@@ -462,9 +466,43 @@ pub struct Renderer {
     plate: PlateRenderer,
 }
 
+/// The glyph atlases and the bind group that reads them with the globals.
+struct GlyphAtlases {
+    mask: wgpu::Texture,
+    color: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+fn atlas_texture(device: &wgpu::Device, label: &str, size: u32, format: wgpu::TextureFormat) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn globals_bind_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, globals: &wgpu::Buffer, mask: &wgpu::Texture, color: &wgpu::Texture) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("globals"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&mask.create_view(&Default::default())) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&color.create_view(&Default::default())) },
+        ],
+    })
+}
+
 pub struct AtlasUpload<'a> {
     pub data: &'a [u8],
     pub bytes_per_pixel: u32,
+    /// The atlas's side, in pixels, which is also a row of `data`. An atlas that grew since the last upload gets a texture of the new size,
+    /// and the upload after a growth holds everything placed before it.
     pub stride: u32,
     pub rect: [u32; 4],
 }
@@ -550,30 +588,10 @@ impl Renderer {
         let image_pipeline = make("image", "image_vs", "image_fs", &image_pipeline_layout, &[Some(image_vb_layout)], true, premul);
         let mica_pipeline = make("mica", "mica_vs", "mica_fs", &base_layout, &[], false, None);
 
-        let atlas = |label, size, format| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            })
-        };
-        let mask_atlas = atlas("mask atlas", MASK_ATLAS_SIZE, wgpu::TextureFormat::R8Unorm);
-        let color_atlas = atlas("color atlas", COLOR_ATLAS_SIZE, wgpu::TextureFormat::Rgba8Unorm);
+        let mask = atlas_texture(device, "mask atlas", MASK_ATLAS_START, wgpu::TextureFormat::R8Unorm);
+        let color = atlas_texture(device, "color atlas", COLOR_ATLAS_START, wgpu::TextureFormat::Rgba8Unorm);
         let globals = device.create_buffer(&wgpu::BufferDescriptor { label: Some("globals"), size: size_of::<Globals>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globals"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&mask_atlas.create_view(&Default::default())) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&color_atlas.create_view(&Default::default())) },
-            ],
-        });
+        let bind_group = globals_bind_group(device, &layout, &globals, &mask, &color);
         let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
 
         let plate = {
@@ -611,8 +629,9 @@ impl Renderer {
             PlateRenderer { shrink: make("plate shrink", "shrink_fs"), blur: make("plate blur", "blur_fs"), finish: make("plate finish", "finish_fs"), uniforms, bind_group, stride, scratch: Vec::new(), last_used: None }
         };
 
-        let rect_buf = GrowBuffer::new(device, "rects", 1 << 20);
-        let glyph_buf = GrowBuffer::new(device, "glyphs", 4 << 20);
+        // Room for about 1600 boxes and 8000 glyphs, which a busy window needs; each doubles past what a frame asks for.
+        let rect_buf = GrowBuffer::new(device, "rects", 1 << 17);
+        let glyph_buf = GrowBuffer::new(device, "glyphs", 1 << 18);
         let image_buf = GrowBuffer::new(device, "images", 1 << 14);
         Self {
             ranges: Vec::new(),
@@ -621,11 +640,10 @@ impl Renderer {
             image_pipeline,
             mica_pipeline,
             globals,
-            bind_group,
+            globals_layout: layout,
+            atlases: std::sync::Mutex::new(GlyphAtlases { mask, color, bind_group }),
             image_layout,
             image_sampler,
-            mask_atlas,
-            color_atlas,
             rect_buf,
             glyph_buf,
             image_buf,
@@ -882,11 +900,23 @@ impl Renderer {
         }
     }
 
-    fn upload_atlas(&self, texture: &wgpu::Texture, up: &AtlasUpload<'_>) {
+    fn upload_atlas(&self, color: bool, up: &AtlasUpload<'_>) {
         let [x, y, w, h] = up.rect;
         if w == 0 || h == 0 {
             return;
         }
+        let mut atlases = self.atlases.lock().unwrap_or_else(|p| p.into_inner());
+        let atlases = &mut *atlases;
+        if (if color { &atlases.color } else { &atlases.mask }).width() != up.stride {
+            let device = &self.gpu.device;
+            if color {
+                atlases.color = atlas_texture(device, "color atlas", up.stride, wgpu::TextureFormat::Rgba8Unorm);
+            } else {
+                atlases.mask = atlas_texture(device, "mask atlas", up.stride, wgpu::TextureFormat::R8Unorm);
+            }
+            atlases.bind_group = globals_bind_group(device, &self.globals_layout, &self.globals, &atlases.mask, &atlases.color);
+        }
+        let texture = if color { &atlases.color } else { &atlases.mask };
         let bpp = up.bytes_per_pixel;
         let start = ((y * up.stride + x) * bpp) as usize;
         self.gpu.queue.write_texture(
@@ -898,11 +928,11 @@ impl Renderer {
     }
 
     pub fn upload_mask_atlas(&self, up: &AtlasUpload<'_>) {
-        self.upload_atlas(&self.mask_atlas, up);
+        self.upload_atlas(false, up);
     }
 
     pub fn upload_color_atlas(&self, up: &AtlasUpload<'_>) {
-        self.upload_atlas(&self.color_atlas, up);
+        self.upload_atlas(true, up);
     }
 
     /// Records and submits one frame into `target`.
@@ -967,6 +997,7 @@ impl Renderer {
         let (device, queue) = (&gpu.device, &gpu.queue);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         self.run_plate_passes(&plate_passes, &mut encoder);
+        let bind_group = self.atlases.get_mut().unwrap_or_else(|p| p.into_inner()).bind_group.clone();
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main"),
@@ -982,7 +1013,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(0, &bind_group, &[]);
             if !scene.ground_covered {
                 pass.set_pipeline(&self.mica_pipeline);
                 pass.draw(0..3, 0..1);

@@ -337,6 +337,9 @@ ToolExecEnd(c) ==
   /\ UNCHANGED <<wakeFoldPending, turn, round, roundDue, steerPending, callDanger, callFresh,
                  callGrant, turnLegal, agentPhase, taskRid, agentWaited, agentLegal>>
 
+(* The host also hands off a call whose own process ended while processes   *)
+(* it started still hold its output; that is the same event at another      *)
+(* host moment, which this clockless model does not distinguish.            *)
 (* S6+S9+S10+S12: A deadline does not abandon running work. An executing    *)
 (* call hands its process to an empty task slot, which mints a fresh        *)
 (* identity as a spawn does. Like a spawn, it is never refused for capacity *)

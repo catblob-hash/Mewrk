@@ -19,7 +19,7 @@ use swash::text::{Codepoint, Script};
 use swash::zeno::{Format, Mask, Transform, Vector};
 use swash::{CacheKey, FontDataRef, FontRef, Setting};
 
-use crate::gpu::{AtlasUpload, GlyphInst, Renderer, COLOR_ATLAS_SIZE, GLYPH_COLOR, MASK_ATLAS_SIZE};
+use crate::gpu::{AtlasUpload, GlyphInst, Renderer, COLOR_ATLAS_SIZE, COLOR_ATLAS_START, GLYPH_COLOR, MASK_ATLAS_SIZE, MASK_ATLAS_START};
 use crate::theme::{Color, TypeStyle, Weight};
 
 // ---------------------------------------------------------------- hashing
@@ -469,27 +469,38 @@ struct AtlasGlyph {
     color: bool,
 }
 
+/// Square, from `start` a side, doubling up to `max` before anything has to go.
 struct Atlas {
     alloc: BucketedAtlasAllocator,
     data: Vec<u8>,
     size: u32,
+    start: u32,
+    max: u32,
     bpp: u32,
     dirty: Option<[u32; 4]>,
 }
 
 impl Atlas {
-    fn new(size: u32, bpp: u32) -> Self {
+    fn new(start: u32, max: u32, bpp: u32) -> Self {
         Self {
-            alloc: BucketedAtlasAllocator::new(size2(size as i32, size as i32)),
-            data: vec![0; (size * size * bpp) as usize],
-            size,
+            alloc: BucketedAtlasAllocator::new(size2(start as i32, start as i32)),
+            data: vec![0; (start * start * bpp) as usize],
+            size: start,
+            start,
+            max: max.max(start),
             bpp,
             dirty: None,
         }
     }
 
     fn insert(&mut self, w: u32, h: u32, pixels: &[u8]) -> Option<(u16, u16)> {
-        let a = self.alloc.allocate(size2(w as i32 + 1, h as i32 + 1))?;
+        let a = loop {
+            match self.alloc.allocate(size2(w as i32 + 1, h as i32 + 1)) {
+                Some(a) => break a,
+                None if self.size < self.max => self.grow(),
+                None => return None,
+            }
+        };
         let (x, y) = (a.rectangle.min.x as u32, a.rectangle.min.y as u32);
         let stride = (w * self.bpp) as usize;
         for row in 0..h as usize {
@@ -503,8 +514,30 @@ impl Atlas {
         Some((x as u16, y as u16))
     }
 
+    /// Twice as wide and as tall, with everything where it was. The next upload carries all that was here, to a texture of the new size.
+    fn grow(&mut self) {
+        let (old, size) = (self.size, self.size * 2);
+        self.alloc.grow(size2(size as i32, size as i32));
+        let (old_row, row) = ((old * self.bpp) as usize, (size * self.bpp) as usize);
+        let mut data = vec![0; row * size as usize];
+        for (y, line) in self.data.chunks_exact(old_row).enumerate() {
+            data[y * row..y * row + old_row].copy_from_slice(line);
+        }
+        self.data = data;
+        self.size = size;
+        self.dirty = Some([0, 0, old, old]);
+    }
+
+    /// Empty, and back to the size it started at: a reset comes with a change of scale or font, after which a smaller set of glyphs
+    /// is usual, or with a full atlas, which has to start over anyway.
     fn clear(&mut self) {
-        self.alloc.clear();
+        if self.size != self.start {
+            self.alloc = BucketedAtlasAllocator::new(size2(self.start as i32, self.start as i32));
+            self.data = vec![0; (self.start * self.start * self.bpp) as usize];
+            self.size = self.start;
+        } else {
+            self.alloc.clear();
+        }
         self.dirty = None;
     }
 
@@ -614,11 +647,15 @@ pub struct TextStats {
 
 impl TextCtx {
     pub fn new(scale: f32) -> Self {
-        Self::with_atlas_sizes(scale, MASK_ATLAS_SIZE, COLOR_ATLAS_SIZE)
+        Self::with_atlases(scale, Atlas::new(MASK_ATLAS_START, MASK_ATLAS_SIZE, 1), Atlas::new(COLOR_ATLAS_START, COLOR_ATLAS_SIZE, 4))
     }
 
-    /// Atlases of a particular size. Tests use small ones to make resets happen.
+    /// Atlases of a particular size, which never grow. Tests use small ones to make resets happen.
     pub fn with_atlas_sizes(scale: f32, mask: u32, color: u32) -> Self {
+        Self::with_atlases(scale, Atlas::new(mask, mask, 1), Atlas::new(color, color, 4))
+    }
+
+    fn with_atlases(scale: f32, mask: Atlas, color: Atlas) -> Self {
         Self {
             fonts: FontBook::load(),
             shape: ShapeContext::new(),
@@ -629,8 +666,8 @@ impl TextCtx {
             glyphs: FxMap::default(),
             paths: FxMap::default(),
             icons: HashMap::new(),
-            mask: Atlas::new(mask, 1),
-            color: Atlas::new(color, 4),
+            mask,
+            color,
             epoch: 1,
             scale,
             stats: TextStats::default(),
@@ -1068,7 +1105,7 @@ impl TextCtx {
     /// `data` is SVG path data in physical pixels from the mask's top left, and names the drawing. `pos`, `color` and `clip`
     /// are the caller's to set. `None` when it could not fit, which must not empty the atlas for everybody else.
     pub fn path_mask(&mut self, data: &str, w: u32, h: u32) -> Option<GlyphInst> {
-        if w == 0 || h == 0 || w > self.mask.size / 2 || h > self.mask.size / 2 {
+        if w == 0 || h == 0 || w > self.mask.max / 2 || h > self.mask.max / 2 {
             return None;
         }
         let key = (hash_str(data), w, h);
@@ -2074,6 +2111,55 @@ mod tests {
         cells.sort_unstable();
         cells.dedup();
         assert_eq!(cells.len(), 40, "forty different characters must occupy forty different atlas cells");
+    }
+
+    #[test]
+    fn a_full_atlas_doubles_with_everything_where_it_was() {
+        let mut atlas = Atlas::new(16, 64, 1);
+        let mut placed = Vec::new();
+        for n in 1..=200u8 {
+            let Some(at) = atlas.insert(7, 7, &[n; 49]) else { break };
+            placed.push((at, n));
+            atlas.take_upload();
+        }
+        assert_eq!(atlas.size, 64, "it grew as far as it may");
+        assert!(placed.len() > 16, "more fit than in what it started at: {}", placed.len());
+        for ((x, y), n) in placed {
+            for row in 0..7 {
+                let at = (y as usize + row) * 64 + x as usize;
+                assert_eq!(&atlas.data[at..at + 7], &[n; 7], "glyph {n} at {x},{y}");
+            }
+        }
+        atlas.clear();
+        assert_eq!((atlas.size, atlas.data.len()), (16, 256), "a reset gives the memory back");
+    }
+
+    #[test]
+    fn the_upload_after_a_growth_carries_what_was_there() {
+        let mut atlas = Atlas::new(16, 32, 1);
+        while atlas.size == 16 {
+            atlas.insert(7, 7, &[1; 49]).expect("room");
+            if atlas.size == 16 {
+                atlas.take_upload();
+            }
+        }
+        let [x, y, w, h] = atlas.take_upload().expect("an upload");
+        assert!(x == 0 && y == 0 && w >= 16 && h >= 16, "{x},{y} {w}x{h}");
+    }
+
+    #[test]
+    fn text_past_the_first_atlas_grows_it_instead_of_starting_over() {
+        let mut ctx = TextCtx::with_atlases(2.0, Atlas::new(128, 1024, 1), Atlas::new(64, 64, 4));
+        let mut doc = Doc::new(100_000.0);
+        doc.push(&mut ctx, &(0x4E00u32..0x4E00 + 200).filter_map(char::from_u32).collect::<String>(), BODY, Color::WHITE);
+        let mut out = Vec::new();
+        doc.paint(&mut ctx, &mut out, 0.0, 0.0, [0, 0, i16::MAX, i16::MAX], 0.0..10_000.0);
+        assert_eq!(ctx.stats.atlas_resets, 0);
+        assert!(ctx.mask.size > 128);
+        let mut cells: Vec<[u16; 2]> = out.iter().map(|g| g.uv).collect();
+        cells.sort_unstable();
+        cells.dedup();
+        assert_eq!(cells.len(), out.len(), "every glyph keeps a cell of its own");
     }
 
     #[test]

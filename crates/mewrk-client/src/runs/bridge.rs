@@ -52,7 +52,9 @@ impl Cx {
         serde_json::from_value(value).map_err(|error| format!("{command}: {error}"))
     }
 
-    /// The same for a command with an `onEvent` channel, whose messages run on the UI thread in order.
+    /// The same for a command with an `onEvent` channel, whose messages run on the UI thread in order. They are quiet jobs
+    /// ([`crate::Task::post_quiet`]): a run's events are buffered until its next commit, which is what draws them, and the
+    /// few a window must show at once (an approval card) ask for a frame themselves.
     fn call_streaming<T: DeserializeOwned>(&self, command: &str, mut args: Value, on_event: impl Fn(&mut App, Value) + Send + Sync + 'static) -> (Result<T, String>, OpenStream) {
         let (value, stream) = match &self.backend {
             Some(backend) => {
@@ -60,12 +62,12 @@ impl Cx {
                 let on_event = Arc::new(on_event);
                 let sink: EventSink = Arc::new(move |event| {
                     let on_event = on_event.clone();
-                    task.post(move |app| on_event(app, event));
+                    task.post_quiet(move |app| on_event(app, event));
                 });
                 (backend.invoke(command, args, Some(sink)), OpenStream(None))
             }
             None => {
-                let channel = self.task.open_channel(on_event);
+                let channel = self.task.open_quiet_channel(on_event);
                 args["onEvent"] = channel.arg();
                 (self.task.invoke::<Value>(command, args), OpenStream(Some(channel)))
             }

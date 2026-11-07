@@ -1,5 +1,5 @@
 {
-  "keyCount": 509,
+  "keyCount": 513,
   "keys": [
     {
       "description": "Frame of the environment block at the head of the host system prompt: the heading and the sentence introducing the fact list. `{facts}` is the list, one ` - ` item per `system.environment.*` line. Emptying this key removes the whole block, facts included.",
@@ -2029,6 +2029,30 @@
       ]
     },
     {
+      "description": "Closes the result of a foreground command that finished while processes it started still held its output; those were adopted by a task slot instead of being waited on.",
+      "id": "task.shell_left_running",
+      "placeholders": [
+        "shell_ref"
+      ]
+    },
+    {
+      "description": "Same note when the command's output, and what those processes print later, is being written to a file, which it names.",
+      "id": "task.shell_left_running_file",
+      "placeholders": [
+        "shell_ref",
+        "path"
+      ]
+    },
+    {
+      "description": "Result envelope body once the processes a command left running (see `task.shell_left_running`) have exited, carrying only what they printed after the command's own result.",
+      "id": "task.shell_left_running_result",
+      "placeholders": [
+        "shell_ref",
+        "tool_name",
+        "body"
+      ]
+    },
+    {
       "description": "Receipt of a command started with `run_in_background`: its task address, and the file its output is written to while it runs.",
       "id": "task.shell_background_receipt",
       "placeholders": [
@@ -2873,6 +2897,11 @@
       "placeholders": [
         "seconds"
       ]
+    },
+    {
+      "description": "Closes the result of a command that finished while processes it started still held its output, when those could not be moved to the background and were stopped.",
+      "id": "tool.shell_left_running_stopped",
+      "placeholders": []
     },
     {
       "description": "Suffix when a tool result was cut to the output limit.",

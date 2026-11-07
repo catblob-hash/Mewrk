@@ -66,14 +66,46 @@ pub struct Rig {
     pub input: Input,
     pub clipboard: TestClipboard,
     pub size: (f32, f32),
+    /// The last [`Self::app_frame`] left something for the views: what a handler or a view asked for is not on screen yet.
+    due: bool,
+    /// [`Self::app_frame`]s in a row that only scrolled.
+    streak: u32,
     _data: TempDir,
 }
+
+/// The app's loop runs the views at least this often while frames only scroll (`SCROLLED_STREAK_MAX` in the shell).
+const SCROLLED_STREAK_MAX: u32 = 12;
 
 impl Rig {
     pub fn new() -> Self {
         let data = TempDir::new("data");
         let app = start_app(&data.0);
-        Self { app, scene: Scene::default(), text: TextCtx::new(1.0), mem: UiMemory::default(), input: Input::default(), clipboard: TestClipboard::default(), size: (1000.0, 800.0), _data: data }
+        Self { app, scene: Scene::default(), text: TextCtx::new(1.0), mem: UiMemory::default(), input: Input::default(), clipboard: TestClipboard::default(), size: (1000.0, 800.0), due: true, streak: 0, _data: data }
+    }
+
+    /// A frame as the app's loop runs one: with nothing but the wheel or a scroller's own motion since the last, that frame's tree
+    /// painted again where the scrollers have moved it ([`render_scrolled`]); otherwise the views. Answers whether the views ran.
+    pub fn app_frame(&mut self, view: &mut dyn FnMut(&mut App) -> E) -> bool {
+        let ticked = self.app.tick();
+        self.scene.clear();
+        set_window_size(self.size.0, self.size.1);
+        set_theme(Theme::dark());
+        let wheel = self.input.scroll != 0.0 || any_scroll_moving();
+        if !ticked && !self.due && wheel && self.streak < SCROLLED_STREAK_MAX {
+            let mut ui = Ui::new(&mut self.scene, &mut self.text, Theme::dark(), &self.input, &mut self.mem, &mut self.clipboard, 1.0, self.size, 0.016, 0.0);
+            if let Some(scrolled) = render_scrolled(&mut self.app, &mut ui) {
+                self.due = scrolled.again;
+                self.streak += 1;
+                self.input.end_frame();
+                return false;
+            }
+        }
+        self.streak = 0;
+        let root = view(&mut self.app);
+        let mut ui = Ui::new(&mut self.scene, &mut self.text, Theme::dark(), &self.input, &mut self.mem, &mut self.clipboard, 1.0, self.size, 0.016, 0.0);
+        self.due = render(root, &mut self.app, &mut ui);
+        self.input.end_frame();
+        true
     }
 
     /// One frame: posted jobs, the view, its handlers.

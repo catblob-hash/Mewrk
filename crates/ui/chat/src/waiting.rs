@@ -174,7 +174,8 @@ fn stream_waiting_cat(k: u64, color: Color) -> E {
     let (width, height) = cat_size(LINE);
     custom(move |_: &mut App, ui: &mut Ui<'_>, r: Rect| {
         let now = clock_ms();
-        // Not `update`, which asks for a frame at once: the cat only ever wants the next one a thirtieth of a second from now.
+        // Not `update`, which asks for a frame at once: the cat only ever wants the next one a thirtieth of a second from now, and only
+        // to paint it again, which a frame that runs no views does.
         let pose = {
             let mut cat = state.borrow_mut();
             let rendered = now - cat.last_paint_ms < CAT_UNSEEN_MS;
@@ -187,7 +188,7 @@ fn stream_waiting_cat(k: u64, color: Color) -> E {
             cat.machine.pose(now)
         };
         paint_cat(ui, r, &pose, color, t_.control_strong_stroke);
-        ui.wake_after(1.0 / 30.0);
+        ui.repaint_after(1.0 / 30.0);
     })
     .key(("stream-cat-drawing", k))
     .size(width, height)
@@ -314,7 +315,7 @@ fn dots(color: Color) -> E {
             ui.fill(rect(x, y, DOT, DOT), DOT * 0.5, color.fade(0.28 + 0.72 * lift));
         }
         if !still {
-            ui.wake_after(1.0 / 30.0);
+            ui.repaint_after(1.0 / 30.0);
         }
     })
     .size(3.0 * 2.5 + 2.0 * 2.0, 5.0)
@@ -344,8 +345,9 @@ fn pulse_label(value: &str, color: Color) -> E {
             return;
         }
         paint_characters(ui, r.x, r.y + (r.h - ACTIVITY.line) * 0.5, &painted, 0, &ACTIVITY, |centre| color.fade(quantized(pulse_alpha(centre, width, time))));
-        ui.wake_after(1.0 / 30.0);
+        ui.repaint_after(1.0 / 30.0);
     })
+    .measure_key(value)
     .measure(move |_: &mut App, ui: &mut Ui<'_>, _, _| (advance(ui, &measured, &ACTIVITY), ACTIVITY.line))
     .shrink0()
     .pass_through()
@@ -364,6 +366,7 @@ fn path_target(key: impl Hash, path: &str, color: Color) -> E {
         };
         ui.label_ellipsis(r.x, r.y + (r.h - FIGURE.line) * 0.5, r.w, &shown, &FIGURE, color);
     })
+    .measure_key(path)
     .measure(move |_: &mut App, ui: &mut Ui<'_>, known, avail: f32| (known.unwrap_or_else(|| ui.measure(&measured, &FIGURE).ceil().min(avail)), FIGURE.line))
     .min_w(0.0)
     .pass_through();

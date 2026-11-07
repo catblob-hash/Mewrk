@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::capabilities::is_encrypted_reasoning;
 use super::context_tokens::canonical_object;
@@ -199,12 +200,12 @@ pub struct ModelRunState {
     pub usage_by_round: BTreeMap<usize, ModelUsage>,
     /// Nested agent usage snapshots, isolated by agent call and child request round.
     pub subagent_usage_by_call: BTreeMap<String, BTreeMap<usize, ModelUsage>>,
-    /// Progress ledger rows per `workflow` call, in arrival order. The card folds
-    /// them with `deriveWorkflowProgress`; keeping the raw stream here rather than
-    /// the folded view means a late-arriving entry re-folds cheaply and the
-    /// projection stays pure.
+    /// Progress ledger rows per `workflow` card, in arrival order, keyed by the card's context id: the id the timeline,
+    /// the subagent views and the tasks pane know a card by, never the provider call id the host's event names it by.
+    /// The card folds them with `deriveWorkflowProgress`; keeping the raw stream here rather than the folded view means
+    /// a late-arriving entry re-folds cheaply and the projection stays pure.
     pub workflow_progress_by_call: Arc<BTreeMap<String, Vec<WorkflowProgressEntry>>>,
-    /// Live run id per `workflow` call — the address Skip/Retry commands carry.
+    /// Live run id per `workflow` card, by context id as above — the address Skip/Retry commands carry.
     pub workflow_run_id_by_call: BTreeMap<String, String>,
     /// Lifecycle events that arrived before their call's announcement, keyed by
     /// round then call id. Replayed and cleared when the announcement lands.
@@ -939,7 +940,7 @@ fn hook_status_label(status: StreamingHookStatus) -> &'static str {
     }
 }
 
-/// Append one workflow progress row to its call's stream.
+/// Append one workflow progress row to its card's stream, under the card's context id.
 ///
 /// Deliberately append-only: the merge lives in `deriveWorkflowProgress`, which
 /// is pure and therefore testable without a tree. Folding here instead would put
@@ -952,13 +953,13 @@ fn hook_status_label(status: StreamingHookStatus) -> &'static str {
 /// merged row per step, while this array stores every transition, so evicting
 /// the front of it can delete every trace of a step that finished early. That
 /// step would vanish from the card mid-run, and the totals with it.
-fn apply_workflow_progress(run: &mut ModelRunState, call_id: &str, run_id: &str, entry: WorkflowProgressEntry) {
-    push_workflow_progress(&mut run.workflow_progress_by_call, &mut run.workflow_run_id_by_call, call_id, run_id, entry);
+fn apply_workflow_progress(run: &mut ModelRunState, context_id: &str, run_id: &str, entry: WorkflowProgressEntry) {
+    push_workflow_progress(&mut run.workflow_progress_by_call, &mut run.workflow_run_id_by_call, context_id, run_id, entry);
 }
 
 /// [`apply_workflow_progress`] on the two maps alone, for whoever keeps them outside a run.
-pub(super) fn push_workflow_progress(progress_by_call: &mut Arc<BTreeMap<String, Vec<WorkflowProgressEntry>>>, run_id_by_call: &mut BTreeMap<String, String>, call_id: &str, run_id: &str, entry: WorkflowProgressEntry) {
-    let entries = Arc::make_mut(progress_by_call).entry(call_id.to_owned()).or_default();
+pub(super) fn push_workflow_progress(progress_by_call: &mut Arc<BTreeMap<String, Vec<WorkflowProgressEntry>>>, run_id_by_call: &mut BTreeMap<String, String>, context_id: &str, run_id: &str, entry: WorkflowProgressEntry) {
+    let entries = Arc::make_mut(progress_by_call).entry(context_id.to_owned()).or_default();
     entries.push(entry);
     if entries.len() > WORKFLOW_PROGRESS_ENTRY_LIMIT {
         let mut excess = entries.len() - WORKFLOW_PROGRESS_ENTRY_LIMIT;
@@ -973,7 +974,7 @@ pub(super) fn push_workflow_progress(progress_by_call: &mut Arc<BTreeMap<String,
     // Last writer wins, and there is only ever one: the host mints a run id per
     // workflow call and reuses it for every transition of that run, including
     // across a resume.
-    run_id_by_call.insert(call_id.to_owned(), run_id.to_owned());
+    run_id_by_call.insert(context_id.to_owned(), run_id.to_owned());
 }
 
 /// Total live transcript rows the renderer keeps across every background child
@@ -1138,6 +1139,10 @@ pub enum ModelStreamEffect {
     ToolCompleted { tool_name: Option<String>, success: bool, output: String },
     /// A host-settled tool card replaces its persisted counterpart by id.
     ToolContextSettled { context: ContextItem },
+    /// A background task's event (`SubagentEvent`, `SubagentDelta`, `WorkflowProgress`) for a call this run did not make:
+    /// a task an earlier run started, still going. The run has no row for it; the conversation's task overlay draws it
+    /// on the task's persisted card.
+    ForeignTaskEvent { event: ModelStreamEvent, at: String },
 }
 
 /// The duration to record for a round whose reasoning just closed without the
@@ -1236,10 +1241,14 @@ pub fn reduce_model_stream_event(run: &mut ModelRunState, event: &ModelStreamEve
         ModelStreamEvent::ToolCallArgumentsReady { .. } | ModelStreamEvent::ToolExecutionStarted { .. } => {
             apply_tool_stream_event(run, event, round, event_at);
         }
+        // A task an earlier run started streams on whichever run is live. This run has no row for its call, so the event
+        // goes to the conversation's task overlay instead of being dropped (`ForeignTaskEvent`).
         ModelStreamEvent::SubagentEvent { call_id, event: nested, .. } => {
             if let Some(tool) = run.streamed_tools_by_round.get_mut(&round).and_then(|tools| tools.iter_mut().find(|tool| &tool.call_id == call_id)) {
                 let id = tool.id.clone();
                 apply_nested_subagent_event(Arc::make_mut(&mut tool.live), &id, nested, event_at);
+            } else {
+                effects.push(ModelStreamEffect::ForeignTaskEvent { event: event.clone(), at: event_at.to_owned() });
             }
             if let Some((key, nested_round, usage)) = nested_usage_update(event) {
                 run.subagent_usage_by_call.entry(key).or_default().insert(nested_round, usage.clone());
@@ -1251,12 +1260,23 @@ pub fn reduce_model_stream_event(run: &mut ModelRunState, event: &ModelStreamEve
             if let Some(tool) = run.streamed_tools_by_round.get_mut(&round).and_then(|tools| tools.iter_mut().find(|tool| &tool.call_id == call_id)) {
                 let id = tool.id.clone();
                 apply_subagent_channel_delta(Arc::make_mut(&mut tool.live), &id, *channel, delta, event_at);
+            } else if !(*channel == SubagentChannel::Status && delta.is_empty()) {
+                // An empty status is a liveness heartbeat, with nothing to draw.
+                effects.push(ModelStreamEffect::ForeignTaskEvent { event: event.clone(), at: event_at.to_owned() });
             }
         }
         ModelStreamEvent::WorkflowProgress { call_id, run_id, entry, .. } => {
-            // The host's row and the renderer's interface are one JSON shape.
-            if let Ok(entry) = serde_json::to_value(entry).and_then(serde_json::from_value) {
-                apply_workflow_progress(run, call_id, run_id, entry);
+            // The host addresses the card by `(round, callId)`, the provider's id. Every reader looks a card up by its
+            // context id, so the row is kept under the context id of the row the provider id names, the way a child's
+            // events find their card above.
+            match run.streamed_tools_by_round.get(&round).and_then(|tools| tools.iter().find(|tool| &tool.call_id == call_id)).map(|tool| tool.id.clone()) {
+                Some(context_id) => {
+                    // The host's row and the renderer's interface are one JSON shape.
+                    if let Ok(entry) = serde_json::to_value(entry).and_then(serde_json::from_value) {
+                        apply_workflow_progress(run, &context_id, run_id, entry);
+                    }
+                }
+                None => effects.push(ModelStreamEffect::ForeignTaskEvent { event: event.clone(), at: event_at.to_owned() }),
             }
         }
         ModelStreamEvent::ToolContextSettled { context, .. } => {
@@ -1364,18 +1384,33 @@ pub struct QueuedModelStreamEvent {
     pub at: String,
 }
 
-/// Fixed commit cadence: 10 FPS.
-pub const MODEL_STREAM_COMMIT_INTERVAL_MS: u64 = 100;
+/// Fixed commit cadence: once a second. What a commit adds fades in over the second after it
+/// ([`super::stream_reveal::STREAM_REVEAL_MS`]), so the text keeps moving while the timeline itself changes once a second.
+pub const MODEL_STREAM_COMMIT_INTERVAL_MS: u64 = 1000;
 
-/// Batches model-stream events at a fixed 10 FPS. Every event enters one buffer in arrival order, so batching changes
+/// How long until the next commit, given when the last one was. Commits keep to the beat the last one set: a whole interval
+/// apart while events keep coming, so each one's fade ends as the next begins. Text that arrives after a pause lands on the
+/// next beat rather than a whole interval after it arrived. The first batch of a stream waits one interval.
+pub fn next_commit_delay(last_commit: Option<Instant>, now: Instant) -> Duration {
+    let interval = Duration::from_millis(MODEL_STREAM_COMMIT_INTERVAL_MS);
+    let Some(last) = last_commit else { return interval };
+    let into_beat = now.saturating_duration_since(last).as_nanos() % interval.as_nanos();
+    let left = interval - Duration::from_nanos(into_beat as u64);
+    // A beat too close to make would commit next to nothing: the one after it, then.
+    if left < interval / 10 { left + interval } else { left }
+}
+
+/// Batches model-stream events at a fixed once a second. Every event enters one buffer in arrival order, so batching changes
 /// commit frequency only. Decoupling rendering from event arrival bounds projection and Markdown work while
 /// preserving every event in each batch.
 ///
-/// The timer itself belongs to whoever owns this: [`Self::push`] says when one must be armed.
+/// The timer itself belongs to whoever owns this: [`Self::push`] says when one must be armed, and [`Self::delay`] for how long.
 #[derive(Debug, Default)]
 pub struct ModelStreamCoalescer {
     pending: Vec<QueuedModelStreamEvent>,
     armed: bool,
+    /// When the last batch was taken: the beat the next commit keeps to.
+    last_commit: Option<Instant>,
 }
 
 impl ModelStreamCoalescer {
@@ -1392,7 +1427,15 @@ impl ModelStreamCoalescer {
     /// The batch to commit, in arrival order: what a timer tick and an immediate flush both do.
     pub fn take(&mut self) -> Vec<QueuedModelStreamEvent> {
         self.armed = false;
+        if !self.pending.is_empty() {
+            self.last_commit = Some(Instant::now());
+        }
         std::mem::take(&mut self.pending)
+    }
+
+    /// How long the timer [`Self::push`] asked for waits: [`next_commit_delay`].
+    pub fn delay(&self) -> Duration {
+        next_commit_delay(self.last_commit, Instant::now())
     }
 
     /// Discards uncommitted events after the run ends.

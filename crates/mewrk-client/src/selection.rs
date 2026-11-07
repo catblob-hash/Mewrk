@@ -98,6 +98,19 @@ impl App {
         self.find_conversation(&workspace_id, &id).cloned()
     }
 
+    /// [`Self::active_conversation_view`] lent rather than copied, for what runs every frame: a stored conversation carries every
+    /// message, and copying it costs as much as the timeline it holds. A draft is still projected, which is cheap.
+    pub fn with_active_conversation<R>(&mut self, f: impl FnOnce(&App, Option<&Conversation>) -> R) -> R {
+        let Some(id) = self.active_conversation_id() else { return f(self, None) };
+        if is_draft_conversation_id(&id) {
+            let draft = self.active_conversation_view();
+            return f(self, draft.as_ref());
+        }
+        let workspace_id = self.active_workspace_id();
+        let app: &App = self;
+        f(app, workspace_id.and_then(|workspace_id| app.find_conversation(&workspace_id, &id)))
+    }
+
     /// `draftActive`.
     pub fn draft_is_active(&mut self) -> bool {
         self.active_conversation_id().is_some_and(|id| self.draft_of(&id).is_some())
@@ -133,9 +146,11 @@ impl App {
 
     /// `activeProjectWorkspaces`: the project's own workspaces as this conversation uses them: its worktree of each stands in for it.
     pub fn active_project_workspaces(&mut self) -> Vec<AttachedWorkspace> {
-        let conversation = self.active_conversation_view();
-        let worktrees = conversation.as_ref().map_or(&[][..], |conversation| &conversation.worktrees);
-        project_workspaces(self.active_workspace(), worktrees)
+        let workspace_id = self.active_workspace_id();
+        self.with_active_conversation(|app, conversation| {
+            let worktrees = conversation.map_or(&[][..], |conversation| &conversation.worktrees);
+            project_workspaces(workspace_id.as_deref().and_then(|id| app.workspace(id)), worktrees)
+        })
     }
 
     /// `activeRegisteredWorkspaces`: the project's workspaces as registered: what worktrees are made from, and named after.
@@ -145,8 +160,8 @@ impl App {
 
     /// `conversationWorkspaces(activeWorkspace, activeConversation)`: in the order the model addresses them.
     pub fn active_conversation_workspaces(&mut self) -> Vec<AttachedWorkspace> {
-        let conversation = self.active_conversation_view();
-        conversation_workspaces(self.active_workspace(), conversation.as_ref())
+        let workspace_id = self.active_workspace_id();
+        self.with_active_conversation(|app, conversation| conversation_workspaces(workspace_id.as_deref().and_then(|id| app.workspace(id)), conversation))
     }
 
     /// `activeWorkspaceMember`: the project workspace the composer's workspace chip has selected, 1-based. A selection

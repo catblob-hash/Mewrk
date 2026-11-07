@@ -1235,6 +1235,18 @@
     // 占位符：{shell_ref} 后台命令的任务地址；{seconds} 超时秒数；{path} 输出文件的路径
     "task.shell_timeout_backgrounded_file": "Command exceeded its {seconds}s timeout and keeps running in the background as {shell_ref}; output so far is in {path} (read or grep it). Its result is delivered when it finishes, or wait with task_wait; task_stop stops it.",
 
+    // 前台命令已结束、但它启动的进程仍占着输出时，结果末尾的说明；这些进程转入后台继续运行，而不是让调用一直等下去。
+    // 占位符：{shell_ref} 后台任务的地址
+    "task.shell_left_running": "[The command finished, but processes it started still hold its output, so they keep running in the background as {shell_ref}; their result is delivered when they exit, or wait with task_wait.]",
+
+    // 同一条说明，用于命令的输出及这些进程之后的输出正写入文件的情况。
+    // 占位符：{shell_ref} 后台任务的地址；{path} 输出文件的路径
+    "task.shell_left_running_file": "[The command finished, but processes it started still hold its output, so they keep running in the background as {shell_ref}; its output and theirs is in {path} (read or grep it). Their result is delivered when they exit, or wait with task_wait; task_stop stops them.]",
+
+    // 命令遗留进程退出后的结果：只含命令本身结果之后它们输出的内容。
+    // 占位符：{shell_ref} 后台任务的地址；{tool_name} 运行该命令的 shell 工具；{body} 这些进程的输出
+    "task.shell_left_running_result": "What background command {shell_ref} ({tool_name}) left running has exited; its output after the command's own result:\n{body}",
+
     // 以 `run_in_background` 启动命令时的回执，含任务地址和输出文件。
     // 占位符：{shell_ref} 后台命令的任务地址；{path} 输出文件的路径
     "task.shell_background_receipt": "{shell_ref}\nOutput so far: {path} (read or grep it). You are notified when it finishes; task_stop stops it.",
@@ -1723,6 +1735,9 @@
     // 超时后命令无法转入后台而被停止时的 shell 结果。
     // 占位符：{seconds} 超时秒数
     "tool.shell_timed_out": "Command timed out after {seconds}s and was stopped, because it could not be moved to the background. Re-run it with run_in_background, or raise its timeout.",
+
+    // 命令结束后遗留并占着输出的进程无法转入后台、因而被停止时的结尾说明。
+    "tool.shell_left_running_stopped": "[Processes the command started still held its output and were stopped, because they could not be moved to the background. To keep something running, start it with run_in_background.]",
 
     // 工具结果被截断到输出上限时附加的后缀。
     "tool.output_truncated": "… output truncated",

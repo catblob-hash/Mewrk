@@ -16,7 +16,8 @@ use crate::props::{ConversationViewProps, OpenInsert};
 use crate::tool_view::ToolPresentation;
 use crate::turn_changes::TurnChangeSummary;
 
-const LIVE_BIT: u32 = 1 << 31;
+/// Marks a map entry as an index into the live contexts rather than the persisted ones.
+pub(crate) const LIVE_BIT: u32 = 1 << 31;
 
 /// The rendered contexts of one frame: indexes through `map`, so reading them never copies the persisted timeline.
 #[derive(Clone)]
@@ -53,8 +54,28 @@ impl<'a> Resolved<'a> {
     /// A map for the persisted contexts with each live one drawn in the place of the persisted context it stands for, and
     /// none added: what a background task's overlay is, as against a run's projection.
     pub fn map_in_place(persisted: &[ContextItem], live: &[LiveContext]) -> Vec<u32> {
-        let over: HashMap<&str, u32> = live.iter().enumerate().map(|(at, context)| (context.id(), at as u32)).collect();
-        persisted.iter().enumerate().map(|(at, item)| over.get(item.id()).map_or(at as u32, |live| live | LIVE_BIT)).collect()
+        Self::map_with_in_place(persisted, live, live.len())
+    }
+
+    /// Both at once: the first `in_place` live contexts drawn in the place of the persisted ones they stand for (a task
+    /// overlay's cards), and the rest a projection that supersedes same-id persisted contexts and follows them (a run's).
+    /// [`Self::map_of`] is this with none in place, [`Self::map_in_place`] with all of them.
+    pub fn map_with_in_place(persisted: &[ContextItem], live: &[LiveContext], in_place: usize) -> Vec<u32> {
+        let in_place = in_place.min(live.len());
+        if in_place == 0 {
+            return Self::map_of(persisted, live);
+        }
+        let over: HashMap<&str, u32> = live[..in_place].iter().enumerate().map(|(at, context)| (context.id(), at as u32)).collect();
+        let streaming: HashSet<&str> = live[in_place..].iter().map(LiveContext::id).collect();
+        let mut map = Vec::with_capacity(persisted.len() + live.len() - in_place);
+        for (at, item) in persisted.iter().enumerate() {
+            if streaming.contains(item.id()) {
+                continue;
+            }
+            map.push(over.get(item.id()).map_or(at as u32, |live| live | LIVE_BIT));
+        }
+        map.extend((in_place as u32..live.len() as u32).map(|at| at | LIVE_BIT));
+        map
     }
 }
 
@@ -100,15 +121,6 @@ pub struct MarqueeDrag {
     pub moved: bool,
 }
 
-/// `lib/followGlide.ts`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FollowGlide {
-    pub position: f32,
-    /// Pixels per second, positive downward.
-    pub velocity: f32,
-    pub time: Option<std::time::Instant>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreviousTimeline {
     pub timeline_id: Option<String>,
@@ -125,7 +137,10 @@ pub struct Follow {
     pub expected_top: f32,
     pub scroll_timeline: Option<String>,
     pub previous: Option<PreviousTimeline>,
-    pub glide: Option<FollowGlide>,
+    /// `lib/followGlide.ts`: the page glides down to what a stream wrote. The scroller carries the glide itself
+    /// ([`fluent::el::ScrollRequest::GlideToEnd`]), so frames that only scroll move it on; this is whether it should, as of
+    /// the last frame that ran the views and whatever the scroller has done since.
+    pub gliding: bool,
     pub jump: bool,
     /// The content's height when last looked at, standing in for a `ResizeObserver` while streaming.
     pub content: f32,
@@ -135,7 +150,7 @@ pub struct Follow {
 
 impl Default for Follow {
     fn default() -> Self {
-        Self { pinned: true, expected_top: 0.0, scroll_timeline: None, previous: None, glide: None, jump: false, content: 0.0, wheel_up: false }
+        Self { pinned: true, expected_top: 0.0, scroll_timeline: None, previous: None, gliding: false, jump: false, content: 0.0, wheel_up: false }
     }
 }
 
@@ -152,6 +167,8 @@ pub struct ToolFacts {
 #[derive(Default)]
 pub struct TimelineState {
     pub fingerprint: u64,
+    /// What the model below was last built from, so that a commit which only changed the tail rebuilds only the tail.
+    pub memo: crate::stream::ModelMemo,
     pub map: Rc<Vec<u32>>,
     pub nodes: Rc<Vec<RenderNode>>,
     /// `renderNodeKey`, hashed, by node position.
@@ -170,6 +187,11 @@ pub struct TimelineState {
     pub heights: HashMap<u64, f32>,
     /// Measured heights of cards and rows, by context id hash, for drags and boxes over what is not built.
     pub unit_heights: HashMap<u64, f32>,
+    /// The block rows whose height in `unit_heights` was measured as the column is now drawn, which are the only ones a block may
+    /// leave out and stand a spacer in for: a row's open body wraps to the width, and reasoning folds by a setting.
+    pub rows_measured: HashSet<u64>,
+    /// What `rows_measured` holds for: the column's width and the settings a row's height follows.
+    pub rows_key: u64,
     pub row_h: Vec<f32>,
     pub tops: Vec<f32>,
     pub total: f32,
@@ -288,6 +310,9 @@ pub struct Frame<'a> {
     pub dimmed: &'a HashSet<String>,
     /// The room docked pieces take among a block's rows: ahead of this context's row, and how much.
     pub dock_inside: Option<(usize, f32)>,
+    /// What of the timeline is built this frame, from the top of its first row: the view and the overscan around it. A block's rows
+    /// outside it stand as spacers. `None` builds everything, as copies of cards do.
+    pub window: Option<(f32, f32)>,
 }
 
 impl Frame<'_> {
@@ -432,7 +457,7 @@ pub fn timeline_snapshot(app: &mut App, id: &str) -> TimelineSnapshot {
         sliding: state.slides.len(),
         landing: state.unit_slides.len(),
         pinned: state.follow.pinned,
-        gliding: state.follow.glide.is_some(),
+        gliding: state.follow.gliding,
         built: state.built.clone(),
         nodes: state.nodes.len(),
         total: state.total,

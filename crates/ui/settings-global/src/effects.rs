@@ -17,7 +17,7 @@ use mewrk_client::prelude::*;
 use mewrk_motion::{Flipbook, Player, Tick, VideoInfo};
 
 use crate::logic::background::{background_after_theme_change, parse_background, Background, BackgroundScheme};
-use crate::logic::background_image::{decode, decode_data_url, is_opaque, tier_covers};
+use crate::logic::background_image::{cover_window, decode, decode_data_url, is_opaque, tier_covers};
 use crate::logic::store;
 
 /// `#rrggbb` as a colour. The tables only hold valid ones, and anything else reads as black rather than failing a frame.
@@ -191,12 +191,14 @@ fn load_backdrop(app: &mut App, value: &str, width: f64, height: f64) {
         Background::Builtin(b) => {
             let bytes = b.picture;
             app.spawn(move |task| {
-                if let Ok(pixels) = decode(bytes) {
-                    let natural = (pixels.width, pixels.height);
-                    let opaque = is_opaque(&pixels);
-                    let picture = upload(pixels.data, pixels.width, pixels.height);
-                    task.post(move |app| adopt(app, token, picture, true, natural, opaque));
-                }
+                let Ok(pixels) = decode(bytes) else { return };
+                let natural = (pixels.width, pixels.height);
+                let Ok(pixels) = cover_window(pixels, width, height) else { return };
+                // Shrunk for this window, a larger one asks again.
+                let largest = (pixels.width, pixels.height) == natural;
+                let opaque = is_opaque(&pixels);
+                let picture = upload(pixels.data, pixels.width, pixels.height);
+                task.post(move |app| adopt(app, token, picture, largest, natural, opaque));
             });
         }
         Background::Imported(id) => {
@@ -207,11 +209,13 @@ fn load_backdrop(app: &mut App, value: &str, width: f64, height: f64) {
                 let full = |key: &str| tier.get(key).and_then(Value::as_u64).unwrap_or(0) as u32;
                 let natural = (full("fullWidth"), full("fullHeight"));
                 let Some(url) = tier.get("dataUrl").and_then(Value::as_str) else { return };
-                if let Ok(pixels) = decode_data_url(url) {
-                    let opaque = is_opaque(&pixels);
-                    let picture = upload(pixels.data, pixels.width, pixels.height);
-                    task.post(move |app| adopt(app, token, picture, largest, natural, opaque));
-                }
+                let Ok(pixels) = decode_data_url(url) else { return };
+                let tier = (pixels.width, pixels.height);
+                let Ok(pixels) = cover_window(pixels, width, height) else { return };
+                let largest = largest && (pixels.width, pixels.height) == tier;
+                let opaque = is_opaque(&pixels);
+                let picture = upload(pixels.data, pixels.width, pixels.height);
+                task.post(move |app| adopt(app, token, picture, largest, natural, opaque));
             });
         }
     }
@@ -276,6 +280,14 @@ fn load_media(app: &mut App, value: &str) {
     });
 }
 
+/// The window in device pixels: what a backdrop has to cover. On a screen of one pixel to a point, a picture for two would take four times
+/// the memory for nothing anyone could see.
+fn window_pixels() -> (f64, f64) {
+    let (w, h) = window_size();
+    let scale = f64::from(fluent::el::window_scale());
+    (f64::from(w) * scale, f64::from(h) * scale)
+}
+
 /// The window size a video has to cover. Under glass all but the thin gutters show the baked plate, where the sharp frame is out of sight, so half the pixels do.
 fn video_covers(app: &App, window: (f64, f64)) -> (f64, f64) {
     let appearance = &app.doc.global_settings.appearance;
@@ -283,8 +295,7 @@ fn video_covers(app: &App, window: (f64, f64)) -> (f64, f64) {
 }
 
 fn adopt_media(app: &mut App, token: u64, media: BackdropMedia) {
-    let (w, h) = window_size();
-    let covers = video_covers(app, (f64::from(w) * 2.0, f64::from(h) * 2.0));
+    let covers = video_covers(app, window_pixels());
     let d = app.local::<Backdrop>();
     if d.media_token != token {
         return;
@@ -360,8 +371,7 @@ pub fn backdrop_media(app: &mut App) -> BackdropMedia {
 /// own, which is Fluent's mica and needs nothing. It paints behind everything and takes no input.
 pub fn window_backdrop(app: &mut App) -> Option<E> {
     let value = app.doc.global_settings.appearance.background.clone();
-    let (w, h) = window_size();
-    let (w, h) = (w as f64 * 2.0, h as f64 * 2.0);
+    let (w, h) = window_pixels();
     let changed = app.local::<Backdrop>().value != value;
     if changed {
         let d = app.local::<Backdrop>();

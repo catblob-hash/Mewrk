@@ -1238,6 +1238,18 @@
     // Placeholders: {shell_ref} the background command's task address; {seconds} the timeout in seconds; {path} the output file's path
     "task.shell_timeout_backgrounded_file": "Command exceeded its {seconds}s timeout and keeps running in the background as {shell_ref}; output so far is in {path} (read or grep it). Its result is delivered when it finishes, or wait with task_wait; task_stop stops it.",
 
+    // Closing note of a foreground command that finished while processes it started still held its output; those keep running in the background instead of holding the call open.
+    // Placeholders: {shell_ref} the background task's address
+    "task.shell_left_running": "[The command finished, but processes it started still hold its output, so they keep running in the background as {shell_ref}; their result is delivered when they exit, or wait with task_wait.]",
+
+    // Same closing note, used when the command's output and what those processes print later is being written to a file.
+    // Placeholders: {shell_ref} the background task's address; {path} the output file's path
+    "task.shell_left_running_file": "[The command finished, but processes it started still hold its output, so they keep running in the background as {shell_ref}; its output and theirs is in {path} (read or grep it). Their result is delivered when they exit, or wait with task_wait; task_stop stops them.]",
+
+    // Result of a command's left-running processes once they have exited: only what they printed after the command's own result.
+    // Placeholders: {shell_ref} the background task's address; {tool_name} the shell tool that ran the command; {body} what those processes printed
+    "task.shell_left_running_result": "What background command {shell_ref} ({tool_name}) left running has exited; its output after the command's own result:\n{body}",
+
     // Receipt for a command started with `run_in_background`: its task address and output file.
     // Placeholders: {shell_ref} the background command's task address; {path} the output file's path
     "task.shell_background_receipt": "{shell_ref}\nOutput so far: {path} (read or grep it). You are notified when it finishes; task_stop stops it.",
@@ -1726,6 +1738,9 @@
     // Shell result when the deadline expired and the command, which could not be moved to the background, was stopped.
     // Placeholders: {seconds} the timeout in seconds
     "tool.shell_timed_out": "Command timed out after {seconds}s and was stopped, because it could not be moved to the background. Re-run it with run_in_background, or raise its timeout.",
+
+    // Closing note when processes a finished command left holding its output could not be moved to the background and were stopped.
+    "tool.shell_left_running_stopped": "[Processes the command started still held its output and were stopped, because they could not be moved to the background. To keep something running, start it with run_in_background.]",
 
     // Suffix added when a tool result was cut to the output limit.
     "tool.output_truncated": "… output truncated",

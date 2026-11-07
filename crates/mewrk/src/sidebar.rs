@@ -267,18 +267,49 @@ fn workspace_options_menu(workspace: &Workspace, name: &str, disabled: bool, res
         .build()
 }
 
+/// What the list draws of a project: the project without its conversations, and those by id and title. The sidebar is built every frame,
+/// and a copy of the projects as they are would copy every message of every conversation loaded.
+struct Group {
+    workspace: Workspace,
+    /// The conversations shown, as id and title.
+    listed: Vec<(String, String)>,
+    /// Every conversation in it, shown or not.
+    conversation_ids: Vec<String>,
+}
+
+impl Group {
+    fn of(workspace: &Workspace, unloaded: &HashSet<String>) -> Self {
+        let listed = visible_conversations(&workspace.conversations, unloaded).iter().map(|conversation| (conversation.id.clone(), conversation.title.clone())).collect();
+        let conversation_ids = workspace.conversations.iter().map(|conversation| conversation.id.clone()).collect();
+        // Every field by name, so that one added later has to be thought about here.
+        let Workspace { id, name, kind, path, machine, additional_workspaces, created_at, default_conversation_preset_id, last_conversation_settings, draft_conversation, conversations: _ } = workspace;
+        let workspace = Workspace {
+            id: id.clone(),
+            name: name.clone(),
+            kind: *kind,
+            path: path.clone(),
+            machine: machine.clone(),
+            additional_workspaces: additional_workspaces.clone(),
+            created_at: created_at.clone(),
+            default_conversation_preset_id: default_conversation_preset_id.clone(),
+            last_conversation_settings: last_conversation_settings.clone(),
+            draft_conversation: draft_conversation.clone(),
+            conversations: Vec::new(),
+        };
+        Self { workspace, listed, conversation_ids }
+    }
+}
+
 /// One project's heading and its conversations.
 #[allow(clippy::too_many_arguments)]
-fn workspace_group(app: &mut App, workspace: &Workspace, collapsed: &Local<HashSet<String>>, drag: &Local<DragSession>, rename: &Local<Option<RenameDraft>>, presets: &[(String, String)], active_workspace: Option<&str>, active_conversation: Option<&str>) -> E {
+fn workspace_group(app: &mut App, group: &Group, collapsed: &Local<HashSet<String>>, drag: &Local<DragSession>, rename: &Local<Option<RenameDraft>>, presets: &[(String, String)], active_workspace: Option<&str>, active_conversation: Option<&str>) -> E {
     let t_ = theme();
+    let Group { workspace, listed, conversation_ids } = group;
     let temporary = is_temporary_workspace(workspace);
     let reserved = is_reserved_workspace(workspace);
     let name = workspace_display_name(workspace);
     let id = workspace.id.clone();
     let is_collapsed = collapsed.with(|set| set.contains(&id));
-    let unloaded = app.unloaded.clone();
-    let listed: Vec<(String, String)> = visible_conversations(&workspace.conversations, &unloaded).iter().map(|conversation| (conversation.id.clone(), conversation.title.clone())).collect();
-    let conversation_ids: Vec<String> = workspace.conversations.iter().map(|conversation| conversation.id.clone()).collect();
     let running = conversation_ids.iter().any(|conversation| app.conversation_is_busy(conversation));
     let deleting = app.workspace_is_deleting(&id);
     let delete_blocked = running || deleting;
@@ -369,7 +400,7 @@ fn workspace_group(app: &mut App, workspace: &Workspace, collapsed: &Local<HashS
     // Opens and closes at once: a project is a list to scan, not a panel to reveal.
     let mut list: E = col().key(("workspace-conversations", id.as_str())).role(Role::List).aria_hidden(is_collapsed);
     if !is_collapsed {
-        for (conversation_id, conversation_title) in &listed {
+        for (conversation_id, conversation_title) in listed {
             let row_el = conversation_row(app, &id, conversation_id, conversation_title, deleting, rename, drag, active_workspace == Some(id.as_str()) && active_conversation == Some(conversation_id.as_str()), dragged.as_ref(), target.as_ref());
             list = list.child(row_el);
         }
@@ -685,10 +716,10 @@ pub fn sidebar(app: &mut App, width: f32) -> E {
 
     let heading = row().h(ROW).mt(14.0).pl(7.0).pr(3.0).shrink0().items_center().child(text(t("项目", "Projects")).ty(ty_section()).color(t_.text_tertiary).flex1()).child(tool_button("new-project", "FolderPlus", t("新建项目", "New project"), ROW_BUTTON, 15.0).on_click(|app: &mut App| app.set_workspace_dialog_open(true, false)));
 
-    let workspaces = app.doc.workspaces.clone();
+    let groups: Vec<Group> = app.doc.workspaces.iter().map(|workspace| Group::of(workspace, &app.unloaded)).collect();
     let mut list: E = col().key(LIST_KEY).role(Role::Navigation).aria_label(t("对话列表", "Conversation list")).flex1().min_h(0.0).scroll_y().pb(12.0).gap(6.0);
-    for workspace in &workspaces {
-        list = list.child(workspace_group(app, workspace, &collapsed, &drag, &rename, &presets, active_workspace.as_deref(), active_conversation.as_deref()));
+    for group in &groups {
+        list = list.child(workspace_group(app, group, &collapsed, &drag, &rename, &presets, active_workspace.as_deref(), active_conversation.as_deref()));
     }
 
     let settings: E = row()

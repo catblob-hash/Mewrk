@@ -1,7 +1,7 @@
 //! Port of `lib/streamReveal.ts`: the streaming reveal.
 //!
-//! The text each commit adds sweeps in from left to right, so a stream reads as being written instead of as runs of
-//! text blinking into place ten times a second.
+//! The text each commit adds sweeps in from left to right, so a stream reads as being written instead of as a second's
+//! worth of text blinking into place at once.
 //!
 //! "What this commit added" is decided on the text as rendered, not on the source. A Markdown source and its
 //! rendering are not the same string (`**bo` renders as `**bo` until the closing `**` turns it into bold `bo`), and
@@ -13,8 +13,8 @@
 
 use super::model_stream::MODEL_STREAM_COMMIT_INTERVAL_MS;
 
-/// One sweep lasts one commit, so each commit's text finishes arriving just as the next begins and the stream moves
-/// continuously.
+/// One sweep lasts one commit interval, so each commit's text finishes arriving just as the next begins and the stream
+/// moves continuously, however seldom the timeline itself changes.
 pub const STREAM_REVEAL_MS: u64 = MODEL_STREAM_COMMIT_INTERVAL_MS;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,7 +122,8 @@ mod tests {
         let split = StreamRevealSplit { text: "aaaabbbb".into(), settled: 4, tick: 0 };
         let timings = reveal_timings(&split, &[(0, 2), (2, 4), (6, 2)]);
         assert_eq!(timings[0], None);
-        assert_eq!(timings[1], Some(RevealTiming { cut: 2, delay_ms: 0.0, duration_ms: 50.0 }));
-        assert_eq!(timings[2], Some(RevealTiming { cut: 0, delay_ms: 50.0, duration_ms: 50.0 }));
+        let half = STREAM_REVEAL_MS as f64 / 2.0;
+        assert_eq!(timings[1], Some(RevealTiming { cut: 2, delay_ms: 0.0, duration_ms: half }));
+        assert_eq!(timings[2], Some(RevealTiming { cut: 0, delay_ms: half, duration_ms: half }));
     }
 }

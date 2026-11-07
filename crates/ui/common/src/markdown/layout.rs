@@ -144,7 +144,9 @@ pub(super) struct Piece {
     pub region: Option<u16>,
     /// What a triple click selects: one piece, or all the runs of one code block.
     pub group: u32,
-    /// Takes part in the streaming reveal. Code and math do not, as upstream's renderer leaves them out.
+    /// Takes part in the streaming reveal. Math does not, as upstream's renderer leaves it out. Code does here, though upstream's
+    /// leaves it out too: with one commit a second, code that arrived whole would land up to a second ahead of the text before it, and
+    /// a long block would grow a second's lines at a time.
     pub fade: bool,
 }
 
@@ -1100,7 +1102,7 @@ impl Cx<'_> {
             natural = natural.max(lay.natural_w);
             let height = lay.h;
             let sep = std::mem::replace(&mut self.sep, Sep::Newline);
-            self.out.pieces.push(Piece { x: env.x + pad_x, y: cur, w: inner_w, lay, key: piece_key, align: TextAlign::Start, sep, region: Some(region_index), group, fade: false });
+            self.out.pieces.push(Piece { x: env.x + pad_x, y: cur, w: inner_w, lay, key: piece_key, align: TextAlign::Start, sep, region: Some(region_index), group, fade: true });
             cur += height;
         }
         self.region = saved_region;

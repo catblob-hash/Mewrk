@@ -65,9 +65,10 @@ pub fn composer_cat() -> E {
         let key = format!("composer-cat:{color}:{opacity}:{frame}");
         let svg = frame_svg(frame, &color, opacity);
         ui.svg_icon(&key, &svg, r.x + WIDTH * 0.5, r.y + WIDTH * 0.5, WIDTH);
-        // The whole composer is redrawn for this, so it steps rather than glides.
+        // Only its painting changes, so a frame that paints the last tree again is enough for the next step. It steps rather than glides,
+        // one picture of the tail per step.
         if !still {
-            ui.wake_after(TAIL_SECONDS / FRAMES as f32);
+            ui.repaint_after(TAIL_SECONDS / FRAMES as f32);
         }
     })
     .key("composer-cat")

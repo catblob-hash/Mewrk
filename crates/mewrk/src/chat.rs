@@ -21,25 +21,29 @@ use crate::effects::{active_subagents, active_workspace_deleting, workspace_git_
 
 /// `timelinePathBaseDir`: the directory a transcript's relative paths are written against.
 pub fn timeline_path_base_dir(app: &mut App) -> Option<String> {
-    let workspace = app.active_workspace()?.clone();
+    let workspace_id = app.active_workspace_id()?;
     let conversation_id = app.active_conversation_id();
-    let registered = mewrk_client::workspaces::registered_project_workspaces(Some(&workspace));
-    let worktrees = conversation_id.as_ref().and_then(|id| app.find_conversation(&workspace.id, id)).map(|c| c.worktrees.clone()).unwrap_or_default();
-    if let Some(primary) = registered.first()
-        && let Some(worktree) = worktree_for(&worktrees, 1, primary)
-    {
-        return Some(worktree.path.clone());
+    // Read in place: the workspace holds every conversation in it, messages and all.
+    let (worktree_path, local, path) = {
+        let workspace = app.workspace(&workspace_id)?;
+        let registered = mewrk_client::workspaces::registered_project_workspaces(Some(workspace));
+        let worktrees = conversation_id.as_ref().and_then(|id| app.find_conversation(&workspace.id, id)).map_or(&[][..], |c| c.worktrees.as_slice());
+        let worktree_path = registered.first().and_then(|primary| worktree_for(worktrees, 1, primary)).map(|worktree| worktree.path.clone());
+        (worktree_path, workspace.machine.is_none(), workspace.path.clone())
+    };
+    if worktree_path.is_some() {
+        return worktree_path;
     }
-    if workspace.machine.is_none()
+    if local
         && let Some(id) = &conversation_id
     {
         let controller = git_controller(app);
-        let surface = git_surface_key(&workspace.id, 1);
+        let surface = git_surface_key(&workspace_id, 1);
         if let Some(root) = git_snapshot_for_workspace(controller.snapshots.get(&git_snapshot_key(id, 1)), Some(surface.as_str())).flatten().map(|snapshot| snapshot.worktree_root.clone()).filter(|root| !root.is_empty()) {
             return Some(root);
         }
     }
-    Some(workspace.path)
+    Some(path)
 }
 
 /// `activeTimelineTools` and `activeEnabledTools`. Kept as long as what they are read from stays: a view that gets new tools

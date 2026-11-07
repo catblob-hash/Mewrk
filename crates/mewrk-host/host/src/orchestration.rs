@@ -568,6 +568,52 @@ pub fn shell_timeout_backgrounded_output(
     }
 }
 
+/// The receipt for a command whose shell exited while processes it started
+/// still held its output, so those were adopted by a task slot rather than
+/// waited on. The command did finish, so the receipt leads with what it printed
+/// — the result the model asked for — and then says what is still running and
+/// where its later output goes.
+pub fn shell_left_running_output(
+    output: &str,
+    shell_ref: &str,
+    output_file: Option<&str>,
+    profile: &PromptProfile,
+) -> String {
+    let note = match output_file {
+        Some(path) => profile.render(
+            PromptKey::TaskShellLeftRunningFile,
+            &[("shell_ref", shell_ref), ("path", path)],
+        ),
+        None => profile.render(PromptKey::TaskShellLeftRunning, &[("shell_ref", shell_ref)]),
+    };
+    if output.trim().is_empty() {
+        note
+    } else {
+        format!("{}\n{note}", output.trim_end())
+    }
+}
+
+/// The envelope body once what a command left running has exited. Its receipt
+/// already carried the command's own result and exit; this carries only what
+/// came after, and no exit code, since those processes' exits were never
+/// collected.
+pub fn shell_left_running_result_text(
+    tool_name: &str,
+    shell_ref: &str,
+    output: &str,
+    profile: &PromptProfile,
+) -> String {
+    let body = if output.trim().is_empty() {
+        profile.text(PromptKey::TaskShellNoOutput)
+    } else {
+        output.trim_end()
+    };
+    profile.render(
+        PromptKey::TaskShellLeftRunningResult,
+        &[("shell_ref", shell_ref), ("tool_name", tool_name), ("body", body)],
+    )
+}
+
 /// The envelope body of a finished background shell command. The first line
 /// restates the address and exit code because the envelope is rendered under
 /// an `[aN · status]` header whose pool name means nothing to the model.
@@ -2386,6 +2432,21 @@ mod tests {
         assert!(adopted.contains("task_stop"), "{adopted}");
         let adopted = shell_timeout_backgrounded_output("shell:3", None, timeout, &profile);
         assert!(adopted.contains("120s timeout") && !adopted.contains("tool-output"), "{adopted}");
+
+        // A command that finished while what it started still held its output:
+        // the result it did produce comes first, then where the rest went.
+        let left = shell_left_running_output("server started\n", "shell:3", Some(path), &profile);
+        assert!(left.starts_with("server started\n["), "{left}");
+        assert!(left.contains("keep running in the background as shell:3"), "{left}");
+        assert!(left.contains(path) && left.contains("task_stop"), "{left}");
+        let left = shell_left_running_output("", "shell:3", None, &profile);
+        assert!(left.starts_with("[The command finished") && !left.contains("tool-output"), "{left}");
+        // And once those exit: only what came after, with no exit code.
+        let after = shell_left_running_result_text("bash", "shell:3", "", &profile);
+        assert_eq!(
+            after,
+            "What background command shell:3 (bash) left running has exited; its output after the command's own result:\n(no output)"
+        );
     }
 
     /// A wait that ends at its deadline names the file of every command still

@@ -73,6 +73,15 @@ impl Groups {
 pub(crate) struct GroupRegistration(i32);
 
 impl GroupRegistration {
+    /// Whether the group has no member left. Only "no such group" counts: a
+    /// member Mewrk may not signal is still a member. While any member lives,
+    /// the id cannot be reused, so an answer seen while watching is this group's.
+    pub(crate) fn is_empty(&self) -> bool {
+        // SAFETY: signal 0 only asks whether the group has a member.
+        let answer = unsafe { libc::kill(-self.0, 0) };
+        answer == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
     /// Sends `signal` to every process still in the group, its leader included.
     pub(crate) fn signal(&self, signal: libc::c_int) {
         // SAFETY: `kill` with a negative id only signals the processes of that group.

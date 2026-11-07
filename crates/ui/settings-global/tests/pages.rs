@@ -195,7 +195,12 @@ fn a_built_in_picture_becomes_the_backdrop_and_a_solid_one_follows_the_theme() {
     rig.click(&mut app, &view, ("background-builtin", "builtin:desk"));
     assert_eq!(app.doc.global_settings.appearance.background, "builtin:desk");
     rig.until(&mut app, &view, "the picture to decode", |app| backdrop_size(app).is_some());
-    assert_eq!(backdrop_size(&mut app), Some((3840, 2400)));
+    // Just what covers 1280x900 at 2x, of a 3840x2400 picture. A larger window asks again, up to the picture's own size.
+    assert_eq!(backdrop_size(&mut app), Some((2880, 1800)));
+    rig.size = (2560.0, 1600.0);
+    rig.until(&mut app, &view, "the picture for the larger window", |app| backdrop_size(app) == Some((3840, 2400)));
+    rig.size = (1280.0, 900.0);
+    rig.settle(&mut app, &view);
     rig.click(&mut app, &view, ("background-solid", "solid:night"));
     let on_screen_dark = mewrk_settings_global::effects::resolved_scheme(&app) == mewrk_settings_global::logic::background::BackgroundScheme::Night;
     assert_eq!(app.doc.global_settings.appearance.background, if on_screen_dark { "solid" } else { "solid:night" });

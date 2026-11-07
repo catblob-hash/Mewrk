@@ -4967,7 +4967,7 @@ fn run_shell(
         // for it. A caller with nowhere to put it falls through to a stop.
         ShellWaitOutcome::DeadlineReached(run) => {
             let refused = match handoff {
-                Some(handoff) => match handoff(run, guard, context) {
+                Some(handoff) => match handoff(run, guard, context, ShellHandoffReason::Deadline) {
                     // The command outlives this call now, so its directory is
                     // not read back — the same rule Claude Code applies to every
                     // backgrounded command, and for the same reason: it would
@@ -5001,6 +5001,82 @@ fn run_shell(
                     spill,
                     profile,
                 ),
+                images: Vec::new(),
+                diff: None,
+                opened_file: None,
+                file_touch: None,
+            })
+        }
+        // The command's shell is done, but something it started and left running
+        // still holds its output. Waiting for that would wait for as long as those
+        // processes run, a server's forever, with no deadline or stop left to end
+        // the call. The command's own result is taken now; what it left running is
+        // handed on like a command at its deadline, or, with nowhere to put it,
+        // ended, and the call says so.
+        ShellWaitOutcome::LeftRunning(mut run, status) => {
+            let (printed, cwd_report) = run.take_output_so_far(status, profile);
+            // The shell has exited, so where it ended is final: it is read back
+            // now, as for any finished call.
+            let reported = if workspace.is_local() {
+                adopt_reported_cwd(context.cwd_file(), local_anchor)
+            } else {
+                judge_remote_cwd(
+                    cwd_report.as_deref(),
+                    kind.dialect() == crate::shell_backend::ScriptDialect::PowerShell,
+                )
+            };
+            let cwd_note = reported.adopt(state, conversation_id, workspace, profile);
+            let with_note = |mut output: String| {
+                if let Some(note) = &cwd_note {
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+                    output.push_str(note);
+                }
+                output
+            };
+            let refused = match handoff {
+                Some(handoff) => {
+                    let output = with_note(crate::tool_output::fit(
+                        printed.clone(),
+                        crate::tool_output::SHELL_INLINE_CHARS,
+                        spill,
+                        profile,
+                    ));
+                    match handoff(run, guard, context, ShellHandoffReason::LeftRunning { output }) {
+                        ShellHandoffOutcome::Adopted(receipt) => {
+                            return Ok(Outcome {
+                                success: status.success(),
+                                output: receipt,
+                                images: Vec::new(),
+                                diff: None,
+                                opened_file: None,
+                                file_touch: None,
+                            })
+                        }
+                        ShellHandoffOutcome::Refused(run, guard, context) => (run, guard, context),
+                    }
+                }
+                None => (run, guard, context),
+            };
+            let (run, mut guard, context) = refused;
+            let rest = run.stop_left_running(&mut guard, status, profile)?;
+            drop(context);
+            let mut output = printed;
+            for part in [rest.output.as_str(), profile.text(PromptKey::ToolShellLeftRunningStopped)] {
+                if !part.is_empty() {
+                    output.push('\n');
+                    output.push_str(part);
+                }
+            }
+            Ok(Outcome {
+                success: status.success() && rest.success,
+                output: with_note(crate::tool_output::fit(
+                    output,
+                    crate::tool_output::SHELL_INLINE_CHARS,
+                    spill,
+                    profile,
+                )),
                 images: Vec::new(),
                 diff: None,
                 opened_file: None,
@@ -5148,6 +5224,9 @@ pub(crate) struct ShellProcessResult {
     /// What a remote call reported about the directory it ended in, raw: see
     /// [`judge_remote_cwd`]. `None` for a local call, which reports in a file.
     pub cwd_report: Option<String>,
+    /// This settles what a command left running after its own result was
+    /// taken: `output` is only what came after, and `exit_code` is `None`.
+    pub left_running: bool,
 }
 
 /// What happened when a timed-out run was offered to the task surface.
@@ -5166,13 +5245,32 @@ pub(crate) enum ShellHandoffOutcome {
     ),
 }
 
-/// Offered a running command whose deadline expired, together with the row that
+/// Why a foreground run is being offered to the task surface, which is what its
+/// receipt has to explain.
+pub(crate) enum ShellHandoffReason {
+    /// The deadline passed with the command still running.
+    Deadline,
+    /// The command itself ended, but something it started and left running
+    /// still holds its output open: `cd dir && server > log &` leaves one in the
+    /// subshell that waits on the server. `output` is what the command printed,
+    /// already fitted for the model, which the receipt carries in place of a
+    /// result that will not come until those processes end.
+    LeftRunning { output: String },
+}
+
+/// Offered a running command whose deadline expired, or one whose shell exited
+/// while what it started still holds its output, together with the row that
 /// owns its stop button.
 ///
 /// Taking both by value is the point: adopting the command means adopting
 /// responsibility for finishing it and for retiring its row, and a borrow could
 /// not express that. The executor keeps no way to reach the run afterwards.
-pub(crate) type ShellHandoff<'a> = dyn Fn(ShellRun, crate::shell_tasks::ShellTaskGuard, ShellCallContext) -> ShellHandoffOutcome
+pub(crate) type ShellHandoff<'a> = dyn Fn(
+        ShellRun,
+        crate::shell_tasks::ShellTaskGuard,
+        ShellCallContext,
+        ShellHandoffReason,
+    ) -> ShellHandoffOutcome
     + 'a;
 
 /// A spawned command with its two pipe readers already draining it.
@@ -5188,8 +5286,11 @@ pub(crate) struct ShellRun {
     job: ShellJob,
     /// Carried only so a timed-out result can name the deadline it missed.
     timeout: Option<Duration>,
-    stdout_thread: thread::JoinHandle<CapturedStream>,
-    stderr_thread: thread::JoinHandle<CapturedStream>,
+    readers: ShellReaders,
+    /// Set once the command's own result has been taken
+    /// ([`ShellRun::take_output_so_far`]): what settles later is only what it
+    /// left running, whose exit is not the shell's.
+    left_running: bool,
 }
 
 /// Why [`ShellRun::wait`] returned.
@@ -5201,6 +5302,31 @@ pub(crate) enum ShellWaitOutcome {
     /// or stop it. The guard has *not* been finished, because the command has
     /// not ended.
     DeadlineReached(ShellRun),
+    /// The shell exited with this status, but its output is still open: what it
+    /// started and left running holds the pipes. Only a wait with a deadline —
+    /// the synchronous leg — returns this, after [`SHELL_EXIT_DRAIN`]. As with
+    /// a deadline, the processes are untouched and the guard is not finished;
+    /// the caller hands the run on or ends what is left of it.
+    LeftRunning(ShellRun, ExitStatus),
+}
+
+/// How long a command's output may go on arriving once its shell has exited.
+/// What was already in the pipes drains in a few milliseconds; a pipe still
+/// open after this is held by something the command started and left running,
+/// and waiting for it to close would mean waiting for that to end — forever, for
+/// a server.
+const SHELL_EXIT_DRAIN: Duration = Duration::from_secs(1);
+
+/// After a kill, how long the readers get to see their pipes close. Everything
+/// in the job or the group dies at once; a process that left it (`setsid`, a
+/// breakaway) survives and can hold a pipe for as long as it runs. The call then
+/// settles on what had been read, and the reader goes on draining by itself.
+const SHELL_KILL_DRAIN: Duration = Duration::from_secs(2);
+
+/// What [`ShellRun::drain_after_exit`] came to.
+enum Drained {
+    Ended(ShellProcessEnd),
+    LeftRunning,
 }
 
 impl ShellRun {
@@ -5218,19 +5344,142 @@ impl ShellRun {
         let stderr = child
             .take_stderr()
             .ok_or_else(|| "Failed to capture command standard error".to_owned())?;
-        let stdout_thread = collect_pipe(
+        let (ended, ended_rx) = std::sync::mpsc::channel();
+        let stdout = collect_pipe(
             stdout,
             guard.output_sink(ShellOutputStream::Stdout),
             cwd_tag.as_deref().map(CwdReportFilter::new),
+            ended.clone(),
         );
-        let stderr_thread = collect_pipe(stderr, guard.output_sink(ShellOutputStream::Stderr), None);
+        let stderr = collect_pipe(
+            stderr,
+            guard.output_sink(ShellOutputStream::Stderr),
+            None,
+            ended,
+        );
         Ok(ShellRun {
             child,
             job,
             timeout,
-            stdout_thread,
-            stderr_thread,
+            readers: ShellReaders {
+                stdout,
+                stderr,
+                ended: ended_rx,
+                open: 2,
+            },
+            left_running: false,
         })
+    }
+
+    /// Takes what the command has printed so far, formatted as the result of
+    /// a command that exited with `status`, and the directory report its output
+    /// carried (a remote call's). This is the command's result: a run whose
+    /// shell exited while what it started still holds its output is handed on
+    /// with it, and settles later with only what came after.
+    pub(crate) fn take_output_so_far(
+        &mut self,
+        status: ExitStatus,
+        profile: &PromptProfile,
+    ) -> (String, Option<String>) {
+        self.left_running = true;
+        let (mut stdout, stderr) = self.readers.take_so_far();
+        let cwd_report = stdout.cwd_report.take();
+        let output = format_process_output(
+            status,
+            ShellCompletion::Exited,
+            &stdout,
+            &stderr,
+            self.timeout,
+            profile,
+        );
+        (output, cwd_report)
+    }
+
+    /// Whether none of the command's own processes is left, though a pipe is
+    /// still open: the job is empty, or the process group is gone. What holds
+    /// the pipe then left the tree (`setsid`, a breakaway), so a stop could not
+    /// reach it either, and waiting for it would only keep the call, or the
+    /// task, open. A remote command's tree is the agent's to know about.
+    fn tree_gone(&mut self) -> bool {
+        match &self.child {
+            ShellChild::Local(child) => self.job.is_empty(child.id()),
+            ShellChild::Remote { .. } => false,
+        }
+    }
+
+    /// The stop a wait must act on, if one was asked for.
+    fn requested_stop(
+        guard: &crate::shell_tasks::ShellTaskGuard,
+        extra_stop: &dyn Fn() -> bool,
+    ) -> Option<ShellProcessEnd> {
+        if guard.stop_requested() {
+            // A stop nobody is credited with (the row dropped with its
+            // conversation, the host's own cleanup) keeps the original
+            // reading, as before there was a model stop.
+            Some(match guard.stop_attribution() {
+                Some(crate::agents::StopOrigin::Model) => ShellProcessEnd::StoppedByModel,
+                _ => ShellProcessEnd::StoppedByUser,
+            })
+        } else if extra_stop() {
+            Some(ShellProcessEnd::Cancelled)
+        } else {
+            None
+        }
+    }
+
+    /// The shell has exited; what is left is its output. For almost every
+    /// command both pipes have closed by now, or close within milliseconds. When
+    /// they have not, something the command left running holds them, and this
+    /// keeps answering a stop while it waits, since that can last as long as
+    /// those processes do. A wait that may hand the run on (`may_hand_on`, the
+    /// synchronous leg) gives up after [`SHELL_EXIT_DRAIN`]; the background leg
+    /// waits for as long as it takes, which is what its task is for.
+    fn drain_after_exit(
+        &mut self,
+        guard: &crate::shell_tasks::ShellTaskGuard,
+        extra_stop: &dyn Fn() -> bool,
+        may_hand_on: bool,
+    ) -> Drained {
+        let drained_by = Instant::now() + SHELL_EXIT_DRAIN;
+        loop {
+            let slice = if may_hand_on {
+                SHELL_STOP_POLL.min(drained_by.saturating_duration_since(Instant::now()))
+            } else {
+                SHELL_STOP_POLL
+            };
+            if self.readers.wait(slice) {
+                return Drained::Ended(ShellProcessEnd::Exited);
+            }
+            if let Some(end) = Self::requested_stop(guard, extra_stop) {
+                kill_shell_child(&mut self.child, &self.job);
+                return Drained::Ended(end);
+            }
+            if self.tree_gone() {
+                return Drained::Ended(ShellProcessEnd::Exited);
+            }
+            if may_hand_on && Instant::now() >= drained_by {
+                return Drained::LeftRunning;
+            }
+        }
+    }
+
+    /// Ends what a command whose shell had already exited left running, and
+    /// settles what came after its own result: used when such a run cannot be
+    /// handed on. A stop asked for meanwhile is what ended it.
+    pub(crate) fn stop_left_running(
+        mut self,
+        guard: &mut crate::shell_tasks::ShellTaskGuard,
+        status: ExitStatus,
+        profile: &PromptProfile,
+    ) -> Result<ShellProcessResult, String> {
+        let end = Self::requested_stop(guard, &|| false).unwrap_or(ShellProcessEnd::Exited);
+        kill_shell_child(&mut self.child, &self.job);
+        match self.settle(guard, status, end, profile)? {
+            ShellWaitOutcome::Settled(result) => Ok(result),
+            ShellWaitOutcome::DeadlineReached(_) | ShellWaitOutcome::LeftRunning(..) => {
+                unreachable!("settle never reports a deadline")
+            }
+        }
     }
 
     /// Drives the command to a terminal state, or to `deadline`.
@@ -5251,20 +5500,15 @@ impl ShellRun {
                 .wait_timeout(SHELL_STOP_POLL)
                 .map_err(|error| format!("Failed while waiting for command: {error}"))?
             {
-                Some(status) => break (status, ShellProcessEnd::Exited),
+                Some(status) => match self.drain_after_exit(guard, extra_stop, deadline.is_some()) {
+                    Drained::Ended(end) => break (status, end),
+                    Drained::LeftRunning => {
+                        return Ok(ShellWaitOutcome::LeftRunning(self, status));
+                    }
+                },
                 None => {
-                    let end = if guard.stop_requested() {
-                        // A stop nobody is credited with (the row dropped with
-                        // its conversation, the host's own cleanup) keeps the
-                        // original reading, as before there was a model stop.
-                        match guard.stop_attribution() {
-                            Some(crate::agents::StopOrigin::Model) => {
-                                ShellProcessEnd::StoppedByModel
-                            }
-                            _ => ShellProcessEnd::StoppedByUser,
-                        }
-                    } else if extra_stop() {
-                        ShellProcessEnd::Cancelled
+                    let end = if let Some(end) = Self::requested_stop(guard, extra_stop) {
+                        end
                     } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         // Deliberately not a kill. The command is still running
                         // and still draining into both the model's capture and
@@ -5300,8 +5544,8 @@ impl ShellRun {
     ) -> Result<ShellProcessResult, String> {
         match self.wait(guard, cancel_probe, None, profile)? {
             ShellWaitOutcome::Settled(result) => Ok(result),
-            ShellWaitOutcome::DeadlineReached(_) => {
-                unreachable!("a run waited without a deadline cannot reach one")
+            ShellWaitOutcome::DeadlineReached(_) | ShellWaitOutcome::LeftRunning(..) => {
+                unreachable!("a run waited without a deadline cannot reach one, nor give up on its output")
             }
         }
     }
@@ -5321,16 +5565,17 @@ impl ShellRun {
             .map_err(|error| format!("Failed to terminate command: {error}"))?;
         match self.settle(guard, status, ShellProcessEnd::TimedOut, profile)? {
             ShellWaitOutcome::Settled(result) => Ok(result),
-            ShellWaitOutcome::DeadlineReached(_) => {
+            ShellWaitOutcome::DeadlineReached(_) | ShellWaitOutcome::LeftRunning(..) => {
                 unreachable!("settle never reports a deadline")
             }
         }
     }
 
-    /// Records the outcome and joins the readers. Split out of `wait` because a
-    /// backgrounded run re-enters here through its own `wait` on the new thread.
+    /// Records the outcome and collects what the readers captured. Split out of
+    /// `wait` because a backgrounded run re-enters here through its own `wait`
+    /// on the new thread.
     fn settle(
-        self,
+        mut self,
         guard: &mut crate::shell_tasks::ShellTaskGuard,
         status: ExitStatus,
         end: ShellProcessEnd,
@@ -5362,16 +5607,33 @@ impl ShellRun {
         if let Some(runtime) = runtime {
             guard.measured_runtime(runtime);
         }
-        // Joined after the tree is down, never before: these threads end when the last copy of the
-        // write handle closes, and a surviving grandchild holds one. That is why the kill has to
-        // cover the whole tree — otherwise the command is "stopped" and this still blocks.
-        let mut stdout = self.stdout_thread.join().map_err(|_| {
-            "The command standard-output reader thread terminated unexpectedly".to_owned()
-        })?;
+        // Collected after the tree is down, never before: the readers end when the last copy of
+        // each write handle closes, and a surviving grandchild holds one. That is why the kill has
+        // to cover the whole tree. One it could not reach is not waited on past
+        // `SHELL_KILL_DRAIN`.
+        let (mut stdout, stderr) = self.readers.finish(SHELL_KILL_DRAIN)?;
         let cwd_report = stdout.cwd_report.take();
-        let stderr = self.stderr_thread.join().map_err(|_| {
-            "The command standard-error reader thread terminated unexpectedly".to_owned()
-        })?;
+        // A command that ended on its own may have started something meant to
+        // outlive it; one that was stopped or timed out had its tree ended.
+        if end == ShellProcessEnd::Exited {
+            if let ShellChild::Local(child) = &self.child {
+                let leader = child.id();
+                self.job.keep_alive(leader);
+            }
+        }
+        if self.left_running {
+            // The shell's exit was reported with the command's own result; what
+            // ends here is what it left running, whose exits nobody collected.
+            return Ok(ShellWaitOutcome::Settled(ShellProcessResult {
+                end,
+                success: completion == ShellCompletion::Exited,
+                exit_code: None,
+                output: left_running_output(completion, &stdout, &stderr, profile),
+                runtime,
+                cwd_report,
+                left_running: true,
+            }));
+        }
         let output = format_process_output(
             status,
             completion,
@@ -5387,6 +5649,7 @@ impl ShellRun {
             output,
             runtime,
             cwd_report,
+            left_running: false,
         }))
     }
 }
@@ -5402,7 +5665,7 @@ pub(crate) fn collect_shell_process(
     // stop.
     match ShellRun::start(spawned, guard, None)?.wait(guard, extra_stop, None, profile)? {
         ShellWaitOutcome::Settled(result) => Ok(result),
-        ShellWaitOutcome::DeadlineReached(_) => {
+        ShellWaitOutcome::DeadlineReached(_) | ShellWaitOutcome::LeftRunning(..) => {
             unreachable!("a run started without a deadline cannot reach one")
         }
     }
@@ -5453,6 +5716,11 @@ pub(crate) fn kill_process_tree_or_child(child: &mut std::process::Child, job: &
         // `run_shell` made the command its own session leader, so its process-group id is its
         // pid and the negative target reaches every descendant that did not deliberately leave
         // the group. Unlike the terminal's pty, a plain `Command` gets no group for free.
+        // A group already seen empty is not this command's any more.
+        if job.group_gone() {
+            let _ = child.kill();
+            return;
+        }
         let killed = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0;
         if killed {
             return;
@@ -5471,6 +5739,10 @@ pub(crate) struct ShellJob {
     /// quitting Mewrk ends it the way closing the job does on Windows.
     #[cfg(unix)]
     group: std::sync::OnceLock<crate::process_groups::GroupRegistration>,
+    /// Set once the group was seen to be empty. Its id is free for reuse from
+    /// then on, so it is never signalled again, by a stop or by quitting.
+    #[cfg(unix)]
+    group_gone: std::sync::atomic::AtomicBool,
 }
 
 // The handle is owned solely by this struct and only ever used from the thread running the
@@ -5494,7 +5766,9 @@ impl ShellJob {
             }
             // Kill-on-close is the backstop: if this call ends without reaching the explicit
             // terminate — a panic, an early `?` — dropping the handle still takes the tree with
-            // it rather than leaking processes that outlive the app's interest in them.
+            // it rather than leaking processes that outlive the app's interest in them. A
+            // command that ended on its own hands what it left running to `keep_alive`
+            // instead, so that goes on until it exits or Mewrk does.
             let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             unsafe {
@@ -5513,6 +5787,71 @@ impl ShellJob {
         Self {
             #[cfg(unix)]
             group: std::sync::OnceLock::new(),
+            #[cfg(unix)]
+            group_gone: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether nothing is left of the tree led by `leader`, which this job
+    /// holds. `false` whenever that cannot be told: no job was created, or the
+    /// query failed.
+    pub(crate) fn is_empty(&mut self, _leader: u32) -> bool {
+        #[cfg(windows)]
+        {
+            self.handle.is_some_and(job_is_empty)
+        }
+        #[cfg(unix)]
+        {
+            use std::sync::atomic::Ordering;
+            if self.group_gone.load(Ordering::Acquire) {
+                return true;
+            }
+            let Ok(group) = i32::try_from(_leader) else {
+                return false;
+            };
+            // SAFETY: signal 0 only asks whether the group has a member. Every
+            // member keeps the id from being reused, so a "no such group" seen
+            // while the command's pipes are being waited on is about this group.
+            let gone = group > 1
+                && unsafe { libc::kill(-group, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if gone {
+                self.group_gone.store(true, Ordering::Release);
+                // Nothing to end at exit any more, and the id may be reused.
+                drop(self.group.take());
+            }
+            gone
+        }
+        #[cfg(not(any(windows, unix)))]
+        false
+    }
+
+    /// Whether the group was seen to be empty, after which it must not be
+    /// signalled: see [`ShellJob::is_empty`].
+    #[cfg(unix)]
+    fn group_gone(&self) -> bool {
+        self.group_gone.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Lets whatever a command that ended on its own left running go on after
+    /// the call: `server > log 2>&1 &` is how a command starts something meant
+    /// to outlive it. Closing the job would kill it (the job is kill-on-close),
+    /// and dropping the group's registration would let it outlive Mewrk; parked
+    /// in [`lingering`] instead, it runs until it exits or Mewrk does, the same
+    /// end every other process Mewrk starts has. Nothing is parked for a tree
+    /// that is already empty, nor for a command that was stopped: those paths
+    /// end the tree and never come here.
+    pub(crate) fn keep_alive(&mut self, leader: u32) {
+        if self.is_empty(leader) {
+            return;
+        }
+        #[cfg(windows)]
+        if let Some(handle) = self.handle.take() {
+            lingering::park(lingering::Parked::Job(lingering::JobHandle(handle)));
+        }
+        #[cfg(unix)]
+        if let Some(group) = self.group.take() {
+            lingering::park(lingering::Parked::Group(group));
         }
     }
 
@@ -5592,6 +5931,120 @@ impl Drop for ShellJob {
 
             if let Some(handle) = self.handle.take() {
                 unsafe { CloseHandle(handle) };
+            }
+        }
+    }
+}
+
+/// Whether a job has no process left in it. `false` when that cannot be told.
+#[cfg(windows)]
+fn job_is_empty(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use windows_sys::Win32::System::JobObjects::{
+        JobObjectBasicAccountingInformation, QueryInformationJobObject,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    };
+    // SAFETY: a plain-data out parameter of the size passed, for a job handle
+    // the caller owns.
+    let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+    let asked = unsafe {
+        QueryInformationJobObject(
+            handle,
+            JobObjectBasicAccountingInformation,
+            std::ptr::addr_of_mut!(info).cast(),
+            std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    asked != 0 && info.ActiveProcesses == 0
+}
+
+/// What finished commands left running, held until it exits so that it still
+/// ends with Mewrk: a parked job's handle closes when Mewrk's process does
+/// (kill-on-close), and a parked group stays registered for the exit path and
+/// the watchdog ([`crate::process_groups`]). A reaper thread, running only
+/// while something is parked, lets go of each one as it empties.
+pub(crate) mod lingering {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// How often the reaper looks for parked trees that have emptied.
+    const REAP_EVERY: Duration = Duration::from_secs(2);
+
+    pub(crate) enum Parked {
+        #[cfg(windows)]
+        Job(JobHandle),
+        #[cfg(unix)]
+        Group(crate::process_groups::GroupRegistration),
+    }
+
+    impl Parked {
+        fn is_empty(&self) -> bool {
+            match self {
+                #[cfg(windows)]
+                Self::Job(job) => super::job_is_empty(job.0),
+                #[cfg(unix)]
+                Self::Group(group) => group.is_empty(),
+            }
+        }
+    }
+
+    /// A job handle this list owns; closing it ends whatever is still in it.
+    #[cfg(windows)]
+    pub(crate) struct JobHandle(pub(crate) windows_sys::Win32::Foundation::HANDLE);
+
+    // A process-wide handle owned solely by the list; not thread-affine.
+    #[cfg(windows)]
+    unsafe impl Send for JobHandle {}
+
+    #[cfg(windows)]
+    impl Drop for JobHandle {
+        fn drop(&mut self) {
+            // SAFETY: owned here and not used after.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+
+    struct List {
+        parked: Vec<Parked>,
+        reaping: bool,
+    }
+
+    static LIST: Mutex<List> = Mutex::new(List {
+        parked: Vec::new(),
+        reaping: false,
+    });
+
+    fn list() -> std::sync::MutexGuard<'static, List> {
+        LIST.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn park(parked: Parked) {
+        let mut list = list();
+        list.parked.push(parked);
+        if list.reaping {
+            return;
+        }
+        list.reaping = true;
+        let started = std::thread::Builder::new()
+            .name("mewrk-shell-lingering".into())
+            .spawn(reap);
+        if started.is_err() {
+            // Without a reaper the entries stay until Mewrk exits, which is the
+            // bound they have anyway; the next park tries again.
+            list.reaping = false;
+        }
+    }
+
+    fn reap() {
+        loop {
+            std::thread::sleep(REAP_EVERY);
+            let mut list = list();
+            // Dropped outside the lock would be tidier, but letting go of an
+            // empty job or group is a handle close or a set removal.
+            list.parked.retain(|parked| !parked.is_empty());
+            if list.parked.is_empty() {
+                list.reaping = false;
+                return;
             }
         }
     }
@@ -5680,18 +6133,24 @@ impl CapturedStream {
 /// whitespace used to be stripped here, which only earned its keep while the PowerShell console was
 /// widened to thousands of columns and padded every formatted row out to that width; Claude Code
 /// widens nothing and trims nothing, so neither does this.
+///
+/// The capture is shared with the thread rather than returned by it, so a command can be settled,
+/// or handed on, while something it left running still holds the pipe; `ended` hears when the
+/// pipe closes, so nobody has to poll for that.
 fn collect_pipe<R: Read + Send + 'static>(
     mut pipe: R,
     mut sink: ShellOutputSink,
     mut report: Option<CwdReportFilter>,
-) -> thread::JoinHandle<CapturedStream> {
-    thread::spawn(move || {
-        let mut captured = CapturedStream::default();
+    ended: std::sync::mpsc::Sender<()>,
+) -> PipeReader {
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(CapturedStream::default()));
+    let shared = std::sync::Arc::clone(&captured);
+    let thread = thread::spawn(move || {
         let mut chunk = [0_u8; 8192];
-        let mut pass = |text: &[u8], captured: &mut CapturedStream| {
+        let mut pass = |text: &[u8]| {
             if !text.is_empty() {
                 sink.append(text);
-                captured.push(text);
+                lock_capture(&shared).push(text);
             }
         };
         loop {
@@ -5700,20 +6159,108 @@ fn collect_pipe<R: Read + Send + 'static>(
                 Ok(read) => match report.as_mut() {
                     Some(report) => {
                         let text = report.feed(&chunk[..read]);
-                        pass(&text, &mut captured);
+                        pass(&text);
+                        // Kept current, for a call settled before this pipe closes.
+                        if let Some(found) = &report.found {
+                            let mut captured = lock_capture(&shared);
+                            if captured.cwd_report.as_ref() != Some(found) {
+                                captured.cwd_report = Some(found.clone());
+                            }
+                        }
                     }
-                    None => pass(&chunk[..read], &mut captured),
+                    None => pass(&chunk[..read]),
                 },
             }
         }
         if let Some(mut report) = report {
             let text = report.finish();
-            pass(&text, &mut captured);
-            captured.cwd_report = report.found;
+            pass(&text);
+            lock_capture(&shared).cwd_report = report.found;
         }
         sink.finish();
-        captured
-    })
+        let _ = ended.send(());
+    });
+    PipeReader {
+        thread: Some(thread),
+        captured,
+    }
+}
+
+fn lock_capture(
+    captured: &std::sync::Mutex<CapturedStream>,
+) -> std::sync::MutexGuard<'_, CapturedStream> {
+    captured.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One pipe's reader thread and what it has captured so far.
+struct PipeReader {
+    thread: Option<thread::JoinHandle<()>>,
+    captured: std::sync::Arc<std::sync::Mutex<CapturedStream>>,
+}
+
+impl PipeReader {
+    /// What the pipe has delivered. A reader that has ended is joined first, so
+    /// a panic in it is an error rather than a silently short capture; one
+    /// still blocked is left to finish draining on its own.
+    fn take(&mut self, ended: bool, which: &str) -> Result<CapturedStream, String> {
+        if ended {
+            if let Some(thread) = self.thread.take() {
+                thread.join().map_err(|_| {
+                    format!("The command {which} reader thread terminated unexpectedly")
+                })?;
+            }
+        }
+        Ok(std::mem::take(&mut *lock_capture(&self.captured)))
+    }
+}
+
+/// A command's two readers, and the channel each reports the end of its pipe
+/// on.
+pub(crate) struct ShellReaders {
+    stdout: PipeReader,
+    stderr: PipeReader,
+    ended: std::sync::mpsc::Receiver<()>,
+    /// Pipes not yet heard to close.
+    open: usize,
+}
+
+impl ShellReaders {
+    /// Waits up to `limit` for both pipes to close; true once they have.
+    fn wait(&mut self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while self.open > 0 {
+            match self
+                .ended
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(()) => self.open -= 1,
+                // Both readers are gone, however they went: none is left to wait
+                // for, and joining tells whether one of them panicked.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => self.open = 0,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return false,
+            }
+        }
+        true
+    }
+
+    /// Takes what both pipes have delivered so far; what they deliver from
+    /// here on is captured afresh.
+    fn take_so_far(&mut self) -> (CapturedStream, CapturedStream) {
+        (
+            std::mem::take(&mut *lock_capture(&self.stdout.captured)),
+            std::mem::take(&mut *lock_capture(&self.stderr.captured)),
+        )
+    }
+
+    /// Waits up to `limit` for both pipes to close, then takes what they
+    /// delivered.
+    fn finish(mut self, limit: Duration) -> Result<(CapturedStream, CapturedStream), String> {
+        let ended = self.wait(limit);
+        Ok((
+            self.stdout.take(ended, "standard-output")?,
+            self.stderr.take(ended, "standard-error")?,
+        ))
+    }
 }
 
 /// Lifts a remote call's directory report ([`remote_session_command`]) out of
@@ -5843,6 +6390,26 @@ fn strip_leading_blank_lines(text: &str) -> &str {
 ///
 /// Length is not decided here: the caller fits the whole text to the shell's
 /// inline share with [`crate::tool_output::fit`], saving the rest to a file.
+/// What processes a command left running printed after its own result was
+/// taken: their output as it came, after the stop sentence when a stop ended
+/// them. Empty when they printed nothing; the caller words that.
+fn left_running_output(
+    completion: ShellCompletion,
+    stdout: &CapturedStream,
+    stderr: &CapturedStream,
+    profile: &PromptProfile,
+) -> String {
+    let stdout = normalize_line_endings(&stdout.text(profile)).into_owned();
+    let stdout = strip_leading_blank_lines(&stdout).trim_end().to_owned();
+    let stderr = normalize_line_endings(&stderr.text(profile)).trim().to_owned();
+    let mut parts: Vec<String> = Vec::new();
+    if completion != ShellCompletion::Exited {
+        parts.push(profile.text(PromptKey::ToolShellUserAborted).to_owned());
+    }
+    parts.extend([stdout, stderr].into_iter().filter(|part| !part.is_empty()));
+    parts.join("\n")
+}
+
 fn format_process_output(
     status: ExitStatus,
     completion: ShellCompletion,
@@ -11042,6 +11609,72 @@ mod tests {
             "(The file has only 2 lines, so the requested start_line is out of range)"
         );
         assert_eq!(read_in(root, json!({"path": "two.txt", "start_line": 2})).output, "two");
+    }
+
+    /// What a command starts in the background with its output redirected keeps running after
+    /// the call: `server > log 2>&1 &` is how a command starts something meant to outlive it.
+    /// On Windows closing the call's kill-on-close job used to end it the moment the call
+    /// returned; it now goes on until it exits or Mewrk does.
+    #[test]
+    fn what_a_finished_command_started_in_the_background_outlives_the_call() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::default();
+        let run = |command: &str| {
+            execute(request(directory.path(), "bash", json!({"command": command})), &state)
+        };
+        let started = run("sleep 60 > /dev/null 2>&1 & echo $! > leftover.pid; printf STARTED");
+        assert!(started.success, "{}", started.output);
+        assert_eq!(started.output, "STARTED");
+        // Past the reaper's first look, which must leave a live tree parked.
+        std::thread::sleep(Duration::from_secs(3));
+        let alive = run("kill -0 \"$(cat leftover.pid)\" && printf ALIVE");
+        let _ = run("kill \"$(cat leftover.pid)\"");
+        assert_eq!(alive.output, "ALIVE", "the process ended with the call that started it");
+    }
+
+    /// A command whose shell exits while something it started still holds its output returns
+    /// once the shell is done. `cd dir && server > log &` is the usual way to get there: the
+    /// redirect covers the server, while the subshell that waits on it keeps the original pipe.
+    /// Waiting for that pipe to close held the call open for as long as the server ran, past its
+    /// timeout and past any stop. Direct execution has no task surface to hand what is left to,
+    /// so it is ended, and the call settles as the exit it was.
+    #[test]
+    fn a_command_returns_when_its_shell_exits_even_if_what_it_started_holds_its_output() {
+        for command in [
+            "mkdir -p sub && cd sub && sleep 60 > /dev/null 2>&1 & printf LEFT-DONE",
+            "sleep 60 & printf LEFT-DONE",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let workspace = directory.path().to_path_buf();
+            let state = AppState::default();
+            let registry = state.shell_tasks.clone();
+            let (sent, received) = std::sync::mpsc::channel();
+            let started = Instant::now();
+            std::thread::spawn(move || {
+                let _ = sent.send(execute(request(&workspace, "bash", json!({"command": command})), &state));
+            });
+            let result = received
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!("`{command}` held the call open after its shell exited"));
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "`{command}` took {:?}",
+                started.elapsed()
+            );
+            assert!(result.success, "{}", result.output);
+            assert!(
+                result.output.starts_with("LEFT-DONE\n[Processes the command started still held its output and were stopped"),
+                "the command's result, then what happened to what it left: {}",
+                result.output
+            );
+            assert!(
+                registry
+                    .task_snapshots("conversation-test")
+                    .iter()
+                    .all(|row| row.outcome == Some(crate::shell_tasks::ShellTaskOutcome::Succeeded)),
+                "the row settled as the exit it was"
+            );
+        }
     }
 }
 

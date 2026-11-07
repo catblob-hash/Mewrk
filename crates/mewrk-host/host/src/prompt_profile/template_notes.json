@@ -2342,6 +2342,48 @@
         }
       }
     },
+    "task.shell_left_running": {
+      "en": "Closing note of a foreground command that finished while processes it started still held its output; those keep running in the background instead of holding the call open.",
+      "zh": "前台命令已结束、但它启动的进程仍占着输出时，结果末尾的说明；这些进程转入后台继续运行，而不是让调用一直等下去。",
+      "placeholders": {
+        "shell_ref": {
+          "en": "the background task's address",
+          "zh": "后台任务的地址"
+        }
+      }
+    },
+    "task.shell_left_running_result": {
+      "en": "Result of a command's left-running processes once they have exited: only what they printed after the command's own result.",
+      "zh": "命令遗留进程退出后的结果：只含命令本身结果之后它们输出的内容。",
+      "placeholders": {
+        "shell_ref": {
+          "en": "the background task's address",
+          "zh": "后台任务的地址"
+        },
+        "tool_name": {
+          "en": "the shell tool that ran the command",
+          "zh": "运行该命令的 shell 工具"
+        },
+        "body": {
+          "en": "what those processes printed",
+          "zh": "这些进程的输出"
+        }
+      }
+    },
+    "task.shell_left_running_file": {
+      "en": "Same closing note, used when the command's output and what those processes print later is being written to a file.",
+      "zh": "同一条说明，用于命令的输出及这些进程之后的输出正写入文件的情况。",
+      "placeholders": {
+        "shell_ref": {
+          "en": "the background task's address",
+          "zh": "后台任务的地址"
+        },
+        "path": {
+          "en": "the output file's path",
+          "zh": "输出文件的路径"
+        }
+      }
+    },
     "task.shell_background_receipt": {
       "en": "Receipt for a command started with `run_in_background`: its task address and output file.",
       "zh": "以 `run_in_background` 启动命令时的回执，含任务地址和输出文件。",
@@ -3534,6 +3576,11 @@
           "zh": "退出码"
         }
       }
+    },
+    "tool.shell_left_running_stopped": {
+      "en": "Closing note when processes a finished command left holding its output could not be moved to the background and were stopped.",
+      "zh": "命令结束后遗留并占着输出的进程无法转入后台、因而被停止时的结尾说明。",
+      "placeholders": {}
     },
     "tool.shell_timed_out": {
       "en": "Shell result when the deadline expired and the command, which could not be moved to the background, was stopped.",

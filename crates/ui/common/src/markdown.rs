@@ -240,6 +240,15 @@ struct Reveal {
     em: f32,
 }
 
+/// The last commit's sweep across the message's whole rendered text, in bytes: what was settled when it began and how much was new.
+/// Each commit's sweep runs in reading order at an even pace in bytes, so this says how far its edge has got at any time.
+#[derive(Clone, Copy, Debug)]
+struct SweepSpan {
+    settled: usize,
+    fresh: usize,
+    since: f32,
+}
+
 struct PendingReveal {
     /// What was on screen from `first_changed` on, or nothing if it had not been drawn yet.
     previous: Option<String>,
@@ -254,6 +263,8 @@ const HOVER_DWELL: f32 = 0.06;
 const MIN_LAYOUT_WIDTH: f32 = 4.0;
 
 struct MdState {
+    /// Which state this is: one made afresh after the table let an earlier one go has not been laid out, whatever else matches.
+    serial: u64,
     /// The width last asked about by layout.
     measured_width: f32,
     content_hash: u64,
@@ -296,6 +307,9 @@ struct MdState {
     hover_path: Option<(u32, u32, u32, f32, bool)>,
     reveals: Vec<Reveal>,
     pending_reveal: Option<PendingReveal>,
+    sweep: Option<SweepSpan>,
+    /// When a view last asked for this message: one not built for a while has not been on screen.
+    last_view: Option<std::time::Instant>,
     source_bytes: usize,
     /// Where the leaf was painted last: what a fragment's window rectangle is worked out from, and what tells a press on this
     /// message from a press elsewhere while this one is not the one being painted.
@@ -309,6 +323,11 @@ struct MdState {
 impl MdState {
     fn new(options: MarkdownOptions) -> Self {
         Self {
+            serial: NEXT_SERIAL.with(|next| {
+                let serial = next.get();
+                next.set(serial + 1);
+                serial
+            }),
             measured_width: 0.0,
             content_hash: 0,
             fresh: true,
@@ -342,6 +361,8 @@ impl MdState {
             hover_path: None,
             reveals: Vec::new(),
             pending_reveal: None,
+            sweep: None,
+            last_view: None,
             source_bytes: 0,
             reading: None,
             pending_copy: None,
@@ -349,8 +370,9 @@ impl MdState {
         }
     }
 
-    /// The text changed: blocks whose source did not change stay as they are, layouts and all.
-    fn update_content(&mut self, content: &str) {
+    /// The text changed: blocks whose source did not change stay as they are, layouts and all. `reveal` fades in what the change
+    /// added: while the message streams, and for the change that ends the stream, which brings the last of its text.
+    fn update_content(&mut self, content: &str, reveal: bool) {
         let options = self.options.parse_options();
         let normalized = math::normalized(content);
         let prepared = math::prepare_math(&normalized, options.single_dollar_math);
@@ -392,7 +414,7 @@ impl MdState {
         // How much of the rendered text can be taken as still on screen, for the reveal.
         let new_hashes: Vec<u64> = self.blocks[..kept].iter().map(|b| b.hash).chain(parsed.items.iter().map(|i| i.hash)).collect();
         let first_changed = self.blocks.iter().map(|b| b.hash).zip(&new_hashes).take_while(|(a, b)| a == *b).count();
-        let previous = self.options.streaming.then(|| {
+        let previous = reveal.then(|| {
             let mut text = String::new();
             for block in &self.blocks[first_changed.min(self.blocks.len())..] {
                 let laid = block.any_laid()?;
@@ -449,11 +471,12 @@ impl MdState {
             }
         }
 
-        if self.options.streaming {
+        if reveal {
             self.pending_reveal = Some(PendingReveal { previous: previous.flatten().filter(|_| had_text), first_changed: first_changed as u32 });
         } else {
             self.pending_reveal = None;
             self.reveals.clear();
+            self.sweep = None;
         }
         self.source.clear();
         self.source.push_str(prepared);
@@ -611,14 +634,27 @@ impl MdState {
     /// The streaming reveal's split, taken on the text as rendered: the longest prefix this render shares with the last one.
     fn settle_reveal(&mut self, width: f32, time: f32) {
         let Some(pending) = self.pending_reveal.take() else { return };
-        if !self.options.streaming {
-            return;
+        let mut first = (pending.first_changed as usize).min(self.blocks.len());
+        let mut previous = pending.previous;
+        let block_text = |block: &TopBlock| block.laid_at(width).map_or_else(String::new, |laid| laid.pieces.iter().map(|piece| piece.lay.doc.text()).collect());
+        // Where block `first`'s text starts in the message's rendered text.
+        let mut start: usize = self.blocks[..first].iter().map(|block| block_text(block).len()).sum();
+        // A sweep still in flight goes on from where its edge has got to rather than landing at once: what it had not reached yet sweeps
+        // in again, with what this commit brings. The commit that ends a stream comes off the beat, often halfway through a sweep.
+        let reached = self.sweep.filter(|sweep| time - sweep.since < REVEAL_SECONDS).map(|sweep| sweep.settled + (sweep.fresh as f32 * ((time - sweep.since) / REVEAL_SECONDS).clamp(0.0, 1.0)) as usize);
+        if let (Some(reached), Some(previous)) = (reached, previous.as_mut()) {
+            // A block the edge has not got through takes part again. It is unchanged, so what was on screen starts with it too.
+            while first > 0 && start > reached {
+                first -= 1;
+                let body = block_text(&self.blocks[first]);
+                start -= body.len();
+                previous.insert_str(0, &body);
+            }
         }
-        let first = pending.first_changed as usize;
         let mut text = String::new();
         // Every piece from the first changed block on, where it starts in that text, and whether it takes part.
         let mut slots: Vec<(Pos, usize, usize)> = Vec::new();
-        for block in &self.blocks[first.min(self.blocks.len())..] {
+        for block in &self.blocks[first..] {
             if let Some(laid) = block.laid_at(width) {
                 for (p, piece) in laid.pieces.iter().enumerate() {
                     let body = piece.lay.doc.text();
@@ -630,19 +666,24 @@ impl MdState {
             }
         }
         // The same text again, a render for some other reason, keeps the split it had, so a sweep in flight is not cut short.
-        if pending.previous.as_deref() == Some(text.as_str()) {
+        if previous.as_deref() == Some(text.as_str()) {
             return;
         }
-        // Only what this commit added is masked: what the last one was still sweeping in is settled now.
+        // This commit's sweep takes over from the last one's.
         self.reveals.clear();
         // One long block still arriving would otherwise be compared a character at a time, whole, on every commit. What is equal
         // byte for byte is settled however it is split, so the split only has to look past that.
-        let same = pending.previous.as_deref().map_or(0, |previous| common_prefix(previous, &text));
-        let previous = pending.previous.map(|previous| StreamRevealSplit { text: previous[same..].to_owned(), settled: 0, tick: 0 });
-        let settled = same + next_stream_reveal_split(previous.as_ref(), &text[same..]).settled;
+        let same = previous.as_deref().map_or(0, |previous| common_prefix(previous, &text));
+        let previous = previous.map(|previous| StreamRevealSplit { text: previous[same..].to_owned(), settled: 0, tick: 0 });
+        let mut settled = same + next_stream_reveal_split(previous.as_ref(), &text[same..]).settled;
+        if let Some(reached) = reached {
+            settled = settled.min(floor_char(&text, reached.saturating_sub(start)));
+        }
         if settled >= text.len() {
+            self.sweep = None;
             return;
         }
+        self.sweep = Some(SweepSpan { settled: start + settled, fresh: text.len() - settled, since: time });
         let spans: Vec<(usize, usize)> = slots.iter().map(|(_, offset, length)| (*offset, *length)).collect();
         let em = self.options.ty.size;
         let timings = reveal_timings(&StreamRevealSplit { text, settled, tick: 0 }, &spans);
@@ -1036,6 +1077,19 @@ pub fn markdown_key(key: impl Hash) -> u64 {
     hash_key(("markdown", hash_key(key)))
 }
 
+thread_local! {
+    /// What every message's layout reads from the app, as of this frame: code blocks' wrapping and folding.
+    static FRAME_APPEARANCE: Cell<Option<(bool, bool)>> = const { Cell::new(None) };
+    static NEXT_SERIAL: Cell<u64> = const { Cell::new(1) };
+}
+
+/// Reads, once a frame before the view is built, what messages lay out by and only the app knows. A leaf has no `App` until it
+/// is measured, and a row laid out last frame is not measured again unless something it reads has changed.
+pub fn begin_frame(app: &App) {
+    data_image::remember_task(app);
+    FRAME_APPEARANCE.set(Some(appearance_defaults(app)));
+}
+
 /// A message as one leaf. `content` is only read on a change; the leaf holds nothing but a reference to retained state, and it
 /// answers `measure` with its height for the width it is asked about.
 pub fn markdown_content(key: impl Hash, content: &str, options: MarkdownOptions) -> E {
@@ -1045,6 +1099,8 @@ pub fn markdown_content(key: impl Hash, content: &str, options: MarkdownOptions)
     {
         let mut s = state.borrow_mut();
         let changed_options = s.parse_options != options.parse_options();
+        let was_streaming = s.options.streaming;
+        let viewed_recently = s.last_view.replace(std::time::Instant::now()).is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(2500));
         // The end of a stream settles what a formula still arriving was only standing in for.
         if s.options.streaming && !options.streaming {
             s.held_math.clear();
@@ -1056,16 +1112,35 @@ pub fn markdown_content(key: impl Hash, content: &str, options: MarkdownOptions)
         s.options = options;
         if s.fresh || hash != s.content_hash || changed_options {
             let before = s.source_bytes;
-            s.update_content(content);
+            // A stream's last commit and its end usually arrive together: what they bring fades in as every commit's text did.
+            // Not for one that was off screen when its stream ended: what arrived meanwhile lands at once.
+            let reveal = s.options.streaming || (was_streaming && viewed_recently && !s.fresh && !changed_options);
+            s.update_content(content, reveal);
             s.content_hash = hash;
             let after = s.source_bytes;
             drop(s);
             TABLE.with(|t| t.borrow_mut().account(before, after));
         }
     }
+    // What the layout depends on besides the blocks, settled before layout as `measure` would settle it, so that the generation
+    // it leaves says whether anything changed: a frame that skips the layout of a row this sits in skips `measure` too. Without
+    // the app's side of it ([`begin_frame`]) nobody can say, and the row is laid out every frame.
+    // The scale and theme are the frame's to check ([`fluent::el::El::memo_layout`] lays everything out again when either changes),
+    // so the check here keeps the ones the message was last laid out in. One never laid out has no key.
+    let layout_key = FRAME_APPEARANCE.get().and_then(|(wrap, collapse)| {
+        let mut s = state.borrow_mut();
+        let theme = s.theme?;
+        let scale = s.scale;
+        s.check_environment(scale, theme, wrap, collapse);
+        Some((s.serial, s.generation, s.content_hash, s.options.streaming, s.held_math.len()))
+    });
     let measured = state.clone();
     let reading = a11y_active().then(|| MdState::reading_tree(&state));
     custom(move |app: &mut App, ui: &mut Ui<'_>, r: Rect| paint_leaf(app, ui, r, &state))
+        .map(|leaf| match layout_key {
+            Some(key) => leaf.measure_key(key),
+            None => leaf,
+        })
         .measure(move |app: &mut App, ui: &mut Ui<'_>, known: Option<f32>, avail: f32| {
             let (wrap, collapse) = appearance_defaults(app);
             data_image::remember_task(app);
@@ -1346,6 +1421,8 @@ impl MdState {
             if over_code != self.hovered_code {
                 self.next_hovered_code = Some(over_code);
                 ui.animating = true;
+                // It changes the message's height, which only a frame that lays out can take: not one that only scrolls.
+                repaint();
             }
         }
         // Prefetch once, after the dwell: the pointer crossing a link on its way somewhere asks nothing.
@@ -1570,13 +1647,14 @@ impl MdState {
     fn paint(&mut self, ui: &mut Ui<'_>, r: Rect, positions: usize) {
         let width = r.w;
         let theme = ui.theme;
-        // The reveal is decoration; text must still land fully opaque without it.
-        if !self.options.streaming || fluent::reduced_motion() {
+        // The reveal is decoration; text must still land fully opaque without it, and does once its second is over, the stream's
+        // last one included. Only its painting changes as it goes, so frames that paint the last tree again carry it.
+        if fluent::reduced_motion() {
             self.reveals.clear();
         }
         self.reveals.retain(|reveal| ui.time - reveal.since < REVEAL_SECONDS);
         if !self.reveals.is_empty() {
-            ui.animating = true;
+            ui.repaint_after(0.0);
         }
         let selection = self.selection.filter(|s| !s.is_empty()).map(|s| s.range);
         let top = (ui.clip.y - r.y).max(0.0);
@@ -1586,6 +1664,7 @@ impl MdState {
         let (px, py) = ui.input.pointer.unwrap_or((f32::MIN, f32::MIN));
         let pointer_inside = ui.pointer_in(&r);
         let hover_link = self.hover_link(width, &ys, pointer_inside, px - r.x, py - r.y);
+        let hold = self.reveal_hold(width, &ys, ui.time);
         // A floated picture can hang into view from a block above.
         let first = if self.has_floats { 0 } else { first };
         for i in first..ys.len() {
@@ -1600,9 +1679,29 @@ impl MdState {
             if ys[i] + laid.floats.iter().map(|f| f.y + f.h).fold(laid.height, f32::max) <= top {
                 continue;
             }
-            paint_block(ui, laid, index, r.x, y0, top - ys[i], bottom - ys[i], selection, reveals, ui_map, scale, &theme, hover_link, pointer_inside, px, py);
+            paint_block(ui, laid, index, r.x, y0, top - ys[i], bottom - ys[i], hold - ys[i], selection, reveals, ui_map, scale, &theme, hover_link, pointer_inside, px, py);
         }
         self.positions[positions].ys = ys;
+    }
+
+    /// How far down the message the streaming reveal has got: the top of the first piece still waiting for its turn, or the foot of
+    /// one still sweeping in. A stream only adds at its end, so everything below is new, and nothing drawn whole there (a box, a
+    /// bullet, a rule, a picture, a formula) may show up ahead of the text before it, as it would up to a second early. Infinite when
+    /// nothing is held back.
+    fn reveal_hold(&self, width: f32, ys: &[f32], time: f32) -> f32 {
+        let mut hold = f32::INFINITY;
+        for reveal in &self.reveals {
+            let into = time - reveal.since - reveal.delay;
+            if into >= reveal.duration {
+                continue;
+            }
+            let at = reveal.start.block as usize;
+            let (Some(top), Some(piece)) = (ys.get(at), self.blocks.get(at).and_then(|block| block.laid_at(width)).and_then(|laid| laid.pieces.get(reveal.start.piece as usize))) else { continue };
+            // Text that was on screen already stands above the hold; text whose turn is still to come does not.
+            let started = into > 0.0 || reveal.start.byte > 0;
+            hold = hold.min(top + piece.y + if started { piece.h() } else { 0.0 });
+        }
+        hold
     }
 
     fn hover_link(&self, width: f32, ys: &[f32], inside: bool, x: f32, y: f32) -> Option<(u32, u32, u32)> {
@@ -1660,7 +1759,7 @@ fn paint_piece_text(ui: &mut Ui<'_>, piece: &mut Piece, x: f32, y: f32) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn paint_block(ui: &mut Ui<'_>, laid: &mut Laid, index: u32, ox: f32, oy: f32, top: f32, bottom: f32, selection: Option<(Pos, Pos)>, reveals: &[Reveal], ui_map: &HashMap<UiKey, BlockUi>, scale: f32, theme: &Theme, hover_link: Option<(u32, u32, u32)>, pointer_inside: bool, px: f32, py: f32) {
+fn paint_block(ui: &mut Ui<'_>, laid: &mut Laid, index: u32, ox: f32, oy: f32, top: f32, bottom: f32, hold: f32, selection: Option<(Pos, Pos)>, reveals: &[Reveal], ui_map: &HashMap<UiKey, BlockUi>, scale: f32, theme: &Theme, hover_link: Option<(u32, u32, u32)>, pointer_inside: bool, px: f32, py: f32) {
     let saved_clip = ui.clip;
     // How far each box has moved what lies in it, and what of it shows: a box inside another moves and is cut off with it.
     let own: Vec<f32> = laid.regions.iter().map(|g| ui_map.get(&g.key).map_or(0.0, |u| u.scroll_x).clamp(0.0, g.max_scroll())).collect();
@@ -1678,12 +1777,29 @@ fn paint_block(ui: &mut Ui<'_>, laid: &mut Laid, index: u32, ox: f32, oy: f32, t
         });
     }
     let clip_of = |region: Option<u16>| region.map(|g| clips[g as usize]);
+    // What is drawn whole below where the reveal has got waits for it, but not inside a table: a cell already on screen can stand
+    // taller than the one being written beside it, and reading order is not top to bottom there.
+    let mut in_table = vec![false; laid.regions.len()];
+    for grid in &laid.grids {
+        if let Some(at) = in_table.get_mut(grid.region as usize) {
+            *at = true;
+        }
+    }
+    for i in 0..laid.regions.len() {
+        if let Some(parent) = laid.regions[i].parent {
+            in_table[i] |= in_table.get(parent as usize).copied().unwrap_or(false);
+        }
+    }
+    let held = |y: f32, region: Option<u16>| y >= hold && !region.is_some_and(|g| in_table.get(g as usize).copied().unwrap_or(false));
 
     // Boxes.
     let from = laid.decos.partition_point(|d| d.r.y + laid.max_deco_h <= top);
     for deco in &laid.decos[from..] {
         if deco.r.y >= bottom {
             break;
+        }
+        if held(deco.r.y, deco.region) {
+            continue;
         }
         if deco.r.bottom() <= top {
             continue;
@@ -1722,18 +1838,26 @@ fn paint_block(ui: &mut Ui<'_>, laid: &mut Laid, index: u32, ox: f32, oy: f32, t
     }
     ui.clip = saved_clip;
 
-    // Markers.
+    // Markers. One whose item is still to sweep in waits for it: a bullet a second ahead of its text reads as an empty item.
+    let sweeping = reveals.iter().any(|reveal| reveal.start.block == index);
     let from = laid.markers.partition_point(|m| m.y + 40.0 <= top);
     for marker in &laid.markers[from..] {
         if marker.y >= bottom {
             break;
         }
+        if held(marker.y, marker.region) {
+            continue;
+        }
+        let alpha = if sweeping { marker_alpha(laid, index, marker, reveals, ui.time) } else { 1.0 };
+        if alpha <= 0.0 {
+            continue;
+        }
         ui.clip = clip_of(marker.region).map_or(saved_clip, |c| saved_clip.intersect(&c));
-        paint_marker(ui, marker, ox - marker.region.map_or(0.0, |g| scrolls[g as usize]), oy, theme);
+        paint_marker(ui, marker, ox - marker.region.map_or(0.0, |g| scrolls[g as usize]), oy, theme, alpha);
     }
 
     for image in &laid.images {
-        if image.r.bottom() <= top || image.r.y >= bottom {
+        if image.r.bottom() <= top || image.r.y >= bottom || held(image.r.y, image.region) {
             continue;
         }
         ui.clip = clip_of(image.region).map_or(saved_clip, |c| saved_clip.intersect(&c));
@@ -1763,6 +1887,13 @@ fn paint_block(ui: &mut Ui<'_>, laid: &mut Laid, index: u32, ox: f32, oy: f32, t
             continue;
         }
         let aligned = piece.align != TextAlign::Start;
+        // What takes no part in the reveal waits whole for the sweep to reach it.
+        if !piece.fade && held(piece.y, piece.region) {
+            continue;
+        }
+        let sweep = piece.fade.then(|| reveals.iter().find(|reveal| (reveal.start.block, reveal.start.piece) == (index, p as u32))).flatten().and_then(|reveal| Sweep::new(piece, reveal, ui.time, scale, aligned));
+        // How much shows of a box or a rule whose left edge is at `(sx, sy)` in the piece: it arrives as the edge reaches its text.
+        let shows = |sx: f32, sy: f32| sweep.as_ref().map_or(1.0, |sweep| sweep.alpha(sx * scale + 1.0, sy * scale));
 
         // Inline boxes and rules.
         for span in &piece.lay.spans {
@@ -1771,21 +1902,26 @@ fn paint_block(ui: &mut Ui<'_>, laid: &mut Laid, index: u32, ox: f32, oy: f32, t
                 continue;
             }
             let dx = if aligned { piece.line_dx_at(sy + sh * 0.5, scale) } else { 0.0 };
+            let alpha = shows(dx + sx, sy + sh * 0.5);
+            if alpha <= 0.0 {
+                continue;
+            }
             let shown = rect(x + dx + sx, y + sy, sw, sh);
+            let color = span.color.fade(alpha);
             match span.kind {
-                SpanKind::Code => ui.fill(shown, 4.0, span.color),
+                SpanKind::Code => ui.fill(shown, 4.0, color),
                 SpanKind::Kbd => {
-                    ui.card(shown, 4.0, span.color, theme.control_strong_stroke);
+                    ui.card(shown, 4.0, color, theme.control_strong_stroke.fade(alpha));
                     // `border-bottom-width: 2px`.
-                    ui.fill(rect(shown.x + 1.0, shown.bottom() - 2.0, (shown.w - 2.0).max(0.0), 1.0), 0.0, theme.control_strong_stroke);
+                    ui.fill(rect(shown.x + 1.0, shown.bottom() - 2.0, (shown.w - 2.0).max(0.0), 1.0), 0.0, theme.control_strong_stroke.fade(alpha));
                 }
-                SpanKind::Mark => ui.fill(shown, 3.0, span.color),
-                SpanKind::Line => ui.fill(shown, 0.0, span.color),
+                SpanKind::Mark => ui.fill(shown, 3.0, color),
+                SpanKind::Line => ui.fill(shown, 0.0, color),
                 SpanKind::Dotted => {
                     let (from, to) = (shown.x.max(ui.clip.x), shown.right().min(ui.clip.right()));
                     let mut at = shown.x + ((from - shown.x) / 3.0).floor().max(0.0) * 3.0;
                     while at < to {
-                        ui.fill(rect(at, shown.y, 1.0, 1.0), 0.0, span.color);
+                        ui.fill(rect(at, shown.y, 1.0, 1.0), 0.0, color);
                         at += 3.0;
                     }
                 }
@@ -1799,7 +1935,10 @@ fn paint_block(ui: &mut Ui<'_>, laid: &mut Laid, index: u32, ox: f32, oy: f32, t
                     continue;
                 }
                 let dx = if aligned { piece.line_dx_at(r[1] + r[3] * 0.5, scale) } else { 0.0 };
-                ui.fill(rect(x + dx + r[0], y + r[1] + link.under, r[2], 1.0), 0.0, color);
+                let alpha = shows(dx + r[0], r[1] + r[3] * 0.5);
+                if alpha > 0.0 {
+                    ui.fill(rect(x + dx + r[0], y + r[1] + link.under, r[2], 1.0), 0.0, color.fade(alpha));
+                }
             }
         }
 
@@ -1827,14 +1966,13 @@ fn paint_block(ui: &mut Ui<'_>, laid: &mut Laid, index: u32, ox: f32, oy: f32, t
         if !piece.lay.shifts.is_empty() {
             shift_glyphs(&mut ui.scene.layers[layer].glyphs[mark..], piece, x, y, scale);
         }
-        if piece.fade
-            && let Some(reveal) = reveals.iter().find(|reveal| (reveal.start.block, reveal.start.piece) == (index, p as u32))
-        {
-            let time = ui.time;
-            sweep_glyphs(&mut ui.scene.layers[layer].glyphs[mark..], piece, reveal, time, x, y, scale, aligned);
+        if let Some(sweep) = &sweep {
+            sweep_glyphs(&mut ui.scene.layers[layer].glyphs[mark..], sweep, x, y, scale);
         }
-        // After the sweep: a formula is not swept in, as upstream's renderer leaves it out.
-        paint_formulas(ui, piece, x, y, top - piece.y, bottom - piece.y, scale);
+        // After the sweep: a formula is not swept in, as upstream's renderer leaves it out. It waits whole for its turn.
+        if !held(piece.y, piece.region) {
+            paint_formulas(ui, piece, x, y, top - piece.y, bottom - piece.y, scale);
+        }
     }
     ui.clip = saved_clip;
 
@@ -1897,27 +2035,44 @@ fn line_offset(piece: &Piece, line_y_phys: f32, scale: f32) -> f32 {
     piece.line_dx_at((line_y_phys + 0.5) / scale, scale)
 }
 
-fn paint_marker(ui: &mut Ui<'_>, marker: &layout::Marker, ox: f32, oy: f32, theme: &Theme) {
+/// How much of a marker shows while the stream's reveal is under way: none until the sweep reaches the first text of its item, then
+/// all of it as quickly as the edge uncovers that text's first characters. A marker whose item was already on screen shows in full.
+fn marker_alpha(laid: &Laid, index: u32, marker: &layout::Marker, reveals: &[Reveal], time: f32) -> f32 {
+    // The item's first text: the first piece in reading order on the marker's line, at or right of where the marker stands.
+    let line = marker.y..marker.y + marker.ty.line.max(1.0);
+    let from = laid.first_piece_near(line.start);
+    let Some(p) = laid.pieces[from..].iter().take_while(|piece| !laid.past(piece, line.end)).position(|piece| piece.y < line.end && piece.y + piece.h() > line.start && piece.x >= marker.x - 1.0).map(|at| from + at) else { return 1.0 };
+    let Some(reveal) = reveals.iter().find(|reveal| (reveal.start.block, reveal.start.piece) == (index, p as u32)) else { return 1.0 };
+    if reveal.start.byte > 0 {
+        return 1.0;
+    }
+    // The edge takes about two ems to uncover a glyph, a small share of the piece's own sweep.
+    let into = time - reveal.since - reveal.delay;
+    (into / (reveal.duration * 0.15).max(0.05)).clamp(0.0, 1.0)
+}
+
+fn paint_marker(ui: &mut Ui<'_>, marker: &layout::Marker, ox: f32, oy: f32, theme: &Theme, alpha: f32) {
     let (x, y) = (ox + marker.x, oy + marker.y);
     let line = marker.ty.line;
+    let color = marker.color.fade(alpha);
     // A list's marker sits outside its text, about a space off it.
     let dot = rect(x - marker.ty.size * 0.9, y + line * 0.5 - 2.5, 5.0, 5.0);
     match &marker.kind {
-        layout::MarkerKind::Disc => ui.fill(dot, 2.5, marker.color),
-        layout::MarkerKind::Circle => ui.card(dot, 2.5, Color::TRANSPARENT, marker.color),
-        layout::MarkerKind::Square => ui.fill(dot, 0.0, marker.color),
-        layout::MarkerKind::Number(label) => ui.label_right(x - marker.ty.size * 0.35, y, label, &marker.ty, marker.color),
+        layout::MarkerKind::Disc => ui.fill(dot, 2.5, color),
+        layout::MarkerKind::Circle => ui.card(dot, 2.5, Color::TRANSPARENT, color),
+        layout::MarkerKind::Square => ui.fill(dot, 0.0, color),
+        layout::MarkerKind::Number(label) => ui.label_right(x - marker.ty.size * 0.35, y, label, &marker.ty, color),
         layout::MarkerKind::Check(done) => {
             let r = rect(x, y, 13.0, 13.0);
             if *done {
-                ui.fill(r, 3.0, theme.accent);
-                ui.named_icon("Check", r.x + 6.5, r.y + 6.5, 10.0, theme.text_on_accent, 0.0);
+                ui.fill(r, 3.0, theme.accent.fade(alpha));
+                ui.named_icon("Check", r.x + 6.5, r.y + 6.5, 10.0, theme.text_on_accent.fade(alpha), 0.0);
             } else {
-                ui.card(r, 3.0, Color::TRANSPARENT, theme.control_strong_stroke);
+                ui.card(r, 3.0, Color::TRANSPARENT, theme.control_strong_stroke.fade(alpha));
             }
         }
         layout::MarkerKind::Disclosure(open) => {
-            ui.named_icon("ChevronRight", x + 6.0, y + line * 0.5, 12.0, marker.color, if *open { 90.0 } else { 0.0 });
+            ui.named_icon("ChevronRight", x + 6.0, y + line * 0.5, 12.0, color, if *open { 90.0 } else { 0.0 });
         }
     }
 }
@@ -1960,37 +2115,55 @@ fn shift_glyphs(glyphs: &mut [GlyphInst], piece: &Piece, x: f32, y: f32, scale: 
 /// The streaming reveal, `.stream-fresh`'s mask: a gradient over a glyph at a time, since a mask needs something to mask. The edge runs
 /// along the new text's line fragments laid end to end, so the sweep follows it onto the next line. Whether a glyph is new is decided by
 /// where it is against those fragments, since a document does not keep which byte a glyph came from.
-#[allow(clippy::too_many_arguments)]
-fn sweep_glyphs(glyphs: &mut [GlyphInst], piece: &Piece, reveal: &Reveal, time: f32, x: f32, y: f32, scale: f32, aligned: bool) {
-    // Hidden through its delay, shown for good once its turn is over.
-    let progress = ((time - reveal.since - reveal.delay) / reveal.duration.max(0.001)).clamp(0.0, 1.0);
-    if progress >= 1.0 {
-        return;
-    }
-    let mut fragments = Vec::new();
-    piece.lay.doc.selection_rects(reveal.start.byte as usize..piece.lay.doc.text().len(), 0.0..f32::MAX, &mut fragments);
-    if aligned {
-        for fragment in &mut fragments {
-            fragment[0] += line_offset(piece, fragment[1], scale) * scale;
-        }
-    }
-    let width: f32 = fragments.iter().map(|fragment| fragment[2]).sum();
+fn sweep_glyphs(glyphs: &mut [GlyphInst], sweep: &Sweep, x: f32, y: f32, scale: f32) {
     for g in glyphs {
         let gx = g.pos[0] + g.size[0] as f32 * 0.5 - (x * scale).round();
         let gy = g.pos[1] + g.size[1] as f32 * 0.5 - (y * scale).round();
+        let alpha = sweep.alpha(gx, gy);
+        if alpha < 1.0 {
+            g.color = g.color.fade(alpha);
+        }
+    }
+}
+
+/// One piece's share of the streaming reveal as of this frame: the new text's line fragments, which the edge runs along laid end to
+/// end, so that the sweep follows the text onto the next line. In physical pixels from the piece's origin.
+struct Sweep {
+    fragments: Vec<[f32; 4]>,
+    width: f32,
+    em: f32,
+    progress: f32,
+}
+
+impl Sweep {
+    /// `None` once the piece's turn is over.
+    fn new(piece: &Piece, reveal: &Reveal, time: f32, scale: f32, aligned: bool) -> Option<Self> {
+        // Hidden through its delay, shown for good once its turn is over.
+        let progress = ((time - reveal.since - reveal.delay) / reveal.duration.max(0.001)).clamp(0.0, 1.0);
+        if progress >= 1.0 {
+            return None;
+        }
+        let mut fragments = Vec::new();
+        piece.lay.doc.selection_rects(reveal.start.byte as usize..piece.lay.doc.text().len(), 0.0..f32::MAX, &mut fragments);
+        if aligned {
+            for fragment in &mut fragments {
+                fragment[0] += line_offset(piece, fragment[1], scale) * scale;
+            }
+        }
+        let width = fragments.iter().map(|fragment| fragment[2]).sum();
+        Some(Self { fragments, width, em: reveal.em * scale, progress })
+    }
+
+    /// How much shows of what sits at `(x, y)`. Whatever is not on the new text's lines, or is left of where it starts, was there already.
+    fn alpha(&self, x: f32, y: f32) -> f32 {
         let mut along = 0.0;
-        for [fx, fy, fw, fh] in &fragments {
-            if gy >= *fy && gy < fy + fh {
-                if gx >= fx - 1.0 {
-                    let alpha = fresh_alpha(along + gx - fx, width, reveal.em * scale, progress);
-                    if alpha < 1.0 {
-                        g.color = g.color.fade(alpha);
-                    }
-                }
-                break;
+        for [fx, fy, fw, fh] in &self.fragments {
+            if y >= *fy && y < fy + fh {
+                return if x >= fx - 1.0 { fresh_alpha(along + x - fx, self.width, self.em, self.progress) } else { 1.0 };
             }
             along += fw;
         }
+        1.0
     }
 }
 

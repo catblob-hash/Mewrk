@@ -14,7 +14,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use taffy::prelude::{auto, length, percent, AvailableSpace, Size, TaffyTree};
+use taffy::prelude::{auto, length, percent, AvailableSpace, Size};
 pub use taffy::style::Style as LayoutStyle;
 use taffy::style::{AlignItems, Dimension, Display, FlexDirection, FlexWrap, JustifyContent, LengthPercentage, LengthPercentageAuto, Overflow, Position};
 
@@ -25,6 +25,7 @@ use crate::theme::*;
 use crate::ui::{rect, CursorKind, Icon, Key, KeyPress, Rect, Scroll, Ui};
 
 mod a11y;
+mod layout;
 pub use a11y::{a11y_action, a11y_active, announce, announce_assertive, set_a11y_active, take_a11y_update, AriaChild};
 pub(crate) use a11y::{a11y_note_text_input, a11y_take_edits, A11yEdit, TextInput};
 pub use accesskit::{AriaCurrent, HasPopup, Invalid, Live, Orientation, Role, Toggled};
@@ -32,7 +33,7 @@ pub use accesskit::{AriaCurrent, HasPopup, Invalid, Live, Orientation, Role, Tog
 pub type Handler<A> = Rc<dyn Fn(&mut A)>;
 pub type PointerHandler<A> = Rc<dyn Fn(&mut A, PointerEvent)>;
 pub type KeyHandler<A> = Rc<dyn Fn(&mut A, &KeyPress) -> bool>;
-type CustomPaint<A> = Box<dyn FnOnce(&mut A, &mut Ui<'_>, Rect)>;
+type CustomPaint<A> = Box<dyn FnMut(&mut A, &mut Ui<'_>, Rect)>;
 type CustomMeasure<A> = Box<dyn FnMut(&mut A, &mut Ui<'_>, Option<f32>, f32) -> (f32, f32)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +101,10 @@ struct Runtime {
     /// Elements with an `on_hover_change` under the pointer last frame.
     hover_watched: Vec<u64>,
     overlay_rects: Vec<Rect>,
+    /// [`scroll_coverage`] as this frame's views have said it so far.
+    coverage: HashMap<u64, (f32, f32)>,
+    /// The scrollers in the last frame's tree. `scrolls` keeps those of views no longer shown.
+    frame_scrollers: Vec<u64>,
     /// The ids the last press landed on, deepest first: what "focus is somewhere in here" asks about.
     press_path: Vec<u64>,
     focus: u64,
@@ -125,10 +130,40 @@ pub enum ScrollRequest {
     Reveal { y: f32, h: f32 },
     /// Moves by this much at once, with no easing: content that changed height above the viewport stays put on screen.
     Shift(f32),
+    /// Glides down to the end at this rate and keeps up with it ([`crate::ui::Scroll::glide_to_end`]), in frames that only
+    /// scroll as well. Asking again while it glides carries the glide on. Neither this nor [`Self::StopGlide`] asks for a frame
+    /// with the views: the glide goes on without them.
+    GlideToEnd { rate: f32 },
+    StopGlide,
 }
 
 thread_local! {
     static RT: RefCell<Runtime> = RefCell::new(Runtime::default());
+    static PHASES: std::cell::Cell<RenderPhases> = const { std::cell::Cell::new(RenderPhases { tree: 0, layout: 0, input: 0, paint: 0, handlers: 0, nodes: 0, memo_roots: 0, memo_adopted: 0 }) };
+}
+
+/// What the last [`render`] spent on each of its parts, in microseconds, for `MEWRK_TRACE` and the headless bench.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RenderPhases {
+    /// Turning the element tree into nodes.
+    pub tree: u32,
+    /// Taffy, with every leaf's measuring.
+    pub layout: u32,
+    /// Placing, hit testing, scrolling, presses and keys.
+    pub input: u32,
+    /// Painting, custom leaves included.
+    pub paint: u32,
+    /// The handlers the frame fired.
+    pub handlers: u32,
+    /// Nodes in the frame's tree.
+    pub nodes: u32,
+    /// [`El::memo_layout`] subtrees, and how many of them took over the last frame's layout.
+    pub memo_roots: u32,
+    pub memo_adopted: u32,
+}
+
+pub fn last_render_phases() -> RenderPhases {
+    PHASES.with(std::cell::Cell::get)
 }
 
 fn with_rt<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
@@ -192,6 +227,12 @@ pub fn repaint() {
     with_rt(|rt| rt.repaint = true);
 }
 
+/// Takes back a [`repaint`] asked for between frames: whoever runs work there (a quiet job, say) owes a frame with its views run
+/// when this is `true`, and nothing otherwise.
+pub fn take_repaint_request() -> bool {
+    with_rt(|rt| std::mem::take(&mut rt.repaint))
+}
+
 /// Whether a popover, menu or dialog was up last frame. A native child view sits above everything the GPU draws, so it
 /// has to get out of the way of these.
 pub fn overlay_open() -> bool {
@@ -218,7 +259,9 @@ pub fn scroll_request(key: impl Hash, request: ScrollRequest) {
     let id = hash_key(key);
     with_rt(|rt| {
         rt.scroll_requests.push((id, request));
-        rt.repaint = true;
+        if !matches!(request, ScrollRequest::GlideToEnd { .. } | ScrollRequest::StopGlide) {
+            rt.repaint = true;
+        }
     });
 }
 
@@ -226,6 +269,12 @@ pub fn scroll_request(key: impl Hash, request: ScrollRequest) {
 pub fn scroll_state(key: impl Hash) -> Option<(f32, f32, f32)> {
     let id = hash_key(key);
     with_rt(|rt| rt.scrolls.get(&id).map(|s| (s.offset, s.content, s.viewport)))
+}
+
+/// Whether a scroller was still gliding to its end ([`ScrollRequest::GlideToEnd`]) as of last frame.
+pub fn scroll_gliding(key: impl Hash) -> bool {
+    let id = hash_key(key);
+    with_rt(|rt| rt.scrolls.get(&id).is_some_and(Scroll::gliding))
 }
 
 /// Whether the last press landed inside the element with this key, for keys that answer "while focus is in here".
@@ -300,7 +349,7 @@ pub struct Span {
     pub color: Option<Color>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TextFlow {
     /// One line per `\n`, as wide as it needs.
     NoWrap,
@@ -427,6 +476,10 @@ pub struct El<A: 'static> {
     presentation: bool,
     portal: Option<Portal<A>>,
     aria: Option<Box<a11y::Aria<A>>>,
+    /// [`El::memo_layout`].
+    memo: bool,
+    /// [`El::measure_key`].
+    measure_key: Option<u64>,
 }
 
 /// A box that stacks its children vertically, which is what a `div` does.
@@ -460,6 +513,8 @@ pub fn div<A>() -> El<A> {
         presentation: false,
         portal: None,
         aria: None,
+        memo: false,
+        measure_key: None,
     }
 }
 
@@ -508,7 +563,7 @@ pub fn spacer<A>() -> El<A> {
 }
 
 /// A leaf that paints itself. Give it a size, or `.measure` it.
-pub fn custom<A>(paint: impl FnOnce(&mut A, &mut Ui<'_>, Rect) + 'static) -> El<A> {
+pub fn custom<A>(paint: impl FnMut(&mut A, &mut Ui<'_>, Rect) + 'static) -> El<A> {
     let mut e = div();
     e.leaf = Leaf::Custom { paint: Some(Box::new(paint)), measure: None };
     e
@@ -1199,6 +1254,21 @@ impl<A: 'static> El<A> {
         self
     }
 
+    /// Everything a `custom` leaf's `measure` answers depend on besides the question: the same key, the same answers. Without one, a
+    /// measured leaf keeps the subtree around it from taking over an earlier frame's layout ([`Self::memo_layout`]).
+    pub fn measure_key(mut self, key: impl Hash) -> Self {
+        self.measure_key = Some(hash_key(key));
+        self
+    }
+
+    /// Lays this subtree out only when it changed. A frame whose subtree here is built exactly as the last frame's was (the same
+    /// styles, the same text, leaves measured with the same [`Self::measure_key`]) takes over that frame's layout of it, as taffy's
+    /// own tree keeps the layout of a node nothing marked dirty. For something large that mostly stays put, such as a timeline row.
+    pub fn memo_layout(mut self) -> Self {
+        self.memo = true;
+        self
+    }
+
     /// An image covers its box, cropping if it must, instead of being fitted inside it.
     pub fn cover(mut self) -> Self {
         if let Leaf::Image { cover, .. } = &mut self.leaf {
@@ -1509,6 +1579,8 @@ struct Node<A: 'static> {
     full_text: Option<Arc<str>>,
     /// What a custom leaf said it cut while it was painted.
     cut_line: Option<Arc<str>>,
+    /// A custom leaf's paint, once it has painted: the leaf itself is then `Leaf::None`.
+    custom_paint: Option<CustomPaint<A>>,
     cursor: Option<CursorKind>,
     scroll: Option<ScrollAxis>,
     clip: bool,
@@ -1543,15 +1615,50 @@ struct PortalRoot<A: 'static> {
 
 struct Frame<A: 'static> {
     nodes: Vec<Node<A>>,
-    taffy: TaffyTree<usize>,
+    taffy: layout::LayoutTree,
     portals: Vec<PortalRoot<A>>,
     /// Nodes whose width only `max_w` limits, with that limit.
     capped: Vec<(taffy::tree::NodeId, f32)>,
+    /// [`El::memo_layout`] subtrees, outermost first, by id.
+    memo_roots: Vec<(u64, taffy::tree::NodeId)>,
+    /// How many memo subtrees the node being added is inside: only their leaves need keys.
+    memo_depth: u32,
+}
+
+/// What a leaf's size depends on besides the question it is asked, for [`El::memo_layout`].
+fn leaf_key<A>(leaf: &Leaf<A>, measure_key: Option<u64>) -> Option<u64> {
+    let mut h = FxHasher::default();
+    match leaf {
+        Leaf::None => return Some(0),
+        Leaf::Text { spans, flow, hanging, .. } => {
+            1u8.hash(&mut h);
+            for s in spans {
+                s.text.hash(&mut h);
+                s.ty.hash(&mut h);
+            }
+            flow.hash(&mut h);
+            hanging.to_bits().hash(&mut h);
+        }
+        Leaf::Icon { size, .. } => {
+            2u8.hash(&mut h);
+            size.to_bits().hash(&mut h);
+        }
+        Leaf::Image { natural, .. } => {
+            3u8.hash(&mut h);
+            natural.hash(&mut h);
+        }
+        Leaf::Custom { measure: None, .. } => return Some(4),
+        Leaf::Custom { measure: Some(_), .. } => {
+            5u8.hash(&mut h);
+            measure_key?.hash(&mut h);
+        }
+    }
+    Some(h.finish())
 }
 
 impl<A: 'static> Frame<A> {
     fn add(&mut self, el: El<A>, parent: usize, id: u64, portal_root: usize) -> usize {
-        let El { key, mut style, vis, children, leaf, on, tooltip, hover_text, full_text, cursor, scroll, clip, pass_through, inert, invisible, overlay, reveal, reveal_force, conceal_levels, disabled, keep_focus, editable, focus_under, keeps_tab, skip_tab, presentation, portal, aria } = el;
+        let El { key, mut style, vis, children, leaf, on, tooltip, hover_text, full_text, cursor, scroll, clip, pass_through, inert, invisible, overlay, reveal, reveal_force, conceal_levels, disabled, keep_focus, editable, focus_under, keeps_tab, skip_tab, presentation, portal, aria, memo, measure_key } = el;
         let id = key.map_or(id, std::num::NonZeroU64::get);
         let inert = inert || self.nodes.get(parent).is_some_and(|parent| parent.inert);
         let pass_through = pass_through || inert;
@@ -1561,12 +1668,20 @@ impl<A: 'static> Frame<A> {
         let idx = self.nodes.len();
         let cap = style.max_size.width.into_raw();
         let cap = (style.size.width == auto() && cap.tag() == taffy::style::CompactLength::LENGTH_TAG).then(|| cap.value());
+        let memo = memo && portal.is_none();
+        self.memo_depth += memo as u32;
         let tf = match leaf {
-            Leaf::None => self.taffy.new_leaf(style).expect("taffy"),
-            _ => self.taffy.new_leaf_with_context(style, idx).expect("taffy"),
+            Leaf::None => self.taffy.new_leaf(style),
+            _ => {
+                let key = if self.memo_depth > 0 { leaf_key(&leaf, measure_key) } else { None };
+                self.taffy.new_leaf_with_context(style, idx, key)
+            }
         };
         if let Some(cap) = cap {
             self.capped.push((tf, cap));
+        }
+        if memo {
+            self.memo_roots.push((id, tf));
         }
         let is_portal = portal.is_some();
         self.nodes.push(Node {
@@ -1581,6 +1696,7 @@ impl<A: 'static> Frame<A> {
             hover_text,
             full_text,
             cut_line: None,
+            custom_paint: None,
             cursor,
             scroll,
             clip,
@@ -1619,14 +1735,34 @@ impl<A: 'static> Frame<A> {
             }
         }
         if !tf_children.is_empty() {
-            self.taffy.set_children(tf, &tf_children).expect("taffy");
+            self.taffy.set_children(tf, &tf_children);
         }
+        self.memo_depth -= memo as u32;
         idx
+    }
+
+    /// [`Self::place`] for the whole tree and every portal.
+    fn place_all(&mut self, root_idx: usize, window: Rect, order: &mut Vec<usize>) {
+        order.clear();
+        self.place(root_idx, 0.0, 0.0, window, order);
+        for i in 0..self.portals.len() {
+            let (root, modal) = (self.portals[i].root, self.portals[i].portal.modal);
+            let layout = *self.taffy.layout(self.nodes[root].tf);
+            let (w, h) = (layout.size.width, layout.size.height);
+            let (x, y) = if modal {
+                (0.0, 0.0)
+            } else {
+                let p = &self.portals[i].portal;
+                place_popover(p, w, h, window)
+            };
+            // `place` adds the node's own location, which for a portal root is meaningless.
+            self.place(root, x - layout.location.x, y - layout.location.y, window, order);
+        }
     }
 
     /// Absolute rectangles and paint order, from the layout and the scrollers' current offsets.
     fn place(&mut self, idx: usize, ox: f32, oy: f32, clip: Rect, order: &mut Vec<usize>) {
-        let layout = *self.taffy.layout(self.nodes[idx].tf).expect("taffy");
+        let layout = *self.taffy.layout(self.nodes[idx].tf);
         let (x, y) = (ox + layout.location.x, oy + layout.location.y);
         let r = rect(x, y, layout.size.width, layout.size.height);
         let node = &mut self.nodes[idx];
@@ -1816,23 +1952,47 @@ fn paint_hover_text(ui: &mut Ui<'_>, id: u64, anchor: Rect, words: Arc<str>) {
     ui.clip = rect(0.0, 0.0, ui.size.0, ui.size.1);
     let r = rect(x, y, w, h);
     ui.acrylic(r, CONTROL_RADIUS, theme.flyout, theme.flyout_stroke);
-    paint_text(ui, id, rect(x + 8.0, y + 5.0, size.width, size.height), &spans, TextFlow::Wrap, TextAlign::Start, false, 0.0, false);
+    paint_text(ui, id, rect(x + 8.0, y + 5.0, size.width, size.height), size.width, &spans, TextFlow::Wrap, TextAlign::Start, false, 0.0, false);
     ui.layer = layer;
     ui.clip = clip;
 }
 
 /// One frame of a tree: layout, hit testing, painting, then handlers. Returns whether another frame is wanted.
 pub fn render<A: 'static>(root: El<A>, app: &mut A, ui: &mut Ui<'_>) -> bool {
+    let began = std::time::Instant::now();
+    let micros = |from: std::time::Instant, to: std::time::Instant| to.duration_since(from).as_micros() as u32;
     with_rt(|rt| rt.frame += 1);
     let window = rect(0.0, 0.0, ui.size.0, ui.size.1);
     let scale = ui.scale;
     let theme = ui.theme;
+    let mut previous = take_retained::<A>();
 
     // ---- build
-    let mut frame = Frame { nodes: Vec::with_capacity(256), taffy: TaffyTree::new(), portals: Vec::new(), capped: Vec::new() };
+    let mut frame = Frame { nodes: Vec::with_capacity(256), taffy: layout::LayoutTree::with_capacity(512), portals: Vec::new(), capped: Vec::new(), memo_roots: Vec::new(), memo_depth: 0 };
     let root_style_size = Size { width: length(window.w), height: length(window.h) };
     let root = root.with_style(|s| s.size = root_style_size);
     let root_idx = frame.add(root, NONE, 0x1505, NONE);
+    // What came out as it was last frame takes over last frame's layout. Text is measured in the window's scale and the
+    // theme's type, so a change to either starts over.
+    let text_epoch = ui.text.epoch;
+    let mut memo_adopted = 0u32;
+    if let Some(previous) = &mut previous
+        && LAYOUT_MEMO.get()
+        && previous.scale == scale
+        && previous.theme == theme
+        && previous.text_epoch == text_epoch
+    {
+        for &(id, tf) in &frame.memo_roots {
+            if !frame.taffy.adopted(tf)
+                && let Some(&old) = previous.memo_index.get(&id)
+                && frame.taffy.adopt(tf, &mut previous.frame.taffy, old)
+            {
+                memo_adopted += 1;
+            }
+        }
+    }
+    drop(previous);
+    let built = std::time::Instant::now();
 
     // ---- layout
     let mut nodes_ptr = std::mem::take(&mut frame.nodes);
@@ -1844,10 +2004,11 @@ pub fn render<A: 'static>(root: El<A>, app: &mut A, ui: &mut Ui<'_>) -> bool {
             if pass == 1 {
                 let mut again = false;
                 for &(tf, cap) in &frame.capped {
-                    if frame.taffy.layout(tf).expect("taffy").size.width >= cap - 0.5 {
-                        let mut style = frame.taffy.style(tf).expect("taffy").clone();
+                    // One that took over last frame's layout may have its limit in place already.
+                    if frame.taffy.layout(tf).size.width >= cap - 0.5 && frame.taffy.style(tf).size.width != length(cap) {
+                        let mut style = frame.taffy.style(tf).clone();
                         style.size.width = length(cap);
-                        frame.taffy.set_style(tf, style).expect("taffy");
+                        frame.taffy.set_capped_style(tf, style);
                         again = true;
                     }
                 }
@@ -1890,140 +2051,18 @@ pub fn render<A: 'static>(root: El<A>, app: &mut A, ui: &mut Ui<'_>) -> bool {
                             },
                             Leaf::None => Size::ZERO,
                         }
-                    })
-                    .expect("taffy");
+                    });
             }
         }
     }
     frame.nodes = nodes_ptr;
+    // Nothing before layout has the `Ui`, so this is a leaf's measuring asking for frames: what only laying out again shows.
+    let measure_animates = ui.animating;
+    let laid_out = std::time::Instant::now();
 
-    // ---- place
-    let mut order = Vec::with_capacity(frame.nodes.len());
-    let place_all = |frame: &mut Frame<A>, order: &mut Vec<usize>| {
-        order.clear();
-        frame.place(root_idx, 0.0, 0.0, window, order);
-        for i in 0..frame.portals.len() {
-            let (root, modal) = (frame.portals[i].root, frame.portals[i].portal.modal);
-            let layout = *frame.taffy.layout(frame.nodes[root].tf).expect("taffy");
-            let (w, h) = (layout.size.width, layout.size.height);
-            let (x, y) = if modal {
-                (0.0, 0.0)
-            } else {
-                let p = &frame.portals[i].portal;
-                place_popover(p, w, h, window)
-            };
-            // `place` adds the node's own location, which for a portal root is meaningless.
-            frame.place(root, x - layout.location.x, y - layout.location.y, window, order);
-        }
-    };
-    place_all(&mut frame, &mut order);
-
-    // ---- hit test
+    // ---- place, hit test, wheel, scroll requests and scroller motion
+    let (order, target, hover_path, _) = place_and_scroll(&mut frame, root_idx, window, ui);
     let pointer = ui.input.pointer;
-    let mut target = NONE;
-    if let Some((px, py)) = pointer {
-        for &i in order.iter().rev() {
-            let n = &frame.nodes[i];
-            if n.pass_through || n.disabled && n.on.click.is_none() && n.hover_text.is_none() {
-                continue;
-            }
-            if n.rect.contains(px, py) && n.clip_rect.contains(px, py) {
-                target = i;
-                break;
-            }
-        }
-    }
-    let mut hover_path = Vec::new();
-    let mut at = target;
-    while at != NONE {
-        frame.nodes[at].hovered = true;
-        hover_path.push(at);
-        at = frame.nodes[at].parent;
-    }
-
-    // ---- wheel, scroll requests and scroller motion
-    // The innermost scroller under the pointer takes the wheel, and what it has no room for goes on to the one around it.
-    let mut wheel_left = if ui.mem.block_pointer { 0.0 } else { ui.input.scroll };
-    let mut wheel_shares: Vec<(usize, f32)> = Vec::new();
-    for &i in &hover_path {
-        if wheel_left == 0.0 {
-            break;
-        }
-        if frame.nodes[i].scroll.is_none() {
-            continue;
-        }
-        let room = with_rt(|rt| rt.scrolls.get(&frame.nodes[i].id).map_or(0.0, |s| s.wheel_room(wheel_left)));
-        let share = wheel_left.abs().min(room.max(0.0)).copysign(wheel_left);
-        if share != 0.0 {
-            wheel_shares.push((i, share));
-            wheel_left -= share;
-        }
-    }
-    let requests = with_rt(|rt| std::mem::take(&mut rt.scroll_requests));
-    let mut moved = false;
-    for i in order.clone() {
-        let (id, axis) = (frame.nodes[i].id, frame.nodes[i].scroll);
-        let Some(axis) = axis else { continue };
-        let layout = *frame.taffy.layout(frame.nodes[i].tf).expect("taffy");
-        let content = layout.content_size.height.max(layout.size.height);
-        let r = frame.nodes[i].rect;
-        let mut s = with_rt(|rt| rt.scrolls.remove(&id)).unwrap_or_else(|| if axis == ScrollAxis::YStickToEnd { Scroll::default() } else { Scroll::from_top() });
-        let before = s.offset;
-        s.content = content;
-        s.viewport = r.h;
-        for (rid, req) in &requests {
-            if *rid == id {
-                match *req {
-                    ScrollRequest::To(y) => s.scroll_to(y),
-                    ScrollRequest::ToEnd => s.scroll_to_end(),
-                    ScrollRequest::By(d) => s.scroll_to(s.offset + d),
-                    ScrollRequest::Shift(d) => s.shift_clamped(d),
-                    ScrollRequest::Reveal { y, h } => {
-                        if y < s.offset {
-                            s.scroll_to(y);
-                        } else if y + h > s.offset + s.viewport {
-                            s.scroll_to(y + h - s.viewport);
-                        }
-                    }
-                }
-            }
-        }
-        if axis == ScrollAxis::YManual {
-            s.stick = false;
-        }
-        let share = wheel_shares.iter().find(|(at, _)| *at == i).map_or(0.0, |(_, share)| *share);
-        s.advance_by(ui, r, content, share);
-        if axis == ScrollAxis::YManual {
-            s.stick = false;
-        }
-        if (s.offset - before).abs() > 0.01 {
-            moved = true;
-        }
-        with_rt(|rt| rt.scrolls.insert(id, s));
-    }
-    if moved {
-        for n in &mut frame.nodes {
-            n.hovered = false;
-        }
-        place_all(&mut frame, &mut order);
-        target = NONE;
-        if let Some((px, py)) = pointer {
-            for &i in order.iter().rev() {
-                let n = &frame.nodes[i];
-                if !n.pass_through && n.rect.contains(px, py) && n.clip_rect.contains(px, py) {
-                    target = i;
-                    break;
-                }
-            }
-        }
-        hover_path.clear();
-        let mut at = target;
-        while at != NONE {
-            frame.nodes[at].hovered = true;
-            hover_path.push(at);
-            at = frame.nodes[at].parent;
-        }
-    }
 
     with_rt(|rt| rt.shift = ui.input.shift);
 
@@ -2257,6 +2296,37 @@ pub fn render<A: 'static>(root: El<A>, app: &mut A, ui: &mut Ui<'_>) -> bool {
     }
 
     // ---- paint
+    let handled_input = std::time::Instant::now();
+    // Painting is where selectable text and custom widgets hear a press, and a captured one is not theirs.
+    let target = if captured.is_some() { NONE } else { target };
+    paint_frame(&mut frame, root_idx, &order, &hover_path, target, app, ui, &mut fired);
+    // ---- remember
+    remember(&frame, root_idx, window, scale, ui, true);
+
+    // ---- handlers, with the whole frame finished
+    let painted = std::time::Instant::now();
+    let any = !fired.is_empty();
+    for f in fired {
+        f(app);
+    }
+    let done = std::time::Instant::now();
+    PHASES.with(|phases| phases.set(RenderPhases { tree: micros(began, built), layout: micros(built, laid_out), input: micros(laid_out, handled_input), paint: micros(handled_input, painted), handlers: micros(painted, done), nodes: frame.nodes.len() as u32, memo_roots: frame.memo_roots.len() as u32, memo_adopted }));
+    let memo_index = frame.memo_roots.iter().copied().collect();
+    let scrollers = frame.nodes.iter().filter(|n| n.scroll.is_some()).map(|n| n.id).collect();
+    let coverage = with_rt(|rt| {
+        rt.frame_scrollers = scrollers;
+        std::mem::take(&mut rt.coverage)
+    });
+    let repaintable = !measure_animates && frame.portals.is_empty();
+    let input = &ui.input;
+    let held = Held { pointer: input.pointer, shift: input.shift, alt: input.alt, preedit: input.ime_preedit.clone() };
+    put_retained(Retained { frame, root_idx, window, memo_index, scale, theme, text_epoch, repaintable, coverage, held });
+    with_rt(|rt| std::mem::take(&mut rt.repaint)) || any
+}
+
+/// Every root painted into its band of layers, then hover text and the cursor.
+#[allow(clippy::too_many_arguments)]
+fn paint_frame<A: 'static>(frame: &mut Frame<A>, root_idx: usize, order: &[usize], hover_path: &[usize], target: usize, app: &mut A, ui: &mut Ui<'_>, fired: &mut Vec<Box<dyn FnOnce(&mut A)>>) {
     let mut base_layer = LAYER_BASE;
     let mut modal_layer = LAYER_MODAL;
     let mut popup_layer = LAYER_POPUP;
@@ -2264,8 +2334,6 @@ pub fn render<A: 'static>(root: El<A>, app: &mut A, ui: &mut Ui<'_>) -> bool {
     let saved_clip = ui.clip;
     let tree_roots: Vec<(usize, Option<bool>)> = std::iter::once((root_idx, None)).chain(frame.portals.iter().map(|p| (p.root, Some(p.portal.modal)))).collect();
     let (mut modal_seen, mut popup_seen) = (false, false);
-    // Painting is where selectable text and custom widgets hear a press, and a captured one is not theirs.
-    let target = if captured.is_some() { NONE } else { target };
     for (root, portal) in tree_roots {
         let mut layer_of = match portal {
             None => &mut base_layer,
@@ -2280,12 +2348,12 @@ pub fn render<A: 'static>(root: El<A>, app: &mut A, ui: &mut Ui<'_>) -> bool {
             _ => {}
         }
         ui.layer = *layer_of;
-        paint(&mut frame, root, app, ui, target, &mut layer_of, &mut fired);
+        paint(frame, root, app, ui, target, &mut layer_of, fired);
     }
     ui.layer = saved_layer;
     ui.clip = saved_clip;
 
-    match hover_note(&frame, &order, target, ui) {
+    match hover_note(frame, order, target, ui) {
         Some((id, anchor, words)) => {
             // Something held has no use for it, nor has what it passes over, and it stays away after the release until the pointer moves on.
             let since = if ui.mem.active != 0 {
@@ -2310,7 +2378,7 @@ pub fn render<A: 'static>(root: El<A>, app: &mut A, ui: &mut Ui<'_>) -> bool {
     }
 
     // The topmost hovered element with a cursor decides.
-    for &i in &hover_path {
+    for &i in hover_path {
         let n = &frame.nodes[i];
         if let Some(c) = n.cursor {
             ui.cursor = c;
@@ -2328,7 +2396,11 @@ pub fn render<A: 'static>(root: El<A>, app: &mut A, ui: &mut Ui<'_>) -> bool {
             break;
         }
     }
-    // ---- remember
+}
+
+/// What views and handlers read about the frame just painted. `retire` drops the state no view asked for: only a frame that
+/// ran its views knows.
+fn remember<A: 'static>(frame: &Frame<A>, root_idx: usize, window: Rect, scale: f32, ui: &mut Ui<'_>, retire: bool) {
     let any_portal = !frame.portals.is_empty();
     let portal_rects: Vec<Rect> = frame.portals.iter().map(|portal| frame.nodes[portal.root].rect).collect();
     let focus_now = ui.mem.focus;
@@ -2344,20 +2416,290 @@ pub fn render<A: 'static>(root: El<A>, app: &mut A, ui: &mut Ui<'_>) -> bool {
                 rt.rects.insert(n.id, n.rect);
             }
         }
-        let frame_no = rt.frame;
-        rt.states.retain(|_, (_, last)| frame_no.saturating_sub(*last) < 2);
-        rt.docs.retain(|_, d| frame_no.saturating_sub(d.frame) < 30);
+        // Only a frame that built its views says what they still use.
+        if retire {
+            let frame_no = rt.frame;
+            rt.states.retain(|_, (_, last)| frame_no.saturating_sub(*last) < 2);
+            rt.docs.retain(|_, d| frame_no.saturating_sub(d.frame) < 30);
+        }
     });
     if a11y_active() {
-        a11y::finish_frame(&frame, root_idx, focus_now, window, scale);
+        a11y::finish_frame(frame, root_idx, focus_now, window, scale);
     }
 
-    // ---- handlers, with the whole frame finished
-    let any = !fired.is_empty();
+}
+
+/// Rectangles from the layout and the scrollers' offsets, what the pointer is over, and the wheel and scroll requests applied:
+/// the part of a frame that one painting the last frame's tree again ([`render_scrolled`]) does as well. Answers the paint order,
+/// the node under the pointer, the path up from it, and each scroller that moved, with its offset and viewport.
+#[allow(clippy::type_complexity)]
+fn place_and_scroll<A: 'static>(frame: &mut Frame<A>, root_idx: usize, window: Rect, ui: &mut Ui<'_>) -> (Vec<usize>, usize, Vec<usize>, Vec<(u64, f32, f32)>) {
+    // ---- place
+    let mut order = Vec::with_capacity(frame.nodes.len());
+    frame.place_all(root_idx, window, &mut order);
+
+    // ---- hit test
+    let pointer = ui.input.pointer;
+    let mut target = NONE;
+    if let Some((px, py)) = pointer {
+        for &i in order.iter().rev() {
+            let n = &frame.nodes[i];
+            if n.pass_through || n.disabled && n.on.click.is_none() && n.hover_text.is_none() {
+                continue;
+            }
+            if n.rect.contains(px, py) && n.clip_rect.contains(px, py) {
+                target = i;
+                break;
+            }
+        }
+    }
+    let mut hover_path = Vec::new();
+    let mut at = target;
+    while at != NONE {
+        frame.nodes[at].hovered = true;
+        hover_path.push(at);
+        at = frame.nodes[at].parent;
+    }
+
+    // ---- wheel, scroll requests and scroller motion
+    // The innermost scroller under the pointer takes the wheel, and what it has no room for goes on to the one around it.
+    let mut wheel_left = if ui.mem.block_pointer { 0.0 } else { ui.input.scroll };
+    let mut wheel_shares: Vec<(usize, f32)> = Vec::new();
+    for &i in &hover_path {
+        if wheel_left == 0.0 {
+            break;
+        }
+        if frame.nodes[i].scroll.is_none() {
+            continue;
+        }
+        let room = with_rt(|rt| rt.scrolls.get(&frame.nodes[i].id).map_or(0.0, |s| s.wheel_room(wheel_left)));
+        let share = wheel_left.abs().min(room.max(0.0)).copysign(wheel_left);
+        if share != 0.0 {
+            wheel_shares.push((i, share));
+            wheel_left -= share;
+        }
+    }
+    let requests = with_rt(|rt| std::mem::take(&mut rt.scroll_requests));
+    let mut moved = false;
+    let mut moved_ids = Vec::new();
+    for i in order.clone() {
+        let (id, axis) = (frame.nodes[i].id, frame.nodes[i].scroll);
+        let Some(axis) = axis else { continue };
+        let layout = *frame.taffy.layout(frame.nodes[i].tf);
+        let content = layout.content_size.height.max(layout.size.height);
+        let r = frame.nodes[i].rect;
+        let mut s = with_rt(|rt| rt.scrolls.remove(&id)).unwrap_or_else(|| if axis == ScrollAxis::YStickToEnd { Scroll::default() } else { Scroll::from_top() });
+        let before = s.offset;
+        s.content = content;
+        s.viewport = r.h;
+        for (rid, req) in &requests {
+            if *rid == id {
+                match *req {
+                    ScrollRequest::To(y) => s.scroll_to(y),
+                    ScrollRequest::ToEnd => s.scroll_to_end(),
+                    ScrollRequest::By(d) => s.scroll_to(s.offset + d),
+                    ScrollRequest::Shift(d) => s.shift_clamped(d),
+                    ScrollRequest::GlideToEnd { rate } => s.glide_to_end(rate),
+                    ScrollRequest::StopGlide => s.stop_glide(),
+                    ScrollRequest::Reveal { y, h } => {
+                        if y < s.offset {
+                            s.scroll_to(y);
+                        } else if y + h > s.offset + s.viewport {
+                            s.scroll_to(y + h - s.viewport);
+                        }
+                    }
+                }
+            }
+        }
+        if axis == ScrollAxis::YManual {
+            s.stick = false;
+        }
+        let share = wheel_shares.iter().find(|(at, _)| *at == i).map_or(0.0, |(_, share)| *share);
+        s.advance_by(ui, r, content, share);
+        if axis == ScrollAxis::YManual {
+            s.stick = false;
+        }
+        if (s.offset - before).abs() > 0.01 {
+            moved = true;
+            moved_ids.push((id, s.offset, s.viewport));
+        }
+        with_rt(|rt| rt.scrolls.insert(id, s));
+    }
+    if moved {
+        for n in &mut frame.nodes {
+            n.hovered = false;
+        }
+        frame.place_all(root_idx, window, &mut order);
+        target = NONE;
+        if let Some((px, py)) = pointer {
+            for &i in order.iter().rev() {
+                let n = &frame.nodes[i];
+                if !n.pass_through && n.rect.contains(px, py) && n.clip_rect.contains(px, py) {
+                    target = i;
+                    break;
+                }
+            }
+        }
+        hover_path.clear();
+        let mut at = target;
+        while at != NONE {
+            frame.nodes[at].hovered = true;
+            hover_path.push(at);
+            at = frame.nodes[at].parent;
+        }
+    }
+
+    (order, target, hover_path, moved_ids)
+}
+
+thread_local! {
+    /// The last frame's tree, laid out and painted: what the next frame takes layouts over from.
+    static RETAINED: RefCell<Option<Box<dyn Any>>> = const { RefCell::new(None) };
+    static LAYOUT_MEMO: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether [`El::memo_layout`] subtrees take over the last frame's layout. On by default; off lays everything out every frame, for
+/// a comparison.
+pub fn set_layout_memo(on: bool) {
+    LAYOUT_MEMO.set(on);
+}
+
+struct Retained<A: 'static> {
+    frame: Frame<A>,
+    root_idx: usize,
+    window: Rect,
+    memo_index: HashMap<u64, taffy::tree::NodeId>,
+    scale: f32,
+    theme: Theme,
+    text_epoch: u32,
+    /// Nothing about the tree changes with time alone: no leaf's size is animating, and nothing floats over it.
+    repaintable: bool,
+    /// [`scroll_coverage`], as the views that built this tree said it.
+    coverage: HashMap<u64, (f32, f32)>,
+    /// The input the tree was last painted with, which a frame painting it again must find unchanged.
+    held: Held,
+}
+
+#[derive(PartialEq)]
+struct Held {
+    pointer: Option<(f32, f32)>,
+    shift: bool,
+    alt: bool,
+    preedit: Option<String>,
+}
+
+/// How a frame that painted the last one's tree again went.
+#[derive(Clone, Copy, Debug)]
+pub struct Scrolled {
+    /// Something asked for a frame with its views run ([`repaint`]).
+    pub again: bool,
+    /// A scroller is still easing towards where the wheel sent it.
+    pub moving: bool,
+}
+
+thread_local! {
+    static SCROLL_FAST_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Some scroller in the last frame's tree is still easing towards where the wheel or a request sent it.
+pub fn any_scroll_moving() -> bool {
+    with_rt(|rt| rt.frame_scrollers.iter().any(|id| rt.scrolls.get(id).is_some_and(Scroll::moving)))
+}
+
+/// Whether [`render_scrolled`] may paint the last frame's tree again. On by default; off runs every frame in full, for a comparison.
+pub fn set_scroll_fast_path(on: bool) {
+    SCROLL_FAST_PATH.set(on);
+}
+
+/// Says that of the scroller `key`, only the content from `top` to `bottom` (in its own coordinates, as its offset is) was built
+/// this frame: a virtual list's rows near the viewport. A frame that only scrolls ([`render_scrolled`]) moves the viewport that far
+/// at most, and leaves the rest to a frame that builds the rows. A scroller that says nothing has all of its content built.
+pub fn scroll_coverage(key: impl Hash, top: f32, bottom: f32) {
+    let id = hash_key(key);
+    with_rt(|rt| {
+        let at = rt.coverage.entry(id).or_insert((top, bottom));
+        *at = (at.0.max(top), at.1.min(bottom));
+    });
+}
+
+/// A frame in which nothing has happened but the wheel and the scrollers' easing: no input besides, nothing from other threads, no
+/// view asking for one. It paints the last frame's tree again at the scrollers' new offsets, without running the views or laying
+/// anything out, as a browser scrolls a page by moving what it has already laid out. Hover, the scrollbars and custom leaves are
+/// painted afresh. `None` when the frame needs its views after all: the caller then renders it in full, and nothing here has
+/// changed anything it would read.
+pub fn render_scrolled<A: 'static>(app: &mut A, ui: &mut Ui<'_>) -> Option<Scrolled> {
+    let began = std::time::Instant::now();
+    if !SCROLL_FAST_PATH.get() || a11y_active() {
+        return None;
+    }
+    let mut retained = take_retained::<A>()?;
+    let input = &ui.input;
+    let held = Held { pointer: input.pointer, shift: input.shift, alt: input.alt, preedit: input.ime_preedit.clone() };
+    let quiet = !input.down
+        && !input.pressed
+        && !input.released
+        && !input.double_click
+        && !input.right_pressed
+        && !input.middle_pressed
+        && input.scroll_x == 0.0
+        && !input.zoom_modifier
+        && input.keys.is_empty()
+        && input.text.is_empty()
+        && input.ime_commit.is_none()
+        && input.dropped.is_empty()
+        && !input.hovered_file
+        && input.hovered_paths.is_empty();
+    let asked = with_rt(|rt| !rt.scroll_requests.is_empty() || rt.focus_request.is_some() || rt.repaint);
+    let window = rect(0.0, 0.0, ui.size.0, ui.size.1);
+    if !quiet || asked || ui.mem.active != 0 || !retained.repaintable || held != retained.held || window != retained.window || ui.scale != retained.scale || ui.theme != retained.theme {
+        put_retained(*retained);
+        return None;
+    }
+    let Retained { frame, root_idx, coverage, .. } = &mut *retained;
+    let root_idx = *root_idx;
+    let scrollers: Vec<u64> = frame.nodes.iter().filter(|n| n.scroll.is_some()).map(|n| n.id).collect();
+    let saved: Vec<(u64, Scroll)> = with_rt(|rt| scrollers.iter().filter_map(|id| rt.scrolls.get(id).map(|s| (*id, *s))).collect());
+    for n in &mut frame.nodes {
+        n.hovered = false;
+    }
+    let animating = ui.animating;
+    let (order, target, hover_path, moved) = place_and_scroll(frame, root_idx, window, ui);
+    // Past what was built, or onto something that hears the pointer arrive: that is the views' to answer.
+    let uncovered = moved.iter().any(|&(id, offset, viewport)| coverage.get(&id).is_some_and(|&(top, bottom)| offset < top - 0.5 || offset + viewport > bottom + 0.5));
+    let watched: Vec<u64> = hover_path.iter().filter(|&&i| frame.nodes[i].on.hover_change.is_some()).map(|&i| frame.nodes[i].id).collect();
+    let hover_changed = with_rt(|rt| watched.len() != rt.hover_watched.len() || watched.iter().any(|id| !rt.hover_watched.contains(id)));
+    if uncovered || hover_changed {
+        with_rt(|rt| rt.scrolls.extend(saved));
+        ui.animating = animating;
+        put_retained(*retained);
+        return None;
+    }
+    let placed = std::time::Instant::now();
+    let mut fired: Vec<Box<dyn FnOnce(&mut A)>> = Vec::new();
+    let (saved_layer, saved_clip) = (ui.layer, ui.clip);
+    paint_frame(frame, root_idx, &order, &hover_path, target, app, ui, &mut fired);
+    ui.layer = saved_layer;
+    ui.clip = saved_clip;
+    let scale = ui.scale;
+    remember(frame, root_idx, window, scale, ui, false);
+    let painted = std::time::Instant::now();
     for f in fired {
         f(app);
     }
-    with_rt(|rt| std::mem::take(&mut rt.repaint)) || any
+    let moving = with_rt(|rt| scrollers.iter().any(|id| rt.scrolls.get(id).is_some_and(Scroll::moving)));
+    let micros = |from: std::time::Instant, to: std::time::Instant| to.duration_since(from).as_micros() as u32;
+    PHASES.with(|phases| phases.set(RenderPhases { tree: 0, layout: 0, input: micros(began, placed), paint: micros(placed, painted), handlers: 0, ..last_render_phases() }));
+    put_retained(*retained);
+    Some(Scrolled { again: with_rt(|rt| std::mem::take(&mut rt.repaint)), moving })
+}
+
+
+fn take_retained<A: 'static>() -> Option<Box<Retained<A>>> {
+    RETAINED.with(|r| r.borrow_mut().take()).and_then(|any| any.downcast::<Retained<A>>().ok())
+}
+
+fn put_retained<A: 'static>(retained: Retained<A>) {
+    RETAINED.with(|r| *r.borrow_mut() = Some(Box::new(retained)));
 }
 
 fn place_popover<A>(p: &Portal<A>, w: f32, h: f32, window: Rect) -> (f32, f32) {
@@ -2497,6 +2839,8 @@ fn paint<A: 'static>(frame: &mut Frame<A>, idx: usize, app: &mut A, ui: &mut Ui<
         ui.discard_since(mark);
         **layer = spent;
         ui.layer = at;
+        // Still invisible to a frame that paints this tree again.
+        frame.nodes[idx].invisible = true;
         return;
     }
     let r = frame.nodes[idx].rect;
@@ -2580,7 +2924,10 @@ fn paint<A: 'static>(frame: &mut Frame<A>, idx: usize, app: &mut A, ui: &mut Ui<
     // What is not a closure stays where it is, for the accessibility tree to read once the frame is painted.
     match &frame.nodes[idx].leaf {
         Leaf::None => {}
-        Leaf::Text { spans, flow, align, selectable, hanging } => paint_text(ui, id, r, spans, *flow, *align, *selectable, *hanging, is_target),
+        Leaf::Text { spans, flow, align, selectable, hanging } => {
+            let measured_w = frame.taffy.unrounded_width(frame.nodes[idx].tf);
+            paint_text(ui, id, r, measured_w, spans, *flow, *align, *selectable, *hanging, is_target)
+        }
         Leaf::Icon { icon, size, color, rotate } => {
             let (size, rotate) = (*size, *rotate);
             let c = color.unwrap_or(ui.theme.text_secondary);
@@ -2596,20 +2943,26 @@ fn paint<A: 'static>(frame: &mut Frame<A>, idx: usize, app: &mut A, ui: &mut Ui<
                 ui.image(*image, r, *radius, 1.0);
             }
         }
+        // Once painted, a custom leaf is a plain box to the rest of the frame (the cursor, the accessibility tree), and its paint
+        // is kept apart, for a frame that paints this one again.
         Leaf::Custom { .. } => {
             if let Leaf::Custom { paint: Some(p), .. } = std::mem::replace(&mut frame.nodes[idx].leaf, Leaf::None) {
-                if a11y_active() {
-                    a11y::set_painting(id);
-                }
-                let on_top = is_target || hover_contains_target(frame, idx, target);
-                let saved = ui.mem.block_pointer;
-                ui.mem.block_pointer = saved || !on_top;
-                ui.clip = clip.intersect(&r);
-                p(app, ui, r);
-                ui.mem.block_pointer = saved;
-                frame.nodes[idx].cut_line = ui.cut_line.take();
+                frame.nodes[idx].custom_paint = Some(p);
             }
         }
+    }
+    if let Some(mut p) = frame.nodes[idx].custom_paint.take() {
+        if a11y_active() {
+            a11y::set_painting(id);
+        }
+        let on_top = is_target || hover_contains_target(frame, idx, target);
+        let saved = ui.mem.block_pointer;
+        ui.mem.block_pointer = saved || !on_top;
+        ui.clip = clip.intersect(&r);
+        p(app, ui, r);
+        ui.mem.block_pointer = saved;
+        frame.nodes[idx].cut_line = ui.cut_line.take();
+        frame.nodes[idx].custom_paint = Some(p);
     }
 
     // Children, in-flow before overlays.
@@ -2664,7 +3017,10 @@ fn hover_contains_target<A>(frame: &Frame<A>, idx: usize, target: usize) -> bool
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-fn paint_text(ui: &mut Ui<'_>, id: u64, r: Rect, spans: &[Span], flow: TextFlow, align: TextAlign, selectable: bool, hanging: f32, is_target: bool) {
+/// `measured_w` is the width layout measured the text at, before rounding: a document made here (one that layout kept from an earlier
+/// frame never measured this time) is set at it, as measuring would have.
+#[allow(clippy::too_many_arguments)]
+fn paint_text(ui: &mut Ui<'_>, id: u64, r: Rect, measured_w: f32, spans: &[Span], flow: TextFlow, align: TextAlign, selectable: bool, hanging: f32, is_target: bool) {
     let scale = ui.scale;
     let theme = ui.theme;
     // Aligned text that fits on one line: a document always starts its lines at the left, and this path can place it.
@@ -2727,7 +3083,8 @@ fn paint_text(ui: &mut Ui<'_>, id: u64, r: Rect, spans: &[Span], flow: TextFlow,
     })
     .unwrap_or_else(|| {
         let frame = with_rt(|rt| rt.frame);
-        let mut doc = Doc::new((r.w * scale).max(1.0));
+        let width = if (measured_w - r.w).abs() <= 1.0 { measured_w } else { r.w };
+        let mut doc = Doc::new((width * scale).max(1.0));
         begin_text_doc(ctx, &mut doc, spans, hanging);
         for s in spans {
             doc.push(ctx, &s.text, s.ty, s.color.unwrap_or(theme.text_primary));
@@ -3030,6 +3387,7 @@ pub fn menu_panel<A: 'static>(rows: Vec<MenuRow<A>>, close: Handler<A>) -> El<A>
 /// One line set in a named family.
 pub fn family_text<A: 'static>(label: Arc<str>, family: Arc<str>, ty: TypeStyle, color: Color) -> El<A> {
     let (measured, measured_family) = (label.clone(), family.clone());
+    let (label_key, family_key) = (label.clone(), family.clone());
     custom::<A>(move |_, ui, r| {
         ui.with_clip(r, |ui| {
             ui.family_label(r.x, r.y + (r.h - ty.line) * 0.5, &label, &family, &ty, color);
@@ -3037,6 +3395,7 @@ pub fn family_text<A: 'static>(label: Arc<str>, family: Arc<str>, ty: TypeStyle,
     })
     .min_w(0.0)
     .pass_through()
+    .measure_key((label_key, family_key, ty))
     .measure(move |_, ui, known, _| {
         let run = ui.text.family_line(&measured, &measured_family, &ty, Color::WHITE);
         (known.unwrap_or(run.width / ui.scale), ty.line)
@@ -3147,6 +3506,20 @@ pub fn set_window_size(w: f32, h: f32) {
 /// The window's size in logical pixels, for media-query-like decisions in views.
 pub fn window_size() -> (f32, f32) {
     (WINDOW_W.with(|s| *s.borrow()), WINDOW_H.with(|s| *s.borrow()))
+}
+
+thread_local! {
+    static WINDOW_SCALE: std::cell::Cell<f32> = const { std::cell::Cell::new(2.0) };
+}
+
+/// Device pixels to a logical one, zoom included: what a picture needs to look sharp in this window.
+pub fn set_window_scale(scale: f32) {
+    WINDOW_SCALE.with(|s| s.set(scale));
+}
+
+/// Two until a window says otherwise, so nothing is too small for a Retina screen.
+pub fn window_scale() -> f32 {
+    WINDOW_SCALE.with(std::cell::Cell::get)
 }
 
 /// What a text field keeps between frames.
@@ -3404,11 +3777,13 @@ pub fn sideways<A: 'static>(key: impl Hash, content: El<A>) -> El<A> {
 /// How many rows of a uniform virtual list are on screen, from the scroller's state last frame, with `overscan`
 /// more on each side. Pair with spacers of the skipped height.
 pub fn visible_rows(scroller: impl Hash, count: usize, row_h: f32, overscan: usize) -> std::ops::Range<usize> {
-    let (offset, _, viewport) = scroll_state(scroller).unwrap_or((0.0, 0.0, 1200.0));
+    let (offset, _, viewport) = scroll_state(&scroller).unwrap_or((0.0, 0.0, 1200.0));
     let viewport = if viewport > 0.0 { viewport } else { 1200.0 };
     let first = ((offset / row_h).floor() as usize).saturating_sub(overscan);
     let last = (((offset + viewport) / row_h).ceil() as usize + overscan).min(count);
-    first.min(count)..last
+    let first = first.min(count);
+    scroll_coverage(scroller, if first == 0 { f32::NEG_INFINITY } else { first as f32 * row_h }, if last >= count { f32::INFINITY } else { last as f32 * row_h });
+    first..last
 }
 
 /// Handle to the set of hovered ids, should a test want it.

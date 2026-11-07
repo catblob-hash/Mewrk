@@ -42,9 +42,20 @@ pub fn stream_reveal_text(key: impl Hash, value: &str, ty: TypeStyle, color: Col
     let state = use_state(("stream-reveal", hash_key(key)), || Reveal { split: None, arrived: Instant::now() });
     let (settled, arrived) = {
         let mut reveal = state.borrow_mut();
-        let next = next_stream_reveal_split(reveal.split.as_ref(), value);
+        let mut next = next_stream_reveal_split(reveal.split.as_ref(), value);
         // The same text keeps its split, so a sweep still in flight is not cut short by a frame drawn for some other reason.
         if reveal.split.as_ref() != Some(&next) {
+            // New text while the last sweep is still going goes on from where its edge has got to: what it had not reached sweeps in
+            // again with the new, rather than landing at once.
+            let progress = reveal.arrived.elapsed().as_secs_f32() * 1000.0 / STREAM_REVEAL_MS as f32;
+            if let Some(last) = reveal.split.as_ref().filter(|_| progress < 1.0) {
+                let reached = last.settled + ((last.text.len() - last.settled) as f32 * progress) as usize;
+                let mut at = reached.min(value.len());
+                while !value.is_char_boundary(at) {
+                    at -= 1;
+                }
+                next.settled = next.settled.min(at);
+            }
             reveal.arrived = Instant::now();
             reveal.split = Some(next.clone());
         }
@@ -64,7 +75,8 @@ pub fn stream_reveal_text(key: impl Hash, value: &str, ty: TypeStyle, color: Col
             ui.label_ellipsis(r.x, y, r.w, &painted, &ty, color);
             return;
         }
-        ui.wake_after(1.0 / 60.0);
+        // Only the painting moves, so a frame that paints the last tree again carries the sweep.
+        ui.repaint_after(1.0 / 60.0);
         let before = &painted[..settled];
         if !before.is_empty() {
             ui.label(r.x, y, before, &ty, color);
@@ -73,6 +85,7 @@ pub fn stream_reveal_text(key: impl Hash, value: &str, ty: TypeStyle, color: Col
         let fresh_width = advance(ui, &painted, &ty) - start;
         paint_characters(ui, r.x, y, &painted, settled, &ty, |centre| color.fade(quantized(fresh_alpha(centre - start, fresh_width, ty.size, progress))));
     })
+    .measure_key((value, ty))
     .measure(move |_, ui, _, _| (ui.measure(&measured, &ty), ty.line))
     .min_w(0.0)
     .with_style(|s| s.flex_shrink = 1.0)

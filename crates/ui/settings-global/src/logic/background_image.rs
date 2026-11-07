@@ -45,6 +45,23 @@ pub fn tier_covers(tier: (u32, u32), width: f64, height: f64) -> bool {
     tier.0 as f64 >= width.round() && tier.1 as f64 >= height.round()
 }
 
+/// The size a picture of this size has once shrunk to just cover a window of this many device pixels, never above its own.
+pub fn cover_size(picture: (u32, u32), width: f64, height: f64) -> (u32, u32) {
+    let scale = (width / f64::from(picture.0.max(1))).max(height / f64::from(picture.1.max(1))).min(1.0);
+    let side = |side: u32| ((f64::from(side) * scale).ceil() as u32).clamp(1, side.max(1));
+    (side(picture.0), side(picture.1))
+}
+
+/// A picture shrunk to just cover the window, or as it is when it is no larger. The tier that covers a window can be half again as wide
+/// and as tall, and the built-in pictures are 3840 wide for any window: on the GPU, a 1440x900 window's backdrop took 35 MiB where 20 do.
+pub fn cover_window(pixels: Pixels, width: f64, height: f64) -> Result<Pixels, String> {
+    let (w, h) = cover_size((pixels.width, pixels.height), width, height);
+    if (w, h) == (pixels.width, pixels.height) {
+        return Ok(pixels);
+    }
+    area_resize(&pixels, w, h)
+}
+
 pub fn is_opaque(pixels: &Pixels) -> bool {
     pixels.data.chunks_exact(4).all(|p| p[3] == 255)
 }
@@ -136,6 +153,21 @@ pub fn decode_data_url(data_url: &str) -> Result<Pixels, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_picture_is_kept_just_large_enough_to_cover_the_window() {
+        assert_eq!(cover_size((3840, 2400), 2880.0, 1800.0), (2880, 1800));
+        assert_eq!(cover_size((3840, 2160), 2880.0, 1800.0), (3200, 1800));
+        assert_eq!(cover_size((3840, 2400), 5120.0, 2880.0), (3840, 2400), "never above its own size");
+        for (window, picture) in [((2881.4, 1799.6), (3840, 2400)), ((1000.5, 333.3), (1921, 1081)), ((640.0, 2000.0), (7680, 4320))] {
+            let size = cover_size(picture, window.0, window.1);
+            assert!(tier_covers(size, window.0, window.1), "{size:?} covers {window:?}");
+        }
+        let pixels = Pixels { width: 8, height: 4, data: vec![255; 8 * 4 * 4] };
+        let fitted = cover_window(pixels, 4.0, 1.0).unwrap();
+        assert_eq!((fitted.width, fitted.height), (4, 2));
+        assert!(is_opaque(&fitted));
+    }
 
     #[test]
     fn what_cannot_be_read_goes_on_as_it_is_and_fails_as_unreadable_later() {

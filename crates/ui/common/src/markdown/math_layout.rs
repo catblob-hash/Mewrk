@@ -195,7 +195,7 @@ pub(super) fn cache_stats() -> (u64, usize) {
     })
 }
 
-/// A formula at a text size, from the cache if it was set before. A stream re-reads its whole text ten times a second, and this
+/// A formula at a text size, from the cache if it was set before. A stream re-reads its whole text at every commit, and this
 /// is what makes every formula already on screen a map lookup.
 pub(super) fn typeset(text: &mut TextCtx, source: &str, display: bool, base_size: f32) -> Rc<Typeset> {
     // As MathJax's `ex`es do, the formula takes its size from the text around it: letters as tall as the letters beside them.

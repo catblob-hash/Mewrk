@@ -123,8 +123,9 @@ pub enum KernelEvent {
     ToolSettle {
         c: SlotId,
     },
-    /// A call whose deadline expired hands its still-running work to task slot
-    /// `a` under fresh identity `r`, instead of abandoning it.
+    /// A call whose deadline expired, or whose own process ended while what it
+    /// started still runs, hands that still-running work to task slot `a` under
+    /// fresh identity `r`, instead of abandoning or waiting on it.
     ToolBackground {
         c: SlotId,
         a: SlotId,
@@ -621,8 +622,9 @@ impl Kernel {
                 slot.fresh = false;
                 self.state.round_due = true;
             }
-            // A deadline does not abandon running work: the executing call hands
-            // its process to an empty task slot under a fresh identity and moves
+            // A deadline does not abandon running work, and a command that left
+            // processes running does not hold its call open on them: the executing
+            // call hands its process to an empty task slot under a fresh identity and moves
             // to `ExecBg`, which is executing minus the right to hand off again.
             // Like a spawn, it is never refused for capacity (S6): no running
             // task, spawned or handed off, stands in its way. The handoff

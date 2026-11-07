@@ -320,6 +320,49 @@ fn scrolling_follows_a_stream_until_the_user_scrolls_away() {
 }
 
 #[test]
+fn a_glide_comes_down_to_an_end_that_keeps_moving_without_overshooting_and_the_wheel_ends_it() {
+    let mut rig = Rig::new();
+    let mut scroll = Scroll::from_top();
+    let area = rect(0.0, 0.0, 600.0, 400.0);
+    let mut content = 1400.0;
+    rig.frame(&mut NoClipboard, |ui| scroll.advance(ui, area, content));
+    scroll.glide_to_end(18.0);
+    let mut last = scroll.offset;
+    let mut frames = 0;
+    while scroll.gliding() {
+        frames += 1;
+        assert!(frames < 400, "comes to rest");
+        // The end moves on partway, as a stream's next commit moves it.
+        if frames == 20 {
+            content += 300.0;
+        }
+        let animating = rig.frame(&mut NoClipboard, |ui| {
+            scroll.advance(ui, area, content);
+            ui.animating
+        });
+        assert!(scroll.offset >= last - 0.01 && scroll.offset <= content - 400.0, "{} after {last}", scroll.offset);
+        assert!((scroll.moving() && animating) || !scroll.gliding(), "asks for the next frame while it glides");
+        last = scroll.offset;
+    }
+    assert!(frames > 10, "glided over {frames} frames rather than jumping");
+    assert_eq!(scroll.offset, content - 400.0);
+
+    // The reader turning the wheel takes over from a glide under way.
+    content += 600.0;
+    scroll.glide_to_end(18.0);
+    rig.frame(&mut NoClipboard, |ui| scroll.advance(ui, area, content));
+    assert!(scroll.gliding());
+    rig.move_to(300.0, 200.0);
+    rig.input.scroll = 40.0;
+    rig.input.scroll_is_pixels = true;
+    rig.frame(&mut NoClipboard, |ui| scroll.advance(ui, area, content));
+    assert!(!scroll.gliding());
+    let left = scroll.offset;
+    rig.frame(&mut NoClipboard, |ui| scroll.advance(ui, area, content));
+    assert_eq!(scroll.offset, left, "and nothing pulls the page on after it");
+}
+
+#[test]
 fn a_steady_scene_keeps_its_buffers() {
     let mut rig = Rig::new();
     for _ in 0..3 {

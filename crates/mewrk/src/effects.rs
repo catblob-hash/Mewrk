@@ -239,15 +239,17 @@ pub fn git_target_for_member(app: &mut App, member: u32) -> Option<GitTarget> {
 pub fn git_members(app: &mut App) -> Vec<GitMember> {
     let Some(conversation) = app.active_conversation_id() else { return Vec::new() };
     let draft = app.draft_is_active();
-    let Some(workspace) = app.active_workspace().cloned() else { return Vec::new() };
+    let Some(workspace_id) = app.active_workspace_id() else { return Vec::new() };
+    // Read in place: this runs every frame, and the workspace holds every conversation in it, messages and all.
+    let Some(workspace) = app.workspace(&workspace_id) else { return Vec::new() };
     let registered: Vec<AttachedWorkspace> = if workspace.kind == WorkspaceKind::Directory {
-        registered_project_workspaces(Some(&workspace))
+        registered_project_workspaces(Some(workspace))
     } else if draft {
         Vec::new()
     } else {
         vec![AttachedWorkspace { machine: None, path: workspace.path.clone() }]
     };
-    let worktrees: Vec<ConversationWorktree> = if draft { Vec::new() } else { app.find_conversation(&workspace.id, &conversation).map(|c| c.worktrees.clone()).unwrap_or_default() };
+    let worktrees: Vec<ConversationWorktree> = if draft { Vec::new() } else { app.find_conversation(&workspace_id, &conversation).map(|c| c.worktrees.clone()).unwrap_or_default() };
     registered
         .into_iter()
         .enumerate()
@@ -255,7 +257,7 @@ pub fn git_members(app: &mut App) -> Vec<GitMember> {
             let member = index + 1;
             let target = git_target_for_member(app, member as u32)?;
             let worktree = worktree_for(&worktrees, member, &entry).cloned();
-            Some(GitMember { member, registered: entry, worktree, key: git_snapshot_key(&conversation, member as u32), surface_key: git_surface_key(&workspace.id, member as u32), target })
+            Some(GitMember { member, registered: entry, worktree, key: git_snapshot_key(&conversation, member as u32), surface_key: git_surface_key(&workspace_id, member as u32), target })
         })
         .collect()
 }
@@ -352,14 +354,15 @@ pub fn git_mutation_disabled_reason(app: &mut App, conversation: &str, member: u
 
 /// `gitPeerOperationRunningFor`.
 fn git_peer_operation_running(app: &mut App, conversation: &str, member: u32) -> bool {
-    let Some(workspace) = app.active_workspace().cloned() else { return false };
-    let registered = registered_project_workspaces(Some(&workspace)).get(member.saturating_sub(1) as usize).cloned();
-    let surface = git_surface_key(&workspace.id, member);
+    let Some(workspace_id) = app.active_workspace_id() else { return false };
+    let Some(workspace) = app.workspace(&workspace_id) else { return false };
+    let registered = registered_project_workspaces(Some(workspace)).get(member.saturating_sub(1) as usize).cloned();
+    let surface = git_surface_key(&workspace_id, member);
     let isolated = |worktrees: &[ConversationWorktree]| registered.as_ref().is_some_and(|entry| worktree_for(worktrees, member as usize, entry).is_some());
     let acting_worktrees = workspace.conversations.iter().find(|c| c.id == conversation).map(|c| c.worktrees.clone()).unwrap_or_default();
     let mut peers: Vec<(String, Vec<ConversationWorktree>)> = workspace.conversations.iter().map(|c| (c.id.clone(), c.worktrees.clone())).collect();
-    if app.draft_of_workspace(&workspace.id).is_some() {
-        peers.push((mewrk_client::drafts::draft_conversation_id(&workspace.id), Vec::new()));
+    if app.draft_of_workspace(&workspace_id).is_some() {
+        peers.push((mewrk_client::drafts::draft_conversation_id(&workspace_id), Vec::new()));
     }
     let summaries: Vec<String> = app.runs().controller.summaries().keys().cloned().collect();
     let controller = git_controller(app);
@@ -372,13 +375,18 @@ fn git_peer_operation_running(app: &mut App, conversation: &str, member: u32) ->
 
 /// `activeWorkspaceTerminalBusy`.
 pub fn workspace_terminal_busy(app: &mut App) -> bool {
-    let Some(workspace) = app.active_workspace().cloned() else { return false };
-    let mut owners: Vec<String> = workspace.conversations.iter().map(|c| c.id.clone()).collect();
-    if let Some(draft) = app.draft_of_workspace(&workspace.id) {
+    let Some(workspace_id) = app.active_workspace_id() else { return false };
+    let Some(mut owners) = conversation_ids_in(app, &workspace_id) else { return false };
+    if let Some(draft) = app.draft_of_workspace(&workspace_id) {
         owners.push(draft.materializes_as);
     }
     let refs: Vec<&str> = owners.iter().map(String::as_str).collect();
     mewrk_pane_terminal::terminal_busy_in(app, &refs)
+}
+
+/// The ids of a project's conversations, read in place: copying the project would copy every message in it.
+fn conversation_ids_in(app: &App, workspace_id: &str) -> Option<Vec<String>> {
+    app.workspace(workspace_id).map(|workspace| workspace.conversations.iter().map(|c| c.id.clone()).collect())
 }
 
 /// `activeWorkspaceDeletionRunning`.
@@ -388,10 +396,10 @@ pub fn active_workspace_deleting(app: &mut App) -> bool {
 
 /// `activeWorkspaceGitMutationRunning`.
 pub fn workspace_git_mutation_running(app: &mut App) -> bool {
-    let Some(workspace) = app.active_workspace().cloned() else { return false };
-    let mut ids: Vec<String> = workspace.conversations.iter().map(|c| c.id.clone()).collect();
-    if app.draft_of_workspace(&workspace.id).is_some() {
-        ids.push(mewrk_client::drafts::draft_conversation_id(&workspace.id));
+    let Some(workspace_id) = app.active_workspace_id() else { return false };
+    let Some(mut ids) = conversation_ids_in(app, &workspace_id) else { return false };
+    if app.draft_of_workspace(&workspace_id).is_some() {
+        ids.push(mewrk_client::drafts::draft_conversation_id(&workspace_id));
     }
     let controller = git_controller(app);
     ids.iter().any(|id| controller.mutation_is_active(id))

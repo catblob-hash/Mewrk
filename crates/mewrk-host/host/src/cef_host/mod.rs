@@ -64,6 +64,9 @@ const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// The rest cut what Chromium does for itself, which a preview pane has no use for and which costs
 /// memory and wake-ups in every process: its own background traffic, and its services.
+///
+/// `in-process-gpu` runs the GPU service on a thread of this process, as Android WebView does: see
+/// [`BROWSER_SWITCH_VALUES`] for what that keeps and what it gives up.
 const BROWSER_SWITCHES: &[&str] = &[
     "disable-background-timer-throttling",
     "disable-renderer-backgrounding",
@@ -77,14 +80,28 @@ const BROWSER_SWITCHES: &[&str] = &[
     "disable-domain-reliability",
     "disable-sync",
     "no-pings",
+    "in-process-gpu",
 ];
 
 /// `BackForwardCache` keeps every page navigated away from alive in the renderer, and
 /// `SpareRendererForSitePerProcess` keeps a renderer with nothing in it ready for the next one: the
 /// two that cost the most for what a preview pane gets from them. Back still works, from the network
 /// and the disk cache. A tab's profile goes with the tab, so its disk cache is only worth so much.
+///
+/// The GPU, network and audio services run in this process rather than one process each
+/// (`in-process-gpu` above, `NetworkServiceInProcess2`, and `AudioServiceOutOfProcess` turned off).
+/// Pages still run only in renderers, one sandboxed process per site and per tab profile, so what
+/// keeps a page from Mewrk and from other pages is unchanged. What goes is the second sandbox those
+/// services had: a renderer that breaks out through one of them lands here, not in another
+/// sandbox, and a GPU driver crash takes Mewrk down rather than restarting a helper. In return the
+/// engine takes 45 MiB less in `examples/cef_processes` (the browser pane's) and about 75 MiB less
+/// in the signed bundle, and wakes the machine a fifth less often under a still page. Calls across
+/// what were process boundaries were never slow enough to measure, and are not faster. The storage
+/// service has no such switch short of `single-process`, and renderers stay out: one per site is
+/// the isolation.
 const BROWSER_SWITCH_VALUES: &[(&str, &str)] = &[
-    ("disable-features", "BackForwardCache,SpareRendererForSitePerProcess,Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,InterestFeedContentSuggestions"),
+    ("disable-features", "BackForwardCache,SpareRendererForSitePerProcess,Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,InterestFeedContentSuggestions,AudioServiceOutOfProcess"),
+    ("enable-features", "NetworkServiceInProcess2"),
     ("disk-cache-size", "67108864"),
 ];
 

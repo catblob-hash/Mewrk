@@ -486,6 +486,7 @@ pub fn path_text_with(key: impl Hash, path: impl Into<Arc<str>>, ty: TypeStyle, 
         }
         ui.label_ellipsis(r.x, r.y + (r.h - ty.line) * 0.5, r.w, &f.shown, &ty, color);
     })
+    .measure_key((measured.as_str(), ty))
     .measure(move |_: &mut App, ui: &mut Ui<'_>, known: Option<f32>, avail: f32| {
         let natural = ui.measure(&measured, &ty).ceil();
         (known.unwrap_or(natural.min(avail)), ty.line)

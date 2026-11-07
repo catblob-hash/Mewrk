@@ -742,12 +742,48 @@ pub fn block_summary(f: &Frame<'_>, entries: &[BlockEntry]) -> String {
 
 /// One uninterrupted stretch of work. There is no heading over the rows and no way to fold them away: each row is one line
 /// already, so a block is as tall as the work it records.
-pub fn timeline_block(f: &Frame<'_>, entries: &[BlockEntry], insertion_index: Option<usize>) -> E {
-    timeline_rows(f, entries, insertion_index, true)
+pub fn timeline_block(f: &Frame<'_>, entries: &[BlockEntry], insertion_index: Option<usize>, window: Option<(f32, f32)>) -> E {
+    timeline_rows(f, entries, insertion_index, true, window)
 }
 
-/// A block, or with no padding the block a row lifted out of one rides in.
-pub fn timeline_rows(f: &Frame<'_>, entries: &[BlockEntry], insertion_index: Option<usize>, padded: bool) -> E {
+/// Which of a block's rows to build, when it is worth leaving any out: a run of work is one row of the virtual list however long it
+/// is, and a few hundred tool calls built every frame cost more than everything else on screen. A row outside `window` (from the
+/// block's top) stands as a spacer at the height it last measured, so only a block whose every row has been measured once is cut,
+/// and what is on screen lands where it would have. A row someone is editing is always built, or its editor would lose what was typed.
+fn rows_to_build(f: &Frame<'_>, entries: &[BlockEntry], insertion_index: Option<usize>, padded: bool, window: Option<(f32, f32)>) -> Option<Vec<Option<f32>>> {
+    let (from, to) = window?;
+    let state = f.shared.borrow();
+    let mut y = if padded { BLOCK_PAD_TOP } else { 0.0 };
+    let mut plan = Vec::with_capacity(entries.len());
+    let mut skipped = 0;
+    for entry in entries {
+        let context = f.contexts.get(entry.index);
+        let id = context.id();
+        if f.lifted.contains(id) {
+            plan.push(None);
+            continue;
+        }
+        let key = hash_id(id);
+        if !state.rows_measured.contains(&key) {
+            return None;
+        }
+        let height = *state.unit_heights.get(&key)?;
+        let special = f.dock_inside.is_some_and(|(at, _)| at == entry.index) || insertion_index == Some(entry.index) || f.editing_context_id == Some(id) || f.editing_question_id == Some(id);
+        let shown = special || (y + height > from && y < to);
+        y += height;
+        if shown {
+            plan.push(None);
+        } else {
+            plan.push(Some(height));
+            skipped += 1;
+        }
+    }
+    (skipped > 0).then_some(plan)
+}
+
+/// A block, or with no padding the block a row lifted out of one rides in. `window` is what is built of it, from its top; `None`
+/// builds every row.
+pub fn timeline_rows(f: &Frame<'_>, entries: &[BlockEntry], insertion_index: Option<usize>, padded: bool, window: Option<(f32, f32)>) -> E {
     let t_ = theme();
     let first = entries.iter().map(|entry| entry.index).min().unwrap_or(0);
     let after = entries.iter().map(|entry| entry.index).max().unwrap_or(0) + 1;
@@ -775,7 +811,17 @@ pub fn timeline_rows(f: &Frame<'_>, entries: &[BlockEntry], insertion_index: Opt
                 false
             });
     }
-    for entry in entries {
+    let plan = rows_to_build(f, entries, insertion_index, padded, window);
+    // Rows left out in a run become one spacer.
+    let mut room = 0.0f32;
+    for (at, entry) in entries.iter().enumerate() {
+        if let Some(height) = plan.as_ref().and_then(|plan| plan[at]) {
+            room += height;
+            continue;
+        }
+        if room > 0.0 {
+            block = block.child(div().h(std::mem::take(&mut room)).shrink0());
+        }
         let context: Item<'_> = f.contexts.get(entry.index);
         if f.lifted.contains(context.id()) {
             continue;
@@ -794,6 +840,9 @@ pub fn timeline_rows(f: &Frame<'_>, entries: &[BlockEntry], insertion_index: Opt
             EntryKind::Hook => hook_row(f, *entry),
             _ => tool_row(f, *entry),
         });
+    }
+    if room > 0.0 {
+        block = block.child(div().h(room).shrink0());
     }
     block
 }

@@ -484,6 +484,7 @@ fn site_icon_request(host: String, url: String) -> E {
         if !first {
             return;
         }
+        let host = host.clone();
         app.invoke::<Option<String>>("web_source_icon", json!({ "url": url }), move |app, result| {
             // A missing icon is ordinary. Reporting it would turn every site without one into an error the user has to read.
             let Some(source) = result.ok().flatten() else { return };

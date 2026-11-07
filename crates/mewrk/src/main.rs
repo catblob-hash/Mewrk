@@ -24,8 +24,9 @@ mod fatal;
 
 const USAGE: &str = "\
 mewrk [--theme system|light|dark] [--exit-after SECONDS] [--scene NAME] [--lang zh|en]
-headless: --headless [--size WxH] [--scale F] [--frames N] [--shot PNG] [--bench SECONDS] [--json PATH] [--scroll PX] [--scene NAME] [--right-click XxY]
-diagnostics: MEWRK_TRACE=1 prints each frame's cost, MEWRK_ANIMATE=1 draws without end, --fullscreen-test toggles full screen every 4 s
+headless: --headless [--size WxH] [--scale F] [--frames N] [--shot PNG] [--bench SECONDS] [--json PATH] [--scroll PX] [--stream-append CHARS] [--scene NAME] [--right-click XxY]
+diagnostics: MEWRK_TRACE=1 prints each frame's cost, MEWRK_ANIMATE=1 draws without end, --fullscreen-test toggles full screen every 4 s, --stream-append CHARS writes into the last reply as a stream would
+comparisons: MEWRK_NO_LAYOUT_MEMO=1 lays every row out every frame, MEWRK_NO_SCROLL_FAST=1 runs the views on frames that only scroll
 accessibility: --a11y-probe JSON [--a11y-steps 'press:NAME;focus:NAME;set:NAME=VALUE;click:NAME;at:X,Y;type:WORDS'] asks the window what an assistive client would and quits; headless, --a11y builds the tree every frame
 Data lives in MEWRK_DATA_DIR, or under the system's folder for application data: ~/Library/Application Support/dev.mewrk.native, %APPDATA%\\dev.mewrk.native.";
 
@@ -119,15 +120,53 @@ struct Core {
     window_scale: f32,
     size_px: (u32, u32),
     timings: Vec<(u32, u32, u32, u32)>,
+    /// The CPU part of each kept frame, in microseconds: the app's tick, the view, then [`fluent::el::RenderPhases`].
+    phases: Vec<[u32; 7]>,
+    /// The last frame's, for `MEWRK_TRACE`.
+    last_phases: [u32; 7],
     keep_timings: bool,
     forced_theme: Option<bool>,
     /// The window's size in the last frame: a scene built for it can be drawn again only at it.
     last_size: Option<(u32, u32)>,
+    /// Something since the last frame needs the views run: input other than the wheel and the pointer, work from other
+    /// threads, a timer, a view asking for it. Without it a frame may only scroll ([`fluent::el::render_scrolled`]).
+    full_due: bool,
+    /// The frame is only for what paints itself differently over time ([`fluent::ui::Ui::repaint_after`]): unless something else
+    /// since the last frame wants the views, it may paint the last tree again, as one that only scrolls does.
+    paint_due: bool,
+    /// Frames in a row that only scrolled or only painted again.
+    scrolled_streak: u32,
+    /// Per kept frame: its tree's nodes, its memo subtrees and how many of them kept their layout, and whether it only scrolled.
+    tree_stats: Vec<(u32, u32, u32, bool)>,
 }
 
+/// At most this many frames in a row only scroll or only paint again. Views that place something by the scroll offset without saying
+/// what they built ([`fluent::el::scroll_coverage`]) catch up this often while the wheel turns, and views that show the time (a
+/// reasoning round's seconds) this often while something only fades.
+const SCROLLED_STREAK_MAX: u32 = 12;
+
+/// How long the wheel stays still before the views see where scrolling left the reader.
+const SCROLL_SETTLE: Duration = Duration::from_millis(100);
+
+/// The least time between two frames that only work from other threads or a view's own animation drives: about 60 a second, a
+/// little under a 60 Hz display's interval so as never to miss one of its refreshes. Streamed text needs no more, and a display
+/// that refreshes faster keeps its rate for the pointer, the wheel and what paints its own motion.
+const CONTENT_FRAME: Duration = Duration::from_millis(13);
+
 struct FrameOutcome {
-    animating: bool,
+    /// Something painted asks for the next frame: an easing, a hover fading, glyphs to build again after an atlas reset.
+    ui_animating: bool,
+    /// Handlers ran or a view asked for another frame: what they changed is not on screen yet.
+    again: bool,
+    /// The frame only scrolled and the scrollers have come to rest: once the wheel has been still for [`SCROLL_SETTLE`], a frame
+    /// with the views, for whatever they show of where the reader now is.
+    settle: bool,
     wake_in: Option<f32>,
+    /// When something that only paints differently next wants a frame ([`fluent::ui::Ui::repaint_after`]).
+    paint_wake_in: Option<f32>,
+    /// The frame ran the views. One that only painted the last tree again heard nothing from them, so what they asked for before
+    /// still stands.
+    views_ran: bool,
     cursor: CursorKind,
     ime_area: Option<fluent::ui::Rect>,
     submission: wgpu::SubmissionIndex,
@@ -164,15 +203,45 @@ impl Core {
         let mut ui = Ui::new(&mut self.scene, &mut self.text, theme, &self.input, &mut self.mem, clipboard, self.scale, size, dt, time);
         fluent::el::set_theme(theme);
         fluent::el::set_window_size(size.0, size.1);
-        self.app.tick();
-        self.app.frame_no += 1;
-        let view = root::root(&mut self.app);
-        let again = fluent::el::render(view, &mut self.app, &mut ui);
+        fluent::el::set_window_scale(self.scale);
+        let ticking = Instant::now();
+        let ticked = self.app.tick();
+        let due = std::mem::take(&mut self.full_due);
+        let paint_due = std::mem::take(&mut self.paint_due);
+        let viewing = Instant::now();
+        let us = |a: Instant, b: Instant| b.duration_since(a).as_micros() as u32;
+        // Nothing but the wheel since the last frame, or the clock for what only paints itself differently: that frame's tree painted
+        // again, where the scrollers have moved it. Its custom leaves paint afresh, at this frame's time.
+        let wheel = self.input.scroll != 0.0 || fluent::el::any_scroll_moving();
+        let scrolled = if ticked || due || !(wheel || paint_due) || self.scrolled_streak >= SCROLLED_STREAK_MAX { None } else { fluent::el::render_scrolled(&mut self.app, &mut ui) };
+        let mut settle = false;
+        let again = match scrolled {
+            Some(scrolled) => {
+                self.scrolled_streak += 1;
+                let p = fluent::el::last_render_phases();
+                self.last_phases = [us(ticking, viewing), 0, 0, 0, p.input, p.paint, 0];
+                settle = wheel && !scrolled.moving;
+                scrolled.again
+            }
+            None => {
+                self.scrolled_streak = 0;
+                self.app.frame_no += 1;
+                let view = root::root(&mut self.app);
+                let rendering = Instant::now();
+                let again = fluent::el::render(view, &mut self.app, &mut ui);
+                let p = fluent::el::last_render_phases();
+                self.last_phases = [us(ticking, viewing), us(viewing, rendering), p.tree, p.layout, p.input, p.paint, p.handlers];
+                again
+            }
+        };
+        self.full_due |= again;
+        let p = fluent::el::last_render_phases();
+        let tree_stats = (p.nodes, p.memo_roots, p.memo_adopted, scrolled.is_some());
         // Handlers just ran, so what they changed is not on screen yet.
-        let (animating, wake_in, cursor, ime_area) = (ui.animating || again, ui.wake_in, ui.cursor, ui.ime_area);
+        let (ui_animating, wake_in, paint_wake_in, cursor, ime_area) = (ui.animating, ui.wake_in, ui.paint_wake_in, ui.cursor, ui.ime_area);
         drop(ui);
         // An atlas reset partway through means glyphs built earlier in this frame are stale. The next one is clean.
-        let animating = animating || self.text.epoch != epoch;
+        let ui_animating = ui_animating || self.text.epoch != epoch;
         self.input.end_frame();
         let t1 = Instant::now();
 
@@ -188,8 +257,10 @@ impl Core {
         if self.keep_timings {
             let (_, glyphs) = self.scene.counts();
             self.timings.push((t1.duration_since(t0).as_micros() as u32, t2.duration_since(t1).as_micros() as u32, glyphs as u32, 0));
+            self.phases.push(self.last_phases);
+            self.tree_stats.push(tree_stats);
         }
-        FrameOutcome { animating, wake_in, cursor, ime_area, submission, motion_next }
+        FrameOutcome { ui_animating, again, settle, wake_in, paint_wake_in, views_ran: scrolled.is_none(), cursor, ime_area, submission, motion_next }
     }
 
     /// Whether a background that moves has something new, and when to look again. It goes to the GPU from here, so all that is left is
@@ -219,6 +290,33 @@ fn percentile(sorted: &[u32], q: f64) -> u32 {
         return 0;
     }
     sorted[((sorted.len() - 1) as f64 * q).round() as usize]
+}
+
+/// `--stream-append`: `chars` more of a sentence on the active conversation's last reply, and the conversation marked as changed.
+fn append_to_last_reply(app: &mut App, n: u32, chars: usize) {
+    const WORDS: &str = "Streaming text arrives a few words at a time, with **bold**, `code` and 中文混排 in it, and wraps across the column. ";
+    let Some(id) = app.active_conversation_id() else { return };
+    let total = WORDS.chars().count();
+    let piece: String = WORDS.chars().cycle().skip(n as usize * chars % total).take(chars).collect();
+    for workspace in &mut app.doc.workspaces {
+        for conversation in &mut workspace.conversations {
+            if conversation.id != id {
+                continue;
+            }
+            let reply = conversation.contexts.iter_mut().rev().find_map(|context| match context {
+                mewrk_client::model::ContextItem::Assistant { content, .. } => Some(content),
+                _ => None,
+            });
+            if let Some(content) = reply {
+                content.push_str(&piece);
+                if n % 60 == 59 {
+                    content.push_str("\n\n");
+                }
+            }
+            conversation.updated_at = format!("bench-{n}");
+            return;
+        }
+    }
 }
 
 fn run_headless(args: &Args) -> Result<(), String> {
@@ -268,12 +366,13 @@ fn run_headless(args: &Args) -> Result<(), String> {
     });
     let view = target.create_view(&Default::default());
     let now = Instant::now();
-    let mut core = Core { app, text: TextCtx::new(scale), scene: Scene::default(), mem: UiMemory::default(), input: Input::default(), renderer, started: now, last_frame: now, scale, window_scale: scale, size_px: size, timings: Vec::new(), keep_timings: bench > 0.0, forced_theme: forced_theme(args), last_size: None };
+    let mut core = Core { app, text: TextCtx::new(scale), scene: Scene::default(), mem: UiMemory::default(), input: Input::default(), renderer, started: now, last_frame: now, scale, window_scale: scale, size_px: size, timings: Vec::new(), phases: Vec::new(), last_phases: [0; 7], keep_timings: bench > 0.0, forced_theme: forced_theme(args), last_size: None, full_due: true, paint_due: false, scrolled_streak: 0, tree_stats: Vec::new() };
     let mut clipboard = NoClipboard;
     let vsync = Duration::from_secs_f64(1.0 / 120.0);
     let begun = Instant::now();
     let mut n = 0;
     let scroll: f32 = args.num("--scroll", 0.0)?;
+    let stream_append: usize = args.num("--stream-append", 0)?;
     if args.flag("--a11y") {
         fluent::el::set_a11y_active(true);
     }
@@ -283,6 +382,11 @@ fn run_headless(args: &Args) -> Result<(), String> {
         if let Some(at) = right_click.filter(|_| n + 30 == frames) {
             core.input.pointer = Some(at);
             core.input.right_pressed = true;
+        }
+        // Text arriving in the conversation's last reply every frame from the thirtieth on, as a stream writes it, to measure what
+        // a frame in which one row changes costs. By frame rather than by time, so that two runs draw the same.
+        if stream_append > 0 && n >= 30 {
+            append_to_last_reply(&mut core.app, n, stream_append);
         }
         // A steady scroll, reversing every few seconds, to measure the frames scrolling a long conversation costs.
         if scroll != 0.0 {
@@ -302,9 +406,11 @@ fn run_headless(args: &Args) -> Result<(), String> {
         if motion_only && begun.elapsed().as_secs_f32() > 3.0 {
             let tick = core.tick_motion(start);
             if tick.rebuild {
+                core.full_due = true;
                 let outcome = core.frame(&view, &mut clipboard);
                 let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: Some(outcome.submission), timeout: Some(Duration::from_secs(5)) });
                 core.timings.clear();
+                core.phases.clear();
                 continue;
             }
             if !tick.changed {
@@ -324,6 +430,7 @@ fn run_headless(args: &Args) -> Result<(), String> {
         let outcome = core.frame(&view, &mut clipboard);
         if motion_only {
             core.timings.clear();
+            core.phases.clear();
         }
         let _ = fluent::el::take_a11y_update();
         let submitted = Instant::now();
@@ -345,7 +452,28 @@ fn run_headless(args: &Args) -> Result<(), String> {
         };
         let (build, render, glyphs, gpu_wait) = (col(|t| t.0), col(|t| t.1), col(|t| t.2), col(|t| t.3));
         let stat = |v: &[u32]| serde_json::json!({"p50_ms": percentile(v, 0.5) as f64 / 1000.0, "p99_ms": percentile(v, 0.99) as f64 / 1000.0, "max_ms": percentile(v, 1.0) as f64 / 1000.0});
-        let report = serde_json::json!({"frames": core.timings.len(), "cpu_build": stat(&build), "cpu_render": stat(&render), "gpu_wait": stat(&gpu_wait), "glyphs_p50": percentile(&glyphs, 0.5), "rss_mib": rss_mib()});
+        // Where `cpu_build` goes.
+        let mut phases = serde_json::Map::new();
+        for (at, name) in ["tick", "view", "tree", "layout", "input", "paint", "handlers"].into_iter().enumerate() {
+            let mut v: Vec<u32> = core.phases.iter().map(|p| p[at]).collect();
+            v.sort_unstable();
+            phases.insert(name.to_owned(), stat(&v));
+        }
+        // Frames that ran their views, and frames that only scrolled.
+        let kind = |scrolled: bool| {
+            let mut v: Vec<u32> = core.timings.iter().zip(&core.tree_stats).filter(|(_, s)| s.3 == scrolled).map(|(t, _)| t.0).collect();
+            v.sort_unstable();
+            v
+        };
+        let (full, fast) = (kind(false), kind(true));
+        let tree = |f: fn(&(u32, u32, u32, bool)) -> u32| {
+            let mut v: Vec<u32> = core.tree_stats.iter().filter(|s| !s.3).map(f).collect();
+            v.sort_unstable();
+            percentile(&v, 0.5)
+        };
+        let report = serde_json::json!({"frames": core.timings.len(), "cpu_build": stat(&build), "cpu_build_phases": phases, "cpu_render": stat(&render), "gpu_wait": stat(&gpu_wait), "glyphs_p50": percentile(&glyphs, 0.5), "rss_mib": rss_mib(),
+            "full_frames": full.len(), "cpu_build_full": stat(&full), "scrolled_frames": fast.len(), "cpu_build_scrolled": stat(&fast),
+            "nodes_p50": tree(|s| s.0), "memo_roots_p50": tree(|s| s.1), "memo_adopted_p50": tree(|s| s.2)});
         println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
         if let Some(path) = args.value("--json") {
             std::fs::write(path, report.to_string()).map_err(|e| format!("{path}: {e}"))?;
@@ -448,6 +576,9 @@ fn save_png(gpu: &Gpu, texture: &wgpu::Texture, size: (u32, u32), path: &str) ->
 #[derive(Debug)]
 enum UserEvent {
     Wake,
+    /// Work from other threads that changes nothing on screen by itself (`mewrk_client::Task::post_quiet`), such as a reply's
+    /// tokens buffered until their commit: run as it arrives, and a frame only if it asks for one.
+    QuietWake,
     Show,
     Exit(i32),
     #[cfg(any(target_os = "macos", windows))]
@@ -612,6 +743,9 @@ struct Shell {
     modifiers: ModifiersState,
     clipboard: SystemClipboard,
     next_wake: Option<Instant>,
+    /// When something that only paints differently next wants a frame: one that paints the last tree again, unless [`Self::next_wake`]
+    /// or anything else comes due by then.
+    next_paint_wake: Option<Instant>,
     /// When a background that moves next wants looking at. Not a reason to build a frame.
     next_motion: Option<Instant>,
     last_click: Option<Instant>,
@@ -636,6 +770,10 @@ struct Shell {
     a11y_probe: Option<A11yProbe>,
     /// The window was closed in full screen and is on its way out of it.
     hide_once_windowed: bool,
+    /// When the last frame began: what [`CONTENT_FRAME`] counts from.
+    last_frame_started: Instant,
+    /// Input came in since the last frame, so what follows from it is drawn at once.
+    input_since_frame: bool,
 }
 
 /// `--a11y-probe`: asks the window what an assistive client would, through AppKit, and writes down what it answers.
@@ -769,6 +907,10 @@ impl Shell {
             }
         };
         app.system_dark = window.theme().is_none_or(|t| t == winit::window::Theme::Dark);
+        let quiet_proxy = self.proxy.clone();
+        app.set_quiet_waker(Arc::new(move || {
+            let _ = quiet_proxy.send_event(UserEvent::QuietWake);
+        }));
         app.native_view = content_view(&window);
         apply_language(&self.args);
         root::init(&mut app);
@@ -777,6 +919,17 @@ impl Shell {
         {
             return Err(format!("--scene: no scene {scene}"));
         }
+        // `--stream-append CHARS`: text arriving in the active conversation's last reply from another thread, 200 times a second, as
+        // a stream sends it: what frames work from other threads gets.
+        if let Some(chars) = self.args.value("--stream-append").and_then(|v| v.parse::<usize>().ok()) {
+            let task = app.task();
+            std::thread::spawn(move || {
+                for n in 0u32.. {
+                    std::thread::sleep(Duration::from_millis(5));
+                    task.post(move |app| append_to_last_reply(app, n, chars));
+                }
+            });
+        }
         // A scene is a picture of something else. Writing `permissions-prompted` into the data folder keeps the sheet out of any other run.
         if self.args.value("--scene").is_none() {
             mewrk_settings_global::first_launch(&mut app);
@@ -784,7 +937,7 @@ impl Shell {
         let forced = forced_theme(&self.args);
 
         let now = Instant::now();
-        let core = Core { app, text: TextCtx::new(scale), scene: Scene::default(), mem: UiMemory::default(), input: Input::default(), renderer, started: now, last_frame: now, scale, window_scale: scale, size_px: (config.width, config.height), timings: Vec::new(), keep_timings: false, forced_theme: forced, last_size: None };
+        let core = Core { app, text: TextCtx::new(scale), scene: Scene::default(), mem: UiMemory::default(), input: Input::default(), renderer, started: now, last_frame: now, scale, window_scale: scale, size_px: (config.width, config.height), timings: Vec::new(), phases: Vec::new(), last_phases: [0; 7], keep_timings: false, forced_theme: forced, last_size: None, full_due: true, paint_due: false, scrolled_streak: 0, tree_stats: Vec::new() };
         window.focus_window();
         window.request_redraw();
         Ok(Some(WindowState { window, surface, config, core, present_blocked: false, surface_stale: false, fullscreen: false, a11y }))
@@ -978,6 +1131,7 @@ impl Shell {
         let tick = state.core.tick_motion(now);
         self.next_motion = tick.next;
         if tick.rebuild {
+            state.core.full_due = true;
             state.window.request_redraw();
             return;
         }
@@ -1012,6 +1166,8 @@ impl Shell {
         let Some(state) = self.state.as_mut() else { return };
         let gpu = state.core.renderer.gpu.clone();
         let trace_start = Instant::now();
+        self.last_frame_started = trace_start;
+        let input_driven = std::mem::take(&mut self.input_since_frame);
         state.sync_fullscreen();
         if std::mem::take(&mut state.surface_stale) {
             state.surface.configure(&gpu.device, &state.config);
@@ -1046,7 +1202,8 @@ impl Shell {
         if self.trace {
             let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1000.0;
             let now = Instant::now();
-            eprintln!("frame t={:.1} size={:?} acquire={:.1} build={:.1} present={:.1}", ms(self.launched, now), state.core.size_px, ms(trace_start, acquired), ms(acquired, built), ms(built, now));
+            let [tick, view, tree, layout, input, paint, handlers] = state.core.last_phases.map(|us| us as f64 / 1000.0);
+            eprintln!("frame t={:.1} size={:?} acquire={:.1} build={:.1} (tick={tick:.1} view={view:.1} tree={tree:.1} layout={layout:.1} input={input:.1} paint={paint:.1} handlers={handlers:.1}) present={:.1}", ms(self.launched, now), state.core.size_px, ms(trace_start, acquired), ms(acquired, built), ms(built, now));
         }
         if !self.first_frame_logged {
             self.first_frame_logged = true;
@@ -1103,15 +1260,36 @@ impl Shell {
             let scale = state.core.scale as f64;
             state.window.set_ime_cursor_area(PhysicalPosition::new(area.x as f64 * scale, area.y as f64 * scale), PhysicalSize::new(area.w as f64 * scale, area.h as f64 * scale));
         }
-        self.next_wake = outcome.wake_in.map(|s| Instant::now() + Duration::from_secs_f32(s.max(0.001)));
+        let wake = outcome.wake_in.map(|s| Instant::now() + Duration::from_secs_f32(s.max(0.001)));
+        // A frame that only scrolled or painted again ran no views, so a wake one of them asked for (the sidebar's blink, a clock's next
+        // second, the settle after the wheel) is still owed: keep the sooner of the two.
+        self.next_wake = if outcome.views_ran { wake } else { [self.next_wake, wake].into_iter().flatten().min() };
         self.next_motion = outcome.motion_next;
-        if outcome.animating || self.fullscreen_test.is_some() || self.animate_test {
+        if outcome.ui_animating || (outcome.again && input_driven) || self.fullscreen_test.is_some() || self.animate_test {
             if cfg!(windows) && state.window.is_visible() == Some(false) {
                 // No paint comes to a hidden window, and nobody is watching this one.
                 self.next_wake = Some(Instant::now() + BLOCKED_RETRY);
             }
             state.window.request_redraw();
+        } else if outcome.again {
+            // What only a view's own animation or another thread drives (a reply streaming in, the timeline following it) gets
+            // frames at about 60 a second, however fast the display. A hidden window, which nobody is watching, much fewer.
+            let at = if cfg!(windows) && state.window.is_visible() == Some(false) { Instant::now() + BLOCKED_RETRY } else { self.last_frame_started + CONTENT_FRAME };
+            self.next_wake = Some(self.next_wake.map_or(at, |w| w.min(at)));
+        } else if outcome.settle {
+            let at = Instant::now() + SCROLL_SETTLE;
+            self.next_wake = Some(self.next_wake.map_or(at, |w| w.min(at)));
         }
+        // What only paints itself differently over time (a reply fading in, the waiting cat) gets frames that paint the last tree again,
+        // at about 60 a second at most, unless a frame with the views comes first: that one paints it too, and asks again.
+        let full_next = outcome.ui_animating || outcome.again || self.fullscreen_test.is_some() || self.animate_test;
+        self.next_paint_wake = outcome.paint_wake_in.filter(|_| !full_next).map(|secs| {
+            if cfg!(windows) && state.window.is_visible() == Some(false) {
+                Instant::now() + BLOCKED_RETRY
+            } else {
+                (Instant::now() + Duration::from_secs_f32(secs.max(0.0))).max(self.last_frame_started + CONTENT_FRAME)
+            }
+        });
         if show_requested {
             self.show_main_window();
         }
@@ -1227,6 +1405,13 @@ impl ApplicationHandler<UserEvent> for Shell {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        // The menu bar, the tray and assistive technology act for the user, and the views have to hear of it.
+        if !matches!(event, UserEvent::Wake | UserEvent::QuietWake) {
+            self.input_since_frame = true;
+            if let Some(state) = &mut self.state {
+                state.core.full_due = true;
+            }
+        }
         match event {
             UserEvent::A11y(event) => {
                 if self.trace {
@@ -1281,9 +1466,27 @@ impl ApplicationHandler<UserEvent> for Shell {
                 self.exit_code = code;
                 event_loop.exit();
             }
+            UserEvent::QuietWake => {
+                let Some(state) = self.state.as_mut() else { return };
+                // Something not quiet is waiting too: its own wake brings the frame, and the frame runs everything in order.
+                if !state.core.app.run_quiet_jobs() || !fluent::el::take_repaint_request() {
+                    return;
+                }
+                self.user_event(event_loop, UserEvent::Wake);
+            }
             UserEvent::Wake => {
-                if self.state.as_ref().is_some_and(|state| !state.present_blocked) {
+                let Some(state) = self.state.as_mut() else { return };
+                state.core.full_due = true;
+                if state.present_blocked {
+                    return;
+                }
+                // Work from other threads, such as a reply streaming in, comes at whatever rate it is sent; frames for it come
+                // at about 60 a second.
+                let at = self.last_frame_started + CONTENT_FRAME;
+                if Instant::now() >= at {
                     self.frame_soon();
+                } else {
+                    self.next_wake = Some(self.next_wake.map_or(at, |w| w.min(at)));
                 }
             }
         }
@@ -1300,6 +1503,13 @@ impl ApplicationHandler<UserEvent> for Shell {
         if let WindowEvent::RedrawRequested = event {
             self.redraw();
             return;
+        }
+        self.input_since_frame = true;
+        // The wheel and the pointer are what a frame that only scrolls can answer, and it looks at the pointer itself.
+        if !matches!(event, WindowEvent::MouseWheel { .. } | WindowEvent::CursorMoved { .. })
+            && let Some(state) = &mut self.state
+        {
+            state.core.full_due = true;
         }
         if let WindowEvent::KeyboardInput { event, .. } = event {
             self.on_key(event);
@@ -1471,6 +1681,9 @@ impl ApplicationHandler<UserEvent> for Shell {
             return;
         }
         let mut wake = self.next_wake;
+        if let Some(at) = self.next_paint_wake {
+            wake = Some(wake.map_or(at, |w| w.min(at)));
+        }
         if let Some(at) = self.next_motion {
             wake = Some(wake.map_or(at, |w| w.min(at)));
         }
@@ -1488,11 +1701,26 @@ impl ApplicationHandler<UserEvent> for Shell {
         if let Some(at) = self.a11y_probe.as_ref().map(|probe| probe.next) {
             wake = Some(wake.map_or(at, |w| w.min(at)));
         }
+        let now = Instant::now();
+        let (full, paint) = (self.next_wake.is_some_and(|at| at <= now), self.next_paint_wake.is_some_and(|at| at <= now));
         match wake {
             // Only a look at the clock for a moving background, and that has been seen to above.
-            Some(when) if when <= Instant::now() && self.next_wake.is_none_or(|at| at > Instant::now()) => event_loop.set_control_flow(ControlFlow::Poll),
-            Some(when) if when <= Instant::now() => {
-                self.next_wake = None;
+            Some(when) if when <= now && !full && !paint => event_loop.set_control_flow(ControlFlow::Poll),
+            Some(when) if when <= now => {
+                if full {
+                    self.next_wake = None;
+                }
+                if paint {
+                    self.next_paint_wake = None;
+                }
+                if let Some(state) = &mut self.state {
+                    // A frame only to paint again may still find it needs the views: input, or work from other threads.
+                    if full {
+                        state.core.full_due = true;
+                    } else {
+                        state.core.paint_due = true;
+                    }
+                }
                 if let Some(state) = &self.state {
                     if state.present_blocked {
                         self.redraw();
@@ -1500,7 +1728,7 @@ impl ApplicationHandler<UserEvent> for Shell {
                         self.frame_soon();
                     }
                 }
-                event_loop.set_control_flow(if self.next_wake.is_some() { ControlFlow::Poll } else { ControlFlow::Wait });
+                event_loop.set_control_flow(if self.next_wake.is_some() || self.next_paint_wake.is_some() { ControlFlow::Poll } else { ControlFlow::Wait });
             }
             Some(when) => event_loop.set_control_flow(ControlFlow::WaitUntil(when)),
             // Nothing is happening, so the process sleeps: no timers, no spinning, no GPU work.
@@ -1600,6 +1828,9 @@ fn run_windowed(args: Args) -> Result<(), String> {
         modifiers: ModifiersState::empty(),
         clipboard: SystemClipboard(arboard::Clipboard::new().ok()),
         next_wake: None,
+        next_paint_wake: None,
+        last_frame_started: launched,
+        input_since_frame: false,
         next_motion: None,
         last_click: None,
         control_click: false,
@@ -1659,6 +1890,13 @@ fn main() {
     mewrk_client::prepare_process();
     if args.flag(fatal::RESET_FLAG) {
         fatal::run_reset(reset_config());
+    }
+    // For comparing against: every subtree laid out every frame, and every frame built in full.
+    if std::env::var_os("MEWRK_NO_LAYOUT_MEMO").is_some() {
+        fluent::el::set_layout_memo(false);
+    }
+    if std::env::var_os("MEWRK_NO_SCROLL_FAST").is_some() {
+        fluent::el::set_scroll_fast_path(false);
     }
     let result = if args.flag("--headless") { run_headless(&args) } else { run_windowed(args) };
     if let Err(e) = result {

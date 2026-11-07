@@ -78,6 +78,18 @@ pub struct TypeStyle {
     pub serif: bool,
 }
 
+/// By the bits of its sizes: what tells two styles apart for a cache.
+impl std::hash::Hash for TypeStyle {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.size.to_bits().hash(h);
+        self.line.to_bits().hash(h);
+        self.weight.hash(h);
+        self.mono.hash(h);
+        self.italic.hash(h);
+        self.serif.hash(h);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Weight {
     Regular,

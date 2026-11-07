@@ -9,7 +9,7 @@
 //! something; a document change it did not make itself (a model picked, a provider enabled) needs it called too, and
 //! once a frame is cheap enough to be the way.
 //!
-//! The streamed state is [`App::run_view`]: built at most once per commit, and commits come at 10 per second however
+//! The streamed state is [`App::run_view`]: built at most once per commit, and commits come once a second however
 //! fast tokens do, so a view reads it every frame without copying anything.
 
 mod api;

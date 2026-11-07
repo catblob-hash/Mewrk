@@ -12,23 +12,23 @@ use std::time::Instant;
 use mewrk_client::model::{ContextItem, ToolCategory, ToolDescriptor};
 use mewrk_client::prelude::*;
 use mewrk_client::runs::timeline_history::{timeline_clipboard_key, timeline_clipboard_shortcut, timeline_history_key, TimelineClipboardAction, TimelineKeyPress, IS_APPLE_PLATFORM};
-use mewrk_client::runs::{ConversationTurnStatus, LiveContext, RunView, TaskOverlayView, TimelineHistoryAction};
+use mewrk_client::runs::{ConversationTurn, ConversationTurnStatus, LiveContext, RunView, TaskOverlayView, TimelineHistoryAction};
 use mewrk_client::task_tools::is_preview_tool_name;
 use mewrk_ui_common::context_menu::{context_menu, ContextMenuAnchor, ContextMenuItem, ContextMenuProps, ContextMenuSection};
 use mewrk_ui_common::markdown::{clear_text_selection, estimate_markdown_height, has_text_selection};
 
 use crate::cards::{context_card, insertion_line_view, stock_empty_state, timeline_insert_editor, turn_notices, waiting_indicator};
 use crate::drag::{start_session, DockAt, DragGeometry, DragOutcome, DragSession, Look, MarkState, Mover, PressDrag, Slide, Unit, BLOCK_PAD_BOTTOM, BLOCK_PAD_TOP, SLOT_GAP};
-use crate::frame::{drawn_slide, extras_key, hash_id, row_key, timeline_state, unit_key, DockRoom, FollowGlide, Frame, MarqueeDrag, MenuState, MenuView, PreviousTimeline, Resolved, Settling, Shared, TimelineState};
+use crate::frame::{drawn_slide, extras_key, hash_id, row_key, timeline_state, unit_key, DockRoom, Frame, MarqueeDrag, MenuState, MenuView, PreviousTimeline, Resolved, Settling, Shared, TimelineState, LIVE_BIT};
 use crate::inline_text_editor::InsertKind;
 use crate::item::Item;
 use crate::kit::clipboard_leaf;
-use crate::nodes::{build_context_render_nodes, context_visual_length, display_insertion_index, project_turns, rendered_context_indexes, RenderNode};
-use crate::orchestration::is_host_authored_user_context;
+use crate::nodes::{build_context_render_nodes, build_context_render_nodes_from, context_visual_length, display_insertion_index, ends_answer_search, project_turns, rendered_context_indexes, RenderNode, TurnProjection};
+use crate::orchestration::{is_host_authored_user_context, is_legacy_paused_question};
 use crate::props::{ConversationViewProps, OpenInsert, TimelineEditorState};
 use crate::question_card::{question_timeline_card, QuestionCardProps};
 use crate::rows::{find_item, timeline_block, timeline_rows};
-use crate::turn_changes::{message_change_spans, summarize_span_changes, turn_changes};
+use crate::turn_changes::{message_change_spans, summarize_span_changes, turn_changes, ChangeSpan, TurnChangeSummary};
 
 /// Wide enough to absorb fractional scroll metrics, narrow enough that the user has to actually be at the bottom to
 /// re-attach to follow-output.
@@ -54,25 +54,10 @@ fn column_width(app: &App) -> f32 {
 const GHOST_SALT: u64 = 0x6807;
 const DOCK_SALT: u64 = 0xD0C4;
 
-/// `FOLLOW_GLIDE_RATE`: a line-high step is 90 % covered in about 200 ms.
+/// `FOLLOW_GLIDE_RATE`: a line-high step is 90 % covered in about 200 ms. `stepFollowGlide`'s critically damped spring is the
+/// scroller's own ([`fluent::ui::glide_step`]): it never overshoots, so from rest it only ever moves down, and an upward step is
+/// how the timeline recognises the reader leaving the bottom.
 const FOLLOW_GLIDE_RATE: f32 = 18.0;
-const MAX_STEP_SECONDS: f32 = 0.05;
-
-/// `stepFollowGlide`: one frame of a critically damped spring pulled toward the bottom. It never overshoots, so from rest it
-/// only ever moves down: an upward step is how the scroller recognises the reader leaving the bottom.
-pub fn step_follow_glide(glide: FollowGlide, target: f32, now: Instant) -> (FollowGlide, bool) {
-    let seconds = glide.time.map_or(1.0 / 60.0, |time| now.saturating_duration_since(time).as_secs_f32().clamp(0.0, MAX_STEP_SECONDS));
-    let offset = glide.position - target;
-    let rate = FOLLOW_GLIDE_RATE;
-    let decay = (-rate * seconds).exp();
-    let drive = glide.velocity + rate * offset;
-    let next_offset = (offset + drive * seconds) * decay;
-    let velocity = (glide.velocity - rate * drive * seconds) * decay;
-    if next_offset.abs() < 0.5 && velocity.abs() < 20.0 {
-        return (FollowGlide { position: target, velocity: 0.0, time: Some(now) }, true);
-    }
-    (FollowGlide { position: target.min(glide.position.max(target + next_offset)), velocity, time: Some(now) }, false)
-}
 
 /// `upwardScrollKeys`, and the rest of what a page scrolls with when nothing editable has the keys.
 fn scroll_key_delta(key: Key, viewport: f32, content: f32) -> Option<f32> {
@@ -111,14 +96,328 @@ fn estimate_node(contexts: &Resolved<'_>, node: &RenderNode, width: f32, message
     }
 }
 
+/// The parts of a frame's fingerprint, kept apart so that an update can tell what changed. A change to the persisted contexts or
+/// to the rest builds the model again in full; one only to the live contexts or to the turns keeps what it can of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FingerprintParts {
+    /// The persisted contexts: where they are, how many, and when the conversation last changed.
+    persisted: u64,
+    /// The run's and the task overlay's revisions, which change with each commit.
+    live: u64,
+    /// `props.turns`, by address and length.
+    turns: u64,
+    /// Everything else the model reads: workflow keys, `change_spans`, `streaming`, the language and `props.contexts`.
+    rest: u64,
+}
+
+impl FingerprintParts {
+    fn combined(&self) -> u64 {
+        hash_key((self.persisted, self.live, self.turns, self.rest))
+    }
+}
+
+fn turns_part(props: &ConversationViewProps) -> u64 {
+    hash_key(((!props.turns.is_empty()).then(|| Rc::as_ptr(&props.turns) as usize), props.turns.len()))
+}
+
+fn rest_part(props: &ConversationViewProps) -> u64 {
+    let mut workflow_keys: Vec<&str> = props.workflow_run_by_call.keys().map(String::as_str).collect();
+    workflow_keys.sort_unstable();
+    hash_key((&workflow_keys, props.change_spans.as_ref().map(|spans| Rc::as_ptr(spans) as usize), props.streaming, mewrk_client::i18n::is_english(), (!props.contexts.is_empty()).then(|| Rc::as_ptr(&props.contexts) as usize)))
+}
+
+/// What holds the live contexts a model was built from. The model keeps it, so that the next update can tell which of them changed.
+#[derive(Clone, Default)]
+enum LiveHolder {
+    #[default]
+    None,
+    Run(Arc<RunView>),
+    Overlay(Arc<TaskOverlayView>),
+    Contexts(Rc<Vec<LiveContext>>),
+}
+
+impl LiveHolder {
+    fn contexts(&self) -> &[LiveContext] {
+        match self {
+            Self::None => &[],
+            Self::Run(run) => &run.contexts,
+            Self::Overlay(overlay) => &overlay.contexts,
+            Self::Contexts(contexts) => contexts,
+        }
+    }
+
+    /// Whether both hold the very same contexts.
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::None, Self::None) => true,
+            (Self::Run(a), Self::Run(b)) => Arc::ptr_eq(a, b),
+            (Self::Overlay(a), Self::Overlay(b)) => Arc::ptr_eq(a, b),
+            (Self::Contexts(a), Self::Contexts(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+/// One change span as last summed: the contexts from `lo` up to the user's message at `hi` (or the end), and the list they came to
+/// with the node it is drawn after.
+#[derive(Clone, Debug, PartialEq)]
+struct SpanMemo {
+    lo: usize,
+    hi: usize,
+    summary: Option<(usize, Rc<TurnChangeSummary>)>,
+}
+
+/// What a timeline's model was last built from, and the parts of it an update can pick up from: see [`rebuild_tail`].
+#[derive(Default)]
+pub struct ModelMemo {
+    /// The fingerprint's parts as of the last build: `None` before the first, and once the timeline is drawn anew.
+    parts: Option<FingerprintParts>,
+    /// The live contexts the model was built from, and how many of them stand in the place of a persisted one.
+    live: LiveHolder,
+    in_place: usize,
+    /// Context indexes a turn is anchored at, ascending: `build_context_render_nodes`' `break_after_indexes`.
+    anchors: Vec<usize>,
+    /// Whether the last change span was withheld as still being written.
+    open: bool,
+    /// Two contexts' ids hash alike, the same id twice or two that collide: what is kept by id cannot then be updated piece by piece,
+    /// and every update is a full one.
+    ambiguous: bool,
+    /// The messages the user wrote as drawn, by index, ascending: where change spans begin and end.
+    boundaries: Vec<usize>,
+    /// Every change span, in order. Empty while `props.change_spans` is given.
+    spans: Vec<SpanMemo>,
+    /// What the layout reads of the turn projection, by node position: how many notices follow a node, and whether the last of them is
+    /// a failure, which takes away the gap above the next row.
+    notice_marks: Vec<(usize, (usize, bool))>,
+    /// Estimated heights by node position, NaN where none has been needed yet, at the width and type size of `estimated_at`.
+    estimates: Vec<f32>,
+    estimated_at: (u32, u32),
+    /// The width and type size of the last layout, when nothing was being dragged in it: a layout that can be continued.
+    laid_out_at: Option<(u32, u32)>,
+}
+
+impl ModelMemo {
+    /// The next update builds everything.
+    fn forget(&mut self) {
+        self.parts = None;
+    }
+}
+
+fn layout_key(width: f32, message_size: f32) -> (u32, u32) {
+    (width.to_bits(), message_size.to_bits())
+}
+
+/// The first row whose stored height is filed under one of `keys`. Heights are kept by hashed node key, and keys can hash alike, so
+/// this need not be the row that was measured.
+fn first_row_of(state: &TimelineState, keys: &[u64]) -> usize {
+    state.node_keys.iter().position(|key| keys.contains(key)).unwrap_or(state.node_keys.len())
+}
+
+/// Context indexes a turn is anchored at, ascending and once each.
+fn turn_anchor_indexes(turns: &[ConversationTurn], index_of: impl Fn(&str) -> Option<usize>) -> Vec<usize> {
+    let mut anchors: Vec<usize> = turns.iter().filter_map(|turn| index_of(&turn.anchor_context_id)).collect();
+    anchors.sort_unstable();
+    anchors.dedup();
+    anchors
+}
+
+/// Whether the last change span is withheld: a running round is still writing it.
+fn spans_open(props: &ConversationViewProps) -> bool {
+    props.streaming || props.turns.iter().any(|turn| turn.status == ConversationTurnStatus::Running)
+}
+
+/// The index of the message a node draws, when it is one the user wrote: an answer folded into its question card and a note the host
+/// wrote in the user's place are not where the user spoke.
+fn user_message_index(node: &RenderNode, contexts: &Resolved<'_>) -> Option<usize> {
+    let RenderNode::Context { index } = node else { return None };
+    let item = contexts.get(*index);
+    (matches!(item.item, ContextItem::User { .. }) && !is_host_authored_user_context(item.item)).then_some(*index)
+}
+
+/// The stretches `message_change_spans` cuts after the user's message at `opener` (the start, with none), by index: each runs from
+/// just past one message up to the next in `boundaries`, and the last, which a running round is still writing, only when not `open`.
+fn span_ranges(opener: Option<usize>, boundaries: &[usize], count: usize, open: bool) -> Vec<(Option<usize>, usize, usize)> {
+    let mut ranges = Vec::new();
+    let (mut opener, mut lo) = (opener, opener.map_or(0, |at| at + 1));
+    for &at in boundaries {
+        if lo < at {
+            ranges.push((opener, lo, at));
+        }
+        opener = Some(at);
+        lo = at + 1;
+    }
+    if lo < count && !open {
+        ranges.push((opener, lo, count));
+    }
+    ranges
+}
+
+/// What one span's calls changed, and the drawn node holding the newest of its contexts, which is where the span ends on screen.
+fn span_summary(span: &ChangeSpan, contexts: &Resolved<'_>, index_of: &impl Fn(&str) -> Option<usize>, node_of: &impl Fn(usize) -> Option<usize>) -> Option<(usize, Rc<TurnChangeSummary>)> {
+    let summary = summarize_span_changes(span, |id| index_of(id).map(|index| contexts.get(index)))?;
+    let last = span.context_ids.iter().filter_map(|id| index_of(id)).filter_map(node_of).max()?;
+    Some((last, Rc::new(summary)))
+}
+
+/// What the layout reads of a turn projection, by node position, ascending.
+fn notice_marks(projection: &TurnProjection, turns: &[ConversationTurn]) -> Vec<(usize, (usize, bool))> {
+    let failed = |at: &usize| turns.get(*at).is_some_and(|turn| turn.error.is_some());
+    let mut marks: Vec<_> = projection.notices_after_node.iter().map(|(position, notices)| (*position, (notices.len(), notices.last().is_some_and(failed)))).collect();
+    marks.sort_unstable_by_key(|(position, _)| *position);
+    marks
+}
+
+/// How many lists of changed files follow each node, by position, ascending: all the layout reads of them.
+fn change_marks(changes: &HashMap<usize, Vec<Rc<TurnChangeSummary>>>) -> Vec<(usize, usize)> {
+    let mut marks: Vec<_> = changes.iter().map(|(position, summaries)| (*position, summaries.len())).collect();
+    marks.sort_unstable_by_key(|(position, _)| *position);
+    marks
+}
+
+/// The first position at which two lists of marks, each ascending by position, say different things.
+fn first_mark_difference<T: PartialEq>(a: &[(usize, T)], b: &[(usize, T)]) -> Option<usize> {
+    let mut pairs = a.iter().zip(b);
+    if let Some(((at_a, mark_a), (at_b, mark_b))) = pairs.find(|((at_a, mark_a), (at_b, mark_b))| at_a != at_b || mark_a != mark_b) {
+        return Some(if at_a == at_b && mark_a != mark_b { *at_a } else { (*at_a).min(*at_b) });
+    }
+    let shorter = a.len().min(b.len());
+    a.get(shorter).or(b.get(shorter)).map(|(at, _)| *at)
+}
+
+/// The least index in one ascending list and not in the other.
+fn first_set_difference(a: &[usize], b: &[usize]) -> Option<usize> {
+    let mut pairs = a.iter().zip(b);
+    if let Some((at_a, at_b)) = pairs.find(|(at_a, at_b)| at_a != at_b) {
+        return Some((*at_a).min(*at_b));
+    }
+    let shorter = a.len().min(b.len());
+    a.get(shorter).or(b.get(shorter)).copied()
+}
+
+/// Whether the model reads two live contexts alike. It reads the card and how it streams, not a child's live transcript or a clock.
+fn reads_alike(a: &LiveContext, b: &LiveContext) -> bool {
+    a.streaming == b.streaming && a.stream_status == b.stream_status && a.item == b.item
+}
+
+/// The map of this update's contexts. When the live contexts only grew at the end, and none of the new ones stands for a context the
+/// timeline already draws, it is the old map with them added; otherwise it is made anew.
+fn next_map(old_map: &[u32], old_live: &[LiveContext], old_in_place: usize, persisted: &[ContextItem], live: &[LiveContext], in_place: usize, context_index: &HashMap<u64, u32>) -> Rc<Vec<u32>> {
+    let grown = in_place == old_in_place
+        && live.len() >= old_live.len()
+        && live.iter().zip(old_live).all(|(new, old)| new.id() == old.id())
+        && live[old_live.len()..].iter().all(|context| !context_index.contains_key(&hash_id(context.id())));
+    if grown {
+        let mut map = Vec::with_capacity(old_map.len() + live.len() - old_live.len());
+        map.extend_from_slice(old_map);
+        map.extend((old_live.len() as u32..live.len() as u32).map(|at| at | LIVE_BIT));
+        return Rc::new(map);
+    }
+    Rc::new(Resolved::map_with_in_place(persisted, live, in_place))
+}
+
+/// The first index at which the contexts differ from what the model was built from, in anything the model reads. The persisted
+/// contexts are the same ones: a change to them is not followed piece by piece.
+fn first_changed(old_map: &[u32], map: &[u32], old_live: &[LiveContext], live: &[LiveContext]) -> usize {
+    let end = old_map.iter().zip(map).position(|(old, new)| old != new).unwrap_or(old_map.len().min(map.len()));
+    let differs = |at: &u32| at & LIVE_BIT != 0 && !reads_alike(&old_live[(at & !LIVE_BIT) as usize], &live[(at & !LIVE_BIT) as usize]);
+    old_map[..end].iter().position(differs).unwrap_or(end)
+}
+
+/// The nearest context before `before` at which a legacy question's search for its answer would stop.
+fn answer_search_end(contexts: &Resolved<'_>, before: usize) -> Option<usize> {
+    (0..before).rev().find(|&at| ends_answer_search(&contexts.get(at)))
+}
+
+/// Where the node pass picks up after `last` with no block open: just past a card or a question (whose answer, if it lies further on,
+/// is held aside), or just past a block's last row.
+fn resume_index(last: Option<&RenderNode>) -> usize {
+    match last {
+        None => 0,
+        Some(RenderNode::Context { index }) => index + 1,
+        Some(RenderNode::Question { entry, .. }) => entry + 1,
+        Some(RenderNode::Block { entries, .. }) => entries.iter().map(|entry| entry.index).max().map_or(0, |index| index + 1),
+    }
+}
+
+/// How an update of the model went.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelUpdate {
+    /// Nothing the fingerprint covers changed.
+    Unchanged,
+    /// Something changed, but nothing the model reads of it: only what points at the new contexts moved on.
+    Kept,
+    /// What follows the first change was built again, and what precedes it kept.
+    Tail,
+    /// Everything was built again.
+    Full,
+}
+
+/// What one frame builds the model from.
+struct ModelSource<'a> {
+    persisted: &'a [ContextItem],
+    live: LiveHolder,
+    in_place: usize,
+    parts: FingerprintParts,
+}
+
+/// Brings the model up to date with a frame's contexts: not at all when the fingerprint says nothing changed, from the first change
+/// on when only the live contexts or the turns did ([`rebuild_tail`]), and in full otherwise.
+fn update_model(state: &mut TimelineState, source: ModelSource<'_>, props: &ConversationViewProps, width: f32, message_size: f32) -> ModelUpdate {
+    let ModelSource { persisted, live: holder, in_place, parts } = source;
+    let combined = parts.combined();
+    let unchanged = state.fingerprint == combined;
+    let live = holder.contexts();
+    if unchanged && state.map.is_empty() == (persisted.is_empty() && live.is_empty()) {
+        return ModelUpdate::Unchanged;
+    }
+    state.fingerprint = combined;
+    let in_place = in_place.min(live.len());
+    let old_holder = std::mem::take(&mut state.memo.live);
+    let follows = !unchanged
+        && state.memo.parts.is_some_and(|old| old.persisted == parts.persisted && old.rest == parts.rest)
+        && !state.memo.ambiguous
+        && props.change_spans.is_none()
+        && state.drag.as_ref().is_none_or(|drag| drag.session.is_none());
+    let selection_before = (follows && verify_enabled()).then(|| state.selection.clone());
+    let mut update = None;
+    if follows {
+        let old = Resolved { persisted, live: old_holder.contexts(), map: state.map.clone() };
+        let same_live = old_holder.same(&holder) && state.memo.in_place == in_place;
+        update = rebuild_tail(state, persisted, live, in_place, &old, same_live, props, width, message_size);
+    }
+    let update = match update {
+        Some(update) => {
+            if let Some(selection) = selection_before {
+                verify_model(state, persisted, live, in_place, selection, props, width, message_size);
+            }
+            update
+        }
+        None => {
+            state.map = Rc::new(Resolved::map_with_in_place(persisted, live, in_place));
+            let contexts = Resolved { persisted, live, map: state.map.clone() };
+            rebuild_model(state, &contexts, props, width, message_size);
+            ModelUpdate::Full
+        }
+    };
+    state.memo.parts = Some(parts);
+    state.memo.in_place = in_place;
+    drop(old_holder);
+    state.memo.live = holder;
+    update
+}
+
 /// Rebuilds what is derived from the contexts, when they changed.
 fn rebuild_model(state: &mut TimelineState, contexts: &Resolved<'_>, props: &ConversationViewProps, width: f32, message_size: f32) {
     let count = contexts.count();
+    let mut ambiguous = false;
     let mut context_index = HashMap::with_capacity(count);
     for index in 0..count {
-        context_index.insert(hash_id(contexts.get(index).id()), index as u32);
+        let id = contexts.get(index).id();
+        ambiguous |= context_index.insert(hash_id(id), index as u32).is_some();
     }
-    let turn_anchors: HashSet<usize> = props.turns.iter().filter_map(|turn| context_index.get(&hash_id(&turn.anchor_context_id)).map(|index| *index as usize)).collect();
+    let anchors = turn_anchor_indexes(&props.turns, |id| context_index.get(&hash_id(id)).map(|index| *index as usize));
+    let turn_anchors: HashSet<usize> = anchors.iter().copied().collect();
     let views = props.workflow_run_by_call.clone();
     let nodes = build_context_render_nodes(contexts, &turn_anchors, |call| views.contains_key(call));
     let mut node_of_context = vec![u32::MAX; count];
@@ -141,30 +440,29 @@ fn rebuild_model(state: &mut TimelineState, contexts: &Resolved<'_>, props: &Con
     // place are not where the user spoke.
     state.changes_after.clear();
     let items: Vec<Item<'_>> = (0..count).map(|index| contexts.get(index)).collect();
-    let user_nodes: HashSet<&str> = nodes
-        .iter()
-        .filter_map(|node| match node {
-            RenderNode::Context { index } => {
-                let item = contexts.get(*index);
-                (matches!(item.item, ContextItem::User { .. }) && !is_host_authored_user_context(item.item)).then(|| item.id())
-            }
-            _ => None,
-        })
-        .collect();
+    let boundaries: Vec<usize> = nodes.iter().filter_map(|node| user_message_index(node, contexts)).collect();
+    let user_nodes: HashSet<&str> = boundaries.iter().map(|index| contexts.get(*index).id()).collect();
+    let open = spans_open(props);
     let owned;
     let spans = match &props.change_spans {
         Some(spans) => spans.as_slice(),
         None => {
-            let open = props.streaming || props.turns.iter().any(|turn| turn.status == ConversationTurnStatus::Running);
             owned = message_change_spans(&items, |item| user_nodes.contains(item.id()), open);
             owned.as_slice()
         }
     };
-    for span in spans {
-        let Some(summary) = summarize_span_changes(span, |id| index_of(id).map(|index| contexts.get(index))) else { continue };
-        // The drawn node holding the newest of `ids`, which is where a span ends on screen.
-        let Some(last) = span.context_ids.iter().filter_map(|id| index_of(id)).filter_map(node_of).max() else { continue };
-        state.changes_after.entry(last).or_default().push(Rc::new(summary));
+    // The same spans by index, for an update to pick up from.
+    let ranges = if props.change_spans.is_none() { span_ranges(None, &boundaries, count, open) } else { Vec::new() };
+    ambiguous |= props.change_spans.is_none() && ranges.len() != spans.len();
+    let mut memo_spans = Vec::with_capacity(ranges.len());
+    for (at, span) in spans.iter().enumerate() {
+        let summary = span_summary(span, contexts, &index_of, &node_of);
+        if let Some((last, summary)) = &summary {
+            state.changes_after.entry(*last).or_default().push(summary.clone());
+        }
+        if let Some(&(_, lo, hi)) = ranges.get(at) {
+            memo_spans.push(SpanMemo { lo, hi, summary });
+        }
     }
     state.rendered = Rc::new(rendered_context_indexes(&nodes));
     state.nodes = Rc::new(nodes);
@@ -173,23 +471,369 @@ fn rebuild_model(state: &mut TimelineState, contexts: &Resolved<'_>, props: &Con
     state.node_of_context = node_of_context;
     state.question_answers = question_answers;
     state.selection.retain(|id| state.context_index.contains_key(&hash_id(id)));
+    let memo = &mut state.memo;
+    memo.anchors = anchors;
+    memo.open = open;
+    memo.ambiguous = ambiguous;
+    memo.boundaries = boundaries;
+    memo.spans = memo_spans;
+    memo.notice_marks = notice_marks(&state.projection, &state.turns);
+    memo.estimates.clear();
     state.layout_dirty = true;
     relayout(state, contexts, width, message_size);
+}
+
+/// The incremental half of [`update_model`], for an update in which only the live contexts or the turns changed. The model is kept up
+/// to the first context that differs from what it was built from, and only what that change can reach is built again; what comes out
+/// is exactly what [`rebuild_model`] would build. `None`, with nothing touched, for a change it cannot follow.
+///
+/// - Nodes are kept up to the last one the node pass had closed before the change. A block still open there could take new rows, and
+///   a legacy question whose search for its answer runs on into the change could find a different one, so those are built again, as
+///   is everything after them.
+/// - The index of ids, the node of each context, node keys, answered questions and what is drawn lose what the rebuilt nodes held
+///   and take what the new ones hold.
+/// - A change span that ends at a message of the user's before the rebuilt nodes keeps its sum; those after it are summed again.
+/// - The layout goes on from the first row whose height can differ, when the last layout had nothing dragged in it.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_tail(state: &mut TimelineState, persisted: &[ContextItem], live: &[LiveContext], in_place: usize, old: &Resolved<'_>, same_live: bool, props: &ConversationViewProps, width: f32, message_size: f32) -> Option<ModelUpdate> {
+    let old_count = old.count();
+    let map = if same_live { old.map.clone() } else { next_map(&old.map, old.live, state.memo.in_place, persisted, live, in_place, &state.context_index) };
+    let contexts = Resolved { persisted, live, map };
+    let count = contexts.count();
+    let changed = if same_live { old_count } else { first_changed(&old.map, &contexts.map, old.live, live) };
+
+    // ---- the ids from the change on. One whose hash the model already holds before it would make what is kept by id ambiguous.
+    let mut tail_ids: HashMap<u64, u32> = HashMap::with_capacity(count - changed);
+    for index in changed..count {
+        let id = contexts.get(index).id();
+        let key = hash_id(id);
+        let held_before = state.context_index.get(&key).is_some_and(|at| (*at as usize) < changed);
+        if held_before || tail_ids.insert(key, index as u32).is_some() {
+            return None;
+        }
+    }
+    let anchors = {
+        let index_of = |id: &str| {
+            let key = hash_id(id);
+            tail_ids.get(&key).or_else(|| state.context_index.get(&key).filter(|at| (**at as usize) < changed)).map(|at| *at as usize)
+        };
+        turn_anchor_indexes(&props.turns, index_of)
+    };
+    let open = spans_open(props);
+    // A turn anchored somewhere else now splits blocks somewhere else.
+    let cut = first_set_difference(&state.memo.anchors, &anchors).map_or(changed, |at| at.min(changed));
+    let nodes_changed = cut < old_count || cut < count;
+
+    // ---- which nodes are kept, and where the pass picks up
+    let old_nodes = state.nodes.clone();
+    let (keep, start, held) = if nodes_changed {
+        let mut keep = old_nodes.partition_point(|node| node.first_index() < cut);
+        if keep > 0 && matches!(old_nodes[keep - 1], RenderNode::Block { .. }) {
+            keep -= 1;
+        }
+        // A legacy question that has not met the end of its search before the cut may find its answer in what changed.
+        if let Some(at) = answer_search_end(&contexts, cut)
+            && is_legacy_paused_question(&contexts.get(at))
+        {
+            match state.node_of_context.get(at) {
+                Some(&node) if node != u32::MAX => keep = keep.min(node as usize),
+                _ => return None,
+            }
+        }
+        let start = resume_index(keep.checked_sub(1).map(|at| &old_nodes[at]));
+        // The one kept question whose answer can lie past the start: the nearest place before it a search stops at.
+        let held = answer_search_end(&contexts, start).and_then(|at| {
+            let node = *state.node_of_context.get(at)? as usize;
+            match old_nodes.get(node)? {
+                RenderNode::Question { entry, answer: Some(answer), .. } if *entry == at && *answer >= start => Some((*answer, node)),
+                _ => None,
+            }
+        });
+        (keep, start, held)
+    } else {
+        (old_nodes.len(), count, None)
+    };
+    let tail = if nodes_changed {
+        let views = props.workflow_run_by_call.clone();
+        let turn_anchors: HashSet<usize> = anchors.iter().copied().collect();
+        build_context_render_nodes_from(&contexts, &turn_anchors, |call| views.contains_key(call), start, held.map(|(answer, _)| answer))
+    } else {
+        Vec::new()
+    };
+
+    // ---- from here on the model changes in place
+    if nodes_changed {
+        for index in changed..old_count {
+            let key = hash_id(old.get(index).id());
+            if state.context_index.get(&key) == Some(&(index as u32)) {
+                state.context_index.remove(&key);
+            }
+        }
+        state.context_index.extend(tail_ids);
+        for node in &old_nodes[keep..] {
+            if let RenderNode::Question { entry, answer: Some(_), .. } = node {
+                state.question_answers.remove(old.get(*entry).id());
+            }
+        }
+        drop(old_nodes);
+        let nodes = Rc::make_mut(&mut state.nodes);
+        nodes.truncate(keep);
+        state.node_keys.truncate(keep);
+        state.node_of_context.truncate(start);
+        state.node_of_context.resize(count, u32::MAX);
+        let rendered = Rc::make_mut(&mut state.rendered);
+        rendered.truncate(rendered.partition_point(|index| *index < start));
+        let mut drawn: Vec<usize> = Vec::new();
+        if let Some((answer, node)) = held {
+            state.node_of_context[answer] = node as u32;
+            drawn.push(answer);
+        }
+        for node in tail {
+            let position = nodes.len() as u32;
+            for index in node.indexes() {
+                state.node_of_context[index] = position;
+                drawn.push(index);
+            }
+            state.node_keys.push(hash_id(&node.key(&&contexts)));
+            if let RenderNode::Question { entry, answer: Some(answer), .. } = &node {
+                state.question_answers.insert(contexts.get(*entry).id().to_owned(), contexts.get(*answer).id().to_owned());
+            }
+            nodes.push(node);
+        }
+        drawn.sort_unstable();
+        rendered.extend(drawn);
+        state.memo.estimates.truncate(keep);
+    }
+    // A box adds what was picked out when it began to what it touches, which may be gone by now.
+    state.selection.retain(|id| state.context_index.contains_key(&hash_id(id)));
+    state.map = contexts.map.clone();
+    let index_of = |id: &str| state.context_index.get(&hash_id(id)).map(|index| *index as usize);
+    let node_of = |index: usize| state.node_of_context.get(index).copied().filter(|node| *node != u32::MAX).map(|node| node as usize);
+    let projection = project_turns(&props.turns, index_of, node_of, &contexts);
+
+    // ---- change spans: those closed at a message before the start keep their sums
+    let old_change_marks = change_marks(&state.changes_after);
+    let mut changes_moved = false;
+    if nodes_changed || open != state.memo.open {
+        let memo = &mut state.memo;
+        let first = memo.boundaries.partition_point(|at| *at < start);
+        let opener = first.checked_sub(1).map(|at| memo.boundaries[at]);
+        memo.boundaries.truncate(first);
+        memo.boundaries.extend(state.nodes[keep..].iter().filter_map(|node| user_message_index(node, &contexts)));
+        let kept = opener.map_or(0, |opener| memo.spans.partition_point(|span| span.hi <= opener));
+        let gone = memo.spans.split_off(kept);
+        for (opener, lo, hi) in span_ranges(opener, &memo.boundaries[first..], count, open) {
+            let key = format!("after:{}", opener.map_or("start", |at| contexts.get(at).id()));
+            let span = ChangeSpan { key, context_ids: (lo..hi).map(|index| contexts.get(index).id().to_owned()).collect() };
+            let summary = span_summary(&span, &contexts, &index_of, &node_of);
+            memo.spans.push(SpanMemo { lo, hi, summary });
+        }
+        changes_moved = memo.spans[kept..].iter().map(|span| &span.summary).ne(gone.iter().map(|span| &span.summary));
+        if changes_moved {
+            state.changes_after.clear();
+            for span in &memo.spans {
+                if let Some((last, summary)) = &span.summary {
+                    state.changes_after.entry(*last).or_default().push(summary.clone());
+                }
+            }
+        }
+    }
+
+    // ---- the layout, from the first row whose height can have changed
+    let marks = notice_marks(&projection, &state.turns);
+    let projection_moved = projection != state.projection;
+    let mut from = keep;
+    if let Some(at) = first_mark_difference(&state.memo.notice_marks, &marks) {
+        from = from.min(at);
+    }
+    if let Some(at) = first_mark_difference(&old_change_marks, &change_marks(&state.changes_after)) {
+        from = from.min(at);
+    }
+    state.projection = projection;
+    let memo = &mut state.memo;
+    memo.notice_marks = marks;
+    memo.anchors = anchors;
+    memo.open = open;
+    relayout_from(state, &contexts, width, message_size, from);
+    Some(if nodes_changed || projection_moved || changes_moved { ModelUpdate::Tail } else { ModelUpdate::Kept })
+}
+
+/// `MEWRK_TIMELINE_VERIFY=1`: every incremental update of a timeline's model is checked against a full rebuild of the same inputs,
+/// and what differs is printed. A full rebuild per update is what this costs.
+fn verify_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MEWRK_TIMELINE_VERIFY").is_ok_and(|value| value.trim() == "1"))
+}
+
+/// Builds the model in full beside the one an incremental update left, from the same inputs, and prints how the two differ.
+#[allow(clippy::too_many_arguments)]
+fn verify_model(state: &TimelineState, persisted: &[ContextItem], live: &[LiveContext], in_place: usize, selection: HashSet<String>, props: &ConversationViewProps, width: f32, message_size: f32) {
+    let mut full = TimelineState { selection, heights: state.heights.clone(), turns: state.turns.clone(), ..TimelineState::default() };
+    full.map = Rc::new(Resolved::map_with_in_place(persisted, live, in_place));
+    let contexts = Resolved { persisted, live, map: full.map.clone() };
+    rebuild_model(&mut full, &contexts, props, width, message_size);
+    let differences = model_differences(state, &full);
+    if !differences.is_empty() {
+        eprintln!("timeline {}: the incremental model update differs from a full rebuild:\n  {}", props.timeline_id.as_deref().unwrap_or("timeline"), differences.join("\n  "));
+    }
+}
+
+/// Where two lists first differ, said briefly: a timeline's lists are long.
+fn list_difference<T: PartialEq + std::fmt::Debug>(name: &str, a: &[T], b: &[T]) -> Option<String> {
+    if a == b {
+        return None;
+    }
+    let at = a.iter().zip(b).position(|(a, b)| a != b).unwrap_or(a.len().min(b.len()));
+    Some(format!("{name}: {} against {} long, first differing at {at}: {:?} against {:?}", a.len(), b.len(), a.get(at), b.get(at)))
+}
+
+fn sorted_entries<K: Ord + Clone, V: Clone>(map: impl IntoIterator<Item = (K, V)>) -> Vec<(K, V)> {
+    let mut entries: Vec<(K, V)> = map.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+/// What two timelines' models disagree on, field by field: nothing when one is exactly the other.
+fn model_differences(a: &TimelineState, b: &TimelineState) -> Vec<String> {
+    let mut out = Vec::new();
+    let changes = |state: &TimelineState| sorted_entries(state.changes_after.iter().map(|(at, summaries)| (*at, summaries.iter().map(|summary| (**summary).clone()).collect::<Vec<_>>())));
+    let sorted = |state: &TimelineState| {
+        let mut ids: Vec<String> = state.selection.iter().cloned().collect();
+        ids.sort();
+        ids
+    };
+    let (sorted_a, sorted_b) = (sorted(a), sorted(b));
+    out.extend(list_difference("map", &a.map[..], &b.map[..]));
+    out.extend(list_difference("nodes", &a.nodes[..], &b.nodes[..]));
+    out.extend(list_difference("node keys", &a.node_keys[..], &b.node_keys[..]));
+    out.extend(list_difference("context index", &sorted_entries(a.context_index.iter().map(|(k, v)| (*k, *v))), &sorted_entries(b.context_index.iter().map(|(k, v)| (*k, *v)))));
+    out.extend(list_difference("node of context", &a.node_of_context[..], &b.node_of_context[..]));
+    out.extend(list_difference("question answers", &sorted_entries(a.question_answers.clone()), &sorted_entries(b.question_answers.clone())));
+    if a.projection != b.projection {
+        out.push(format!("projection: {:?} against {:?}", a.projection, b.projection));
+    }
+    out.extend(list_difference("changes after", &changes(a), &changes(b)));
+    out.extend(list_difference("rendered", &a.rendered[..], &b.rendered[..]));
+    out.extend(list_difference("selection", &sorted_a, &sorted_b));
+    out.extend(list_difference("row heights", &a.row_h[..], &b.row_h[..]));
+    out.extend(list_difference("tops", &a.tops[..], &b.tops[..]));
+    if a.total != b.total {
+        out.push(format!("total: {} against {}", a.total, b.total));
+    }
+    out.extend(list_difference("adjust", &sorted_entries(a.adjust.iter().map(|(k, v)| (*k, *v))), &sorted_entries(b.adjust.iter().map(|(k, v)| (*k, *v)))));
+    let extras = |state: &TimelineState| {
+        let mut rows: Vec<usize> = state.extras_only.iter().copied().collect();
+        rows.sort_unstable();
+        rows
+    };
+    out.extend(list_difference("extras only", &extras(a), &extras(b)));
+    if a.dock != b.dock || a.flush != b.flush {
+        out.push(format!("dock and flush: {:?} {:?} against {:?} {:?}", a.dock, a.flush, b.dock, b.flush));
+    }
+    out.extend(list_difference("turn anchors", &a.memo.anchors[..], &b.memo.anchors[..]));
+    out.extend(list_difference("user messages", &a.memo.boundaries[..], &b.memo.boundaries[..]));
+    out.extend(list_difference("change spans", &a.memo.spans[..], &b.memo.spans[..]));
+    if a.memo.open != b.memo.open || a.memo.ambiguous != b.memo.ambiguous {
+        out.push(format!("open and ambiguous: {} {} against {} {}", a.memo.open, a.memo.ambiguous, b.memo.open, b.memo.ambiguous));
+    }
+    out.extend(list_difference("notice marks", &a.memo.notice_marks[..], &b.memo.notice_marks[..]));
+    out
+}
+
+/// A timeline's model outside a frame: the update [`context_stream`] makes, over contexts handed to it rather than read off the app.
+/// For tests and benches, which hold an incremental update to what a full rebuild of the same inputs builds.
+#[doc(hidden)]
+pub struct ModelProbe {
+    state: TimelineState,
+    width: f32,
+    message_size: f32,
+}
+
+#[doc(hidden)]
+impl ModelProbe {
+    pub fn new(width: f32, message_size: f32) -> Self {
+        Self { state: TimelineState::default(), width, message_size }
+    }
+
+    /// One frame's update. The revisions stand for what a frame fingerprints the persisted and the live contexts by, and the first
+    /// `in_place` live contexts are drawn in the place of the persisted ones they stand for. With `full`, any change builds everything
+    /// again, as every change did before updates were incremental.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(&mut self, persisted: &[ContextItem], persisted_revision: u64, live: &Rc<Vec<LiveContext>>, in_place: usize, live_revision: u64, props: &ConversationViewProps, full: bool) -> ModelUpdate {
+        if full {
+            self.state.memo.forget();
+        }
+        self.state.turns = props.turns.clone();
+        let parts = FingerprintParts { persisted: hash_key((persisted.as_ptr() as usize, persisted.len(), persisted_revision)), live: live_revision, turns: turns_part(props), rest: rest_part(props) };
+        update_model(&mut self.state, ModelSource { persisted, live: LiveHolder::Contexts(live.clone()), in_place, parts }, props, self.width, self.message_size)
+    }
+
+    /// The row at `position` measured at `height`, laid out again as the frame that measured it would: from that row on, or in full.
+    pub fn measure(&mut self, persisted: &[ContextItem], live: &Rc<Vec<LiveContext>>, position: usize, height: f32, full: bool) {
+        let Some(&key) = self.state.node_keys.get(position) else { return };
+        self.state.heights.insert(key, height);
+        let contexts = Resolved { persisted, live, map: self.state.map.clone() };
+        let from = if full { 0 } else { first_row_of(&self.state, &[key]) };
+        relayout_from(&mut self.state, &contexts, self.width, self.message_size, from);
+    }
+
+    /// The column at another width, as a resize leaves it: nothing is laid out again until something else asks for it.
+    pub fn set_width(&mut self, width: f32) {
+        self.width = width;
+    }
+
+    /// Drops every estimated height, as the layout did before it kept them: for a bench to compare against.
+    pub fn forget_estimates(&mut self) {
+        self.state.memo.estimates.clear();
+    }
+
+    /// Picks these contexts out, as a click or a box would.
+    pub fn select(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.state.selection.extend(ids);
+    }
+
+    pub fn nodes(&self) -> usize {
+        self.state.nodes.len()
+    }
+
+    pub fn total(&self) -> f32 {
+        self.state.total
+    }
+
+    /// What this model and `other` disagree on: nothing when one is exactly the other.
+    pub fn differences(&self, other: &Self) -> Vec<String> {
+        model_differences(&self.state, &other.state)
+    }
 }
 
 /// `nodeLayout`'s positions: the stored or estimated height of every row, and where each starts. While a drag has pieces out of the
 /// timeline it closes up over them, keeping what follows them on screen, and pieces docked at the home line take room where they stand.
 fn relayout(state: &mut TimelineState, contexts: &Resolved<'_>, width: f32, message_size: f32) {
+    layout_rows(state, contexts, width, message_size, 0);
+}
+
+/// [`relayout`], keeping the rows before `from` as they are when the last layout can be gone on from: it had nothing dragged in it,
+/// was made at this width and type size, and nothing the rows before `from` read has changed since (their heights included: see
+/// [`first_row_of`]). Otherwise all of it.
+fn relayout_from(state: &mut TimelineState, contexts: &Resolved<'_>, width: f32, message_size: f32, from: usize) {
+    let from = from.min(state.nodes.len()).min(state.row_h.len());
+    let goes_on = from > 0 && !state.layout_dirty && state.memo.laid_out_at == Some(layout_key(width, message_size)) && state.tops.len() > from && state.drag.as_ref().is_none_or(|drag| drag.session.is_none());
+    layout_rows(state, contexts, width, message_size, if goes_on { from } else { 0 });
+}
+
+/// The layout of the rows from `from` on; the rows before it stay as they are, which only a caller that knows them current asks for.
+fn layout_rows(state: &mut TimelineState, contexts: &Resolved<'_>, width: f32, message_size: f32, from: usize) {
     let count = state.nodes.len();
-    state.row_h.clear();
-    state.row_h.reserve(count);
-    state.tops.clear();
-    state.tops.reserve(count + 1);
+    state.row_h.truncate(from);
+    state.row_h.reserve(count - from);
+    state.tops.truncate(from);
+    state.tops.reserve(count + 1 - from);
     state.adjust.clear();
     state.extras_only.clear();
     // Out of the state while it is read, as everything below writes to the state.
     let drag = state.drag.take();
     let session = drag.as_ref().and_then(|drag| drag.session.as_ref());
+    debug_assert!(from == 0 || session.is_none(), "a layout with a drag in it is made in full");
     if session.is_none() {
         state.dock_measured = None;
     }
@@ -236,8 +880,20 @@ fn relayout(state: &mut TimelineState, contexts: &Resolved<'_>, width: f32, mess
     }
     state.dock = room;
     state.flush = flush;
-    let mut y = 0.0;
-    for position in 0..count {
+    // A row's estimate reads its text, so it is kept between layouts at one width and type size; a drag's layouts read what they
+    // are handed.
+    let key = layout_key(width, message_size);
+    let kept_estimates = session.is_none();
+    if kept_estimates {
+        if state.memo.estimated_at != key {
+            state.memo.estimates.clear();
+            state.memo.estimated_at = key;
+        }
+        state.memo.estimates.resize(count, f32::NAN);
+    }
+    // Where the row at `from` starts, as the loop below would have come to it.
+    let mut y = if from == 0 { 0.0 } else { state.tops[from - 1] + state.row_h[from - 1] };
+    for position in from..count {
         // The pieces set down at the home line take room ahead of what follows them.
         if let Some(room) = room
             && room.at == DockAt::Before(position)
@@ -251,7 +907,16 @@ fn relayout(state: &mut TimelineState, contexts: &Resolved<'_>, width: f32, mess
             None => {
                 let gap = row_gap(state, position);
                 let extras = state.changes_after.get(&position).map_or(0.0, |summaries| summaries.len() as f32 * 76.0) + state.projection.notices_after_node.get(&position).map_or(0.0, |notices| notices.len() as f32 * 48.0);
-                gap + extras + estimate_node(contexts, &state.nodes[position], width, message_size)
+                let estimate = if kept_estimates {
+                    let slot = &mut state.memo.estimates[position];
+                    if slot.is_nan() {
+                        *slot = estimate_node(contexts, &state.nodes[position], width, message_size);
+                    }
+                    *slot
+                } else {
+                    estimate_node(contexts, &state.nodes[position], width, message_size)
+                };
+                gap + extras + estimate
             }
         };
         let mut less = shrink.get(&position).copied().unwrap_or(0.0);
@@ -289,6 +954,7 @@ fn relayout(state: &mut TimelineState, contexts: &Resolved<'_>, width: f32, mess
     state.tops.push(y);
     state.total = y;
     state.layout_dirty = false;
+    state.memo.laid_out_at = kept_estimates.then_some(key);
     state.drag = drag;
 }
 
@@ -789,10 +1455,14 @@ fn row_view(f: &Frame<'_>, position: usize) -> E {
     let turns = state.turns.clone();
     let (gap, extras_only) = (row_gap(&state, position), state.extras_only.contains(&position));
     let extras_slide = state.slides.get(&extras_key(node_key)).copied().filter(|_| f.salt == 0);
+    // The window as the node's own top sees it.
+    let top = state.tops.get(position).copied().unwrap_or(0.0) + gap;
+    let window = f.window.map(|(from, to)| (from - top, to - top));
     drop(state);
-    let mut row = col().key(row_key(f.salt, node_key)).w_full().min_w(0.0).shrink0();
+    // A row that comes out as it did last frame keeps last frame's layout: a token streamed into the last row lays out that row.
+    let mut row = col().key(row_key(f.salt, node_key)).w_full().min_w(0.0).shrink0().memo_layout();
     if !extras_only {
-        row = row.pt(gap).child(node_view(f, &nodes[position]));
+        row = row.pt(gap).child(node_view(f, &nodes[position], window));
     }
     if changes.is_empty() && notices.is_empty() {
         return row;
@@ -814,20 +1484,23 @@ fn row_view(f: &Frame<'_>, position: usize) -> E {
     row.child(extras)
 }
 
-/// `renderTimelineNode`.
-fn node_view(f: &Frame<'_>, node: &RenderNode) -> E {
+/// `renderTimelineNode`. `window` is what is built of it, from its top; `None` builds all of it.
+fn node_view(f: &Frame<'_>, node: &RenderNode, window: Option<(f32, f32)>) -> E {
     let mut slot = col().w_full().min_w(0.0);
     match node {
         RenderNode::Block { entries, .. } => {
             // A block draws several contexts as rows, so an insert index anywhere inside it is answered by the one editor drawn ahead of the block.
             let first = entries.iter().map(|entry| entry.index).min().unwrap_or(0);
             let after = entries.iter().map(|entry| entry.index).max().unwrap_or(0) + 1;
+            let mut window = window;
             if f.insert_editor_index.is_some_and(|index| index >= first && index < after) {
                 slot = slot.child(timeline_insert_editor(f));
+                // The editor ahead of the rows moves them by however tall it is.
+                window = None;
             }
             // Only the block the line falls in hears where it is.
             let insertion = f.display_insertion_index.filter(|index| *index >= first && *index < after);
-            slot.child(timeline_block(f, entries, insertion))
+            slot.child(timeline_block(f, entries, insertion, window))
         }
         RenderNode::Question { entry, answer, .. } => {
             if f.insert_editor_index == Some(*entry) {
@@ -889,9 +1562,9 @@ fn piece_view(f: &Frame<'_>, session: &DragSession, piece: usize) -> E {
         RenderNode::Block { entries, .. } => {
             let rows: Vec<_> = piece.units.iter().filter_map(|&unit| session.units[unit].row).map(|row| entries[row]).collect();
             // A row lifted out of its block keeps a block around it, with no padding of its own.
-            timeline_rows(f, &rows, None, !piece.row)
+            timeline_rows(f, &rows, None, !piece.row, None)
         }
-        node => node_view(f, node),
+        node => node_view(f, node, None),
     }
 }
 
@@ -909,7 +1582,7 @@ fn dock_view(f: &Frame<'_>, session: &DragSession, key: u64, top: f32) -> E {
                     _ => None,
                 })
                 .collect();
-            timeline_block(f, &rows, None)
+            timeline_block(f, &rows, None, None)
         } else {
             piece_view(f, session, pieces[0])
         });
@@ -917,9 +1590,9 @@ fn dock_view(f: &Frame<'_>, session: &DragSession, key: u64, top: f32) -> E {
     dock
 }
 
-/// What is drawn over a conversation's persisted contexts: its run's projection, else what its background tasks streamed
-/// since that run settled (drawn in place, [`Resolved::map_in_place`]); the props' own contexts on a timeline that is not a
-/// conversation's.
+/// What is drawn over a conversation's persisted contexts: its run's view (the cards of tasks earlier runs started, then
+/// the run's projection), else what its background tasks streamed since the last run settled; the props' own contexts on
+/// a timeline that is not a conversation's.
 fn live_contexts<'a>(conversation: Option<&str>, run: Option<&'a RunView>, overlay: Option<&'a TaskOverlayView>, props: &'a ConversationViewProps) -> &'a [LiveContext] {
     match (conversation, run, overlay) {
         (None, _, _) => props.contexts.as_slice(),
@@ -929,7 +1602,27 @@ fn live_contexts<'a>(conversation: Option<&str>, run: Option<&'a RunView>, overl
     }
 }
 
-/// The overlay of a conversation with no run: a run's own stream carries its tasks.
+/// How many of [`live_contexts`] are drawn in the place of the persisted card each stands for (a task overlay's cards),
+/// ahead of those that follow the persisted contexts (a run's projection): [`Resolved::map_with_in_place`].
+fn live_in_place(conversation: Option<&str>, run: Option<&RunView>, overlay: Option<&TaskOverlayView>) -> usize {
+    match (conversation, run, overlay) {
+        (Some(_), Some(run), _) => run.in_place,
+        (Some(_), None, Some(overlay)) => overlay.contexts.len(),
+        _ => 0,
+    }
+}
+
+/// What holds [`live_contexts`], for the model to keep until the next update compares against it.
+fn live_holder(conversation: Option<&str>, run: Option<&Arc<RunView>>, overlay: Option<&Arc<TaskOverlayView>>, props: &ConversationViewProps) -> LiveHolder {
+    match (conversation, run, overlay) {
+        (None, _, _) => LiveHolder::Contexts(props.contexts.clone()),
+        (Some(_), Some(run), _) => LiveHolder::Run(run.clone()),
+        (Some(_), None, Some(overlay)) => LiveHolder::Overlay(overlay.clone()),
+        (Some(_), None, None) => LiveHolder::None,
+    }
+}
+
+/// The overlay of a conversation with no run. With a run, the run's view carries it.
 fn task_overlay_of(app: &mut App, conversation: Option<&str>, run: Option<&RunView>) -> Option<Arc<TaskOverlayView>> {
     if run.is_some() {
         return None;
@@ -981,12 +1674,13 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
         state.slides.clear();
         state.unit_slides.clear();
         state.menu = None;
-        state.follow.glide = None;
+        state.follow.gliding = false;
         // A body is known by its address, and one freed on the way out can hand that on to the next one drawn here.
         state.fingerprint = 0;
+        state.memo.forget();
     }
 
-    let (first, last, count_contexts, anchor_position);
+    let (first, last, count_contexts, anchor_position, build_window);
     {
         let persisted: &[ContextItem] = match (&draft, conversation.as_deref()) {
             (Some(draft), _) => draft,
@@ -995,20 +1689,23 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
         };
         let live: &[LiveContext] = live_contexts(conversation.as_deref(), run.as_deref(), overlay.as_deref(), &props);
         let updated = conversation.as_deref().and_then(|id| app.conversation(id)).map(|conversation| conversation.updated_at.as_str());
-        let mut workflow_keys: Vec<&str> = props.workflow_run_by_call.keys().map(String::as_str).collect();
-        workflow_keys.sort_unstable();
-        let fingerprint = hash_key((persisted.as_ptr() as usize, persisted.len(), updated, run.as_ref().map(|run| run.revision), overlay.as_ref().map(|overlay| overlay.revision), (!props.contexts.is_empty()).then(|| Rc::as_ptr(&props.contexts) as usize), (!props.turns.is_empty()).then(|| Rc::as_ptr(&props.turns) as usize), props.turns.len(), &workflow_keys, props.change_spans.as_ref().map(|spans| Rc::as_ptr(spans) as usize), props.streaming, mewrk_client::i18n::is_english()));
+        // In parts, so that a commit which only moved the live contexts or the turns can be told from any other change.
+        let parts = FingerprintParts {
+            persisted: hash_key((persisted.as_ptr() as usize, persisted.len(), updated)),
+            live: hash_key((run.as_ref().map(|run| run.revision), overlay.as_ref().map(|overlay| overlay.revision))),
+            turns: turns_part(&props),
+            rest: rest_part(&props),
+        };
         let mut guard = shared.borrow_mut();
         let state = &mut *guard;
         state.turns = props.turns.clone();
-        if state.fingerprint != fingerprint || state.map.is_empty() != (persisted.is_empty() && live.is_empty()) {
-            state.fingerprint = fingerprint;
-            state.map = Rc::new(if overlay.is_some() { Resolved::map_in_place(persisted, live) } else { Resolved::map_of(persisted, live) });
-            let contexts = Resolved { persisted, live, map: state.map.clone() };
+        if state.fingerprint != parts.combined() || state.map.is_empty() != (persisted.is_empty() && live.is_empty()) {
             let before_order = state.node_keys.clone();
             let anchor_key = state.anchor_key;
             let anchor_top = anchor_key_top(state, anchor_key);
-            rebuild_model(state, &contexts, &props, width, message_size);
+            let in_place = live_in_place(conversation.as_deref(), run.as_deref(), overlay.as_deref());
+            let source = ModelSource { persisted, live: live_holder(conversation.as_deref(), run.as_ref(), overlay.as_ref(), &props), in_place, parts };
+            update_model(state, source, &props, width, message_size);
             // A drag measures the cards it found when it began, so a timeline whose order changes under it ends it.
             if before_order != state.node_keys {
                 state.drag = None;
@@ -1030,6 +1727,9 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
 
         // ---- what scrolled since last frame
         let follow = &mut state.follow;
+        // A glide is the scroller's to carry on, through frames that only scroll, and to end: at the end, or when the wheel or the
+        // scrollbar takes over.
+        follow.gliding &= scroll_gliding(scroller);
         let same_timeline = follow.scroll_timeline.as_deref() == Some(timeline_id.as_str());
         let distance = content_h - offset - viewport;
         let scrolled = (offset - follow.expected_top).abs() > 0.5 || !same_timeline;
@@ -1041,7 +1741,7 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
                 follow.pinned = distance < 180.0;
             } else if offset < follow.expected_top {
                 follow.pinned = false;
-                follow.glide = None;
+                follow.gliding = false;
                 follow.jump = false;
             }
             follow.scroll_timeline = Some(timeline_id.clone());
@@ -1050,7 +1750,7 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
         // Only one that moved the timeline itself: a code block or an output pane with room of its own takes the wheel first.
         if std::mem::take(&mut follow.wheel_up) && offset < follow.expected_top - 0.01 {
             follow.pinned = false;
-            follow.glide = None;
+            follow.gliding = false;
             follow.jump = false;
         }
 
@@ -1079,6 +1779,12 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
         let anchor_node_key = state.node_keys.get(anchor).copied().unwrap_or(0);
         let mut changed = false;
         let mut first_measure = false;
+        let mut moved: Vec<u64> = Vec::new();
+        let rows_key = hash_key((width.round() as i32, message_size.to_bits(), serif, collapse_reasoning, single_dollar_math, render_user_markdown, mewrk_client::i18n::is_english()));
+        if state.rows_key != rows_key {
+            state.rows_key = rows_key;
+            state.rows_measured.clear();
+        }
         for position in std::mem::take(&mut state.built) {
             let Some(&key) = state.node_keys.get(position) else { continue };
             let Some(r) = rect_of(row_key(0, key)) else { continue };
@@ -1089,6 +1795,7 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
                 first_measure |= held.is_none();
                 state.heights.insert(key, at_rest);
                 changed = true;
+                moved.push(key);
             }
             match &state.nodes[position] {
                 RenderNode::Block { entries, .. } => {
@@ -1096,6 +1803,7 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
                         let id = contexts.get(entry.index).id();
                         if let Some(r) = rect_of(unit_key(0, id)) {
                             state.unit_heights.insert(hash_id(id), r.h);
+                            state.rows_measured.insert(hash_id(id));
                         }
                     }
                 }
@@ -1116,7 +1824,9 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
             state.layout_dirty = true;
         }
         if changed || state.layout_dirty {
-            relayout(state, &contexts, width, message_size);
+            // The rows above the first one whose height was measured anew stay where they are, unless something else moved them.
+            let from = if state.layout_dirty { 0 } else { first_row_of(state, &moved) };
+            relayout_from(state, &contexts, width, message_size, from);
             if !state.follow.pinned {
                 // What changed above the reader stays above them.
                 shift += state.tops.get(anchor).copied().unwrap_or(0.0) - anchor_top_before;
@@ -1196,7 +1906,7 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
         let timeline_changed = previous.as_ref().is_some_and(|previous| previous.timeline_id != next.timeline_id);
         // The owning surface restores its saved position after a switch. Do not reinterpret the new timeline as appended output.
         if timeline_changed || count == 0 || menu_open || !follow.pinned || dragging {
-            follow.glide = None;
+            follow.gliding = false;
             follow.jump = false;
         } else {
             let initial = previous.is_none();
@@ -1207,38 +1917,38 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
             let changed_contexts = previous.as_ref() != Some(&next);
             if initial || appended || growing || streaming_update {
                 // What a stream writes glides, and so does whatever lands while a glide is still moving. Anything else jumps.
-                if !initial && (props.streaming || follow.glide.is_some()) {
-                    follow.glide.get_or_insert(FollowGlide { position: offset, velocity: 0.0, time: None });
+                if !initial && (props.streaming || follow.gliding) {
+                    follow.gliding = true;
                 } else {
                     follow.jump = true;
                 }
             } else if changed_contexts {
                 // A glide may finish the distance it was already covering, but never past a tail that went away.
                 if previous.as_ref().is_some_and(|previous| next.length < previous.length) {
-                    follow.glide = None;
+                    follow.gliding = false;
                 }
             }
             // Commits are not the only thing that grows a live page: a body opening under its row, the waiting line changing shape.
             let grew = state.total + PAD_TOP + PAD_BOTTOM > follow.content + 0.5;
             if props.streaming && grew && same_timeline {
-                follow.glide.get_or_insert(FollowGlide { position: offset, velocity: 0.0, time: None });
+                follow.gliding = true;
             }
             let start = offset + shift;
             // Pinned to the bottom is at the bottom: what rounding leaves over is not the reader having moved.
-            if follow.glide.is_none() && (bottom - start).abs() > 0.5 && (bottom - start).abs() <= SCROLL_BOTTOM_EPSILON {
+            if !follow.gliding && (bottom - start).abs() > 0.5 && (bottom - start).abs() <= SCROLL_BOTTOM_EPSILON {
                 follow.jump = true;
             }
-            if std::mem::take(&mut follow.jump) || (follow.glide.is_some() && fluent::reduced_motion()) {
-                follow.glide = None;
+            if std::mem::take(&mut follow.jump) || (follow.gliding && fluent::reduced_motion()) {
+                follow.gliding = false;
                 shift += bottom - start;
-            } else if let Some(glide) = follow.glide {
-                // Something else moved the page, so go on from there.
-                let position = if (start - glide.position).abs() > 1.0 { start } else { glide.position };
-                let (glided, done) = step_follow_glide(FollowGlide { position, ..glide }, bottom, now);
-                shift += glided.position - start;
-                follow.glide = if done { None } else { Some(glided) };
-                repaint();
             }
+        }
+        // The glide itself is the scroller's: it carries it on to wherever the end has got to in frames that only scroll, so a
+        // reply taller than the window is followed without running the views. Asking for it again goes on at its speed.
+        if follow.gliding {
+            scroll_request(scroller, ScrollRequest::GlideToEnd { rate: FOLLOW_GLIDE_RATE });
+        } else if scroll_gliding(scroller) {
+            scroll_request(scroller, ScrollRequest::StopGlide);
         }
         follow.content = state.total + PAD_TOP + PAD_BOTTOM;
         follow.expected_top = (offset + shift).clamp(0.0, bottom.max(offset + shift));
@@ -1253,6 +1963,11 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
         let f_last = state.tops[..nodes_count].partition_point(|y| *y < bottom_edge).max(f_first.min(nodes_count));
         first = f_first.min(nodes_count);
         last = f_last.min(nodes_count);
+        build_window = (top, bottom_edge);
+        // Only these rows are built, so a frame that only scrolls goes no further than them.
+        let covered_top = if top <= 0.0 { f32::NEG_INFINITY } else { PAD_TOP + top };
+        let covered_bottom = if bottom_edge >= state.total { f32::INFINITY } else { PAD_TOP + bottom_edge };
+        scroll_coverage(scroller, covered_top, covered_bottom);
         count_contexts = count;
         // Rows above this are entirely above the reader.
         anchor_position = state.tops[..nodes_count].partition_point(|y| *y <= (offset - PAD_TOP).max(0.0)).saturating_sub(1);
@@ -1371,6 +2086,7 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
             Some(DockRoom { at: DockAt::Inside { before, .. }, height, .. }) => Some((session.units[before].index, height)),
             _ => None,
         }),
+        window: Some(build_window),
     };
 
     let insert_editor_exists = matches!(&props.editor, Some(TimelineEditorState::Insert { .. })) && props.on_cancel_edit.is_some();
@@ -1426,6 +2142,11 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
             let mut view = row_view(&f, position);
             // A slide is only drawn: the layout already has the row where it is going.
             let key = shared.borrow().node_keys[position];
+            // A row never measured stands at an estimate until the next frame measures it and moves what is around it. That has to
+            // be a frame that runs the views, not one that only scrolls on to what the estimate got wrong.
+            if !shared.borrow().heights.contains_key(&key) {
+                repaint();
+            }
             let slide = shared.borrow().slides.get(&key).copied();
             if let Some(slide) = slide {
                 view = drawn_slide(view, &slide, slide_now);
@@ -1496,7 +2217,7 @@ pub fn context_stream(app: &mut App, props: Rc<ConversationViewProps>) -> E {
         }
         column = column.child(mark);
         let nothing = HashSet::new();
-        let copies = |salt: u64| Frame { contexts: contexts.clone(), props: &props, shared: &shared, read_only: true, mutation_read_only: true, render_user_markdown, collapse_reasoning, single_dollar_math, message_ty, explanations: &explanations, selected: &selection, editing_context_id: None, editing_question_id: None, insert_editor_index: None, display_insertion_index: None, open_insert: open_insert.clone(), column_w: width, salt, lifted: &nothing, dimmed: &nothing, dock_inside: None };
+        let copies = |salt: u64| Frame { contexts: contexts.clone(), props: &props, shared: &shared, read_only: true, mutation_read_only: true, render_user_markdown, collapse_reasoning, single_dollar_math, message_ty, explanations: &explanations, selected: &selection, editing_context_id: None, editing_question_id: None, insert_editor_index: None, display_insertion_index: None, open_insert: open_insert.clone(), column_w: width, salt, lifted: &nothing, dimmed: &nothing, dock_inside: None, window: None };
         if session.look == Look::Docked {
             column = column.child(dock_view(&copies(DOCK_SALT), session, hash_key(("tl-dock", scroller)), session.mark_y - view.y + offset));
         }
@@ -1833,7 +2554,7 @@ fn finish_stream(props: &Rc<ConversationViewProps>, shared: &Shared, scroller: u
                 if delta < 0.0 && at > 0.0 {
                     let mut state = shared.borrow_mut();
                     state.follow.pinned = false;
-                    state.follow.glide = None;
+                    state.follow.gliding = false;
                 }
                 return true;
             }

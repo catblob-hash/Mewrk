@@ -359,6 +359,19 @@ fn gives_a_childs_summary_less_reasoning_its_own_card_duration_and_tokens() {
     assert_eq!(*tokens, Some(640));
 }
 
+/// The host names the card by its provider call id; the timeline, the subagent views and the tasks pane know it by its
+/// context id. The rows are kept under the context id, and a row for a call this run never announced has no card here.
+#[test]
+fn keeps_a_workflows_progress_under_its_cards_context_id() {
+    let progress = |call: &str| json!({ "type": "workflow_progress", "round": 1, "callId": call, "runId": "wf_run_1", "entry": { "kind": "agent", "index": 0, "state": "start", "label": "scan" } });
+    let mut run = run_fixture();
+    reduce_all(&mut run, vec![announced(1, "call_wf", "workflow", "ctx_tool_wf"), progress("call_wf"), progress("call_elsewhere")]);
+    assert_eq!(run.workflow_progress_by_call.keys().collect::<Vec<_>>(), ["ctx_tool_wf"]);
+    assert_eq!(run.workflow_progress_by_call["ctx_tool_wf"].len(), 1);
+    assert_eq!(run.workflow_run_id_by_call.keys().collect::<Vec<_>>(), ["ctx_tool_wf"]);
+    assert_eq!(run.workflow_run_id_by_call["ctx_tool_wf"], "wf_run_1");
+}
+
 #[test]
 fn accounts_for_a_workflow_steps_usage_through_both_of_its_envelopes() {
     // A step's own model events reach the renderer wrapped twice — the run's
@@ -703,6 +716,26 @@ mod coalescer {
         coalescer.dispose();
         assert!(coalescer.take().is_empty());
         assert!(coalescer.push(delta("c")), "and nothing stays armed");
+    }
+
+    #[test]
+    fn commits_keep_to_a_one_second_beat() {
+        use std::time::{Duration, Instant};
+        let second = Duration::from_millis(MODEL_STREAM_COMMIT_INTERVAL_MS);
+        assert_eq!(second, Duration::from_secs(1));
+        let last = Instant::now();
+        assert_eq!(next_commit_delay(None, last), second, "the first batch waits a whole interval");
+        // Text right after a commit waits for the next beat, not a full interval after it arrived.
+        assert_eq!(next_commit_delay(Some(last), last + Duration::from_millis(300)), Duration::from_millis(700));
+        // After a pause it lands on the beat the last commit set.
+        assert_eq!(next_commit_delay(Some(last), last + Duration::from_millis(4_250)), Duration::from_millis(750));
+        // A beat too close to make is skipped rather than committing next to nothing.
+        assert_eq!(next_commit_delay(Some(last), last + Duration::from_millis(950)), Duration::from_millis(1_050));
+        let mut coalescer = ModelStreamCoalescer::default();
+        assert_eq!(coalescer.delay(), second);
+        coalescer.push(delta("a"));
+        coalescer.take();
+        assert!(coalescer.delay() > second - Duration::from_millis(50), "a commit starts the beat again");
     }
 
     #[test]

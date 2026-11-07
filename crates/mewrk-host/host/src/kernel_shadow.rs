@@ -82,6 +82,10 @@ struct CallEntry {
     slot: usize,
     danger: bool,
     prompt_outcome: Option<bool>,
+    /// `ToolExecStart` has been projected: at dispatch for a safe call; for a
+    /// dangerous one, when it finishes, or earlier if it is handed to a task
+    /// while still executing.
+    started: bool,
     /// Parameter digest captured after final classification and checked at completion.
     params_digest: u64,
 }
@@ -314,6 +318,7 @@ impl KernelShadow {
                 entry.prompt_outcome = None;
                 inner.active_prompt_call = Some(call_id.to_owned());
             } else {
+                entry.started = true;
                 inner.step(strict, KernelEvent::ToolAllow { c: slot });
                 inner.step(strict, KernelEvent::ToolExecStart { c: slot });
             }
@@ -364,11 +369,14 @@ impl KernelShadow {
                     );
                 }
             }
-            let (slot, danger, prompt_outcome) = (entry.slot, entry.danger, entry.prompt_outcome);
+            let (slot, danger, prompt_outcome, started) =
+                (entry.slot, entry.danger, entry.prompt_outcome, entry.started);
             inner.active_prompt_call = None;
             if rejected {
                 inner.step(strict, KernelEvent::ToolDeny { c: slot });
-            } else if !danger {
+            } else if !danger || started {
+                // Started already: a safe call at dispatch, a dangerous one
+                // when it was handed to a task (`tool_backgrounded`).
                 inner.step(strict, KernelEvent::ToolExecEnd { c: slot });
             } else {
                 let granted = prompt_outcome == Some(true) || hook_allows;
@@ -390,25 +398,47 @@ impl KernelShadow {
         });
     }
 
-    /// A synchronous call that reached its deadline hands its still-running work
-    /// to a task slot. This is the one event that crosses the call and task
+    /// A synchronous call hands its still-running work to a task slot: at its
+    /// deadline, or when its shell exited while what it started still holds
+    /// its output. This is the one event that crosses the call and task
     /// surfaces, so both sides have to be resolvable: an unmapped call or an
     /// agent slot the projection cannot allocate is a scope gap, not a step.
     ///
+    /// A dangerous call's approval is projected only when it finishes, but one
+    /// handed off is plainly executing already, so its approval and start are
+    /// projected here first, from the same evidence `tool_finished` would use
+    /// (`hook_allows` is the hook's grant, which only the caller knows).
+    ///
     /// The call stays executing afterwards — it still owes its receipt — so no
     /// `ToolExecEnd` is emitted here. `tool_finished` continues to close it.
-    pub fn tool_backgrounded(&self, call_id: &str, name: &str, identity: TaskIdentity) {
+    pub fn tool_backgrounded(
+        &self,
+        call_id: &str,
+        name: &str,
+        identity: TaskIdentity,
+        hook_allows: bool,
+    ) {
         self.with_inner(|inner, strict| {
             if inner.unmapped.contains(call_id) {
                 return;
             }
-            let Some(entry) = inner.calls.get(call_id) else {
+            let Some(entry) = inner.calls.get_mut(call_id) else {
                 inner
                     .divergences
                     .push(format!("tool_backgrounded 收到未登记的调用：{call_id}"));
                 return;
             };
             let c = entry.slot;
+            let unstarted = !entry.started;
+            let granted = entry.prompt_outcome == Some(true) || hook_allows;
+            entry.started = true;
+            if unstarted {
+                if granted {
+                    inner.step(strict, KernelEvent::ToolApprove { c });
+                }
+                // Without a grant this start is what S1 rejects, as in `tool_finished`.
+                inner.step(strict, KernelEvent::ToolExecStart { c });
+            }
             let Some((a, r)) = inner.allocate_agent(name, identity) else {
                 return;
             };
@@ -596,6 +626,7 @@ impl ShadowInner {
                 slot,
                 danger,
                 prompt_outcome: None,
+                started: false,
                 params_digest,
             },
         );
@@ -720,6 +751,31 @@ mod tests {
             "{:?}",
             shadow.divergences()
         );
+    }
+
+    /// An approved command handed to a task while it runs (its deadline, or what it
+    /// left running) is approved and started when it is handed off, not again when
+    /// its receipt settles.
+    #[test]
+    fn dangerous_call_handed_to_a_task_while_executing() {
+        for (prompt, hook) in [(Some(true), false), (None, true)] {
+            let shadow = KernelShadow::strict_for_tests();
+            shadow.begin_turn();
+            shadow.round_started();
+            shadow.tool_request("call-1", true, 7);
+            shadow.tool_dispatched("call-1");
+            if let Some(granted) = prompt {
+                shadow.record_prompt_outcome(granted);
+            }
+            shadow.tool_backgrounded("call-1", "a1", tid(1), hook);
+            shadow.tool_finished("call-1", false, hook, true, 7);
+            finish_clean(&shadow);
+            assert!(
+                shadow.divergences().is_empty(),
+                "{:?}",
+                shadow.divergences()
+            );
+        }
     }
 
     #[test]

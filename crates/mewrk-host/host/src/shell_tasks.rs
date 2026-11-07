@@ -1065,6 +1065,12 @@ impl ShellTaskRegistry {
             let Some(entry) = registry.entries.get_mut(shell_task_id) else {
                 return;
             };
+            // A finished row's output is final. A reader still draining a pipe
+            // that a process outside the command's tree holds (the call settled
+            // without it) must not keep growing it.
+            if entry.finished() {
+                return;
+            }
             let seq = entry.output.push(text.as_bytes());
             // Under the same lock as `push`, so the file's order is the page's order.
             if let Some(file) = entry.output.file.as_mut() {

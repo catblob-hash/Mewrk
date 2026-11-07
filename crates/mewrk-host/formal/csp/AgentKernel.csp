@@ -87,6 +87,10 @@
 -- slot to a free task slot, which mints a fresh identity exactly as AgentSpawn
 -- does. The call is not cut short by the handoff: it stays in the pipeline and
 -- settles normally, its receipt now naming the task instead of carrying output.
+-- The host hands off the same way when a command's own process has ended while
+-- processes it started still hold its output: the receipt then carries what the
+-- command printed and names the task that holds the rest. To the protocol the
+-- two are one event; which moment the host picks is outside it, like the clock.
 -- This is the only event that crosses the call and task surfaces, so it
 -- synchronizes both slots.
 --

@@ -4416,8 +4416,9 @@ fn run_model_inner(
                                 // handoff is handed on only when `shell_kind` is
                                 // `Some`, and only a shell tool can invoke it.
                                 let handoff_kind = shell_kind.unwrap_or(tool_executor::ShellKind::Bash);
-                                let shell_handoff = |run, guard, context| {
+                                let shell_handoff = |run, guard, context, reason| {
                                     adopt_timed_out_shell(
+                                        hook_allows_permission,
                                         pool,
                                         kernel_shadow,
                                         &request,
@@ -4431,6 +4432,7 @@ fn run_model_inner(
                                         guard,
                                         context,
                                         shell_timeout,
+                                        reason,
                                     )
                                 };
                                 let handoff: Option<&tool_executor::ShellHandoff<'_>> =
@@ -12748,7 +12750,10 @@ fn run_background_shell(
 }
 
 /// Adopts a foreground shell command whose deadline expired into the run's task
-/// pool, so it keeps running instead of being killed.
+/// pool, so it keeps running instead of being killed. A command whose shell
+/// exited while what it started still holds its output comes here too
+/// (`reason`), so that those processes go on as a task rather than holding the
+/// call open for as long as they run.
 ///
 /// This is the host half of the kernel's `ToolBackground`: the call slot stays
 /// executing and still owes its receipt, while a task slot takes over the
@@ -12766,6 +12771,7 @@ fn run_background_shell(
 /// here rather than through that helper.
 #[allow(clippy::too_many_arguments)]
 fn adopt_timed_out_shell(
+    hook_allows_permission: bool,
     pool: &AgentPool,
     shadow: &crate::kernel_shadow::KernelShadow,
     parent: &RunModelRequest,
@@ -12779,6 +12785,7 @@ fn adopt_timed_out_shell(
     guard: crate::shell_tasks::ShellTaskGuard,
     context: tool_executor::ShellCallContext,
     timeout: std::time::Duration,
+    reason: tool_executor::ShellHandoffReason,
 ) -> tool_executor::ShellHandoffOutcome {
     use tool_executor::ShellHandoffOutcome as Outcome;
     let history = historical_agent_records(&parent.contexts);
@@ -12830,7 +12837,7 @@ fn adopt_timed_out_shell(
     {
         return Outcome::Refused(run, guard, context);
     }
-    shadow.tool_backgrounded(call_id, &name, shared.identity());
+    shadow.tool_backgrounded(call_id, &name, shared.identity(), hook_allows_permission);
     // Nothing below can refuse, so the file is only made for a command that is
     // really being adopted. It starts with what the live buffer still holds: the
     // command has been streaming since before the handoff.
@@ -12864,12 +12871,20 @@ fn adopt_timed_out_shell(
         );
         worker_guard.defuse();
     });
-    Outcome::Adopted(orchestration::shell_timeout_backgrounded_output(
-        &shell_ref,
-        output_file.as_deref(),
-        timeout,
-        &parent.prompt_profile,
-    ))
+    Outcome::Adopted(match reason {
+        tool_executor::ShellHandoffReason::Deadline => orchestration::shell_timeout_backgrounded_output(
+            &shell_ref,
+            output_file.as_deref(),
+            timeout,
+            &parent.prompt_profile,
+        ),
+        tool_executor::ShellHandoffReason::LeftRunning { output } => orchestration::shell_left_running_output(
+            &output,
+            &shell_ref,
+            output_file.as_deref(),
+            &parent.prompt_profile,
+        ),
+    })
 }
 
 /// Opens the file a background command's output is written to while it runs (see
@@ -12971,13 +12986,22 @@ fn drive_background_shell(
     let (status, text) = match result {
         Ok(result) => match result.end {
             tool_executor::ShellProcessEnd::Exited => {
-                let text = orchestration::shell_background_result_text(
-                    tool_name,
-                    &shell_ref,
-                    result.exit_code,
-                    &fit(result.output),
-                    profile,
-                );
+                let text = if result.left_running {
+                    orchestration::shell_left_running_result_text(
+                        tool_name,
+                        &shell_ref,
+                        &fit(result.output),
+                        profile,
+                    )
+                } else {
+                    orchestration::shell_background_result_text(
+                        tool_name,
+                        &shell_ref,
+                        result.exit_code,
+                        &fit(result.output),
+                        profile,
+                    )
+                };
                 if result.success {
                     (AgentLiveStatus::Idle, text)
                 } else {
@@ -28619,6 +28643,177 @@ mod tests {
             "command": "printf 'EARLY-%s' MARK; sleep 600",
             "timeout": 200
         }));
+    }
+
+    /// A command that finishes while something it started still holds its output — here the
+    /// subshell `a && b &` makes, waiting on its `sleep` — returns what it printed once its shell
+    /// exits, and what it left running goes on as a task the model can see and stop. The call
+    /// used to wait for the pipe to close, which is for as long as a server runs: past the
+    /// timeout, with the stop button doing nothing.
+    #[test]
+    fn a_command_that_leaves_processes_holding_its_output_returns_and_they_become_a_task() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let request = loop_request_for(address, workspace.path());
+        let conversation = request.conversation_id.clone();
+        let call = |id: &str, name: &str, arguments: Value| {
+            json!({"type":"function_call","status":"completed","call_id":id,"name":name,
+                "arguments":arguments.to_string()})
+        };
+        let completed = |output: Vec<Value>| {
+            json!({"model":"model-test","status":"completed","output":output,
+                "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}})
+        };
+        let server = serve_json_sequence(
+            listener,
+            vec![
+                completed(vec![call(
+                    "start",
+                    "bash",
+                    json!({"command": "mkdir -p srv && cd srv && sleep 600 > /dev/null 2>&1 & printf 'LEFT-%s' MARK"}),
+                )]),
+                completed(vec![
+                    call("list", "task_list", json!({})),
+                    call("stop", "task_stop", json!({"task":"shell:1"})),
+                    call(
+                        "wait-stopped",
+                        "task_wait",
+                        json!({"tasks":["shell:1"],"timeout_seconds":30}),
+                    ),
+                ]),
+                responses_text_output("stopped it"),
+            ],
+        );
+        let state = AppState::default();
+        let started = Instant::now();
+        let response = run_model(request, &state, &discard_event, &approve_tool).unwrap();
+        let bodies = server.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let outputs = |tool: &str| -> Vec<(bool, String)> {
+            response
+                .contexts
+                .iter()
+                .filter_map(|context| match context {
+                    ContextItem::Tool {
+                        tool_name, result, ..
+                    } if tool_name == tool => Some((result.success, result.output.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let receipt = &outputs("bash")[0];
+        assert!(receipt.0, "{receipt:?}");
+        assert!(receipt.1.starts_with("LEFT-MARK\n"), "what it printed comes first: {receipt:?}");
+        assert!(
+            receipt.1.contains("keep running in the background as shell:1")
+                && receipt.1.contains("shell-1-output.txt"),
+            "{receipt:?}"
+        );
+        assert!(bodies[1].contains("LEFT-MARK"), "the model is sent the output");
+        let list = &outputs("task_list")[0];
+        assert!(list.1.contains("shell:1 · running"), "{list:?}");
+        let stop = &outputs("task_stop")[0];
+        assert!(stop.0 && stop.1.starts_with("Stopping shell:1"), "{stop:?}");
+        let delivered = &outputs("task_wait")[0];
+        assert!(
+            delivered.1.contains("was stopped with task_stop"),
+            "a stop reaches what the command left running: {delivered:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.shell_tasks.is_running(&conversation, "1") {
+            assert!(Instant::now() < deadline, "the stopped command's row stayed running");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let row = state.shell_tasks.task_snapshot(&conversation, "1").unwrap();
+        assert!(row.background, "the row changed hands");
+        assert_eq!(row.outcome, Some(crate::shell_tasks::ShellTaskOutcome::Stopped));
+        assert_eq!(bodies.len(), 3);
+        // The command needed approval, which the kernel projection has to see
+        // before the handoff, not only when the receipt settles.
+        let tasks = state.conversation_tasks(&conversation);
+        assert!(
+            tasks.shadow.divergences().is_empty(),
+            "{:?}",
+            tasks.shadow.divergences()
+        );
+    }
+
+    /// When what a command left running exits by itself, its result carries only
+    /// what it printed after the receipt, and no exit code: the shell's was
+    /// reported with the command's own result, and theirs was never collected.
+    #[test]
+    fn what_a_command_left_running_reports_only_what_came_after_its_result() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let request = loop_request_for(address, workspace.path());
+        let call = |id: &str, name: &str, arguments: Value| {
+            json!({"type":"function_call","status":"completed","call_id":id,"name":name,
+                "arguments":arguments.to_string()})
+        };
+        let completed = |output: Vec<Value>| {
+            json!({"model":"model-test","status":"completed","output":output,
+                "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}})
+        };
+        let server = serve_json_sequence(
+            listener,
+            vec![
+                completed(vec![call(
+                    "start",
+                    "bash",
+                    json!({"command": "(sleep 3; printf 'LATE-%s' MARK) & printf 'EARLY-%s' MARK"}),
+                )]),
+                completed(vec![call(
+                    "wait",
+                    "task_wait",
+                    json!({"tasks":["shell:1"],"timeout_seconds":30}),
+                )]),
+                responses_text_output("done"),
+            ],
+        );
+        let state = AppState::default();
+        let response = run_model(request.clone(), &state, &discard_event, &approve_tool).unwrap();
+        server.join().unwrap();
+        let output = |tool: &str| {
+            response
+                .contexts
+                .iter()
+                .find_map(|context| match context {
+                    ContextItem::Tool {
+                        tool_name, result, ..
+                    } if tool_name == tool => Some((result.success, result.output.clone())),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let receipt = output("bash");
+        assert!(receipt.0, "{receipt:?}");
+        assert!(
+            receipt.1.starts_with("EARLY-MARK\n") && !receipt.1.contains("LATE-MARK"),
+            "{receipt:?}"
+        );
+        let delivered = output("task_wait");
+        assert!(
+            delivered.1.contains("What background command shell:1 (bash) left running has exited"),
+            "{delivered:?}"
+        );
+        assert!(delivered.1.contains("LATE-MARK"), "{delivered:?}");
+        assert!(
+            !delivered.1.contains("EARLY-MARK") && !delivered.1.contains("exit code"),
+            "nothing the receipt already said: {delivered:?}"
+        );
+        let tasks = state.conversation_tasks(&request.conversation_id);
+        assert!(
+            tasks.shadow.divergences().is_empty(),
+            "{:?}",
+            tasks.shadow.divergences()
+        );
     }
 
     /// A foreground command that finishes within its deadline is not a task and leaves no

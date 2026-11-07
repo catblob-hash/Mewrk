@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "agent-rt"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -282,7 +282,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "agent-rt",
  "arboard",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "chaos"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "fastrand",
@@ -1295,7 +1295,7 @@ checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 
 [[package]]
 name = "fluent"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -2430,7 +2430,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-aisdk"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -2462,7 +2462,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-client"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "fluent",
  "mewrk-host",
@@ -2476,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "agent-rt",
  "base64-simd",
@@ -2522,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-host"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -2609,7 +2609,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-motion"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "block2 0.6.2",
  "fastrand",
@@ -2625,7 +2625,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-pane-browser"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "arboard",
@@ -2653,7 +2653,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-pane-files"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "base64-simd",
@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-pane-git"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "fluent",
@@ -2700,7 +2700,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-pane-tasks"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "alacritty_terminal",
@@ -2719,7 +2719,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-pane-terminal"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "fluent",
@@ -2733,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-panes"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "fluent",
  "ignore",
@@ -2758,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-settings-conv"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "fluent",
@@ -2774,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-settings-global"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "base64-simd",
@@ -2828,7 +2828,7 @@ version = "0.1.0"
 
 [[package]]
 name = "mewrk-term"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alacritty_terminal",
  "fluent",
@@ -2839,7 +2839,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-ui-chat"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "fluent",
@@ -2862,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-ui-common"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "base64-simd",
@@ -2882,7 +2882,7 @@ dependencies = [
 
 [[package]]
 name = "mewrk-ui-composer"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "accesskit",
  "arboard",
@@ -4826,7 +4826,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stress"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "agent-rt",
  "chaos",

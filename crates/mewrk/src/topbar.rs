@@ -213,7 +213,7 @@ fn pane_toolbar(app: &mut App, layout: &SidePaneLayout, conversation_id: &str) -
 pub fn topbar(app: &mut App, sidebar_open: bool) -> E {
     let t_ = theme();
     let conversation = app.active_conversation_id();
-    let title = app.active_conversation_view().map(|conversation| conversation.title);
+    let title = app.with_active_conversation(|_, conversation| conversation.map(|conversation| conversation.title.clone()));
     let leading: E = match (&conversation, &title) {
         (Some(id), Some(title)) => conversation_title(app, id, title),
         _ => row().min_w(0.0).items_baseline().gap(7.0).child(text("Mewrk").role(Role::Heading).aria_level(1).ty(fluent::TypeStyle { size: 15.0, line: 20.0, weight: fluent::Weight::Semibold, mono: false, italic: false, serif: false })).child(text(t("喵。开工。", "Mew. Work.")).ty(FINE).color(t_.text_tertiary).ellipsis()),

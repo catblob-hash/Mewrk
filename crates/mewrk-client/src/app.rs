@@ -16,14 +16,28 @@ type ChannelFn = Arc<dyn Fn(Value) + Send + Sync>;
 
 /// How other threads reach the UI thread.
 struct Mailbox {
-    queue: Mutex<Vec<Boxed>>,
+    /// Each job with whether it is quiet ([`Task::post_quiet`]).
+    queue: Mutex<Vec<(Boxed, bool)>>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    /// What a quiet job wakes instead, once the window has said how ([`App::set_quiet_waker`]).
+    quiet_wake: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Mailbox {
     fn post(&self, f: Boxed) {
-        self.queue.lock().unwrap_or_else(|p| p.into_inner()).push(f);
-        (self.wake)();
+        self.push(f, false);
+    }
+
+    fn post_quiet(&self, f: Boxed) {
+        self.push(f, true);
+    }
+
+    fn push(&self, f: Boxed, quiet: bool) {
+        self.queue.lock().unwrap_or_else(|p| p.into_inner()).push((f, quiet));
+        match self.quiet_wake.get().filter(|_| quiet) {
+            Some(wake) => wake(),
+            None => (self.wake)(),
+        }
     }
 }
 
@@ -130,13 +144,25 @@ impl Task {
         self.mailbox.post(Box::new(f));
     }
 
+    /// A job that changes nothing on screen unless it says so with `fluent::el::repaint`: the window runs it as it arrives,
+    /// between frames, and draws nothing for it otherwise. What a stream buffers until its next commit is such a job; the
+    /// commit is not.
+    pub fn post_quiet(&self, f: impl FnOnce(&mut App) + Send + 'static) {
+        self.mailbox.post_quiet(Box::new(f));
+    }
+
     /// A channel whose messages run on the UI thread.
     pub fn open_channel(&self, on_message: impl Fn(&mut App, Value) + Send + Sync + 'static) -> Channel {
-        open_channel(&self.channels, &self.mailbox, on_message)
+        open_channel(&self.channels, &self.mailbox, false, on_message)
+    }
+
+    /// A channel whose messages are quiet jobs ([`Self::post_quiet`]).
+    pub fn open_quiet_channel(&self, on_message: impl Fn(&mut App, Value) + Send + Sync + 'static) -> Channel {
+        open_channel(&self.channels, &self.mailbox, true, on_message)
     }
 }
 
-fn open_channel(channels: &Arc<Channels>, mailbox: &Arc<Mailbox>, on_message: impl Fn(&mut App, Value) + Send + Sync + 'static) -> Channel {
+fn open_channel(channels: &Arc<Channels>, mailbox: &Arc<Mailbox>, quiet: bool, on_message: impl Fn(&mut App, Value) + Send + Sync + 'static) -> Channel {
     let id = {
         let mut next = channels.next.lock().unwrap_or_else(|p| p.into_inner());
         *next += 1;
@@ -146,7 +172,7 @@ fn open_channel(channels: &Arc<Channels>, mailbox: &Arc<Mailbox>, on_message: im
     let mailbox = mailbox.clone();
     let f: ChannelFn = Arc::new(move |value| {
         let on_message = on_message.clone();
-        mailbox.post(Box::new(move |app| on_message(app, value)));
+        mailbox.push(Box::new(move |app| on_message(app, value)), quiet);
     });
     channels.table.write().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), f);
     Channel { id, channels: channels.clone() }
@@ -156,6 +182,12 @@ impl App {
     /// Wakes the UI thread from anywhere, for something that has its own way of handing over what it has.
     pub fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
         self.mailbox.wake.clone()
+    }
+
+    /// How a quiet job ([`Task::post_quiet`]) wakes the UI thread: a window that runs such jobs between frames
+    /// ([`Self::run_quiet_jobs`]) tells them apart this way. Without it they wake it as any job does. Set once.
+    pub fn set_quiet_waker(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.mailbox.quiet_wake.set(wake);
     }
 }
 
@@ -171,7 +203,7 @@ impl App {
                 }
             })
         };
-        let mailbox = Arc::new(Mailbox { queue: Mutex::new(Vec::new()), wake: options.wake.clone() });
+        let mailbox = Arc::new(Mailbox { queue: Mutex::new(Vec::new()), wake: options.wake.clone(), quiet_wake: std::sync::OnceLock::new() });
         let main_mailbox = mailbox.clone();
         let run_on_main: Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync> = Arc::new(move |f| {
             main_mailbox.post(Box::new(move |_| f()));
@@ -222,14 +254,32 @@ impl App {
         }
     }
 
-    /// Handles what other threads left for the UI thread. Returns whether there was anything.
+    /// Handles what other threads left for the UI thread. Returns whether there was anything besides quiet jobs
+    /// ([`Task::post_quiet`]), which ask for a frame themselves if they need one.
     pub fn tick(&mut self) -> bool {
         let jobs = std::mem::take(&mut *self.mailbox.queue.lock().unwrap_or_else(|p| p.into_inner()));
-        let any = !jobs.is_empty();
-        for job in jobs {
+        let mut loud = false;
+        for (job, quiet) in jobs {
+            loud |= !quiet;
             job(self);
         }
-        any
+        loud
+    }
+
+    /// Runs what other threads left for the UI thread now, between frames, if all of it is quiet ([`Task::post_quiet`]).
+    /// `false` leaves the queue as it is, for the next frame's [`Self::tick`]: something in it is not quiet, or it is empty.
+    pub fn run_quiet_jobs(&mut self) -> bool {
+        let jobs = {
+            let mut queue = self.mailbox.queue.lock().unwrap_or_else(|p| p.into_inner());
+            if queue.is_empty() || queue.iter().any(|(_, quiet)| !quiet) {
+                return false;
+            }
+            std::mem::take(&mut *queue)
+        };
+        for (job, _) in jobs {
+            job(self);
+        }
+        true
     }
 
     /// `invoke(command, args).then(done)`. `done` runs on the UI thread.
@@ -270,7 +320,7 @@ impl App {
 
     /// A channel whose messages run on the UI thread.
     pub fn open_channel(&self, on_message: impl Fn(&mut App, Value) + Send + Sync + 'static) -> Channel {
-        open_channel(&self.channels, &self.mailbox, on_message)
+        open_channel(&self.channels, &self.mailbox, false, on_message)
     }
 
     /// Runs a closure on the next frame.

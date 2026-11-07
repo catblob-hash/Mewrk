@@ -52,8 +52,13 @@ impl RenderNode {
         }
     }
 
+    /// The lowest of [`Self::indexes`], without collecting them: an incremental rebuild searches the nodes by it.
     pub fn first_index(&self) -> usize {
-        self.indexes().into_iter().min().unwrap_or(0)
+        match self {
+            Self::Context { index } => *index,
+            Self::Block { entries, .. } => entries.iter().map(|entry| entry.index).min().unwrap_or(0),
+            Self::Question { entry, answer, .. } => answer.map_or(*entry, |answer| answer.min(*entry)),
+        }
     }
 
     pub fn after_index(&self) -> usize {
@@ -98,13 +103,30 @@ fn is_settled_workflow_call(item: &crate::item::ToolItem<'_>) -> bool {
     item.stream_status == Some(Completed) || (!item.streaming && item.stream_status.is_none())
 }
 
+/// Where a legacy question's search for its answer stops: at the next `ask_user` call, or at the next message the user wrote.
+/// Everything else is passed over.
+pub fn ends_answer_search(item: &Item<'_>) -> bool {
+    match item.item {
+        ContextItem::Tool { tool_name, .. } => tool_name == "ask_user",
+        ContextItem::User { .. } => !is_host_authored_user_context(item.item),
+        ContextItem::System { .. } | ContextItem::Reasoning { .. } | ContextItem::Assistant { .. } => false,
+    }
+}
+
 /// Groups the timeline into blocks, questions and plain message cards. A block runs for as long as nothing the user wrote
 /// or the model said interrupts it. `ask_user` is the one tool that leaves the block: its card carries the user's own answer.
 pub fn build_context_render_nodes<'a>(contexts: impl Contexts<'a>, break_after_indexes: &HashSet<usize>, has_workflow_view: impl Fn(&str) -> bool) -> Vec<RenderNode> {
+    build_context_render_nodes_from(contexts, break_after_indexes, has_workflow_view, 0, None)
+}
+
+/// [`build_context_render_nodes`] from context `start` on: the nodes the whole pass goes on to draw once it has reached `start`
+/// with no block open, which is what an incremental rebuild appends to the nodes it keeps. `held_answer` is an answer at or
+/// after `start` that a question before it folds into its card, so it is not drawn here either.
+pub fn build_context_render_nodes_from<'a>(contexts: impl Contexts<'a>, break_after_indexes: &HashSet<usize>, has_workflow_view: impl Fn(&str) -> bool, start: usize, held_answer: Option<usize>) -> Vec<RenderNode> {
     let count = contexts.count();
     let mut answers: HashMap<usize, usize> = HashMap::new();
-    let mut projected: HashSet<usize> = HashSet::new();
-    for index in 0..count {
+    let mut projected: HashSet<usize> = held_answer.into_iter().collect();
+    for index in start..count {
         let item = contexts.at(index);
         // Only a question from before questions blocked has its answer in the next user message.
         if !is_legacy_paused_question(&item) {
@@ -112,25 +134,15 @@ pub fn build_context_render_nodes<'a>(contexts: impl Contexts<'a>, break_after_i
         }
         for answer_index in index + 1..count {
             let candidate = contexts.at(answer_index);
-            match candidate.item {
-                ContextItem::System { .. } | ContextItem::Reasoning { .. } | ContextItem::Assistant { .. } => continue,
-                ContextItem::Tool { tool_name, .. } => {
-                    if tool_name == "ask_user" {
-                        break;
-                    }
-                    continue;
-                }
-                ContextItem::User { .. } => {
-                    if is_host_authored_user_context(candidate.item) {
-                        continue;
-                    }
-                    if !break_after_indexes.contains(&answer_index) && !projected.contains(&answer_index) {
-                        answers.insert(index, answer_index);
-                        projected.insert(answer_index);
-                    }
-                    break;
-                }
+            if !ends_answer_search(&candidate) {
+                continue;
             }
+            // Another question ends the search unanswered; the user's next message answers it.
+            if matches!(candidate.item, ContextItem::User { .. }) && !break_after_indexes.contains(&answer_index) && !projected.contains(&answer_index) {
+                answers.insert(index, answer_index);
+                projected.insert(answer_index);
+            }
+            break;
         }
     }
 
@@ -142,7 +154,7 @@ pub fn build_context_render_nodes<'a>(contexts: impl Contexts<'a>, break_after_i
             nodes.push(RenderNode::Block { key, entries: std::mem::take(block) });
         }
     };
-    for index in 0..count {
+    for index in start..count {
         let item = contexts.at(index);
         if break_after_indexes.contains(&index) {
             flush(&mut block, &mut nodes);

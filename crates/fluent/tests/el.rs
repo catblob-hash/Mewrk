@@ -892,3 +892,147 @@ fn hover_text_wraps_inside_the_window_and_lies_over_a_portal() {
         assert!(g.pos[0] >= 0.0 && g.pos[0] < 800.0 && g.pos[1] >= 0.0 && g.pos[1] < 600.0, "{:?}", g.pos);
     }
 }
+
+// ---------------------------------------------------------------- frames that only scroll, and layouts kept
+
+thread_local! {
+    static VIEWS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+impl Rig {
+    /// A frame that tries to only scroll, as the app's loop does when nothing but the wheel has happened.
+    fn scroll_frame(&mut self, app: &mut App) -> Option<Scrolled> {
+        self.scene.clear();
+        let mut ui = Ui::new(&mut self.scene, &mut self.text, Theme::dark(), &self.input, &mut self.mem, &mut self.clipboard, 1.0, (800.0, 600.0), 0.016, self.time);
+        let scrolled = render_scrolled(app, &mut ui);
+        self.input.end_frame();
+        scrolled
+    }
+}
+
+fn counted_list(_: &App) -> El<App> {
+    VIEWS.set(VIEWS.get() + 1);
+    col::<App>().child(
+        div()
+            .key("list")
+            .h(100.0)
+            .scroll_y()
+            .children((0..10).map(|i| div::<App>().key(("row", i)).h(50.0).shrink0().bg(fluent::Color::rgb(0x10_0000 * (i + 1))).on_click(move |a: &mut App| a.clicks.push(if i == 2 { "two" } else { "other" })))),
+    )
+}
+
+#[test]
+fn a_frame_that_only_scrolls_moves_what_was_laid_out_without_running_the_view() {
+    let mut rig = Rig::new();
+    let mut app = App::default();
+    rig.input.pointer = Some((10.0, 10.0));
+    rig.frame(&mut app, &counted_list);
+    rig.frame(&mut app, &counted_list);
+    let views = VIEWS.get();
+    rig.input.scroll = -100.0;
+    rig.input.scroll_is_pixels = true;
+    let scrolled = rig.scroll_frame(&mut app).expect("only the wheel happened");
+    assert!(!scrolled.moving && !scrolled.again);
+    assert_eq!(VIEWS.get(), views, "the view did not run");
+    assert_eq!(scroll_state("list").unwrap().0, 100.0);
+    rect_near(rect_of(("row", 2)).unwrap(), 0.0, 0.0, 800.0, 50.0);
+    // What is drawn is where it now is: the third row's fill at the top.
+    let top: Vec<u8> = rig.scene.layers[fluent::gpu::LAYER_BASE].rects.iter().filter(|r| r.rect[1] == 0.0 && r.rect[3] == 50.0).map(|r| r.fill.r).collect();
+    assert_eq!(top, [0x30]);
+    // And what the pointer lands on, once the views have run again.
+    rig.click(&mut app, &counted_list, 10.0, 10.0);
+    assert_eq!(app.clicks, ["two"]);
+}
+
+#[test]
+fn a_frame_that_only_scrolls_goes_no_further_than_what_was_built() {
+    let view = |app: &App| {
+        // Only the first three rows' worth is built, as a virtual list builds what is near the viewport.
+        scroll_coverage("list", f32::NEG_INFINITY, 150.0);
+        counted_list(app)
+    };
+    let mut rig = Rig::new();
+    let mut app = App::default();
+    rig.input.pointer = Some((10.0, 10.0));
+    rig.frame(&mut app, &view);
+    rig.frame(&mut app, &view);
+    rig.input.scroll = -40.0;
+    rig.input.scroll_is_pixels = true;
+    assert!(rig.scroll_frame(&mut app).is_some(), "40 down still shows only what was built");
+    rig.input.scroll = -40.0;
+    rig.input.scroll_is_pixels = true;
+    assert!(rig.scroll_frame(&mut app).is_none(), "180 is past it");
+    assert_eq!(scroll_state("list").unwrap().0, 40.0, "and the frame that gave up moved nothing");
+}
+
+#[test]
+fn anything_but_the_wheel_needs_the_views() {
+    let mut rig = Rig::new();
+    let mut app = App::default();
+    rig.input.pointer = Some((10.0, 10.0));
+    rig.frame(&mut app, &counted_list);
+    rig.input.scroll = -50.0;
+    rig.input.pressed = true;
+    assert!(rig.scroll_frame(&mut app).is_none(), "a press");
+    rig.input.pointer = Some((10.0, 30.0));
+    rig.input.scroll = -50.0;
+    assert!(rig.scroll_frame(&mut app).is_none(), "the pointer moved");
+    rig.input.pointer = Some((10.0, 10.0));
+    rig.frame(&mut app, &counted_list);
+    repaint();
+    rig.input.scroll = -50.0;
+    assert!(rig.scroll_frame(&mut app).is_none(), "a view asked for a frame");
+}
+
+fn rows_view(texts: &[String]) -> El<App> {
+    col::<App>().w(400.0).children(texts.iter().enumerate().map(|(i, t)| {
+        col::<App>().key(("memo-row", i)).memo_layout().p(6.0).gap(4.0).child(text(t.clone())).child(row::<App>().gap(8.0).child(icon(fluent::ui::Icon::Check, 12.0)).child(text("meta").ellipsis()))
+    }))
+}
+
+#[test]
+fn rows_that_come_out_the_same_keep_their_layout_and_land_where_a_fresh_layout_puts_them() {
+    let long = "words that wrap across the column more than once, as a reply does when it runs on for a while ".repeat(3);
+    let mut texts: Vec<String> = (0..6).map(|i| format!("row {i}: {long}")).collect();
+    let mut rig = Rig::new();
+    let mut app = App::default();
+    let shown = std::cell::RefCell::new(texts.clone());
+    let view = |_: &App| rows_view(&shown.borrow());
+    rig.frame(&mut app, &view);
+    rig.frame(&mut app, &view);
+    let p = last_render_phases();
+    assert_eq!((p.memo_roots, p.memo_adopted), (6, 6), "nothing changed");
+    // A token lands in the second row: that row is laid out again, and everything under it moves down with it.
+    texts[1].push_str("and a few more words, enough for another line of it");
+    *shown.borrow_mut() = texts.clone();
+    rig.frame(&mut app, &view);
+    let p = last_render_phases();
+    assert_eq!((p.memo_roots, p.memo_adopted), (6, 5));
+    let kept: Vec<Rect> = (0..6).map(|i| rect_of(("memo-row", i)).unwrap()).collect();
+    set_layout_memo(false);
+    rig.frame(&mut app, &view);
+    set_layout_memo(true);
+    let fresh: Vec<Rect> = (0..6).map(|i| rect_of(("memo-row", i)).unwrap()).collect();
+    assert_eq!(kept, fresh);
+}
+
+#[test]
+fn a_width_limit_from_last_frame_gives_way_when_the_room_shrinks() {
+    let long = "a line long enough to be held to its widest, and then some more words to be sure of it ".repeat(2);
+    let width = std::cell::Cell::new(800.0f32);
+    // Stretched across a column, the text takes the room it has, and is held to its widest only when there is more.
+    let view = |_: &App| col::<App>().child(col::<App>().w(width.get()).child(col::<App>().key("capped-row").memo_layout().child(text(long.clone()).key("capped").max_w(500.0))));
+    let mut rig = Rig::new();
+    let mut app = App::default();
+    rig.frame(&mut app, &view);
+    rig.frame(&mut app, &view);
+    assert!((rect_of("capped").unwrap().w - 500.0).abs() < 1.0, "held to its widest: {:?}", rect_of("capped"));
+    width.set(300.0);
+    rig.frame(&mut app, &view);
+    let kept = rect_of("capped").unwrap();
+    set_layout_memo(false);
+    rig.frame(&mut app, &view);
+    set_layout_memo(true);
+    assert_eq!(kept, rect_of("capped").unwrap());
+    assert!(kept.w <= 300.5, "{kept:?}");
+}

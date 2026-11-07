@@ -77,7 +77,7 @@ pub fn normalize_math_delimiters(content: &str) -> String {
 }
 
 pub(super) fn normalized(content: &str) -> Cow<'_, str> {
-    // Most replies have none of this, and a stream asks ten times a second.
+    // Most replies have none of this, and a stream asks at every commit.
     let bytes = content.as_bytes();
     let special = bytes.iter().enumerate().any(|(i, b)| *b == b'$' || (*b == b'\\' && matches!(bytes.get(i + 1), Some(b'(' | b')' | b'[' | b']'))));
     if !special {

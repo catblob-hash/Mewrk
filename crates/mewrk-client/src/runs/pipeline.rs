@@ -20,7 +20,7 @@ use super::conversation_turns::{self, annotate_turn_failure, clear_turn_failures
 use super::image_short_ids::{
     image_placeholder_ids, image_short_ids_in_use, next_image_short_id, renumber_images_for_send, reserve_queued_message_ids, strip_image_placeholder, text_without_image_placeholders, with_image_placeholders,
 };
-use super::model_stream::{cumulative_model_run_usage, reduce_model_stream_event, trim_live_context_budget, ModelRunState, ModelStreamEffect, MODEL_STREAM_COMMIT_INTERVAL_MS};
+use super::model_stream::{cumulative_model_run_usage, reduce_model_stream_event, trim_live_context_budget, ModelRunState, ModelStreamEffect};
 use super::run_contexts::{
     apply_streamed_run_contexts, backfill_requested_tool_input, contexts_from_interrupted_run, contexts_from_model_run, merge_finalized_interrupted_run_contexts, merge_unique_contexts, run_stream_context_prefixes,
 };
@@ -148,11 +148,11 @@ fn split_conversation_turn(app: &mut App, workspace_id: &str, conversation_id: &
 /// `persistInterruptedRun`.
 fn persist_interrupted_run(app: &mut App, workspace_id: &str, conversation_id: &str, run: &ModelRunState) {
     // Callers capture their snapshot before awaiting the backend's cancel
-    // acknowledgement, and stream state publishes on a fixed 100 ms cadence, so
-    // that snapshot can be a commit behind — or the last events may still be
-    // buffered. Flush, then re-read: losing the final tenth of a second of a
-    // turn is losing exactly the content the user was looking at when they
-    // chose to stop it.
+    // acknowledgement, and stream state publishes on a fixed once-a-second
+    // cadence, so that snapshot can be a commit behind — or the last events may
+    // still be buffered. Flush, then re-read: losing the final second of a turn
+    // is losing exactly the content the user was looking at when they chose to
+    // stop it.
     flush_pending_events(app, conversation_id);
     let latest = runs(app).controller.run(conversation_id).filter(|current| current.request_id == run.request_id).cloned().unwrap_or_else(|| run.clone());
     let interrupted = contexts_from_interrupted_run(&latest);
@@ -247,13 +247,13 @@ pub(super) fn answer_question_blocking(cx: &Cx, conversation_id: &str, prompt_id
 
 /// `registerRunState`: registers a run in the controller using the shared shape for started and adopted runs.
 fn register_run_state(app: &mut App, workspace_id: &str, conversation_id: &str, request_id: &str, request: Arc<ModelRunRequest>, started_at: String) {
-    // From here the run's own stream carries the conversation's tasks.
-    app.forget_task_overlay(conversation_id);
+    // The conversation's task overlay stays: the tasks earlier runs started go on streaming into it, now through this
+    // run's stream, and this run's view draws it.
     runs(app).controller.insert(conversation_id, ModelRunState::new(workspace_id, request_id, request, started_at));
 }
 
 /// `modelRunController.flushPendingEvents`: immediately folds this conversation's uncommitted buffered stream events
-/// into run state. Events commit at 10 FPS, so an interrupted run must flush before persistence: the final visible
+/// into run state. Events commit once a second, so an interrupted run must flush before persistence: the final visible
 /// prose is the most likely data still buffered.
 pub(super) fn flush_pending_events(app: &mut App, conversation_id: &str) {
     let Some(buffer) = runs(app).streams.get_mut(conversation_id) else { return };
@@ -284,6 +284,7 @@ fn commit_batch(app: &mut App, workspace_id: &str, conversation_id: &str, reques
         trim_live_context_budget(running);
         true
     });
+    let mut task_events = false;
     for effect in effects {
         match effect {
             ModelStreamEffect::TurnSplit { item, run_before_input } => split_conversation_turn(app, workspace_id, conversation_id, &run_before_input, &item),
@@ -306,7 +307,15 @@ fn commit_batch(app: &mut App, workspace_id: &str, conversation_id: &str, reques
                 }
             }
             ModelStreamEffect::ToolContextSettled { context } => seams::apply_settled_tool_context(app, conversation_id, context),
+            ModelStreamEffect::ForeignTaskEvent { event, at } => {
+                super::task_overlay::receive_task_stream_event_at(app, conversation_id, event, at);
+                task_events = true;
+            }
         }
+    }
+    // Tasks earlier runs started that report on this run's stream have waited for this commit already: they show with it.
+    if task_events {
+        super::task_overlay::commit_task_overlay(app, conversation_id);
     }
     // The host owns persistence: it writes each canonical context when produced
     // and throttles streaming prose into `streaming` rows. The renderer has no
@@ -319,9 +328,11 @@ fn handle_run_event(app: &mut App, conversation_id: &str, request_id: &str, valu
         return;
     }
     // The channel layer intercepts `run_concluded` for adopted runs; started runs
-    // receive their result from the invoke promise, so ignore it with pings here.
+    // receive their result from the invoke promise, so ignore it with pings here,
+    // past noting that the host has settled the run.
     match value.get("type").and_then(Value::as_str) {
-        Some("ping" | "run_concluded" | "debug_request_body") => return,
+        Some("run_concluded") => return note_settled_on_host(app, conversation_id, request_id),
+        Some("ping" | "debug_request_body") => return,
         _ => {}
     }
     match value.get("type").and_then(Value::as_str) {
@@ -351,12 +362,12 @@ fn handle_run_event(app: &mut App, conversation_id: &str, request_id: &str, valu
         }
     };
     let needs_timer = match runs(app).streams.get_mut(conversation_id) {
-        Some(buffer) if buffer.request_id == request_id => buffer.coalescer.push(event),
+        Some(buffer) if buffer.request_id == request_id => buffer.coalescer.push(event).then(|| buffer.coalescer.delay()),
         _ => return,
     };
-    if needs_timer {
+    if let Some(delay) = needs_timer {
         let id = conversation_id.to_owned();
-        let timer = app.set_timer(Duration::from_millis(MODEL_STREAM_COMMIT_INTERVAL_MS), move |app| {
+        let timer = app.set_timer(delay, move |app| {
             if let Some(buffer) = runs(app).streams.get_mut(&id) {
                 buffer.timer = None;
             }
@@ -367,6 +378,13 @@ fn handle_run_event(app: &mut App, conversation_id: &str, request_id: &str, valu
             buffer.timer = Some(timer);
         }
     }
+}
+
+/// The host settled this run: its stream delivered `run_concluded`. The renderer settles it once `run_model` returns (or
+/// the settlement is taken); until then a background task's event pushed for the conversation is the run's to hand over,
+/// not a stray from before it began (see [`super::task_overlay`]).
+fn note_settled_on_host(app: &mut App, conversation_id: &str, request_id: &str) {
+    runs(app).settled_on_host.insert(conversation_id.to_owned(), request_id.to_owned());
 }
 
 /// What the lifecycle's `drive` gets to hand its events to.
@@ -390,7 +408,7 @@ impl RunKey {
 /// `runTurnLifecycle`: `drive` is the event source. Started runs invoke `run_model`; adopted runs use the attach
 /// channel and settlement slot. Both use the same lifecycle below.
 fn run_turn_lifecycle(cx: &Cx, key: RunKey, request: Arc<ModelRunRequest>, drive: impl FnOnce(RunKey) -> RunOutcome) {
-    // Each run gets its own commit buffer. It commits batches at 10 FPS while retaining every event.
+    // Each run gets its own commit buffer. It commits batches once a second while retaining every event.
     {
         let key = key.clone();
         cx.update(move |app| {
@@ -415,6 +433,13 @@ fn settle_run(app: &mut App, key: &RunKey, request: &Arc<ModelRunRequest>, outco
     // On failure too, so an interrupted snapshot includes the final content before the stream broke.
     flush_pending_events(app, conversation_id);
     let still_ours = runs(app).controller.run_token(conversation_id) == Some(request_id);
+    // The background tasks that outlive the run go on in the conversation's overlay, from where the run's stream left
+    // them; taken here, before settlement clears what the run streamed. Not after a stop or a failure: what the run left
+    // running then is not known to go on, and a card handed over for a child that ended unreported would read as running.
+    let settled_normally = matches!(&outcome, Ok(response) if !matches!(response.stop_reason.as_deref(), Some("cancelled" | "canceled" | "stopped")));
+    let handoff = (still_ours && settled_normally)
+        .then(|| runs(app).controller.run(conversation_id).filter(|run| run.request_id == request_id).map(super::task_overlay::TaskHandoff::of))
+        .flatten();
     if still_ours {
         match outcome {
             Ok(response) => settle_response(app, workspace_id, conversation_id, request_id, request, response),
@@ -455,6 +480,10 @@ fn settle_run(app: &mut App, key: &RunKey, request: &Arc<ModelRunRequest>, outco
         state.controller.delete_run_token(conversation_id);
         state.controller.remove(conversation_id);
     }
+    if state.settled_on_host.get(conversation_id).is_some_and(|settled| settled == request_id) {
+        state.settled_on_host.remove(conversation_id);
+    }
+    super::task_overlay::run_ended(app, conversation_id, handoff);
     // A run that ends without retracting its cards — a dropped channel, a
     // crashed worker — must not leave a card the user can still click. But a
     // background task's card is deliberately still alive host-side, so this
@@ -669,9 +698,13 @@ fn adopt_conversation_run(cx: &Cx, workspace_id: &str, conversation_id: &str) {
     }
     let shared = Arc::new(Mutex::new(AdoptChannel::default()));
     let channel_state = shared.clone();
+    let channel_conversation = conversation_id.to_owned();
     let (attach, stream) = cx.attach_model_run(conversation_id, move |app, value| {
         let mut channel = channel_state.lock().unwrap_or_else(|p| p.into_inner());
         if value.get("type").and_then(Value::as_str) == Some("run_concluded") {
+            if let Some(request_id) = value.get("requestId").and_then(Value::as_str) {
+                note_settled_on_host(app, &channel_conversation, request_id);
+            }
             channel.concluded = true;
             if let Some(conclude) = channel.conclude.take() {
                 let _ = conclude.send(());
@@ -707,6 +740,8 @@ fn adopt_conversation_run(cx: &Cx, workspace_id: &str, conversation_id: &str) {
     let request = Arc::new(*request);
     let key = RunKey::new(workspace_id, conversation_id, &request_id);
     let (tx, rx) = mpsc::channel::<()>();
+    // A run that had already settled when it was attached sends no `run_concluded`: it is settled on the host from the start.
+    let finished = settlement.is_some();
     let registered = {
         let (key, request, shared) = (key.clone(), request.clone(), shared.clone());
         cx.update(move |app| {
@@ -723,6 +758,9 @@ fn adopt_conversation_run(cx: &Cx, workspace_id: &str, conversation_id: &str) {
             // failure record until the settlement either replaces or clears it.
             clear_model_run_error(app, conversation_id, ClearErrorScope::Notice);
             register_run_state(app, &key.workspace_id, conversation_id, &key.request_id, request.clone(), now_iso());
+            if finished {
+                note_settled_on_host(app, conversation_id, &key.request_id);
+            }
             // Restore a same-generation turn marked interrupted during loading because
             // the host is still running it or awaiting its settlement.
             let resumed_at = now_iso();

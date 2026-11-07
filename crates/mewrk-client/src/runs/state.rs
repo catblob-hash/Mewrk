@@ -71,6 +71,10 @@ pub struct RunsState {
     /// What background tasks stream while their conversation has no run, by conversation. Display only; see
     /// [`super::task_overlay`].
     pub(super) task_overlays: HashMap<String, TaskOverlay>,
+    /// Runs the host has settled, by conversation: their stream delivered `run_concluded`, and the renderer has not
+    /// settled them yet. A task event pushed in that window is held for the overlay instead of dropped (see
+    /// [`super::task_overlay`]).
+    pub(super) settled_on_host: HashMap<String, String>,
     /// Conversations whose run finished while another one was open. Their mark turns blue until they are opened;
     /// this is the renderer's own notice, so a restart forgets it.
     pub unseen_completions: HashSet<String>,

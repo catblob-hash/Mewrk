@@ -18,7 +18,7 @@ use mewrk_ui_chat::inline_text_editor::InsertKind;
 use mewrk_ui_chat::item::Item;
 use mewrk_ui_chat::nodes::*;
 use mewrk_ui_chat::props::ConversationViewProps;
-use mewrk_ui_chat::stream::{insertable_tool_groups, step_follow_glide};
+use mewrk_ui_chat::stream::insertable_tool_groups;
 use mewrk_ui_chat::*;
 use mewrk_ui_common::context_menu::menu_row_key;
 use serde_json::json;
@@ -66,6 +66,29 @@ fn draws_a_background_task_overlay_over_its_card_in_place_where_a_run_projection
     // A run's projection is the run's own tail, so it follows what is persisted.
     let appended = Resolved { persisted: &persisted, live: &live, map: Rc::new(Resolved::map_of(&persisted, &live)) };
     assert_eq!(ids(&appended), ["u", "a", "spawn"]);
+}
+
+/// A later run's view: the overlay's card of a task an earlier run started, in its place, then the run's own projection,
+/// which supersedes the persisted copy of a row it streams and follows the rest.
+#[test]
+fn draws_an_earlier_tasks_card_in_place_beside_a_later_runs_projection() {
+    use mewrk_ui_chat::frame::Resolved;
+    let persisted = vec![
+        user("u", "dispatch a scout"),
+        tool("spawn", "agent_spawn", json!({ "task": "map the repo" }), "started"),
+        assistant("a", "turn over"),
+        user("u2", "anything else?"),
+        assistant("r", "partial"),
+    ];
+    let card = streaming(persisted[1].clone(), Some(StreamingToolPhase::Completed));
+    let reply = streaming(assistant("r", "partial, and more"), None);
+    let live = vec![card, reply];
+    let resolved = Resolved { persisted: &persisted, live: &live, map: Rc::new(Resolved::map_with_in_place(&persisted, &live, 1)) };
+    let ids: Vec<String> = (0..resolved.count()).map(|index| resolved.get(index).id().to_owned()).collect();
+    assert_eq!(ids, ["u", "spawn", "a", "u2", "r"]);
+    assert!(resolved.get(1).streaming, "the overlay's card");
+    assert!(resolved.get(4).streaming, "the run's row, not its persisted copy");
+    assert_eq!(Resolved::map_with_in_place(&persisted, &live, 0), Resolved::map_of(&persisted, &live));
 }
 
 // ---------------------------------------------------------------- buildContextRenderNodes
@@ -294,26 +317,6 @@ fn a_copied_tool_card_leaves_behind_what_tied_it_to_its_place_and_is_pasted_only
     assert_eq!(free.contexts.len(), 1);
     let proved = with_copied_tool_proofs(&free, &["signed".to_owned()]);
     assert!(matches!(&proved[0], ContextItem::Tool { attestation, .. } if attestation == "signed"));
-}
-
-#[test]
-fn glides_down_without_overshooting() {
-    let mut glide = mewrk_ui_chat::frame::FollowGlide { position: 0.0, velocity: 0.0, time: None };
-    let start = std::time::Instant::now();
-    let mut last = 0.0;
-    let mut done = false;
-    for frame in 1..400 {
-        let (next, finished) = step_follow_glide(glide, 400.0, start + std::time::Duration::from_millis(frame * 16));
-        assert!(next.position >= last - 0.01 && next.position <= 400.0, "{} after {last}", next.position);
-        last = next.position;
-        glide = next;
-        if finished {
-            done = true;
-            break;
-        }
-    }
-    assert!(done);
-    assert_eq!(last, 400.0);
 }
 
 // ---------------------------------------------------------------- the view, under a scripted pointer
@@ -752,6 +755,41 @@ fn glides_down_to_a_streaming_tail_over_several_frames_and_lets_go_the_moment_th
     rig.frame(&mut view);
     let snapshot = timeline_snapshot(&mut rig.app, ID);
     assert!(!snapshot.pinned && !snapshot.gliding, "{snapshot:?}");
+}
+
+#[test]
+fn follows_a_reply_taller_than_the_window_in_frames_that_only_scroll() {
+    let mut rig = Rig::new();
+    let log = Log::default();
+    let base = tall(30);
+    let growing = |text: &str| {
+        let mut contexts = base.clone();
+        contexts.push(streaming(assistant("live", text), None));
+        contexts
+    };
+    let mut p = props(growing("first"), &log);
+    p.streaming = true;
+    let mut view = |app: &mut App| root(app, &p);
+    rig.point(300.0, 300.0);
+    rig.settle(&mut view);
+    // A commit that leaves the reply far taller than the window.
+    let mut more = p.clone();
+    more.contexts = Rc::new(growing(&"more text in the stream\n\n".repeat(60)));
+    let mut view = |app: &mut App| root(app, &more);
+    let (mut frames, mut full) = (0u32, 0u32);
+    while frames < 240 {
+        full += u32::from(rig.app_frame(&mut view));
+        frames += 1;
+        if frames > 2 && !any_scroll_moving() && bottom_gap().abs() < 1.0 {
+            break;
+        }
+    }
+    assert!(bottom_gap().abs() < 1.0, "followed to the end: {} ({full} of {frames} frames ran the views)", bottom_gap());
+    assert!(frames > 10, "glided there over {frames} frames rather than jumping");
+    // The commit and the frame that measures what it built, a frame for rows the glide reaches that were not built, and one in
+    // every so many that only scroll: the glide itself needs none.
+    assert!(full * 3 <= frames, "{full} of {frames} frames ran the views");
+    assert!(timeline_snapshot(&mut rig.app, ID).pinned);
 }
 
 #[test]
@@ -1648,6 +1686,66 @@ fn an_editor_scrolled_far_from_the_view_keeps_what_was_typed() {
     scroll_request(scroller(), ScrollRequest::Shift(-1_000_000.0));
     rig.settle(&mut view);
     assert_eq!(draft(()).borrow().text, "typed by hand");
+}
+
+/// One run of work, `count` calls long: a single row of the virtual list.
+fn long_run(count: usize) -> Vec<LiveContext> {
+    (0..count).map(|at| live(tool(&format!("w{at}"), "read", json!({ "path": format!("src/file{at}.rs") }), "x"))).collect()
+}
+
+#[test]
+fn a_long_run_of_work_builds_only_the_rows_near_the_view_and_puts_each_where_it_would_be() {
+    let mut rig = Rig::new();
+    let log = Log::default();
+    let p = props(long_run(300), &log);
+    let mut view = |app: &mut App| root(app, &p);
+    rig.settle(&mut view);
+    let total = timeline_snapshot(&mut rig.app, ID).total;
+    assert_eq!(timeline_snapshot(&mut rig.app, ID).nodes, 1, "the whole run is one block");
+    assert!(rect_of(unit_key(0, "w299")).is_some(), "the end is in view");
+    assert!(rect_of(unit_key(0, "w0")).is_none(), "and the start, far above, stands as room");
+
+    // The top: the first rows, one under the other, and nothing from the far end.
+    scroll_request(scroller(), ScrollRequest::Shift(-1_000_000.0));
+    rig.settle(&mut view);
+    assert!(rect_of(unit_key(0, "w299")).is_none());
+    let first = card_rect("w0");
+    let h = first.h;
+    assert!(h > 10.0);
+    for at in 1..10 {
+        let r = card_rect(&format!("w{at}"));
+        assert!((r.h - h).abs() < 0.5, "w{at} is a row like the others");
+        assert!((r.y - (first.y + at as f32 * h)).abs() < 0.5, "w{at} at {} rather than {}", r.y, first.y + at as f32 * h);
+    }
+
+    // Partway down: the rows built there sit as far below the first as the rows above them are tall, room included.
+    let top = scroll_state(scroller()).expect("it scrolls").0;
+    scroll_request(scroller(), ScrollRequest::Shift(150.0 * h));
+    rig.settle(&mut view);
+    let moved = scroll_state(scroller()).unwrap().0 - top;
+    let row = card_rect("w150");
+    assert!((row.y - (first.y + 150.0 * h - moved)).abs() < 0.5, "w150 at {} rather than {}", row.y, first.y + 150.0 * h - moved);
+    assert!(rect_of(unit_key(0, "w0")).is_none() && rect_of(unit_key(0, "w299")).is_none(), "both ends are left out");
+    assert!((timeline_snapshot(&mut rig.app, ID).total - total).abs() < 0.5, "and the run is as tall as ever");
+}
+
+#[test]
+fn a_row_being_edited_in_a_long_run_stays_built_however_far_it_is() {
+    use mewrk_ui_chat::props::TimelineEditorState;
+    let mut rig = Rig::new();
+    let log = Log::default();
+    let contexts = long_run(300);
+    let item = contexts[0].item.clone();
+    let mut p = props(contexts, &log);
+    p.on_cancel_edit = Some(Rc::new(|_| {}));
+    p.on_save_tool_edit = Some(Rc::new(|_, _, _, _, _| {}));
+    p.editor = Some(TimelineEditorState::Edit { kind: InsertKind::Tool, item, index: 0 });
+    let mut view = |app: &mut App| root(app, &p);
+    rig.settle(&mut view);
+    scroll_request(scroller(), ScrollRequest::Shift(1_000_000.0));
+    rig.settle(&mut view);
+    assert!(rect_of(unit_key(0, "w1")).is_none(), "its neighbours are left out");
+    assert!(rect_of(unit_key(0, "w0")).is_some(), "the row with the editor is not");
 }
 
 #[test]
